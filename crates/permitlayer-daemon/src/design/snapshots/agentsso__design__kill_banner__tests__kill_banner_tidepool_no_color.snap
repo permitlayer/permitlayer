@@ -1,0 +1,16 @@
+---
+source: crates/permitlayer-daemon/src/design/kill_banner.rs
+expression: out
+---
+  ⏻  killing daemon…
+
+  ✓ 3 active tokens invalidated
+
+  ════════════════════════════════════════════════════════════════
+    DAEMON KILLED · 2026-04-10T12:34:56.789Z
+    cause: user-initiated
+    new requests will receive HTTP 403
+    resume with:  agentsso resume
+  ════════════════════════════════════════════════════════════════
+
+  elapsed: 1.18s

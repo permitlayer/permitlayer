@@ -1,0 +1,19 @@
+Mathematical Operations
+
+Basic arithmetic:
+  123456 + 654321 = 777777
+  999999 - 111111 = 888888
+  12345 * 67890 = 838102050
+
+Number sequences:
+  Fibonacci: 1, 1, 2, 3, 5, 8, 13, 21, 34, 55, 89, 144
+  Primes under 100: 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47
+
+Hexadecimal values:
+  0xFF = 255
+  0xDEADBEEF = 3735928559
+  0x1A2B3C4D = 439041101
+
+Binary:
+  10110110 = 182
+  11111111 = 255

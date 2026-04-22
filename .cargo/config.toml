@@ -1,0 +1,28 @@
+[alias]
+xtask = "run --package xtask --quiet --"
+
+[target.aarch64-apple-darwin]
+linker = "clang"
+rustflags = ["-C", "link-arg=-fuse-ld=/opt/homebrew/opt/lld/bin/ld64.lld"]
+
+# Story 8.8a investigated wiring scripts/xprotect-runner.sh here as
+# a macOS-only cargo runner to ad-hoc codesign test binaries. Live
+# measurement on 2026-04-21 showed:
+#   - fresh binary in target/debug/deps/ cold launch: ~120ms
+#   - post-codesign --sign=- --force: hash changes, re-scan at ~115ms
+#   - ad-hoc signing yielded NO measurable speedup on this machine
+# The earlier 6-8s cold-launch anecdote was a `syspolicyd` backlog
+# artifact from a concurrent nextest run, not a per-binary scan cost.
+# The runner script is retained for future experimentation but NOT
+# wired — enabling it would add signing overhead without bypassing
+# any scan. If XProtect ever becomes a real bottleneck on a
+# contributor's machine, uncomment the block below to test:
+#
+#   [target.'cfg(target_os = "macos")']
+#   runner = "scripts/xprotect-runner.sh"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.test]
+debug = "line-tables-only"

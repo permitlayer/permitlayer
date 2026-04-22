@@ -1,0 +1,16 @@
+# Invalid: two rules with id = "dup" in the same policy. Rule IDs
+# must be unique per policy so HTTP 403 responses can name exactly
+# one rule.
+[[policies]]
+name = "duplicate-rules"
+scopes = ["x.read"]
+resources = ["*"]
+approval-mode = "auto"
+
+[[policies.rules]]
+id = "dup"
+action = "deny"
+
+[[policies.rules]]
+id = "dup"
+action = "allow"

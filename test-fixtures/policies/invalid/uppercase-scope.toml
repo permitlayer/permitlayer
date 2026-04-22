@@ -1,0 +1,8 @@
+# Invalid: scopes must be lowercase alphanumeric + `.` or `-`.
+# Google OAuth scopes are always lowercase; writing "Gmail.Read"
+# here is almost certainly a typo.
+[[policies]]
+name = "uppercase-scope"
+scopes = ["Gmail.Read"]
+resources = ["*"]
+approval-mode = "auto"

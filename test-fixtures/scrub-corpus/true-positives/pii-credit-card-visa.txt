@@ -1,0 +1,8 @@
+Payment confirmation:
+
+Your Visa card 4111111111111111 has been charged $49.99.
+
+Transaction ID: TXN-20240115-001
+Date: January 15, 2024
+
+If this was not you, please contact us immediately.

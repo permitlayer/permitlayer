@@ -1,0 +1,10 @@
+Subject: Password Reset Request
+
+Hi there,
+
+We received a request to reset the password for your account.
+
+Please click the following link to set a new password:
+https://app.acmewidgets.com/password/reset/a8f3b2c1d4e5f6789012
+
+This link expires in 24 hours.

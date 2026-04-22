@@ -1,0 +1,5 @@
+# Invalid: `description` is not a known top-level key. The schema
+# uses `deny_unknown_fields` so typos fail loudly rather than being
+# silently ignored.
+policies = []
+description = "this file has a typo at the top level"

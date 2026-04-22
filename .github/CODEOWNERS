@@ -1,0 +1,28 @@
+# CODEOWNERS — process-level defense for credential discipline.
+#
+# The credential crate holds the 4 policed types (SealedCredential,
+# OAuthToken, OAuthRefreshToken, AgentBearerToken) whose trait discipline
+# is enforced by `cargo xtask validate-credentials` AND by
+# `static_assertions::assert_not_impl_any!` blocks. The orphan rule does NOT
+# prevent the defining crate from writing `impl Serialize for OAuthToken`,
+# so PRs touching this crate need human review beyond the automated gates.
+#
+# Every PR touching these paths must be approved by a credential-security
+# reviewer (listed below). Maintainers — add GitHub usernames when
+# onboarding.
+
+# Credential types and their discipline gates
+/crates/permitlayer-credential/**   @botsdown
+/xtask/src/validate_credentials/**  @botsdown
+
+# Deny.toml dependency-direction bans — removing an edge here removes a
+# compile-time architectural guarantee.
+/deny.toml                          @botsdown
+
+# Workspace-level dependency/lint policy
+/Cargo.toml                         @botsdown
+/rust-toolchain.toml                @botsdown
+
+# `.github/` — protect CODEOWNERS itself, CI workflows, and repo governance.
+# A PR that could weaken review requirements must itself be reviewed.
+/.github/                           @botsdown

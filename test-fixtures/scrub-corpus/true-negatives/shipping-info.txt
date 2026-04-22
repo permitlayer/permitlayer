@@ -1,0 +1,17 @@
+Order Confirmation #ORD-2024-5582
+
+Your order has been shipped!
+
+Tracking number: 1Z999AA10123456784
+Estimated delivery: January 20, 2024
+
+Shipping address:
+123 Main Street
+Anytown, CA 90210
+
+Items:
+1x Widget Pro - $29.99
+1x Widget Case - $9.99
+Subtotal: $39.98
+Tax: $3.20
+Total: $43.18

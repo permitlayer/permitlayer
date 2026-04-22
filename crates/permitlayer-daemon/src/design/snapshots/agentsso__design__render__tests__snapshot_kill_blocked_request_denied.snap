@@ -1,0 +1,7 @@
+---
+source: crates/permitlayer-daemon/src/design/render.rs
+assertion_line: 1031
+expression: "snapshot_event(\"kill-blocked-request\", \"denied\")"
+---
+time      service  resource      outcome    agent         event               
+15:02:14  gmail    messages/123  ▲ blocked  email-triage  kill-blocked-request

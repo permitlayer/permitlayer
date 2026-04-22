@@ -1,0 +1,8 @@
+# Invalid: `scopes = []` is rejected at compile time. If you really
+# want "deny everything", use `approval-mode = "deny"` with an
+# explicit rule instead.
+[[policies]]
+name = "empty-scopes"
+scopes = []
+resources = ["*"]
+approval-mode = "auto"

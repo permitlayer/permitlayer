@@ -1,0 +1,9 @@
+[profile.default]
+# Skip macOS Keychain conformance tests — hit securityd, take 2+ min each.
+# Run explicitly when touching keystore code:
+#   cargo nextest run -p permitlayer-keystore --profile full
+default-filter = "not (test(conformance_macos) or test(async_runtime_not_starved_by_native_keystore))"
+
+[profile.full]
+# Includes Keychain tests.
+default-filter = "all()"

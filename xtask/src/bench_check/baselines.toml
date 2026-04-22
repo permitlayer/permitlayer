@@ -1,0 +1,32 @@
+# Criterion baseline mean walltimes (nanoseconds per iteration).
+#
+# Regenerate by running `cargo xtask bench-check` (without --enforce)
+# on a quiescent host, then copying the measured values into this file.
+# The in-file format is a flat `[benches]` table keyed by bench name.
+#
+# The 3× headroom multiplier (see `bench_check.rs` HEADROOM_MULTIPLIER)
+# is what catches regressions. These values only need to be retuned
+# after an intentional algorithmic change, a hardware upgrade, or a
+# toolchain jump that shifts the baseline class. The absolute walltimes
+# are host-specific; the `--enforce` gate still works meaningfully as
+# long as the harness is run on the same class of machine these were
+# seeded on. Regenerate locally after switching machines.
+#
+# See Story 8.6 AC #1–#2 for the harness contract.
+
+[benches]
+scrub_100kb_no_matches = 132424.89
+scrub_100kb_sparse_matches = 137803.29
+scrub_100kb_dense_matches = 242811.17
+scrub_1mb_no_matches = 1393832.77
+scrub_1mb_sparse_matches = 1373222.21
+scrub_empty = 2.62
+scrub_small_10b = 24.76
+scrub_full_ruleset_100kb_clean = 2917946.37
+scrub_full_ruleset_100kb_sparse = 3371253.36
+scrub_full_ruleset_1mb_clean = 75145913.74
+scrub_full_ruleset_1mb_sparse = 93503983.70
+policy_eval_100_policies_hit_first_rule_allow = 30.23
+policy_eval_100_policies_hit_last_rule_deny = 107.35
+policy_eval_100_policies_fallthrough_allow = 56.96
+policy_eval_100_policies_unmatched_deny = 52.88

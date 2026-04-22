@@ -1,0 +1,15 @@
+Q4 Financial Summary
+
+Revenue: $1,234,567.89
+Operating costs: $987,654.32
+Net profit: $246,913.57
+
+Employee count: 150
+Average salary: $85,000
+
+Key metrics:
+- Customer acquisition cost: $42.50
+- Monthly recurring revenue: $102,945
+- Annual run rate: $1,235,340
+
+All amounts in USD. Report generated 2024-01-15.

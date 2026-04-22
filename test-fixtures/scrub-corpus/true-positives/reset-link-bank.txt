@@ -1,0 +1,11 @@
+Subject: Reset your banking password
+
+Dear Customer,
+
+We received your request to reset your online banking password.
+
+Click here to reset: https://secure.firstnational.com/password/reset?token=a1b2c3d4e5f6&user=12345
+
+This link expires in 30 minutes.
+
+First National Bank

@@ -1,0 +1,11 @@
+---
+source: crates/permitlayer-daemon/src/design/scrub_inline.rs
+assertion_line: 440
+expression: out
+---
+           ┌──────────────────────────────────────────────┐
+           │ Your verification code is <REDACTED_OTP>     │
+           │                                 ↑            │
+           │                        caught: otp-6digit    │
+           └──────────────────────────────────────────────┘
+           why? → agentsso scrub explain otp-6digit

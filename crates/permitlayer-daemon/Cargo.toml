@@ -1,0 +1,99 @@
+[package]
+name = "permitlayer-daemon"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "The agentsso binary: axum server, CLI, lifecycle management."
+
+# Story 8.8b: collapse 23 `tests/*.rs` integration files into one
+# binary. See tests/integration/mod.rs for submodules and
+# tests/README.md for the rationale + new-test-file convention.
+autotests = false
+
+[[bin]]
+name = "agentsso"
+path = "src/main.rs"
+
+[[test]]
+name = "integration"
+path = "tests/integration/mod.rs"
+
+[dependencies]
+permitlayer-proxy = { path = "../permitlayer-proxy", version = "0.1.0" }
+permitlayer-oauth = { path = "../permitlayer-oauth", version = "0.1.0" }
+permitlayer-vault = { path = "../permitlayer-vault", version = "0.1.0" }
+# `test-seam` enables `PassphraseKeyStore::from_passphrase` as a `pub`
+# constructor so the debug-assertion-gated `AGENTSSO_TEST_PASSPHRASE`
+# env var in `cli/start.rs::ensure_master_key_bootstrapped` can use it
+# to route integration tests through the real `bootstrap_from_keystore`
+# path. The feature is a no-op in release builds because the only
+# caller lives behind `#[cfg(debug_assertions)]` and compiles out.
+permitlayer-keystore = { path = "../permitlayer-keystore", version = "0.1.0", features = [
+    "test-seam",
+] }
+permitlayer-core = { path = "../permitlayer-core", version = "0.1.0" }
+permitlayer-credential = { path = "../permitlayer-credential", version = "0.1.0" }
+permitlayer-plugins = { path = "../permitlayer-plugins", version = "0.1.0" }
+# Story 6.2 AD2: the debug-only `/v1/debug/plugin-echo` handler
+# drives JS-side Promise resolution via `Promise::finish`. Already
+# compiled transitively via permitlayer-plugins, so adding it as
+# a direct dep here adds zero C-code build cost — it just makes
+# `rquickjs::Value` and `rquickjs::String` directly nameable from
+# the handler. The handler itself is gated by
+# `#[cfg(debug_assertions)]` so release builds don't include the
+# code path. (H19 re-review finding was about this dep — we
+# concluded the cost is already paid via the transitive dep.)
+rquickjs.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+figment.workspace = true
+toml.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+arc-swap.workspace = true
+dashmap.workspace = true
+tokio.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+ulid.workspace = true
+dirs.workspace = true
+thiserror.workspace = true
+chrono.workspace = true
+tempfile.workspace = true
+dialoguer.workspace = true
+console.workspace = true
+indicatif.workspace = true
+crossterm.workspace = true
+unicode-width.workspace = true
+async-trait.workspace = true
+hkdf.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+reqwest.workspace = true
+url.workspace = true
+notify.workspace = true
+csv.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+nix.workspace = true
+
+[build-dependencies]
+serde_json.workspace = true
+
+[dev-dependencies]
+rmcp = { version = "1.3", features = ["client", "transport-streamable-http-client-reqwest"] }
+insta = { workspace = true }
+http-body-util.workspace = true
+# Needed by the `FailingAuditStore` test fixture in `server::control::tests`
+# to impl the `AuditStore` trait (which is defined via `#[async_trait]`).
+async-trait.workspace = true
+
+[lints]
+workspace = true

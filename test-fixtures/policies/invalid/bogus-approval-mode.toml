@@ -1,0 +1,7 @@
+# Invalid: `approval-mode = "maybe"` is not one of the three
+# allowed values: "auto", "prompt", "deny".
+[[policies]]
+name = "bogus-mode"
+scopes = ["x.read"]
+resources = ["*"]
+approval-mode = "maybe"

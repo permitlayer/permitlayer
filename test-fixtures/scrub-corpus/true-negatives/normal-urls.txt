@@ -1,0 +1,9 @@
+Here are some useful links:
+
+- Documentation: https://docs.example.com/getting-started
+- GitHub repo: https://github.com/example/project
+- Blog post: https://blog.example.com/2024/01/new-features
+- Download page: https://www.example.com/downloads/v2.1.0
+- Status page: https://status.example.com
+
+For more information, visit our website at https://www.example.com.

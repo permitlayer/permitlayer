@@ -1,0 +1,7 @@
+---
+source: crates/permitlayer-daemon/src/design/render.rs
+assertion_line: 1021
+expression: "snapshot_event(\"kill-activated\", \"already-active\")"
+---
+time      service  resource      outcome  agent         event         
+15:02:14  gmail    messages/123  ● ok     email-triage  kill-activated

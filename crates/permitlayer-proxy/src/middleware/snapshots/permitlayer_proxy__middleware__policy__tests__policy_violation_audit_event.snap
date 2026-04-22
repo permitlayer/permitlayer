@@ -1,0 +1,20 @@
+---
+source: crates/permitlayer-proxy/src/middleware/policy.rs
+expression: snapshot
+---
+{
+  "agent_id": "unknown",
+  "event_type": "policy-violation",
+  "extra": {
+    "decision": "deny",
+    "denied_resource": null,
+    "denied_scope": "gmail.modify",
+    "policy_name": "snapshot-test",
+    "rule_id": "default-deny-scope-out-of-allowlist"
+  },
+  "outcome": "denied",
+  "request_id": "01TESTPOLICY",
+  "resource": "users/me",
+  "scope": "gmail.modify",
+  "service": "gmail"
+}

@@ -1,0 +1,7 @@
+Request log:
+  URL: https://api.stripe.com/v1/charges
+  Headers:
+    Content-Type: application/json
+    Authorization: Bearer rk_test_51O7KwpCMwH3zRUWcSp7bqm7T
+
+Response: 200 OK

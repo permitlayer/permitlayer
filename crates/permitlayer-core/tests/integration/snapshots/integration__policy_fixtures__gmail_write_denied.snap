@@ -1,0 +1,12 @@
+---
+source: crates/permitlayer-core/tests/integration/policy_fixtures.rs
+assertion_line: 74
+expression: decision
+---
+{
+  "decision": "deny",
+  "policy_name": "gmail-read-only",
+  "rule_id": "default-deny-scope-out-of-allowlist",
+  "denied_scope": "gmail.modify",
+  "denied_resource": null
+}

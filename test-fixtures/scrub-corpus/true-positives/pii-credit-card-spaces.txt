@@ -1,0 +1,5 @@
+Billing information update:
+
+Your card 4111 1111 1111 1111 on file has been updated.
+
+Next billing date: February 1, 2024.

@@ -1,0 +1,163 @@
+# cargo-deny configuration for permitlayer.
+#
+# Enforces:
+# - License allowlist (MIT/Apache-2.0/BSD/ISC/Unicode families only)
+# - RustSec advisory gate (deny all vulnerabilities)
+# - Registry allowlist (crates.io only)
+# - Workspace dependency-direction rules (see [bans.deny] below)
+
+[graph]
+# Check all targets cargo-deny can see by default.
+all-features = false
+
+[output]
+feature-depth = 1
+
+# ============================================================================
+# Advisories — block on any RustSec advisory
+# ============================================================================
+[advisories]
+# Advisory database: default (rustsec/advisory-db)
+ignore = []
+
+# ============================================================================
+# Licenses — permissive-only, no copyleft
+# ============================================================================
+[licenses]
+# Permissive licenses only. Starts with the licenses currently in use;
+# future stories will add BSD/ISC/etc. as new dependencies require them.
+# cargo-deny will fail the check if a dep brings in a license not listed here.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Unicode-3.0",
+    "BSD-3-Clause",
+    "MPL-2.0",             # option-ext (transitive dep of dirs crate); file-level copyleft only
+    "ISC",                 # common permissive license in Rust ecosystem
+    "BSD-2-Clause",        # common permissive license
+    "CDLA-Permissive-2.0", # webpki-root-certs (TLS CA bundle for rustls)
+    "CC0-1.0",             # notify v8.2.0 (FSF-classified Free/Libre, public-domain-equivalent; carried since Story 5.2 added notify for audit-follow)
+    "Zlib",                # foldhash v0.2 (transitive via hashbrown 0.16 via rquickjs); OSI-approved and FSF Free/Libre; added in Story 6.1 with rquickjs
+]
+confidence-threshold = 0.8
+exceptions = []
+
+[licenses.private]
+ignore = true
+
+# ============================================================================
+# Bans — workspace dependency-direction enforcement
+# ============================================================================
+#
+# Pattern: each workspace crate is listed with `wrappers` enumerating the ONLY
+# crates allowed to depend on it directly. This encodes the architecture.md
+# dependency graph:
+#
+#   daemon → proxy → { plugins → { oauth, core }, connectors, core }
+#                     plugins → { oauth → credential, core → credential }
+#                     core → credential
+#                     vault → { keystore, credential }
+#
+# (Stories 1.3+ will wire `vault` into the graph; for Story 1.1 vault is a
+# leaf-ish crate depended on by nothing yet.)
+#
+# NOTE: cargo-deny's `wrappers` field restricts DIRECT dependents. External
+# crates never depend on workspace crates, so this effectively constrains only
+# workspace-internal dependency edges.
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+
+deny = [
+    # permitlayer-credential: leaf. Every consumer must be explicitly listed.
+    # `permitlayer-proxy` appears here because Story 1.14a (commit eff8771)
+    # added `permitlayer-oauth` as a dep of `permitlayer-proxy` for the
+    # token refresh integration; `permitlayer-oauth` depends on
+    # `permitlayer-credential`, so the proxy is now a transitive wrapper.
+    { crate = "permitlayer-credential", wrappers = [
+        "permitlayer-vault",
+        "permitlayer-core",
+        "permitlayer-oauth",
+        "permitlayer-proxy",
+        "permitlayer-daemon",
+    ] },
+
+    # permitlayer-keystore: vault + daemon (Story 1.6 setup CLI loads keystore).
+    { crate = "permitlayer-keystore", wrappers = [
+        "permitlayer-vault",
+        "permitlayer-daemon",
+    ] },
+
+    # permitlayer-vault: reachable via the proxy stack, daemon binary, and
+    # oauth crate (Story 1.6: oauth seals refresh tokens via vault).
+    { crate = "permitlayer-vault", wrappers = [
+        "permitlayer-proxy",
+        "permitlayer-daemon",
+        "permitlayer-oauth",
+    ] },
+
+    # permitlayer-core: the dep hub for proxy/plugins/daemon. Story 1.6 setup
+    # CLI uses CredentialStore for token persistence.
+    #
+    # `xtask` is listed because the release/scrub-corpus utilities pull in
+    # permitlayer-core for type definitions — this is a pre-existing
+    # allowlist gap that surfaced during Story 1.14a Task 6 `cargo deny check`.
+    # Not related to the refresh integration itself; fixing here because the
+    # full cargo-deny gate must pass for Task 6 verification to complete.
+    { crate = "permitlayer-core", wrappers = [
+        "permitlayer-plugins",
+        "permitlayer-proxy",
+        "permitlayer-daemon",
+        "xtask",
+    ] },
+
+    # permitlayer-oauth: consumed by plugins (host API), daemon CLI (Story 1.6),
+    # and proxy (Story 1.14 — reactive token refresh on upstream 401 via
+    # OAuthClient + refresh::refresh_with_retry; see sprint-change-proposal-2026-04-09.md).
+    { crate = "permitlayer-oauth", wrappers = [
+        "permitlayer-plugins",
+        "permitlayer-daemon",
+        "permitlayer-proxy",
+    ] },
+
+    # permitlayer-plugins: consumed by the proxy stack (host API +
+    # plugin execution surface) AND by the daemon binary (Story 6.1
+    # eager boot construction — `PluginRuntime` is constructed once
+    # at daemon start, held in `AppState` via `Arc`, and shared with
+    # the proxy for per-request execution).
+    { crate = "permitlayer-plugins", wrappers = [
+        "permitlayer-proxy",
+        "permitlayer-daemon",
+    ] },
+
+    # permitlayer-connectors: embedded JS assets consumed by the proxy
+    # (future JS-port dispatch path) AND by permitlayer-plugins (Story 6.3
+    # loader — `builtin_connectors()` enumerated at daemon boot to register
+    # Gmail/Calendar/Drive into `PluginRegistry`).
+    { crate = "permitlayer-connectors", wrappers = [
+        "permitlayer-proxy",
+        "permitlayer-plugins",
+    ] },
+
+    # permitlayer-proxy: consumed only by the daemon binary.
+    { crate = "permitlayer-proxy", wrappers = [
+        "permitlayer-daemon",
+    ] },
+]
+
+# ============================================================================
+# Sources — only crates.io is permitted
+# ============================================================================
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

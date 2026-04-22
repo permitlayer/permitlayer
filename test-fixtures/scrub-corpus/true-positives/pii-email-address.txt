@@ -1,0 +1,9 @@
+Subject: Welcome to our platform
+
+Dear User,
+
+Thank you for signing up! Your account has been created with the email address jane.smith@company.org.
+
+If you have any questions, contact support@company.org.
+
+Welcome aboard!

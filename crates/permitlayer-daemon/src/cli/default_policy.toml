@@ -1,0 +1,148 @@
+# permitlayer default policy file.
+#
+# This file ships with every install. Edit it to match your setup,
+# or copy it to a new file (e.g. `my-team.toml`) in the same
+# directory and register agents against the new policy name.
+#
+# Conventions used throughout this file:
+#   - Keys are kebab-case (TOML idiom).
+#   - Policy and rule IDs are stable strings. They appear verbatim
+#     in HTTP 403 response bodies so you can grep this file to find
+#     the rule that denied a request.
+#   - Rules are evaluated in declaration order. The first rule whose
+#     scopes AND resources match wins. If no rule matches, the
+#     policy's `approval-mode` default applies.
+#   - `scopes = ["*"]` is NOT valid. List every scope you allow
+#     explicitly — default-deny applies to anything not listed.
+#   - `resources = ["*"]` means "any resource". Use explicit values
+#     like `["primary"]` to narrow to specific calendars, labels, etc.
+#
+# How approval prompts work (policies with `approval-mode = "prompt"`):
+#
+# When an agent request matches a prompt-required rule, permitlayer
+# blocks the request and shows an approval prompt on the terminal
+# running `agentsso start`. The operator sees the agent name, the
+# scope, the resource, and the rule ID, then presses one of:
+#
+#   y       — allow this one request
+#   n       — deny this one request
+#   a       — always allow this rule (remembered for the session)
+#   never   — never allow this rule (remembered for the session)
+#
+# If no keystroke arrives within the configured timeout (default 30s,
+# configured via `[approval] timeout_seconds` in `daemon.toml` or
+# overridden by the `AGENTSSO_APPROVAL__TIMEOUT_SECONDS` env var —
+# note the DOUBLE underscore between `APPROVAL` and `TIMEOUT_SECONDS`,
+# matching figment's nested-section convention used elsewhere in
+# `daemon.toml`), the request is denied with HTTP 403
+# `policy.approval_timeout` (a distinct error code from
+# `policy.approval_required` so agents can implement smart retry on
+# AFK timeouts vs deliberate operator denials). Press ENTER with no
+# arrow key to accept the default cursor position, which is "deny" —
+# reflexive enter keeps you safe. The `a` and `never` decisions are
+# cleared when you run `agentsso reload`, receive SIGHUP, or restart
+# the daemon, so edits to this file always take effect (and reload
+# clears the cache BEFORE attempting to recompile, so a failing
+# reload still evicts stale cached decisions).
+#
+# If the daemon has no controlling TTY (e.g., started from a systemd
+# user unit with stdin redirected from /dev/null), approval prompts
+# are structurally unavailable — every prompt-required request will
+# return HTTP 503 `policy.approval_unavailable`. Either run
+# `agentsso start` in a foreground terminal or change affected
+# policies' `approval-mode` to `auto` or `deny`.
+
+# -----------------------------------------------------------------
+# Policy: gmail-read-only
+#
+# Use this for an agent that should only read Gmail. Every read is
+# auto-approved. Any attempt to modify, send, or trash is blocked
+# by the default-deny fallback — only scopes listed below can
+# ever reach the upstream API.
+# -----------------------------------------------------------------
+[[policies]]
+name = "gmail-read-only"
+# Only these two scopes are allowed. Any other scope (`gmail.modify`,
+# `gmail.send`, `gmail.trash`, etc.) is blocked with HTTP 403 and
+# rule_id = "default-deny-scope-out-of-allowlist".
+scopes = ["gmail.readonly", "gmail.metadata"]
+# All mailboxes. Narrow by listing explicit label IDs if you want
+# to restrict to, say, only the Inbox.
+resources = ["*"]
+# Default disposition for requests that match the allowlist but
+# don't hit any rule below. `auto` means auto-approve.
+approval-mode = "auto"
+# Positive framing (AR28): when combined with `approval-mode =
+# "prompt"`, this flag auto-approves scopes ending in `.readonly`
+# or `.metadata` WITHOUT showing a prompt. Writes still prompt.
+# Safe to leave set under `approval-mode = "auto"` — the flag only
+# has runtime effect when the policy is otherwise prompting.
+auto-approve-reads = true
+
+# No explicit rules needed. The scope allowlist above is the
+# complete spec: reads are allowed, everything else is denied by
+# the default-deny fallback. A rule that tried to name specific
+# "deny" scopes would be rejected at compile time because those
+# scopes aren't in the allowlist (see RuleScopeWidensPolicyAllowlist).
+
+# -----------------------------------------------------------------
+# Policy: calendar-prompt-on-write
+#
+# Use this for an agent that should freely read your calendar but
+# get explicit human approval before creating, editing, or deleting
+# an event. Only the primary calendar is in scope.
+# -----------------------------------------------------------------
+[[policies]]
+name = "calendar-prompt-on-write"
+scopes = ["calendar.readonly", "calendar.events"]
+# Only the primary calendar. Family/work calendars are blocked.
+resources = ["primary"]
+# Writes fall into the policy-level prompt disposition unless a
+# more specific rule below carves them out. When the request hits
+# the terminal prompt, the operator can press `a` to remember the
+# decision for the current session — subsequent calendar writes to
+# the `primary` calendar from this agent will pass through without
+# re-prompting until the daemon is restarted, reloaded, or the
+# operator presses `never` to remember a denial instead.
+approval-mode = "prompt"
+# auto-approve-reads = true means scopes ending in .readonly or
+# .metadata skip the prompt entirely. The explicit read rule below
+# would also cover calendar.readonly, but setting the flag makes
+# the intent grep-visible at the policy level.
+auto-approve-reads = true
+
+# Explicit allow for read scopes. Needed because the policy-level
+# default is `prompt`, which would otherwise prompt on reads too.
+[[policies.rules]]
+id = "allow-calendar-reads"
+scopes = ["calendar.readonly"]
+action = "allow"
+
+# Write scope (calendar.events) falls through to this rule and
+# gets an explicit prompt. Without this rule the policy-level
+# `approval-mode = "prompt"` default would do the same thing, but
+# the explicit rule ID makes 403 responses and audit events
+# greppable — you can search for `prompt-calendar-writes` to find
+# every human approval this policy surfaced.
+[[policies.rules]]
+id = "prompt-calendar-writes"
+scopes = ["calendar.events"]
+action = "prompt"
+
+# -----------------------------------------------------------------
+# Policy: drive-research-scope-restricted
+#
+# Use this for an agent that does read-only research across Drive
+# but must not touch any file outside a specific shared folder. The
+# `resources = ["research-shared"]` line narrows every request to
+# exactly that folder ID.
+# -----------------------------------------------------------------
+[[policies]]
+name = "drive-research-scope-restricted"
+scopes = ["drive.readonly", "drive.metadata"]
+# Only this specific folder ID. Swap it for a real folder ID from
+# your Drive when you wire an agent up. Anything else → 403 with
+# rule_id = "default-deny-resource-out-of-allowlist".
+resources = ["research-shared"]
+approval-mode = "auto"
+auto-approve-reads = true

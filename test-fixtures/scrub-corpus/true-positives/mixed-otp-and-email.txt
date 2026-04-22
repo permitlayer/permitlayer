@@ -1,0 +1,10 @@
+Subject: Account verification
+
+Hi user@example.com,
+
+Your verification code is 847291. Please enter this code within 10 minutes.
+
+If you need help, contact support@example.com.
+
+Thanks,
+The Team

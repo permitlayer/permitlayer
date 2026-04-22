@@ -1,0 +1,8 @@
+Subject: Reset your Google Account password
+
+Someone recently requested a password change for your Google Account.
+
+Click the link below to reset your password:
+https://accounts.google.com/reset/password?token=eyJhbGciOiJSUzI1NiJ9abc123
+
+If you didn't ask to change your password, you can ignore this email.

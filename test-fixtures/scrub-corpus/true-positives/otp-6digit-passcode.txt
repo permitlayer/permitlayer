@@ -1,0 +1,10 @@
+Subject: Login passcode
+
+Hello,
+
+Your passcode is 993847 for account verification.
+
+Do not share this with anyone. It will expire shortly.
+
+Best regards,
+Auth Service

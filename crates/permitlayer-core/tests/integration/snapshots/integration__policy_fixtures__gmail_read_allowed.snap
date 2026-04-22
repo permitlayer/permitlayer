@@ -1,0 +1,8 @@
+---
+source: crates/permitlayer-core/tests/integration/policy_fixtures.rs
+assertion_line: 63
+expression: decision
+---
+{
+  "decision": "allow"
+}

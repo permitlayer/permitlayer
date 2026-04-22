@@ -1,0 +1,10 @@
+---
+source: crates/permitlayer-core/tests/integration/policy_fixtures.rs
+assertion_line: 85
+expression: decision
+---
+{
+  "decision": "prompt",
+  "policy_name": "calendar-prompt-on-write",
+  "rule_id": "prompt-calendar-writes"
+}

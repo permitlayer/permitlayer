@@ -1,0 +1,22 @@
+Subject: What's new this month
+
+Hi there!
+
+We've been busy this month with some exciting updates:
+
+New Features:
+- Dark mode support for all platforms
+- Improved search with fuzzy matching
+- Export to PDF and CSV
+
+Coming Soon:
+- Team collaboration tools
+- Advanced analytics dashboard
+- Mobile app redesign
+
+We processed over 500,000 requests last month with 99.9% uptime!
+
+Stay tuned for more updates.
+
+Best,
+The Product Team

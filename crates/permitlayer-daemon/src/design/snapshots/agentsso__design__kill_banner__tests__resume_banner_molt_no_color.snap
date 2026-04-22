@@ -1,0 +1,10 @@
+---
+source: crates/permitlayer-daemon/src/design/kill_banner.rs
+expression: out
+---
+  ⏻  daemon resumed
+
+    RESUMED · 2026-04-10T12:35:08.789Z
+    duration killed: 12s
+
+  elapsed: 0.84s

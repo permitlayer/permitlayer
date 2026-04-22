@@ -1,0 +1,19 @@
+Network Configuration
+
+Primary DNS: 8.8.8.8
+Secondary DNS: 8.8.4.4
+
+Server endpoints:
+  - Production: 10.0.1.100:8080
+  - Staging: 10.0.2.100:8080
+  - Development: 127.0.0.1:3000
+
+CIDR blocks:
+  - VPC: 10.0.0.0/16
+  - Public subnet: 10.0.1.0/24
+  - Private subnet: 10.0.2.0/24
+
+Firewall rules:
+  Allow TCP 443 from 0.0.0.0/0
+  Allow TCP 80 from 0.0.0.0/0
+  Allow TCP 22 from 10.0.0.0/16

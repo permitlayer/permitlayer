@@ -1,0 +1,18 @@
+[server]
+host = "0.0.0.0"
+port = 3820
+workers = 4
+
+[proxy]
+upstream = "https://api.example.com"
+timeout_ms = 30000
+max_retries = 3
+
+[logging]
+level = "info"
+format = "json"
+output = "stdout"
+
+[database]
+url = "postgres://localhost:5432/mydb"
+pool_size = 10

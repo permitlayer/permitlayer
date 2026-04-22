@@ -1,0 +1,13 @@
+Technical Specifications
+
+Model: XR-5000
+Dimensions: 120mm x 85mm x 42mm
+Weight: 250g
+Battery: 5000mAh lithium-polymer
+Display: 6.1" OLED, 2400x1080 resolution
+Processor: ARM Cortex-A78, 2.84GHz
+RAM: 8GB LPDDR5
+Storage: 128GB / 256GB
+
+Operating temperature: -10C to 45C
+Certification: FCC ID: 2AYZZ-XR5000

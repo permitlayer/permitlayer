@@ -1,0 +1,8 @@
+Subject: One-time password
+
+Your one-time code is 98765432 for completing the transaction.
+
+This code is valid for 5 minutes only.
+
+Regards,
+Banking Team

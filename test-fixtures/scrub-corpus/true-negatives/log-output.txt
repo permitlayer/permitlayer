@@ -1,0 +1,7 @@
+2024-01-15T10:23:45.123Z INFO  server::http  > Listening on 0.0.0.0:3820
+2024-01-15T10:23:45.125Z INFO  server::proxy > Proxy initialized with 3 upstream targets
+2024-01-15T10:23:46.001Z DEBUG server::http  > GET /health -> 200 OK (1ms)
+2024-01-15T10:23:47.234Z DEBUG server::proxy > Forwarding POST /api/v1/data -> upstream-1
+2024-01-15T10:23:47.456Z INFO  server::proxy > Response 200, body_size=4096, latency=222ms
+2024-01-15T10:23:48.789Z WARN  server::rate  > Rate limit approaching for client_id=abc123 (950/1000)
+2024-01-15T10:23:49.012Z DEBUG server::http  > GET /metrics -> 200 OK (0ms)

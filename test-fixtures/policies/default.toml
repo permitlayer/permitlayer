@@ -1,0 +1,102 @@
+# permitlayer default policy file.
+#
+# This file ships with every install. Edit it to match your setup,
+# or copy it to a new file (e.g. `my-team.toml`) in the same
+# directory and register agents against the new policy name.
+#
+# Conventions used throughout this file:
+#   - Keys are kebab-case (TOML idiom).
+#   - Policy and rule IDs are stable strings. They appear verbatim
+#     in HTTP 403 response bodies so you can grep this file to find
+#     the rule that denied a request.
+#   - Rules are evaluated in declaration order. The first rule whose
+#     scopes AND resources match wins. If no rule matches, the
+#     policy's `approval-mode` default applies.
+#   - `scopes = ["*"]` is NOT valid. List every scope you allow
+#     explicitly — default-deny applies to anything not listed.
+#   - `resources = ["*"]` means "any resource". Use explicit values
+#     like `["primary"]` to narrow to specific calendars, labels, etc.
+
+# -----------------------------------------------------------------
+# Policy: gmail-read-only
+#
+# Use this for an agent that should only read Gmail. Every read is
+# auto-approved. Any attempt to modify, send, or trash is blocked
+# by the default-deny fallback — only scopes listed below can
+# ever reach the upstream API.
+# -----------------------------------------------------------------
+[[policies]]
+name = "gmail-read-only"
+# Only these two scopes are allowed. Any other scope (`gmail.modify`,
+# `gmail.send`, `gmail.trash`, etc.) is blocked with HTTP 403 and
+# rule_id = "default-deny-scope-out-of-allowlist".
+scopes = ["gmail.readonly", "gmail.metadata"]
+# All mailboxes. Narrow by listing explicit label IDs if you want
+# to restrict to, say, only the Inbox.
+resources = ["*"]
+# Default disposition for requests that match the allowlist but
+# don't hit any rule below. `auto` means auto-approve.
+approval-mode = "auto"
+# Positive framing (AR28): auto-approve read-style scopes even if
+# a rule below would otherwise prompt. Story 4.5 consumes this
+# flag; Story 4.1 stores it for forward compatibility.
+auto-approve-reads = true
+
+# No explicit rules needed. The scope allowlist above is the
+# complete spec: reads are allowed, everything else is denied by
+# the default-deny fallback. A rule that tried to name specific
+# "deny" scopes would be rejected at compile time because those
+# scopes aren't in the allowlist (see RuleScopeWidensPolicyAllowlist).
+
+# -----------------------------------------------------------------
+# Policy: calendar-prompt-on-write
+#
+# Use this for an agent that should freely read your calendar but
+# get explicit human approval before creating, editing, or deleting
+# an event. Only the primary calendar is in scope.
+# -----------------------------------------------------------------
+[[policies]]
+name = "calendar-prompt-on-write"
+scopes = ["calendar.readonly", "calendar.events"]
+# Only the primary calendar. Family/work calendars are blocked.
+resources = ["primary"]
+# Writes fall into the policy-level prompt disposition unless a
+# more specific rule below carves them out.
+approval-mode = "prompt"
+auto-approve-reads = true
+
+# Explicit allow for read scopes. Needed because the policy-level
+# default is `prompt`, which would otherwise prompt on reads too.
+[[policies.rules]]
+id = "allow-calendar-reads"
+scopes = ["calendar.readonly"]
+action = "allow"
+
+# Write scope (calendar.events) falls through to this rule and
+# gets an explicit prompt. Without this rule the policy-level
+# `approval-mode = "prompt"` default would do the same thing, but
+# the explicit rule ID makes 403 responses and audit events
+# greppable — you can search for `prompt-calendar-writes` to find
+# every human approval this policy surfaced.
+[[policies.rules]]
+id = "prompt-calendar-writes"
+scopes = ["calendar.events"]
+action = "prompt"
+
+# -----------------------------------------------------------------
+# Policy: drive-research-scope-restricted
+#
+# Use this for an agent that does read-only research across Drive
+# but must not touch any file outside a specific shared folder. The
+# `resources = ["research-shared"]` line narrows every request to
+# exactly that folder ID.
+# -----------------------------------------------------------------
+[[policies]]
+name = "drive-research-scope-restricted"
+scopes = ["drive.readonly", "drive.metadata"]
+# Only this specific folder ID. Swap it for a real folder ID from
+# your Drive when you wire an agent up. Anything else → 403 with
+# rule_id = "default-deny-resource-out-of-allowlist".
+resources = ["research-shared"]
+approval-mode = "auto"
+auto-approve-reads = true

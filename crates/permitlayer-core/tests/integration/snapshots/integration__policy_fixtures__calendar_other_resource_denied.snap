@@ -1,0 +1,12 @@
+---
+source: crates/permitlayer-core/tests/integration/policy_fixtures.rs
+assertion_line: 96
+expression: decision
+---
+{
+  "decision": "deny",
+  "policy_name": "calendar-prompt-on-write",
+  "rule_id": "default-deny-resource-out-of-allowlist",
+  "denied_scope": null,
+  "denied_resource": "family"
+}

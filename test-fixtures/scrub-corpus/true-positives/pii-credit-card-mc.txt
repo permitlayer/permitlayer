@@ -1,0 +1,7 @@
+Order receipt:
+
+Payment method: Mastercard 5500000000000004
+Amount: $129.95
+Order #: ORD-2024-8847
+
+Your order has been confirmed and will ship within 2 business days.

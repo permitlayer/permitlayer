@@ -1,0 +1,23 @@
+API Reference - User Management
+
+GET /api/v1/users
+Returns a list of all users in the organization.
+
+POST /api/v1/users
+Creates a new user account.
+
+Request body:
+{
+  "name": "string",
+  "role": "admin | member | viewer",
+  "department": "string"
+}
+
+Response codes:
+  200: Success
+  400: Bad request
+  401: Unauthorized
+  404: Not found
+  500: Internal server error
+
+Rate limiting: 1000 requests per hour per API key.

@@ -1,0 +1,63 @@
+# ============================================================================
+# Rust build outputs
+# ============================================================================
+/target
+**/*.rs.bk
+*.pdb
+
+# ============================================================================
+# IDE / editor state
+# ============================================================================
+*.swp
+*.swo
+*~
+.DS_Store
+.idea/
+.vscode/
+*.iml
+
+# ============================================================================
+# Runtime / local state (not yet used — reserved for user-local daemon data)
+# ============================================================================
+/.agentsso-local/
+
+# ============================================================================
+# Planning / authoring tooling — excluded from the project repo
+# ============================================================================
+# BMad module installations and planning artifacts
+/_bmad/
+/_bmad-output/
+
+# Claude Code harness + local agent skills
+/.claude/
+/.agents/
+
+# WDS design-artifact tree (planning output, not project source)
+/design-artifacts/
+
+# Root-level research / product-brief markdowns (pre-implementation research)
+/AI Agent Security & Identity Layer Research.md
+/compass_artifact_*.md
+/permitlayer product brief
+
+# ============================================================================
+# Env / secrets — never check these in
+# ============================================================================
+.env
+.env.*
+!.env.example
+.envrc
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.asc
+*.gpg
+*.token
+id_rsa*
+id_ed25519*
+id_ecdsa*
+id_dsa*
+credentials.json

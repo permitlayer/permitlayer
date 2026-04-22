@@ -1,0 +1,21 @@
+CHANGELOG
+
+## v2.1.0 (2024-01-15)
+
+### Added
+- Dark mode support (#142)
+- CSV export functionality (#156)
+- Rate limiting middleware (#160)
+
+### Fixed
+- Memory leak in connection pool (#155)
+- Incorrect timezone handling (#158)
+- CSS overflow on mobile devices (#161)
+
+### Changed
+- Upgraded database driver to v5.0 (#159)
+- Improved error messages for API validation (#163)
+- Reduced Docker image size by 40% (#164)
+
+### Removed
+- Deprecated v1 API endpoints (#157)

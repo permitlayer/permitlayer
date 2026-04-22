@@ -1,0 +1,13 @@
+Subject: Calendar Event Reminder
+
+You have an upcoming event:
+
+Meeting: Sprint Planning
+Date: January 20, 2024
+Time: 2:00 PM - 3:30 PM
+Location: Conference Room B
+
+Attendees: 8 people
+Duration: 90 minutes
+
+Notes: Please review the backlog before the meeting. We need to estimate 15 stories for the next sprint.

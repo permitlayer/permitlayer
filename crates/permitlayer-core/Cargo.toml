@@ -1,0 +1,80 @@
+[package]
+name = "permitlayer-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Core traits and types for permitlayer: policy, scrubbing, audit, storage."
+
+# Story 8.8b: collapse integration tests into one binary. See
+# tests/integration/mod.rs for submodules and tests/README.md for
+# rationale. `kill9_recovery` stays separate (feature-gated).
+autotests = false
+
+[dependencies]
+permitlayer-credential = { path = "../permitlayer-credential", version = "0.1.0" }
+thiserror.workspace = true
+async-trait.workspace = true
+# Trimmed tokio feature set: only rt + sync + macros. core does not need
+# the multi-threaded runtime or `test-util` at production time — the
+# filesystem adapter uses `spawn_blocking` which only requires `rt`.
+tokio = { version = "1.51", features = ["rt", "sync", "macros", "time"] }
+rand.workspace = true
+tracing.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+chrono = { workspace = true, features = ["serde"] }
+ulid.workspace = true
+aho-corasick.workspace = true
+regex.workspace = true
+static_assertions.workspace = true
+arc-swap.workspace = true
+toml.workspace = true
+# Argon2id for at-rest agent token hashing (Story 4.4).
+argon2.workspace = true
+# HMAC-SHA-256 for the runtime token-lookup index (Story 4.4 dual-index design).
+# See docs/adrs/0003-agent-identity-token-lookup.md for the full rationale.
+hmac.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
+tempfile.workspace = true
+walkdir.workspace = true
+trybuild.workspace = true
+insta = { workspace = true, features = ["json"] }
+criterion.workspace = true
+
+[features]
+# Exposes fault-injection seams for integration tests. Gated behind a
+# feature (not just `#[cfg(test)]`) because integration tests live in
+# `tests/` and cannot see `pub(crate)` items of the crate under test.
+# Production builds MUST NOT enable this feature.
+test-seam = []
+
+[[test]]
+name = "integration"
+path = "tests/integration/mod.rs"
+
+# Kill-9 recovery integration test requires the `test-seam` feature so
+# it can import `CredentialFsIo` and inject `io::Error`s at specific
+# syscall boundaries. `cargo test --workspace --all-features` turns
+# this on automatically; plain `cargo test -p permitlayer-core` skips
+# it (safe — it's a gated test, not a core-required test).
+[[test]]
+name = "kill9_recovery"
+path = "tests/kill9_recovery.rs"
+required-features = ["test-seam"]
+
+[[bench]]
+name = "scrub_bench"
+harness = false
+
+[[bench]]
+name = "policy_bench"
+harness = false
+
+[lints]
+workspace = true

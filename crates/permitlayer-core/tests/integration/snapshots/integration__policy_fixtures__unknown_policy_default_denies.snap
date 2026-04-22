@@ -1,0 +1,12 @@
+---
+source: crates/permitlayer-core/tests/integration/policy_fixtures.rs
+assertion_line: 107
+expression: decision
+---
+{
+  "decision": "deny",
+  "policy_name": "nope",
+  "rule_id": "default-deny-unmatched-policy",
+  "denied_scope": "gmail.readonly",
+  "denied_resource": null
+}

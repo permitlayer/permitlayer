@@ -1,0 +1,15 @@
+error[E0308]: mismatched types
+ --> tests/store_compile_fail/fail/store_rejects_plaintext_vec.rs:8:32
+  |
+8 |     let _ = store.put("gmail", vec![1u8, 2, 3]).await;
+  |                   ---          ^^^^^^^^^^^^^^^ expected `SealedCredential`, found `Vec<u8>`
+  |                   |
+  |                   arguments to this method are incorrect
+  |
+  = note: expected struct `permitlayer_credential::sealed::SealedCredential`
+             found struct `Vec<u8>`
+note: method defined here
+ --> src/store/mod.rs
+  |
+  |     async fn put(&self, service: &str, sealed: SealedCredential) -> Result<(), StoreError>;
+  |              ^^^

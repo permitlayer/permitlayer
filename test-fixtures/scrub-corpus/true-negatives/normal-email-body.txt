@@ -1,0 +1,14 @@
+Subject: Meeting tomorrow
+
+Hi team,
+
+Just a reminder that our weekly standup is tomorrow at 10:00 AM.
+
+Please prepare your updates for the sprint review.
+
+Agenda:
+1. Sprint progress review
+2. Blocker discussion
+3. Next sprint planning
+
+See you there!

@@ -1,0 +1,272 @@
+# release.yml — dist-driven release on tag push with minisign signing
+#
+# Triggered by pushing a tag matching v*.*.* (e.g., v0.1.0).
+# Separate from ci.yml (which runs on push/PR to main).
+#
+# Signing: ed25519 via minisign. The RELEASE_SIGNING_KEY GitHub secret
+# contains the minisign secret key file contents. Each artifact gets a
+# .minisig signature file uploaded alongside it.
+#
+# Platform-specific signing (Apple notarization, GPG, Authenticode) is
+# deferred to Epic 7 when cross-platform release targets are added.
+# For MVP (macOS ARM64 only), ed25519/minisign satisfies the AC.
+
+name: Release
+
+permissions:
+  contents: write
+
+on:
+  push:
+    tags:
+      - "v[0-9]+.[0-9]+.[0-9]+*"
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # --- Plan: determine what to build -----------------------------------------
+  plan:
+    runs-on: ubuntu-22.04
+    outputs:
+      manifest: ${{ steps.plan.outputs.manifest }}
+      tag: ${{ github.ref_name }}
+      tag-flag: ${{ format('--tag={0}', github.ref_name) }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install dist
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh
+      - name: Cache dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: cargo-dist-cache
+          path: ~/.cargo/bin/dist
+      - id: plan
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          dist host --steps=create --tag="$TAG" \
+            --output-format=json > plan-dist-manifest.json
+          echo "dist ran successfully"
+          cat plan-dist-manifest.json
+          echo "manifest=$(jq -c '.' plan-dist-manifest.json)" >> "$GITHUB_OUTPUT"
+      - name: Upload dist-manifest.json
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-plan-dist-manifest
+          path: plan-dist-manifest.json
+
+  # --- Build: compile release artifacts (macOS ARM64) -------------------------
+  build:
+    name: Build (${{ join(matrix.targets, ', ') }})
+    needs: [plan]
+    if: ${{ fromJson(needs.plan.outputs.manifest).ci.github.artifacts_matrix.include != null && (needs.plan.outputs.manifest != '') }}
+    strategy:
+      fail-fast: true
+      matrix: ${{ fromJson(needs.plan.outputs.manifest).ci.github.artifacts_matrix }}
+    runs-on: ${{ matrix.runner }}
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BUILD_MANIFEST_NAME: target/distrib/${{ join(matrix.targets, '-') }}-dist-manifest.json
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install dist
+        uses: actions/download-artifact@v4
+        with:
+          name: cargo-dist-cache
+          path: ~/.cargo/bin/
+      - run: chmod +x ~/.cargo/bin/dist
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+      - id: cargo-dist
+        shell: bash
+        env:
+          TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
+          INSTALL_DIST: ${{ matrix.install-dist }}
+          DIST_ARGS: ${{ matrix.dist-args || '' }}
+        run: |
+          dist build "$TAG_FLAG" \
+            --output-format=json \
+            "--artifacts=$INSTALL_DIST" \
+            $DIST_ARGS \
+            > dist-manifest.json
+          echo "dist ran successfully"
+
+          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
+          jq --raw-output ".upload_files[]" dist-manifest.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-build-${{ join(matrix.targets, '_') }}
+          path: |
+            ${{ steps.cargo-dist.outputs.paths }}
+            ${{ env.BUILD_MANIFEST_NAME }}
+
+  # --- Build global artifacts (source tarball, checksums) ---------------------
+  build-global:
+    needs: [plan, build]
+    if: ${{ always() && needs.plan.result == 'success' && (needs.build.result == 'skipped' || needs.build.result == 'success') }}
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      BUILD_MANIFEST_NAME: target/distrib/global-dist-manifest.json
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install dist
+        uses: actions/download-artifact@v4
+        with:
+          name: cargo-dist-cache
+          path: ~/.cargo/bin/
+      - run: chmod +x ~/.cargo/bin/dist
+      - name: Fetch build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: target/distrib/
+          merge-multiple: true
+      - id: cargo-dist
+        shell: bash
+        env:
+          TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
+        run: |
+          dist build "$TAG_FLAG" \
+            --output-format=json "--artifacts=global" > dist-manifest.json
+          echo "dist ran successfully"
+
+          echo "paths<<EOF" >> "$GITHUB_OUTPUT"
+          jq --raw-output ".upload_files[]" dist-manifest.json >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          cp dist-manifest.json "$BUILD_MANIFEST_NAME"
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-build-global
+          path: |
+            ${{ steps.cargo-dist.outputs.paths }}
+            ${{ env.BUILD_MANIFEST_NAME }}
+
+  # --- Sign: ed25519 signatures for all artifacts ----------------------------
+  sign:
+    needs: [plan, build, build-global]
+    if: ${{ always() && needs.plan.result == 'success' && (needs.build.result == 'skipped' || needs.build.result == 'success') && (needs.build-global.result == 'skipped' || needs.build-global.result == 'success') }}
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install minisign
+        run: |
+          cargo install minisign --locked
+      - name: Fetch all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-build-*
+          path: target/distrib/
+          merge-multiple: true
+      - name: Sign artifacts with ed25519
+        env:
+          RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+        run: |
+          if [ -z "${RELEASE_SIGNING_KEY}" ]; then
+            echo "::error::RELEASE_SIGNING_KEY secret is not set"
+            exit 1
+          fi
+
+          # Write secret key to temp file
+          KEY_FILE="$(mktemp)"
+          trap 'rm -f "$KEY_FILE"' EXIT
+          echo "${RELEASE_SIGNING_KEY}" > "$KEY_FILE"
+
+          # Sign each tarball/zip artifact (skip manifests, checksums, sigs)
+          for artifact in target/distrib/*.tar.xz target/distrib/*.tar.gz target/distrib/*.zip; do
+            [ -f "$artifact" ] || continue
+            echo "Signing: $(basename "$artifact")"
+            minisign -Sm "$artifact" -s "$KEY_FILE" -t "$(basename "$artifact") signed by permitlayer release pipeline"
+          done
+
+          rm -f "$KEY_FILE"
+          trap - EXIT
+
+          # Verify at least one artifact was signed
+          SIG_COUNT="$(find target/distrib -name '*.minisig' 2>/dev/null | wc -l | tr -d ' ')"
+          if [ "$SIG_COUNT" = "0" ]; then
+            echo "::error::No artifacts were signed. Expected at least one .minisig file."
+            exit 1
+          fi
+          echo "Signatures generated: ${SIG_COUNT}"
+          ls -la target/distrib/*.minisig
+      - name: Upload signatures
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-signatures
+          path: target/distrib/*.minisig
+
+  # --- Publish: create GitHub Release ----------------------------------------
+  publish:
+    needs: [plan, build, build-global, sign]
+    if: ${{ always() && needs.plan.result == 'success' && needs.sign.result == 'success' && (needs.build.result == 'skipped' || needs.build.result == 'success') && (needs.build-global.result == 'skipped' || needs.build-global.result == 'success') }}
+    runs-on: ubuntu-22.04
+    env:
+      GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install dist
+        uses: actions/download-artifact@v4
+        with:
+          name: cargo-dist-cache
+          path: ~/.cargo/bin/
+      - run: chmod +x ~/.cargo/bin/dist
+      - name: Fetch all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: artifacts-*
+          path: target/distrib/
+          merge-multiple: true
+      - id: host
+        shell: bash
+        env:
+          TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
+        run: |
+          dist host "$TAG_FLAG" \
+            --steps=upload --steps=release --output-format=json > dist-manifest.json
+          echo "artifacts uploaded and released successfully"
+          cat dist-manifest.json
+      - name: Upload final dist-manifest.json
+        uses: actions/upload-artifact@v4
+        with:
+          name: artifacts-dist-manifest
+          path: dist-manifest.json
+      - name: Download signature artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: artifacts-signatures
+          path: signatures
+      - name: Upload signatures to GitHub Release
+        env:
+          TAG: ${{ needs.plan.outputs.tag }}
+        run: |
+          # dist host --steps=release already created the GitHub Release.
+          # Upload .minisig signature files to the existing release.
+          if ls signatures/*.minisig 1>/dev/null 2>&1; then
+            gh release upload "$TAG" signatures/*.minisig --clobber
+            echo "Uploaded signature files to release $TAG"
+          else
+            echo "::warning::No .minisig files found to upload"
+          fi

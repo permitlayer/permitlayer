@@ -1,0 +1,70 @@
+[package]
+name = "permitlayer-proxy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Tower middleware chain and transport adapters for permitlayer."
+
+# Story 8.8b: collapse integration tests into one binary. See
+# tests/integration/mod.rs for the submodule declarations and
+# tests/README.md for the rationale + new-test-file convention.
+autotests = false
+
+[[test]]
+name = "integration"
+path = "tests/integration/mod.rs"
+
+[dependencies]
+permitlayer-core = { path = "../permitlayer-core", version = "0.1.0" }
+permitlayer-vault = { path = "../permitlayer-vault", version = "0.1.0" }
+permitlayer-credential = { path = "../permitlayer-credential", version = "0.1.0" }
+permitlayer-oauth = { path = "../permitlayer-oauth", version = "0.1.0" }
+permitlayer-plugins = { path = "../permitlayer-plugins", version = "0.1.0" }
+permitlayer-connectors = { path = "../permitlayer-connectors", version = "0.1.0" }
+thiserror.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+http-body-util.workspace = true
+tracing.workspace = true
+ulid.workspace = true
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+arc-swap.workspace = true
+reqwest.workspace = true
+chrono.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+zeroize.workspace = true
+rand.workspace = true
+subtle.workspace = true
+async-trait.workspace = true
+tokio.workspace = true
+url.workspace = true
+rmcp.workspace = true
+schemars.workspace = true
+hyper-util.workspace = true
+urlencoding.workspace = true
+
+[dev-dependencies]
+permitlayer-core = { path = "../permitlayer-core", version = "0.1.0", features = ["test-seam"] }
+permitlayer-oauth = { path = "../permitlayer-oauth", version = "0.1.0", features = ["test-seam"] }
+tokio.workspace = true
+tracing-test.workspace = true
+tracing-subscriber.workspace = true
+mockito.workspace = true
+tempfile.workspace = true
+async-trait.workspace = true
+static_assertions.workspace = true
+insta.workspace = true
+# Story 6.2: rquickjs for the host_api_e2e tests that drive the
+# JS-side Promise resolution via `Promise::finish` (AD2). Already
+# compiled transitively via permitlayer-plugins; this just makes
+# the API directly nameable.
+rquickjs.workspace = true
+
+[lints]
+workspace = true

@@ -1,0 +1,15 @@
+---
+source: crates/permitlayer-core/src/audit/schema.rs
+expression: event
+---
+{
+  "timestamp": "2026-01-15T10:30:45.123Z",
+  "request_id": "01JQXK5V7R000000000000000",
+  "agent_id": "agent-test-001",
+  "service": "gmail",
+  "scope": "mail.readonly",
+  "resource": "messages/abc123",
+  "outcome": "ok",
+  "event_type": "api-call",
+  "schema_version": 2
+}

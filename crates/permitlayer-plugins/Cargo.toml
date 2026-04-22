@@ -1,0 +1,54 @@
+[package]
+name = "permitlayer-plugins"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "QuickJS plugin runtime and host API for permitlayer connectors."
+
+# Story 8.8b: collapse integration tests into one binary. See
+# tests/integration/mod.rs for the submodule declarations and
+# tests/README.md for the rationale + new-test-file convention.
+autotests = false
+
+[[test]]
+name = "integration"
+path = "tests/integration/mod.rs"
+
+[dependencies]
+permitlayer-core = { path = "../permitlayer-core", version = "0.1.0" }
+permitlayer-oauth = { path = "../permitlayer-oauth", version = "0.1.0" }
+# Story 6.3: loader reads embedded built-in JS sources from this crate.
+permitlayer-connectors = { path = "../permitlayer-connectors", version = "0.1.0" }
+thiserror.workspace = true
+rquickjs.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# Story 6.2 host-API service trait + JS marshalling
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+url.workspace = true
+# Story 6.2 host-API: parse `>=MAJOR.MINOR` requirement strings in
+# `agentsso.versionMeetsRequirement` + assert HOST_API_VERSION is
+# valid semver.
+semver = { workspace = true }
+# Story 6.2 AD5: per-process secret stamp key for AgentssoError
+# class identity authentication (see `host_api/error_class.rs`).
+# 16 bytes from OsRng — unpredictable to plugin code.
+rand = { workspace = true }
+# Story 6.3: registry hot-swap slot + content-hash for `.trusted`
+# allowlist (see `loader.rs` and `registry.rs`).
+arc-swap.workspace = true
+sha2.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "time", "test-util"] }
+tempfile.workspace = true
+# Story 6.2 host-API integration tests need epoch-second math for
+# the scoped-token TTL assertions.
+chrono.workspace = true
+
+[lints]
+workspace = true

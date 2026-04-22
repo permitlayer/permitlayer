@@ -1,0 +1,37 @@
+[package]
+name = "permitlayer-keystore"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "OS keychain abstraction for permitlayer. Only crate permitted to use unsafe (platform FFI)."
+
+[features]
+test-seam = []
+
+[dependencies]
+thiserror.workspace = true
+tokio = { workspace = true, features = ["rt", "sync", "macros", "time"] }
+keyring.workspace = true
+argon2.workspace = true
+hmac.workspace = true
+sha2.workspace = true
+rand.workspace = true
+rpassword.workspace = true
+async-trait.workspace = true
+zeroize.workspace = true
+tempfile.workspace = true
+subtle.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "time", "test-util"] }
+walkdir.workspace = true
+
+[[test]]
+name = "conformance"
+required-features = ["test-seam"]
+
+[lints]
+workspace = true

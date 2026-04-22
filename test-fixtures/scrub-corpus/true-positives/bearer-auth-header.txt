@@ -1,0 +1,7 @@
+DEBUG: API request intercepted
+
+POST /api/v1/users HTTP/1.1
+Host: api.example.com
+Authorization: Bearer sk_live_4eC39HqLyjWDarjtT1zdp7dc_abcdef1234567890
+
+{"name": "John Doe", "email": "user@test.com"}

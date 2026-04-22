@@ -1,0 +1,49 @@
+[package]
+name = "permitlayer-oauth"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "OAuth 2.1 client with PKCE and refresh token rotation for permitlayer."
+
+# Story 8.8b: single `integration` test binary.
+autotests = false
+
+[features]
+# Exposes `OAuthClient::new_with_endpoint_overrides` so integration tests
+# in sibling crates (`permitlayer-proxy`, `permitlayer-daemon`) can point
+# the client at a mock localhost server. Not enabled in production
+# builds; consumers must opt in. `#[cfg(test)]` alone is insufficient
+# because tests in other crates link against this crate's non-test
+# compilation unit.
+test-seam = []
+
+[[test]]
+name = "integration"
+path = "tests/integration/mod.rs"
+
+[dependencies]
+permitlayer-credential = { path = "../permitlayer-credential", version = "0.1.0" }
+permitlayer-vault = { path = "../permitlayer-vault", version = "0.1.0" }
+oauth2.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+axum.workspace = true
+open.workspace = true
+url.workspace = true
+rand.workspace = true
+tracing.workspace = true
+subtle.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+mockito.workspace = true
+tokio = { workspace = true, features = ["rt", "macros"] }
+
+[lints]
+workspace = true

@@ -1,0 +1,11 @@
+---
+source: crates/permitlayer-daemon/src/design/scrub_inline.rs
+assertion_line: 447
+expression: out
+---
+           [38;2;245;180;84m┌──────────────────────────────────────────────┐[0m
+           [38;2;245;180;84m│[0m Your verification code is [38;2;245;180;84m<REDACTED_OTP>[0m     [38;2;245;180;84m│[0m
+           [38;2;245;180;84m│[0m                                 ↑            [38;2;245;180;84m│[0m
+           [38;2;245;180;84m│[0m                        [38;2;245;180;84mcaught: otp-6digit[0m    [38;2;245;180;84m│[0m
+           [38;2;245;180;84m└──────────────────────────────────────────────┘[0m
+           [38;2;138;145;160mwhy? → agentsso scrub explain otp-6digit[0m

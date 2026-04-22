@@ -1,0 +1,22 @@
+[package]
+name = "permitlayer-credential"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Sealed credential types for permitlayer. Non-Debug, ZeroizeOnDrop. Leaf crate."
+
+[dependencies]
+zeroize.workspace = true
+thiserror.workspace = true
+static_assertions.workspace = true
+
+[dev-dependencies]
+# serde is used ONLY to name `serde::Serialize`/`serde::de::DeserializeOwned`
+# in the compile-time assertion blocks. Not in the production compile graph.
+serde.workspace = true
+
+[lints]
+workspace = true

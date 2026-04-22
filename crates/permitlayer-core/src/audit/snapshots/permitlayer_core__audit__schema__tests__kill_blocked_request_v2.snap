@@ -1,0 +1,21 @@
+---
+source: crates/permitlayer-core/src/audit/schema.rs
+expression: kill_blocked_request_canonical()
+---
+{
+  "timestamp": "2026-04-11T18:54:48.840Z",
+  "request_id": "01JQXK5V7R000000000000003",
+  "agent_id": "unknown",
+  "service": "gmail",
+  "scope": "-",
+  "resource": "/v1/tools/gmail/users/me/profile",
+  "outcome": "denied",
+  "event_type": "kill-blocked-request",
+  "schema_version": 2,
+  "extra": {
+    "activated_at": "2026-04-11T18:54:48.832Z",
+    "error_code": "daemon_killed",
+    "host": "127.0.0.1:3820",
+    "method": "GET"
+  }
+}

@@ -1,0 +1,7 @@
+Subject: Verify your email address
+
+Please verify your email address by clicking the link below:
+
+https://login.microsoftonline.com/verify/email?code=def456ghi789&user=test
+
+Thank you for registering.

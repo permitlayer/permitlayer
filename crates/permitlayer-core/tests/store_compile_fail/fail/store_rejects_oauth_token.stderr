@@ -1,0 +1,13 @@
+error[E0308]: mismatched types
+ --> tests/store_compile_fail/fail/store_rejects_oauth_token.rs:9:32
+  |
+9 |     let _ = store.put("gmail", token).await;
+  |                   ---          ^^^^^ expected `SealedCredential`, found `OAuthToken`
+  |                   |
+  |                   arguments to this method are incorrect
+  |
+note: method defined here
+ --> src/store/mod.rs
+  |
+  |     async fn put(&self, service: &str, sealed: SealedCredential) -> Result<(), StoreError>;
+  |              ^^^

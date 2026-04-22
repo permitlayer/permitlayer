@@ -1,0 +1,8 @@
+Employee Onboarding Form
+
+Name: Jane Doe
+Date of Birth: 1990-05-15
+SSN: 078-05-1120
+Start Date: 2024-01-15
+
+Please verify your social security number 078-05-1120 is correct.

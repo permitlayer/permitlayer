@@ -1,0 +1,20 @@
+---
+source: crates/permitlayer-core/src/audit/schema.rs
+expression: kill_resumed_canonical()
+---
+{
+  "timestamp": "2026-04-11T18:54:48.859Z",
+  "request_id": "01JQXK5V7R000000000000002",
+  "agent_id": "system",
+  "service": "permitlayer",
+  "scope": "-",
+  "resource": "kill-switch",
+  "outcome": "ok",
+  "event_type": "kill-resumed",
+  "schema_version": 2,
+  "extra": {
+    "duration_killed_seconds": 0,
+    "resumed_at": "2026-04-11T18:54:48.859Z",
+    "was_already_inactive": false
+  }
+}

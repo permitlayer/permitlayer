@@ -1,0 +1,157 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# Cancel superseded runs on the same ref so newer pushes don't wait for stale
+# builds — but NEVER cancel runs on `main`, because every main-branch commit
+# must complete its security gates (audit, deny, credential discipline) and
+# leave a green/red status behind for incident forensics.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  lint:
+    name: Lint (fmt + clippy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        # rust-toolchain.toml pins the channel automatically.
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add rustfmt clippy
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  build-and-test:
+    name: Build + Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+      # Linux needs a running Secret Service daemon so
+      # permitlayer-keystore's libsecret adapter has a backend to talk
+      # to. Install libsecret dev headers + gnome-keyring, then
+      # launch a D-Bus session and unlock the keyring with an empty
+      # passphrase before running the test suite. Follows the
+      # keyring-rs project's own CI pattern.
+      - name: Install Linux keychain backend
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libsecret-1-dev gnome-keyring dbus-x11
+      - name: cargo build
+        run: cargo build --workspace --all-targets --all-features
+      - name: cargo test (Linux — unlock gnome-keyring first)
+        if: runner.os == 'Linux'
+        run: |
+          # Start a D-Bus session, then unlock gnome-keyring (empty
+          # passphrase) inside it so libsecret calls succeed. `dbus-run-session`
+          # cleans up the bus on exit.
+          dbus-run-session -- bash -c '
+            echo -n "" | gnome-keyring-daemon --unlock
+            echo -n "" | gnome-keyring-daemon --start --components=secrets,ssh
+            cargo test --workspace --all-targets --all-features
+          '
+      - name: cargo test (macOS + Windows)
+        if: runner.os != 'Linux'
+        run: cargo test --workspace --all-targets --all-features
+      - name: Verify agentsso --version
+        shell: bash
+        run: |
+          cargo run --quiet --bin agentsso -- --version
+
+  credentials:
+    name: Validate credential types
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+      - name: cargo xtask validate-credentials
+        run: cargo xtask validate-credentials
+
+  contrast:
+    name: WCAG contrast validation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+      - name: cargo xtask contrast-check
+        run: cargo xtask contrast-check
+
+  plugin-api:
+    name: Validate plugin API
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+      # Diff the live permitlayer-plugins host-API surface against
+      # the committed host-api.lock. Fails on breaking changes that
+      # were not accompanied by a major-version bump of
+      # HOST_API_VERSION. See Story 6.5 + NFR41.
+      - name: cargo xtask validate-plugin-api
+        run: cargo xtask validate-plugin-api
+
+  shellcheck:
+    name: Shellcheck + test install scripts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install shellcheck and minisign
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck minisign
+      - name: Shellcheck install script
+        run: shellcheck install/install.sh
+      - name: Run install script tests
+        run: ./install/test-install.sh
+
+  security:
+    name: Security audit + deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust toolchain
+        run: rustup show active-toolchain || rustup toolchain install
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+      - name: Install cargo-audit
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit@0.22
+      - name: Install cargo-deny
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deny@0.19
+      - name: cargo audit
+        run: cargo audit --deny warnings
+      - name: cargo deny check
+        run: cargo deny check
