@@ -30,6 +30,15 @@ jobs:
           rustup component add rustfmt clippy
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
+      # permitlayer-keystore's Linux backend links libdbus via the
+      # `keyring` crate → `secret-service` → `dbus-rs` → `libdbus-sys`
+      # chain. Cross-compiling clippy on Linux still triggers the
+      # build script, so the system dep is required even for a
+      # lint-only job.
+      - name: Install libdbus (clippy build deps)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
       - name: cargo fmt --check
         run: cargo fmt --all --check
       - name: cargo clippy
@@ -48,10 +57,18 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-nextest
       - name: cargo build
         run: cargo build --workspace --all-targets --all-features
-      - name: cargo test
-        run: cargo test --workspace --all-targets --all-features
+      # Use nextest, not `cargo test`. Nextest runs each test in a
+      # separate process, isolating QuickJS sandbox state between
+      # scrub-engine tests that would otherwise share a runtime and
+      # intermittently flake (observed on macOS-14 runners).
+      - name: cargo nextest run
+        run: cargo nextest run --workspace --all-targets --all-features
       - name: Verify agentsso --version
         run: cargo run --quiet --bin agentsso -- --version
 
