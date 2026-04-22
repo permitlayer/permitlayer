@@ -92,12 +92,17 @@ jobs:
         shell: bash
         env:
           TAG_FLAG: ${{ needs.plan.outputs.tag-flag }}
-          INSTALL_DIST: ${{ matrix.install-dist }}
-          DIST_ARGS: ${{ matrix.dist-args || '' }}
+          # dist 0.31 emits `dist_args` (underscore) containing
+          # `--artifacts=<scope> --target=<triple>` as one string.
+          # Older dist versions emitted `install-dist` (hyphen) with the
+          # artifact scope alone — this file used to parse that older
+          # shape. Keep the fallback to `dist-args` for compatibility if
+          # the emitted shape ever swings back.
+          DIST_ARGS: ${{ matrix.dist_args || matrix.dist-args || '' }}
         run: |
+          # shellcheck disable=SC2086 # intentional word-split: DIST_ARGS is `--a=b --c=d`
           dist build "$TAG_FLAG" \
             --output-format=json \
-            "--artifacts=$INSTALL_DIST" \
             $DIST_ARGS \
             > dist-manifest.json
           echo "dist ran successfully"
