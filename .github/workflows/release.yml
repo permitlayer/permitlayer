@@ -229,7 +229,10 @@ jobs:
       - build-local-artifacts
       - build-global-artifacts
     if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') }}
-    runs-on: ubuntu-22.04
+    # ubuntu-latest (noble / 24.04) — the `minisign` package isn't in the
+    # default repos on ubuntu-22.04 (jammy). ci.yml's shellcheck job uses
+    # the same pattern on ubuntu-latest successfully.
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
         with:
@@ -238,7 +241,7 @@ jobs:
         run: |
           # `cargo install minisign` doesn't work — the minisign crate on
           # crates.io is a library, not the CLI binary. The real CLI lives
-          # in Ubuntu's repos (ci.yml's shellcheck job uses the same path).
+          # in Ubuntu's repos; requires ubuntu-latest (24.04), not 22.04.
           sudo apt-get update
           sudo apt-get install -y minisign
       - name: Fetch all artifacts
