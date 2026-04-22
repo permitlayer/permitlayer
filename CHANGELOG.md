@@ -22,6 +22,10 @@ semver contract: deprecated host-API methods MUST appear in a
 `Deprecated` section with the removal timeline, and a `Removed` entry
 is required when a method is dropped in a major bump.
 
+## [Unreleased]
+
+_No unreleased host-API changes yet._
+
 ## [1.0.0-rc.1] - 2026-04-18
 
 First release-candidate of the connector-plugin host API surface
