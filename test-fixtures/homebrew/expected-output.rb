@@ -1,13 +1,14 @@
+# Homebrew formula for agentsso, the permitlayer daemon binary.
 class Agentsso < Formula
-  desc "The agentsso binary: axum server, CLI, lifecycle management."
+  desc "agentsso binary: axum server, CLI, lifecycle management"
   homepage "https://github.com/permitlayer/permitlayer"
-  version "0.1.0"
+  version "0.2.0"
   if OS.mac?
     if Hardware::CPU.arm?
-      url "https://github.com/permitlayer/permitlayer/releases/download/v0.1.0/permitlayer-daemon-aarch64-apple-darwin.tar.xz"
+      url "https://github.com/permitlayer/permitlayer/releases/download/v0.2.0/permitlayer-daemon-aarch64-apple-darwin.tar.xz"
     end
     if Hardware::CPU.intel?
-      url "https://github.com/permitlayer/permitlayer/releases/download/v0.1.0/permitlayer-daemon-x86_64-apple-darwin.tar.xz"
+      url "https://github.com/permitlayer/permitlayer/releases/download/v0.2.0/permitlayer-daemon-x86_64-apple-darwin.tar.xz"
     end
   end
   license "MIT"

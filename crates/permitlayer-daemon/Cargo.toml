@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-description = "The agentsso binary: axum server, CLI, lifecycle management."
+description = "agentsso binary: axum server, CLI, lifecycle management"
 
 # Story 8.8b: collapse 23 `tests/*.rs` integration files into one
 # binary. See tests/integration/mod.rs for submodules and

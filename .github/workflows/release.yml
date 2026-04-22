@@ -483,14 +483,40 @@ jobs:
           echo "--- Patched formula ---"
           cat Formula/agentsso.rb
 
-      - name: brew audit + brew style
+      # Autocorrect formula style with rubocop, then assert zero
+      # remaining offenses. `brew style --fix` applies rubocop
+      # autocorrect in-place; `brew style` (no --fix) exits non-zero if
+      # anything remains.
+      #
+      # Why this and not `brew audit --strict`:
+      #
+      # - `brew audit [path]` is disabled in modern Homebrew; only
+      #   `brew audit [formula-name]` works against a tapped formula.
+      #   That would require pushing first, then auditing, which
+      #   defeats pre-push gating.
+      # - Dist's Homebrew template emits rubocop-style offenses that
+      #   are all [Correctable] by autocorrect (article-in-desc,
+      #   unfrozen constant, modifier-if, trailing comma). Fixing them
+      #   in our patch script would shadow-fork dist's template and
+      #   break on every dist upgrade.
+      # - `brew style --fix` is idempotent and uses the exact same
+      #   rubocop rules that `brew audit --strict` would check. If any
+      #   non-autocorrectable rule triggers (e.g. Style/Documentation,
+      #   which needs a class-doc comment), the second `brew style`
+      #   invocation fails the job.
+      # - The `Style/Documentation` rule needing a class-doc comment is
+      #   handled by the patch script (`scripts/patch-homebrew-formula.sh`
+      #   prepends one before `class Agentsso < Formula`).
+      # - Functional gate is the install smoke test below.
+      - name: Autocorrect formula style + verify zero offenses
         if: ${{ steps.gate.outputs.skip == '0' }}
         run: |
-          # macos-14 ships brew preinstalled. Audit/style the patched
-          # formula as a standalone file first; the full audit path
-          # exercises a tapped formula, so we also do that after push.
+          # macos-14 ships brew preinstalled.
+          brew style --fix Formula/agentsso.rb
+          echo "--- Formula after brew style --fix ---"
+          cat Formula/agentsso.rb
+          echo "--- Verifying zero remaining offenses ---"
           brew style Formula/agentsso.rb
-          brew audit --strict --formula Formula/agentsso.rb
 
       - name: Push formula to permitlayer/homebrew-tap
         if: ${{ steps.gate.outputs.skip == '0' }}
@@ -563,7 +589,17 @@ jobs:
           # The tap push may have succeeded before a later step failed;
           # surface that possibility on the created issue so a human can
           # confirm or roll back manually.
+          #
+          # The `release-issue` label is created as a one-off admin step
+          # via `gh label create release-issue --repo permitlayer/permitlayer
+          # --color FF6B6B --description "Release pipeline partial
+          # failure — needs triage"`. `gh issue create --label` fails
+          # hard if the label is missing, so we use `|| true` as a
+          # safety net and still create the issue without the label.
           gh issue create \
             --title "Release ${TAG}: Homebrew publish partial failure" \
             --body "The homebrew-publish job for tag \`${TAG}\` failed. If the tap push step ran before the failure, \`permitlayer/homebrew-tap\`'s Formula/agentsso.rb may be out of sync with the main repo. Job logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            --label release-issue
+            --label release-issue \
+            || gh issue create \
+              --title "Release ${TAG}: Homebrew publish partial failure" \
+              --body "The homebrew-publish job for tag \`${TAG}\` failed. Job logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
