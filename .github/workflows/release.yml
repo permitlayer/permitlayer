@@ -253,9 +253,14 @@ jobs:
       - name: Sign artifacts with ed25519
         env:
           RELEASE_SIGNING_KEY: ${{ secrets.RELEASE_SIGNING_KEY }}
+          RELEASE_SIGNING_PASSWORD: ${{ secrets.RELEASE_SIGNING_PASSWORD }}
         run: |
           if [ -z "${RELEASE_SIGNING_KEY}" ]; then
             echo "::error::RELEASE_SIGNING_KEY secret is not set"
+            exit 1
+          fi
+          if [ -z "${RELEASE_SIGNING_PASSWORD:-}" ]; then
+            echo "::error::RELEASE_SIGNING_PASSWORD secret is not set"
             exit 1
           fi
 
@@ -264,11 +269,15 @@ jobs:
           trap 'rm -f "$KEY_FILE"' EXIT
           echo "${RELEASE_SIGNING_KEY}" > "$KEY_FILE"
 
-          # Sign each tarball/zip artifact (skip manifests, checksums, sigs)
+          # Sign each tarball/zip artifact (skip manifests, checksums, sigs).
+          # The minisign CLI prompts for the key password on /dev/tty, falling
+          # back to stdin when /dev/tty is unavailable (CI runners). We pipe
+          # the password via stdin on each invocation.
           for artifact in target/distrib/*.tar.xz target/distrib/*.tar.gz target/distrib/*.zip; do
             [ -f "$artifact" ] || continue
             echo "Signing: $(basename "$artifact")"
-            minisign -Sm "$artifact" -s "$KEY_FILE" -t "$(basename "$artifact") signed by permitlayer release pipeline"
+            printf '%s\n' "$RELEASE_SIGNING_PASSWORD" | \
+              minisign -Sm "$artifact" -s "$KEY_FILE" -t "$(basename "$artifact") signed by permitlayer release pipeline"
           done
 
           rm -f "$KEY_FILE"
