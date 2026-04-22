@@ -47,11 +47,6 @@ jobs:
         run: |
           curl --proto '=https' --tlsv1.2 -LsSf \
             https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh
-      - name: Cache dist
-        uses: actions/upload-artifact@v4
-        with:
-          name: cargo-dist-cache
-          path: ~/.cargo/bin/dist
       - id: plan
         env:
           TAG: ${{ github.ref_name }}
@@ -84,11 +79,11 @@ jobs:
         with:
           submodules: recursive
       - name: Install dist
-        uses: actions/download-artifact@v4
-        with:
-          name: cargo-dist-cache
-          path: ~/.cargo/bin/
-      - run: chmod +x ~/.cargo/bin/dist
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Install Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - name: Cache cargo registry
@@ -133,11 +128,11 @@ jobs:
         with:
           submodules: recursive
       - name: Install dist
-        uses: actions/download-artifact@v4
-        with:
-          name: cargo-dist-cache
-          path: ~/.cargo/bin/
-      - run: chmod +x ~/.cargo/bin/dist
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Fetch build artifacts
         uses: actions/download-artifact@v4
         with:
@@ -232,11 +227,11 @@ jobs:
         with:
           submodules: recursive
       - name: Install dist
-        uses: actions/download-artifact@v4
-        with:
-          name: cargo-dist-cache
-          path: ~/.cargo/bin/
-      - run: chmod +x ~/.cargo/bin/dist
+        shell: bash
+        run: |
+          curl --proto '=https' --tlsv1.2 -LsSf \
+            https://github.com/axodotdev/cargo-dist/releases/download/v0.31.0/cargo-dist-installer.sh | sh
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       - name: Fetch all artifacts
         uses: actions/download-artifact@v4
         with:
