@@ -206,7 +206,7 @@ function Get-Release {
     try {
         Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing -TimeoutSec 120
     } catch {
-        Write-Err "failed to download $zipUrl: $($_.Exception.Message)"
+        Write-Err "failed to download ${zipUrl}: $($_.Exception.Message)"
     }
 
     return $zipPath
