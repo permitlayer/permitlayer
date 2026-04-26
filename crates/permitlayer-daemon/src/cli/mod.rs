@@ -5,6 +5,7 @@ pub mod audit;
 pub mod audit_anomaly;
 pub mod audit_export;
 pub mod audit_follow;
+pub mod autostart;
 pub mod config;
 pub mod connectors;
 pub mod credentials;

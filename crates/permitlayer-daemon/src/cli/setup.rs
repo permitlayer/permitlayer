@@ -56,11 +56,19 @@ impl Drop for SpinnerGuard {
     }
 }
 
-/// Arguments for `agentsso setup <service>`.
+/// Arguments for `agentsso setup [service]`.
+///
+/// `service` is optional — the no-arg form (`agentsso setup`) runs the
+/// top-level orchestrator (Story 7.3 Task 3) which interactively picks
+/// a service to set up and then offers OPT-IN autostart. The per-
+/// service form (`agentsso setup gmail|calendar|drive`) runs the
+/// service-only flow unchanged.
 #[derive(Args)]
 pub struct SetupArgs {
     /// The upstream service to set up (e.g., `gmail`).
-    pub service: String,
+    /// Omit to enter the interactive orchestrator (chooses service +
+    /// offers autostart).
+    pub service: Option<String>,
     /// Path to a Google OAuth client JSON file (BYO mode).
     /// If omitted, the shared CASA-certified client is used.
     #[arg(long = "oauth-client", value_name = "PATH")]
@@ -75,7 +83,32 @@ pub struct SetupArgs {
 }
 
 /// Run the `setup` subcommand.
+///
+/// Two paths:
+/// - `service: Some(svc)` → the long-standing per-service OAuth flow.
+///   Unchanged. No autostart prompt — keeps the path stable for users
+///   who already script `agentsso setup gmail` etc.
+/// - `service: None` → the Story 7.3 top-level orchestrator. Picks a
+///   service interactively, runs the per-service flow, then offers
+///   OPT-IN autostart (default = NO; `--non-interactive` requires an
+///   explicit service arg).
 pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
+    // The orchestrator path: no service supplied → interactive picker
+    // + autostart prompt. Defer to a dedicated function so the rest of
+    // this file (the per-service flow) stays untouched. The orchestrator
+    // re-enters this function with `args.service = Some(...)` once the
+    // user picks a service, so the per-service path runs unmodified.
+    //
+    // P21 (code review): treat empty/whitespace-only `Some("")` as
+    // `None` (route to orchestrator). Without this, `agentsso setup ""`
+    // falls into the per-service path, gets trimmed-to-empty, then
+    // fails the SUPPORTED_SERVICES check with the confusing message
+    // `unsupported service: ''`.
+    let service_arg = match args.service.clone() {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => return run_orchestrator(args).await,
+    };
+
     // Story 5.4: setup is a one-shot CLI command, not the daemon —
     // pass `log_dir = None` so only the stdout subscriber is
     // installed. No file appender worker thread, no `WorkerGuard` to
@@ -88,7 +121,7 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
     let _guards =
         crate::telemetry::init_tracing("info", None, 30).context("tracing init failed")?;
 
-    let service = args.service.trim().to_lowercase();
+    let service = service_arg.trim().to_lowercase();
 
     // Static input validation runs FIRST — unknown service names
     // should produce `unsupported_service` errors regardless of whether
@@ -96,7 +129,6 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
     // `agentsso setup bogusservice | tee log.txt` sees "unsupported
     // service" and not the misleading "setup_non_interactive_required"
     // error (Story 2.7 review patch: ordering fix).
-    const SUPPORTED_SERVICES: &[&str] = &["gmail", "calendar", "drive"];
     if !SUPPORTED_SERVICES.contains(&service.as_str()) {
         anyhow::bail!(
             "unsupported service: '{service}'. Supported services: {}",
@@ -862,6 +894,163 @@ fn render_oauth_error(
 /// Only called when `--non-interactive` is set (the non-interactive code path).
 fn non_interactive_skip_reason(force: bool) -> &'static str {
     if force { "--non-interactive --force" } else { "--non-interactive" }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// Story 7.3 Task 3 — top-level `agentsso setup` orchestrator.
+//
+// Runs only when `agentsso setup` is invoked WITHOUT a service arg.
+// Picks a service interactively, runs the per-service flow by re-
+// dispatching back into [`run`], then offers OPT-IN autostart with
+// `default = NO` (per AC #5).
+//
+// `--non-interactive` here is a hard error: the orchestrator's whole
+// purpose is the interactive prompts; CI/scripted callers should pass
+// `agentsso setup gmail` directly. Refusing here gives a clean
+// `setup_service_required` error rather than silently inferring a
+// service.
+// ─────────────────────────────────────────────────────────────────────
+
+/// Services the per-service path validates and the orchestrator
+/// routes to. Single source of truth — P20 (code review): two
+/// previous copies (one in [`run`], one for the orchestrator) risked
+/// drift if a fourth service was added to one but not the other.
+const SUPPORTED_SERVICES: &[&str] = &["gmail", "calendar", "drive"];
+
+async fn run_orchestrator(args: SetupArgs) -> anyhow::Result<()> {
+    use crate::design::render;
+
+    if args.non_interactive {
+        eprint!(
+            "{}",
+            render::error_block(
+                "setup_service_required",
+                "no service argument provided and --non-interactive is set",
+                "agentsso setup gmail   # (or calendar | drive)",
+                None,
+            )
+        );
+        return Err(crate::cli::silent_cli_error(
+            "non-interactive setup invoked without a service",
+        ));
+    }
+
+    let stdout_is_tty = console::Term::stdout().is_term();
+    if !stdout_is_tty {
+        // P22 (code review): rename from `setup_non_interactive_required`
+        // to `setup_orchestrator_requires_tty` so operators grepping
+        // logs can distinguish the orchestrator-specific TTY error from
+        // the per-service `setup_non_interactive_required` error (which
+        // means "you piped per-service setup without --non-interactive").
+        // The remediation differs: orchestrator → use a real terminal
+        // OR pass an explicit service arg; per-service → add the flag.
+        eprint!(
+            "{}",
+            render::error_block(
+                "setup_orchestrator_requires_tty",
+                "stdout is not a terminal — the orchestrator's interactive picker can't run; \
+                 either run from a real terminal or pass an explicit service arg",
+                "agentsso setup gmail   # (or calendar | drive)",
+                None,
+            )
+        );
+        return Err(crate::cli::silent_cli_error("orchestrator invoked with stdout not a tty"));
+    }
+
+    // P34 (code review round 3): build the same teal-themed
+    // dialoguer prompts the per-service path uses (Story 5.1's
+    // accent-color convention via `build_teal_theme`). The
+    // orchestrator's prompts now match the rest of the setup UX
+    // instead of dropping back to default monochrome.
+    let home = super::agentsso_home()?;
+    let theme = Theme::load(&home);
+    let teal_theme = std::sync::Arc::new(build_teal_theme(&theme));
+
+    // Render a brief banner so the user knows they're in the orchestrator
+    // (not the per-service path). Plain text — no color escapes — so it
+    // renders cleanly in any terminal.
+    println!("agentsso setup");
+    println!("  pick a service to connect, then opt into autostart at login (off by default)");
+    println!();
+
+    // Phase 1: pick a service.
+    //
+    // P32 (code review round 3): dialoguer's `interact()` is
+    // synchronous and blocks on stdin. Calling it directly inside a
+    // `#[tokio::main]` runtime stalls an executor thread (the
+    // single-threaded runtime would deadlock; the multi-threaded
+    // runtime burns one worker until input arrives). Wrap in
+    // `spawn_blocking` so the runtime keeps making progress on other
+    // tasks (timers, signal handlers) while we wait for the user.
+    let labels: Vec<String> = SUPPORTED_SERVICES.iter().map(|s| (*s).to_owned()).collect();
+    let theme_for_pick = teal_theme.clone();
+    let pick = tokio::task::spawn_blocking(move || {
+        dialoguer::Select::with_theme(&*theme_for_pick)
+            .with_prompt("Which service do you want to connect?")
+            .items(&labels)
+            .default(0)
+            .interact()
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("setup orchestrator picker join failed: {e}"))??;
+    let service = SUPPORTED_SERVICES[pick];
+    println!();
+
+    // Phase 2: re-dispatch back into the per-service path with the
+    // chosen service. The per-service flow is unchanged.
+    let per_service_args = SetupArgs {
+        service: Some(service.to_owned()),
+        oauth_client: args.oauth_client,
+        non_interactive: false,
+        force: args.force,
+    };
+    Box::pin(run(per_service_args)).await?;
+
+    // Phase 3: OPT-IN autostart prompt. AC #5 invariants:
+    //   - default = false
+    //   - prompt copy explicitly says "off by default"
+    //   - skipping (Enter) leaves autostart disabled
+    println!();
+    // P32 + P34: same spawn_blocking + teal-theme treatment as Phase 1.
+    let theme_for_confirm = teal_theme.clone();
+    let want_autostart = tokio::task::spawn_blocking(move || {
+        dialoguer::Confirm::with_theme(&*theme_for_confirm)
+            .with_prompt(
+                "Enable autostart at login? \
+                 agentsso will start at every login. (Off by default.)",
+            )
+            .default(false)
+            .interact()
+    })
+    .await
+    .map_err(|e| anyhow::anyhow!("setup orchestrator confirm join failed: {e}"))??;
+
+    if want_autostart {
+        // P12 (code review): route the enable result through the same
+        // structured error-rendering helper the `agentsso autostart
+        // enable` CLI uses, so an orchestrator-side autostart failure
+        // produces the same `error_block` an operator gets from the
+        // direct CLI surface (with structured codes for grep). The
+        // helper returns Err on autostart failure; here we
+        // intentionally swallow that Err — OAuth setup already
+        // succeeded, the autostart prompt is sugar on top, and the
+        // user can retry via `agentsso autostart enable` standalone.
+        let outcome = crate::lifecycle::autostart::enable();
+        if let Err(e) = crate::cli::autostart::render_enable_outcome(outcome) {
+            // The structured error block was already rendered by the
+            // helper. Just append the "OAuth still ok" reassurance.
+            tracing::debug!(error = ?e, "orchestrator-side autostart enable failed");
+            eprintln!(
+                "(OAuth setup succeeded; you can retry autostart later \
+                           with `agentsso autostart enable`.)"
+            );
+        }
+    } else {
+        println!("autostart: skipped (off by default)");
+        println!("  enable later with: agentsso autostart enable");
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]

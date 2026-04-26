@@ -161,21 +161,33 @@ per the 2023 CA/Browser Forum baseline). It is on the roadmap for Story 7.7
 or post-MVP funding; until then, sha256 verification is the supported trust
 mechanism.
 
-### Autostart — Story 7.3 will replace this
+### Autostart — managed by `agentsso autostart`
 
 The `-Autostart` flag's Startup-folder `.lnk` is the install-time minimum.
-Story 7.3 will ship `agentsso autostart enable` with proper Task Scheduler
-integration (matches the macOS LaunchAgent + Linux systemd-user pattern).
-When 7.3 lands:
-
-- `agentsso autostart enable` will detect the `agentsso.lnk` shortcut and
-  either replace it with a Scheduled Task or warn you about the duplicate.
-- `agentsso autostart disable` will remove both mechanisms.
-
-For now, if you want to remove the autostart shortcut manually:
+For permanent autostart with retry-on-failure semantics, use:
 
 ```powershell
-Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\agentsso.lnk"
+agentsso autostart enable    # registers a Task Scheduler entry
+agentsso autostart status    # show current state + which mechanism
+agentsso autostart disable   # remove autostart entirely
+```
+
+`agentsso autostart enable` automatically detects an existing
+`-Autostart` shortcut from `install.ps1` and migrates it to Task
+Scheduler in one step (no need to delete the `.lnk` first). Task
+Scheduler is preferred over the Startup-folder shortcut because it:
+
+- Restarts automatically on crash (`<RestartOnFailure>` configured —
+  Startup-folder `.lnk` does not).
+- Does NOT silently die after 72 hours (the OS default — overridden to
+  `<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>`).
+- Does NOT stop when you undock a laptop (battery defaults overridden).
+
+If you ever want to remove autostart manually instead of via the CLI:
+
+```powershell
+schtasks /Delete /TN "AgentSSO Daemon" /F
+Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Startup\agentsso.lnk" -ErrorAction SilentlyContinue
 ```
 
 ### Uninstall — Story 7.4 will own this
@@ -287,3 +299,56 @@ authoritative status check.** `brew services start`'s "Successfully
 started" message means launchd accepted the request, not that the
 daemon is actually running under brew's management. Verify after every
 start.
+
+## Autostart on Linux
+
+`agentsso autostart enable` writes a per-user systemd unit at
+`~/.config/systemd/user/agentsso.service` and runs
+`systemctl --user enable --now agentsso.service`. No `sudo` required.
+
+```sh
+agentsso autostart enable    # systemd-user unit + enable + start
+agentsso autostart status    # current state
+agentsso autostart disable   # stop + disable + remove unit file
+journalctl --user -u agentsso -f   # tail daemon logs
+```
+
+**Linger note.** By default, user-systemd sessions exit at logout — so
+the daemon stops at logout and starts again at next login. This matches
+macOS LaunchAgent semantics. If you want the daemon to keep running
+even when no user is logged in (e.g., on a headless workstation), enable
+linger separately:
+
+```sh
+sudo loginctl enable-linger $USER
+```
+
+This is a one-time setup, not part of `agentsso autostart enable` (it
+requires `sudo`, which the autostart command deliberately avoids).
+
+**WSL note.** WSL1 doesn't have systemd at all. WSL2 has it only when
+`[boot]\nsystemd=true` is set in `/etc/wsl.conf` (default OFF on older
+WSL2 setups). `agentsso autostart enable` will detect missing systemd
+and emit a clean error rather than silently doing nothing.
+
+## Autostart at-a-glance — all three platforms
+
+| Platform | Mechanism | Artifact location |
+|----------|-----------|-------------------|
+| macOS | LaunchAgent | `~/Library/LaunchAgents/dev.agentsso.daemon.plist` |
+| Linux | systemd-user | `~/.config/systemd/user/agentsso.service` |
+| Windows | Task Scheduler | `AgentSSO Daemon` (registry) + `~/.agentsso/autostart/task-scheduler.xml` |
+
+In all three cases:
+
+- **OPT-IN** (off by default). The setup wizard asks; the default is NO.
+- **No `sudo`/admin required** — uses per-user mechanisms only.
+- **Restart-on-crash, NOT restart-on-clean-exit.** `agentsso stop` does
+  not respawn-loop the daemon (lesson from Story 7.1's v0.2.1 hotfix).
+- `agentsso autostart status` is the authoritative cross-platform check.
+
+The setup wizard (`agentsso setup` with no service argument) walks you
+through both connecting a Google service AND deciding about autostart.
+Per-service flows (`agentsso setup gmail|calendar|drive`) skip the
+autostart prompt — they're for users scripting OAuth setup who don't
+want a follow-up question.

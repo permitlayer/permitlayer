@@ -56,6 +56,8 @@ enum Commands {
     Agent(cli::agent::AgentArgs),
     /// List plugin connectors loaded by the daemon (built-in + user-installed) — FR40
     Connectors(cli::connectors::ConnectorsArgs),
+    /// Manage opt-in autostart at login (FR7) — enable/disable/status
+    Autostart(cli::autostart::AutostartArgs),
 }
 
 /// Top-level `main` dispatcher.
@@ -102,6 +104,7 @@ async fn main() -> ExitCode {
         Some(Commands::Resume(args)) => anyhow_to_exit_code(cli::resume::run(args).await),
         Some(Commands::Agent(args)) => anyhow_to_exit_code(cli::agent::run(args).await),
         Some(Commands::Connectors(args)) => anyhow_to_exit_code(cli::connectors::run(args).await),
+        Some(Commands::Autostart(args)) => anyhow_to_exit_code(cli::autostart::run(args).await),
         None => {
             use clap::CommandFactory;
             if let Err(e) = Cli::command().print_help() {
