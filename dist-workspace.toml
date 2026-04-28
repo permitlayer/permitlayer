@@ -18,8 +18,12 @@ installers = ["homebrew"]
 #   PowerShell installer (install/install.ps1) + ClawHub skill that wraps
 #   `agentsso` on Windows. dist 0.31 emits a .zip artifact for this target;
 #   sha256 sidecar (no Authenticode yet — see Story 7.2 Dev Notes for why).
-# Linux x86_64 lands in Story 7.7 (cross-platform CI matrix).
-targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc"]
+# - Linux x86_64 (x86_64-unknown-linux-gnu): added in Story 7.7. Matches
+#   install.sh:142's expected target (the script was wired for this triple
+#   from Story 1.12; dist just wasn't building it). glibc target — musl is
+#   a separate future-story consideration. NFR49 requires glibc 2.31+
+#   (Ubuntu 20.04+, Debian 11+, Fedora 34+, Arch).
+targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
 # Extra files to include in each release artifact
 include = ["LICENSE", "README.md", "install/install.sh"]
 # Homebrew tap configuration (Story 7.1): dist emits Formula/agentsso.rb

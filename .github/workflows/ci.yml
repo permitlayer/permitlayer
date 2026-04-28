@@ -44,13 +44,25 @@ jobs:
       - name: cargo clippy
         run: cargo clippy --workspace --all-targets --all-features -- -D warnings
 
-  # permitlayer currently ships only a macOS ARM64 binary (see
-  # dist-workspace.toml:13 and README "Status: alpha, macOS ARM64 only").
-  # Linux and Windows are Epic 7 — when they land, extend this matrix
-  # and re-add the gnome-keyring unlock step for Linux.
+  # Story 7.7: four-OS matrix enforcing NFR47 cross-platform parity.
+  # Each leg runs the full workspace test suite against its native
+  # KeyStore backend (macos.rs / linux.rs / windows.rs); a failure on
+  # any leg blocks the PR. fail-fast: false so a Linux flake doesn't
+  # mask Windows + macOS visibility on the same PR.
+  #
+  # Linux requires a running secret-service backend (gnome-keyring +
+  # dbus session) before tests run, otherwise LinuxKeyStore conformance
+  # silently skips with BackendUnavailable instead of actually
+  # exercising libsecret — see crates/permitlayer-keystore/tests/
+  # conformance.rs:202. Windows DPAPI works out-of-the-box on hosted
+  # runners; no backend prep needed.
   build-and-test:
-    name: Build + Test (macos-14)
-    runs-on: macos-14
+    name: Build + Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, macos-13, ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
@@ -61,6 +73,42 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: cargo-nextest
+      # Linux-only: install libsecret build deps + start a secret-service
+      # backend so LinuxKeyStore conformance tests exercise the real
+      # libsecret path instead of skipping with BackendUnavailable.
+      # The dbus-launch env vars are exported via $GITHUB_ENV so
+      # subsequent steps inherit them (each Actions step runs in a
+      # fresh shell — without persisting to $GITHUB_ENV the bus is
+      # invisible to `cargo nextest run`).
+      - name: Start secret-service backend (Linux only)
+        if: matrix.os == 'ubuntu-latest'
+        env:
+          KEYRING_PW: test-passphrase-ci-only
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config gnome-keyring dbus-x11
+          # Start a session dbus and persist its env into $GITHUB_ENV so
+          # all subsequent steps see it.
+          eval "$(dbus-launch --sh-syntax)"
+          echo "DBUS_SESSION_BUS_ADDRESS=$DBUS_SESSION_BUS_ADDRESS" >> "$GITHUB_ENV"
+          echo "DBUS_SESSION_BUS_PID=$DBUS_SESSION_BUS_PID" >> "$GITHUB_ENV"
+          # Unlock gnome-keyring-daemon with a known passphrase so
+          # secret-service is available + writable. The daemon
+          # backgrounds itself; --unlock receives the passphrase on
+          # stdin.
+          printf '%s\n' "${KEYRING_PW}" | gnome-keyring-daemon --unlock --components=secrets &
+          # Brief settle so the daemon registers on the bus before the
+          # sanity check runs.
+          sleep 1
+          # Sanity-check: assert the secret-service interface is
+          # actually reachable on the session bus. If this fails,
+          # LinuxKeyStore would skip its conformance — the whole
+          # point of this matrix leg is to NOT skip.
+          dbus-send --session --print-reply --dest=org.freedesktop.secrets \
+                    /org/freedesktop/secrets \
+                    org.freedesktop.DBus.Properties.GetAll \
+                    string:org.freedesktop.Secret.Service \
+            || (echo "::error::secret-service backend did not start" && exit 1)
       - name: cargo build
         run: cargo build --workspace --all-targets --all-features
       # Use nextest, not `cargo test`. Nextest runs each test in a
