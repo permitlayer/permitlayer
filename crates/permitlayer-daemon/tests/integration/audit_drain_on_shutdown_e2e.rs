@@ -16,8 +16,6 @@
 //! tail of the event burst because the `tokio::spawn`ed tasks were
 //! orphaned when the 30-second graceful-shutdown deadline fired.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use crate::common::{DaemonTestConfig, free_port, http_get, start_daemon, wait_for_health};
 
 use std::time::Duration;

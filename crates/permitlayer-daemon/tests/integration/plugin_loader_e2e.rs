@@ -21,8 +21,6 @@
 //! - AC #24 — `AGENTSSO_TEST_TRUST_PROMPT_CANNED_RESPONSES`
 //!   drives the prompt path deterministically.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};

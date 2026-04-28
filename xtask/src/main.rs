@@ -10,6 +10,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 mod bench_check;
+mod check_test_registrations;
 mod contrast;
 mod release;
 mod scrub_corpus;
@@ -61,6 +62,11 @@ enum Command {
         #[arg(long)]
         enforce: bool,
     },
+    /// Story 8.8b registration-discipline guard. Walks every refactored
+    /// crate's `tests/integration/` and asserts every `.rs` file is
+    /// registered in `mod.rs`. Catches the silent-exclusion footgun
+    /// `autotests = false` introduces.
+    CheckTestRegistrations,
 }
 
 fn main() -> Result<()> {
@@ -72,5 +78,6 @@ fn main() -> Result<()> {
         Command::ScrubCorpus => scrub_corpus::run(),
         Command::ValidatePluginApi { update } => validate_plugin_api::run(update),
         Command::BenchCheck { enforce } => bench_check::run(enforce),
+        Command::CheckTestRegistrations => check_test_registrations::run(),
     }
 }

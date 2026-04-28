@@ -10,8 +10,6 @@
 //!   `--until` + `--follow` rejection, broken-pipe clean exit, Ctrl-C
 //!   clean exit.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::io::{Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -657,8 +655,10 @@ fn follow_until_rejected_with_silent_error() {
 /// connected" smoke that proves `emit_hint` actually writes the
 /// amber hint line to stdout in a real subprocess.
 ///
-/// Run manually with: `cargo test --test audit_follow --
-/// --ignored follow_anomaly_hint_fires`.
+/// Run manually with: `cargo test --test integration --
+/// --ignored audit_follow::follow_anomaly_hint_fires`.
+/// (Post-Story-8.8b the binary is `integration`; the module path
+/// prefix scopes the filter to this submodule.)
 #[cfg(unix)]
 #[test]
 #[ignore]

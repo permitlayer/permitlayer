@@ -11,8 +11,6 @@
 //! running daemon to exercise it. Writing synthetic JSONL lines is
 //! simpler, faster, and hermetic.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output};

@@ -5,8 +5,6 @@
 //! against an ephemeral `AGENTSSO_PATHS__HOME`. No daemon is
 //! started — `connectors new` is fully offline.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::path::Path;
 use std::process::{Command, Output};
 

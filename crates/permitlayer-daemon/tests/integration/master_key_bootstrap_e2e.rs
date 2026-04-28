@@ -22,39 +22,17 @@
 //!    touched `bootstrap_from_keystore` end-to-end because
 //!    `AGENTSSO_TEST_MASTER_KEY_HEX` short-circuited before reaching
 //!    it).
+//!
+//! Story 8.8b round-1 review: this file used to define its own
+//! private `spawn_daemon_hermetic` helper, shadowing
+//! `common::start_daemon { hermetic: true, set_test_master_key:
+//! false, .. }`. The dedup migration (2026-04-28) folds this file
+//! into the canonical helper so future fixes (e.g., Windows clean
+//! shutdown) propagate without per-file maintenance.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
-use std::io::{Read, Write};
-use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::common::{agentsso_bin, free_port};
-
-/// Spawn `agentsso start` with a fully-cleared environment plus the
-/// specified test env vars. `.env_clear()` is critical: without it,
-/// any `AGENTSSO_*` var exported in the developer's shell (e.g.,
-/// `AGENTSSO_TELEMETRY__LOG_LEVEL`) would leak into the child
-/// process and could perturb config parsing. Hermetic tests beat
-/// ambient-environment surprise.
-fn spawn_daemon_hermetic(home: &std::path::Path, port: u16, extra_env: &[(&str, &str)]) -> Child {
-    let mut cmd = Command::new(agentsso_bin());
-    cmd.env_clear()
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
-        // HOME and USER are required by some keyring backends even
-        // when we're routing through PassphraseKeyStore.
-        .env("HOME", home.to_str().unwrap())
-        .env("AGENTSSO_PATHS__HOME", home.to_str().unwrap())
-        .arg("start")
-        .arg("--bind-addr")
-        .arg(format!("127.0.0.1:{port}"))
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    for (k, v) in extra_env {
-        cmd.env(k, v);
-    }
-    cmd.spawn().expect("failed to spawn daemon")
-}
+use crate::common::{DaemonTestConfig, free_port, start_daemon, wait_for_health};
 
 /// AC #4: when `AGENTSSO_TEST_FORCE_KEYSTORE_ERROR=1` forces a
 /// keystore construction failure, `agentsso start` exits with code 2
@@ -71,17 +49,26 @@ fn fail_fast_exit_2_when_keystore_unavailable() {
     std::fs::create_dir_all(home.path().join("config")).unwrap();
     let port = free_port();
 
-    let mut child =
-        spawn_daemon_hermetic(home.path(), port, &[("AGENTSSO_TEST_FORCE_KEYSTORE_ERROR", "1")]);
+    let mut handle = start_daemon(DaemonTestConfig {
+        port,
+        home: home.path().to_path_buf(),
+        hermetic: true,
+        // This test exercises a refuse-to-boot path under the REAL
+        // keystore adapter; the test seam (`AGENTSSO_TEST_MASTER_KEY_HEX`)
+        // would short-circuit past it.
+        set_test_master_key: false,
+        extra_env: vec![("AGENTSSO_TEST_FORCE_KEYSTORE_ERROR".into(), "1".into())],
+        ..Default::default()
+    });
 
     // Give the daemon up to 5 seconds to hit the bootstrap path and
     // exit. In practice it exits within ~100ms because the bootstrap
     // is the first `master_key` call the daemon makes.
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        match child.try_wait().unwrap() {
+        match handle.try_wait().unwrap() {
             Some(status) => {
-                let output = child.wait_with_output().unwrap();
+                let output = handle.wait_with_output().unwrap();
                 let stderr = String::from_utf8_lossy(&output.stderr).to_string();
 
                 // AC #4: exit code 2 (fail-fast).
@@ -121,8 +108,7 @@ fn fail_fast_exit_2_when_keystore_unavailable() {
             }
             None => {
                 if Instant::now() > deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
+                    // `handle` Drop will SIGKILL on scope exit.
                     panic!("daemon did not exit within 5s — fail-fast bootstrap path did not fire");
                 }
                 std::thread::sleep(Duration::from_millis(50));
@@ -155,17 +141,23 @@ fn real_keystore_bootstrap_happy_path_persists_and_reuses_master_key() {
     // generates a 16-byte salt, derives the key via Argon2id, and
     // persists both the salt and an HMAC verifier to
     // ~/.agentsso/keystore/passphrase.state.
-    let mut daemon_1 = spawn_daemon_hermetic(
-        home.path(),
-        port_1,
-        &[("AGENTSSO_TEST_PASSPHRASE", "integration-test-passphrase-1.15")],
-    );
+    let mut daemon_1 = start_daemon(DaemonTestConfig {
+        port: port_1,
+        home: home.path().to_path_buf(),
+        hermetic: true,
+        set_test_master_key: false,
+        extra_env: vec![(
+            "AGENTSSO_TEST_PASSPHRASE".into(),
+            "integration-test-passphrase-1.15".into(),
+        )],
+        ..Default::default()
+    });
 
     // Wait for health to confirm the daemon made it past the
     // bootstrap. If `bootstrap_from_keystore` regressed, the daemon
     // would either exit(2) or never reach health.
     assert!(
-        wait_for_health(port_1, Duration::from_secs(5)),
+        wait_for_health(port_1),
         "first daemon instance should boot successfully via PassphraseKeyStore"
     );
 
@@ -178,9 +170,11 @@ fn real_keystore_bootstrap_happy_path_persists_and_reuses_master_key() {
         state_path.display()
     );
 
-    // Shut down the first instance.
-    daemon_1.kill().unwrap();
-    let _ = daemon_1.wait();
+    // Shut down the first instance via SIGTERM (DaemonHandle::Drop
+    // would SIGKILL otherwise; explicit shutdown here matches the
+    // pre-migration behavior of `daemon_1.kill().unwrap(); .wait()`).
+    daemon_1.shutdown_graceful(Duration::from_secs(2));
+    drop(daemon_1);
 
     // Second daemon instance: same home dir, same passphrase. The
     // keystore should read the persisted salt, re-derive the key,
@@ -189,48 +183,27 @@ fn real_keystore_bootstrap_happy_path_persists_and_reuses_master_key() {
     // cause `bootstrap_from_keystore` to return
     // `KeyStoreError::PassphraseMismatch` and the daemon to exit 2.
     let port_2 = free_port();
-    let mut daemon_2 = spawn_daemon_hermetic(
-        home.path(),
-        port_2,
-        &[("AGENTSSO_TEST_PASSPHRASE", "integration-test-passphrase-1.15")],
-    );
+    let mut daemon_2 = start_daemon(DaemonTestConfig {
+        port: port_2,
+        home: home.path().to_path_buf(),
+        hermetic: true,
+        set_test_master_key: false,
+        extra_env: vec![(
+            "AGENTSSO_TEST_PASSPHRASE".into(),
+            "integration-test-passphrase-1.15".into(),
+        )],
+        ..Default::default()
+    });
     assert!(
-        wait_for_health(port_2, Duration::from_secs(5)),
+        wait_for_health(port_2),
         "second daemon instance should boot successfully and re-use the persisted keystore state"
     );
-    daemon_2.kill().unwrap();
-    let _ = daemon_2.wait();
+    daemon_2.shutdown_graceful(Duration::from_secs(2));
+    drop(daemon_2);
 
     // State file should still exist and be unchanged.
     assert!(
         state_path.exists(),
         "PassphraseKeyStore state file should survive across daemon restarts"
     );
-}
-
-/// Wait for the daemon's `/health` endpoint to return a healthy
-/// response. Polls every 50ms up to `timeout`.
-fn wait_for_health(port: u16, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
-            &format!("127.0.0.1:{port}").parse().unwrap(),
-            Duration::from_millis(100),
-        ) {
-            let _ = stream.write_all(
-                format!(
-                    "GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-                )
-                .as_bytes(),
-            );
-            let mut buf = Vec::new();
-            let _ = stream.read_to_end(&mut buf);
-            let response = String::from_utf8_lossy(&buf);
-            if response.contains("\"healthy\"") {
-                return true;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
 }

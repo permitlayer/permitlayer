@@ -13,8 +13,6 @@
 //! of the `AGENTSSO_TEST_FROZEN_DATE` pattern in
 //! `cli/connectors/new.rs`.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::process::{Command, Stdio};
 
 use crate::common::agentsso_bin;

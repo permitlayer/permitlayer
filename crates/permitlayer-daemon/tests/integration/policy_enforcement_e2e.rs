@@ -15,8 +15,6 @@
 //! End-to-end coverage of the register → auth → policy lifecycle with
 //! real bearer tokens lives in `agent_registry_e2e.rs` (Story 4.4).
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};

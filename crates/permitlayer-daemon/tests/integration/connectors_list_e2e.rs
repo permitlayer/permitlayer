@@ -12,8 +12,6 @@
 //!   in-process control-plane tests at
 //!   `server/control.rs::tests::connectors_handler_rejects_non_loopback`.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};

@@ -7,8 +7,6 @@
 //! until the regression is fixed OR a separate security ADR explains
 //! why the new behavior is acceptable.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::time::Duration;
 
 use permitlayer_plugins::{PluginError, PluginRuntime, RuntimeConfig};

@@ -10,8 +10,6 @@
 //! independent code paths; tests that specifically need the
 //! subscriber output live in `logs_credential_redaction_e2e.rs`.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output};

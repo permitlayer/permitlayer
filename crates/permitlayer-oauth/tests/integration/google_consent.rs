@@ -1,7 +1,5 @@
 //! Integration tests for Google OAuth client configuration (Story 1.7).
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::path::PathBuf;
 
 use permitlayer_oauth::google::consent::GoogleOAuthConfig;

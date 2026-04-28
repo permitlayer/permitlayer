@@ -4,8 +4,6 @@
 //! Each test gets its own temp dir for PID file and config isolation.
 //! Ephemeral ports are used to avoid conflicts.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};

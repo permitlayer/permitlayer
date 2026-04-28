@@ -21,8 +21,6 @@
 //! to `scripts/smoke-test.sh` per the Epic 2 retrospective action
 //! item #5.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::sync::Arc;
 
 use arc_swap::ArcSwap;

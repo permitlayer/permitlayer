@@ -10,8 +10,6 @@
 //! These tests verify that the rmcp `StreamableHttpService` is correctly wired
 //! and responds to standard MCP Streamable HTTP protocol requests.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;

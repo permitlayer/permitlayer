@@ -3,8 +3,6 @@
 //! Tests cover: single append, concurrency (NFR42), size-based rotation,
 //! date-based rotation, retention sweep, JSON validity, and schema version.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::sync::Arc;
 
 use permitlayer_core::audit::event::{AUDIT_SCHEMA_VERSION, AuditEvent};

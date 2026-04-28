@@ -19,8 +19,6 @@
 //! - `error_class_*` — AC #22, #23
 //! - `with_host_api_*` — AC #27
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::sync::{Arc, Mutex};
 
 use permitlayer_plugins::{

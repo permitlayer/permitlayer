@@ -3,8 +3,6 @@
 //! Verifies that 50 concurrent scrub calls on the same `Arc<ScrubEngine>`
 //! produce deterministic, identical results with no race conditions.
 
-#![allow(clippy::unwrap_used, clippy::expect_used)]
-
 use std::sync::Arc;
 
 use permitlayer_core::scrub::{Placeholder, ScrubEngine, ScrubRule};

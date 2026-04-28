@@ -7,8 +7,6 @@
 //! refactor that accidentally hides the stub from the public
 //! surface would break these tests.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::sync::Arc;
 
 use permitlayer_plugins::{DecisionDesc, FetchReq, HostServices, PolicyEvalReq, StubHostServices};

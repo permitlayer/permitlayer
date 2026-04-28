@@ -11,8 +11,6 @@
 //!   stdout list (Option A codification of AC #9 — `eprintln!`-based
 //!   warning rather than `tracing::warn!`).
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::process::Command;
 
 /// Run `agentsso scrub explain` with the given args and return

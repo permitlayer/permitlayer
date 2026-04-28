@@ -3,8 +3,6 @@
 //! These tests verify the full request flow through ProxyService::handle
 //! with mock dependencies (CredentialStore, AuditStore, upstream via mockito).
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 

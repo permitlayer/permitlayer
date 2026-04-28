@@ -2,8 +2,6 @@
 //!
 //! Tests scope info, verification module, and error variant behavior.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use permitlayer_oauth::OAuthError;
 use permitlayer_oauth::google::scopes;
 use permitlayer_oauth::google::verify;

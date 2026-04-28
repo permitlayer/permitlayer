@@ -17,7 +17,9 @@
 //! toolchain bumps cost at most a `TRYBUILD=overwrite` re-record.
 //!
 //! Local iteration: `TRYBUILD=overwrite cargo test -p permitlayer-core
-//! --test compile_fail` regenerates snapshots in place.
+//! --test integration compile_fail` regenerates snapshots in place.
+//! (Post-Story-8.8b the binary is named `integration`, not
+//! `compile_fail`; the trailing arg filters down to this submodule.)
 
 #[test]
 fn store_rejects_plaintext_types() {

@@ -34,8 +34,6 @@
 //! spawn-heavy tests via `serial_test` or running them in separate
 //! integration binaries). Deferred.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};

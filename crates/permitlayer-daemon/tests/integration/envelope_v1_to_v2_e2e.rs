@@ -32,8 +32,6 @@
 //!   migration's own tests; the `run_apply` outer flow is covered by
 //!   `update_e2e.rs`.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::io::Read;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};

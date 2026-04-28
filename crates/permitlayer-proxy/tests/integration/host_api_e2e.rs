@@ -12,8 +12,6 @@
 //! transport — the JS-side surface and the Rust-side
 //! `ProxyHostServices` glue both run identically.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::path::Path;
 use std::sync::Arc;
 

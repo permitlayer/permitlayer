@@ -7,8 +7,6 @@
 //! - Returns error content (not transport error) on failure
 //! - Shares the same ProxyService::handle code path as REST
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 

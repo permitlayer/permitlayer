@@ -12,8 +12,6 @@
 //! (3) stopping the daemon, (4) inspecting both file paths for
 //! cross-contamination.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::process::{Command, Stdio};

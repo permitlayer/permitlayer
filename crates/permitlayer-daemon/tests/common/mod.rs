@@ -112,8 +112,13 @@ pub fn agentsso_bin() -> PathBuf {
 /// All fields have sensible defaults that reproduce the "simple
 /// daemon boot" pattern used by the majority of the hand-rolled
 /// copies. The `hermetic` flag opts into the `env_clear`-based
-/// discipline that `master_key_bootstrap_e2e.rs` needs, matching the
+/// discipline that `master_key_bootstrap_e2e.rs` uses, matching the
 /// documented hermetic-env rationale from Story 1.15.
+///
+/// **Story 8.8b round-1 review (2026-04-28):** the dedup is now
+/// complete — `master_key_bootstrap_e2e.rs` and `agent_registry_e2e.rs`
+/// both consume `start_daemon` directly. No daemon-spawn helpers
+/// shadow this one anywhere in the integration test tree.
 ///
 /// # Env var precedence
 ///
@@ -538,17 +543,20 @@ mod tests {
             "agentsso_bin should resolve to a binary named agentsso, got {}",
             p.display()
         );
-        // The parent directory must be a cargo profile dir (`debug` or
-        // `release`), not just any ancestor — tightens against false
-        // positives from nested/custom layouts like `/foo/debug/bar`.
-        let parent_is_profile = p
-            .parent()
-            .and_then(|d| d.file_name())
-            .map(|name| name == "debug" || name == "release")
-            .unwrap_or(false);
+        // The path must live UNDER a cargo `target/` directory.
+        // Story 8.8b round-1 review: the original assertion checked
+        // for `parent.file_name() in {"debug", "release"}`, but the
+        // workspace ships `[profile.dist]` (cargo-dist release builds
+        // land under `target/dist/`) and any future custom profile
+        // would also fail the tight check. We still defend against
+        // nested-debug-dir false positives by walking ancestors and
+        // requiring SOME ancestor to be named `target` — anything
+        // resolving to `/foo/debug/agentsso` without a `target/`
+        // ancestor is rejected.
+        let under_target = p.ancestors().any(|a| a.file_name().is_some_and(|n| n == "target"));
         assert!(
-            parent_is_profile,
-            "agentsso_bin parent should be target/debug or target/release, got {}",
+            under_target,
+            "agentsso_bin path should live under a `target/` directory, got {}",
             p.display()
         );
     }

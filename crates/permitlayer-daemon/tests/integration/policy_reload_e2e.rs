@@ -8,8 +8,6 @@
 //!   daemon returns an error and the old set is preserved.
 //! - Assert `policy-reloaded` audit event was written on the success reload.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use crate::common::{DaemonTestConfig, free_port, http_post, start_daemon, wait_for_health};
 
 const POLICY_A: &str = r#"

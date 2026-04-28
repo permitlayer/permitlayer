@@ -18,9 +18,28 @@ tests/
 ```
 
 Default-feature integration tests live in ONE binary named `integration`.
-The feature-gated `kill9_recovery.rs` stays its own binary because it
-only compiles under `--features test-seam` and collapsing feature-gated
-files into a shared parent binary is awkward.
+
+## Tests that stay separate (and why)
+
+Two integration tests deliberately live OUTSIDE `tests/integration/`
+as their own `[[test]]` entries in `Cargo.toml`. Both have specific
+reasons that future "cleanup" passes MUST NOT undo:
+
+- **`tests/kill9_recovery.rs`** — feature-gated (`required-features =
+  ["test-seam"]`). Only compiles under `--features test-seam`;
+  collapsing feature-gated files into a shared parent binary makes
+  the gate awkward (every other test would also pay the
+  feature-build cost on `--all-features` runs).
+- **`tests/vault_lock_conformance.rs`** — self-spawns the test
+  binary via `std::env::current_exe()` to verify cross-process
+  flock semantics. The child process branch is gated on
+  `PERMITLAYER_VAULT_LOCK_CHILD_HOME` and exits 0 immediately when
+  set. If this file were collapsed into `integration`, the
+  re-invoked child would run inside the same binary that holds
+  every other integration test — and the child's `process::exit(0)`
+  would silently mask any real failures during normal runs.
+  Keeping it a separate binary preserves the invariant that
+  "child re-invocation runs ONLY this test."
 
 ## insta snapshots
 

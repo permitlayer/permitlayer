@@ -9,8 +9,6 @@
 //! - Exactly one `plugin-http-blocked` audit event lands on disk for each
 //!   blocked request.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::path::Path;
 use std::sync::Arc;
 

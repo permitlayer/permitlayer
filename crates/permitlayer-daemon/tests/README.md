@@ -21,6 +21,7 @@ tests/
     ├── connectors_test_e2e.rs
     ├── credentials_status.rs
     ├── daemon_lifecycle.rs
+    ├── envelope_v1_to_v2_e2e.rs    ← added by Story 7.6a
     ├── kill_resume_e2e.rs
     ├── kill_switch_e2e.rs
     ├── logs_audit_isolation_e2e.rs
@@ -31,10 +32,12 @@ tests/
     ├── policy_enforcement_e2e.rs
     ├── policy_reload_e2e.rs
     ├── scrub_explain_warnings.rs
-    └── status_connections_e2e.rs
+    ├── status_connections_e2e.rs
+    ├── uninstall_e2e.rs            ← added by Story 7.4
+    └── update_e2e.rs               ← added by Story 7.5
 ```
 
-All 23 integration tests live in ONE binary named `integration`. The
+All 26 integration tests live in ONE binary named `integration`. The
 shared `common/mod.rs` is declared via `#[path = "../common/mod.rs"] mod
 common;` in `integration/mod.rs`, so submodules import helpers as
 `use crate::common::{free_port, agentsso_bin, …}`.
@@ -42,6 +45,34 @@ common;` in `integration/mod.rs`, so submodules import helpers as
 Pre-Story-8.8b, this crate had 23 separate integration test binaries
 and 10 copies of `fn free_port()` + 12 copies of `fn agentsso_bin()`
 scattered across test files. The collapse eliminated all duplicates.
+Three integration files (`envelope_v1_to_v2_e2e`, `uninstall_e2e`,
+`update_e2e`) have been added since 8.8b shipped; each was registered
+in `integration/mod.rs` at the time it landed.
+
+## Helper self-tests run inside the integration binary
+
+`common/mod.rs` carries a `#[cfg(test)] mod tests` block (~7 unit
+tests) that exercises `free_port`, `agentsso_bin`, the
+`DaemonHandle::Drop` invariant, and `DaemonTestConfig`'s assertion
+guards. Because the integration binary is compiled with `--test`,
+these helper self-tests run as part of every `cargo nextest run -p
+permitlayer-daemon` invocation — they show up under
+`integration::common::tests::*`. This is intentional: it keeps the
+shared helpers covered without adding a separate test binary.
+
+## `free_port()` race window (caveat)
+
+`common::free_port` binds port 0, reads the OS-assigned port, and
+drops the listener before returning. There's a small TOCTOU window
+between drop and the test's actual bind. The doc-comment on
+`free_port` notes "no observed flakes in CI across thousands of
+runs" — that observation predates the Story 8.8b collapse (when the
+24 daemon e2e tests ran in 24 separate binaries). Post-collapse, all
+~25 daemon e2e tests share one process; the per-binary thread pool
+allocates ports more densely. No flakes have been observed
+post-8.8b either, but if intermittent bind failures appear the
+mitigation is either an in-process port-allocation mutex or
+retry-on-bind-failure inside `start_daemon`.
 
 ## Adding a new integration test
 

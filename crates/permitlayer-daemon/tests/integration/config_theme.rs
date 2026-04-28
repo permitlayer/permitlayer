@@ -1,7 +1,5 @@
 //! Integration test: `agentsso config set theme=<name>` persists and reads back.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::process::Command;
 
 /// Run `agentsso config set theme=molt` and verify `ui.toml` is written.

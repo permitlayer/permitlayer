@@ -1,8 +1,6 @@
 //! Integration tests for [`permitlayer_plugins::scope_allowlist`]
 //! (Story 6.4 AC #18).
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use permitlayer_plugins::{ALLOWED_SCOPES, is_allowed};
 
 #[test]

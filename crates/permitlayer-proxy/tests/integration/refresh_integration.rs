@@ -34,8 +34,6 @@
 //! 1s/2s/4s backoff between the 3 refresh attempts runs in microseconds
 //! instead of ~7 seconds of wall clock.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};

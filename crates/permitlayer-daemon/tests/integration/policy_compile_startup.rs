@@ -13,8 +13,6 @@
 //! and `kill_switch_e2e.rs`. Requires `--test-threads=4` or lower for
 //! stable execution (Epic 3 retro line 342).
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use crate::common::{DaemonTestConfig, free_port, start_daemon, wait_for_health};
 use std::time::{Duration, Instant};
 

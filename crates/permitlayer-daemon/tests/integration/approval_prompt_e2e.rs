@@ -27,8 +27,6 @@
 //!   clears the always/never cache so a cached decision no longer
 //!   fires on the next request
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};

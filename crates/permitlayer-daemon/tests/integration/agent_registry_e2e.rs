@@ -19,53 +19,34 @@
 //! out entirely — see `cli::start::ensure_master_key_bootstrapped`
 //! for the full set of `AGENTSSO_TEST_*` seams.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::io::{Read, Write};
-use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::common::{agentsso_bin, free_port};
+use crate::common::{
+    DaemonTestConfig, free_port, start_daemon as start_daemon_common, wait_for_health,
+};
 
-const TEST_MASTER_KEY_HEX: &str =
-    "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+// Story 8.8b round-1 review: this file used to define its own
+// private `start_daemon` (with `AGENTSSO_TEST_MASTER_KEY_HEX`
+// inlined) and its own `wait_for_health(port, timeout)`. Both are
+// now provided by `crate::common`. Local helpers retained below
+// are file-specific (header-aware HTTP, `wait_for_audit_event`)
+// and have no canonical equivalent yet.
 
-fn start_daemon(home: &std::path::Path, port: u16) -> Child {
-    Command::new(agentsso_bin())
-        .arg("start")
-        .arg("--bind-addr")
-        .arg(format!("127.0.0.1:{port}"))
-        .env("AGENTSSO_PATHS__HOME", home.to_str().unwrap())
-        .env("AGENTSSO_TEST_MASTER_KEY_HEX", TEST_MASTER_KEY_HEX)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("failed to start daemon")
-}
-
-fn wait_for_health(port: u16, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if let Ok(mut stream) = std::net::TcpStream::connect_timeout(
-            &format!("127.0.0.1:{port}").parse().unwrap(),
-            Duration::from_millis(100),
-        ) {
-            let _ = stream.write_all(
-                format!(
-                    "GET /health HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"
-                )
-                .as_bytes(),
-            );
-            let mut buf = Vec::new();
-            let _ = stream.read_to_end(&mut buf);
-            let response = String::from_utf8_lossy(&buf);
-            if response.contains("\"healthy\"") {
-                return true;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
+/// Spawn the daemon for this test file's pattern: short-circuit the
+/// keystore via `AGENTSSO_TEST_MASTER_KEY_HEX` (Story 4.4 boot
+/// dependency on a master-derived agent-lookup subkey), bind to
+/// `port`, point at `home`. Returns the canonical [`DaemonHandle`]
+/// so each test gets Drop-kill-on-panic for free.
+fn start_daemon(home: &std::path::Path, port: u16) -> crate::common::DaemonHandle {
+    start_daemon_common(DaemonTestConfig {
+        port,
+        home: home.to_path_buf(),
+        // `set_test_master_key: true` (default) wires
+        // `AGENTSSO_TEST_MASTER_KEY_HEX` to the canonical
+        // `common::TEST_MASTER_KEY_HEX` constant.
+        ..Default::default()
+    })
 }
 
 fn http_request(
@@ -182,9 +163,9 @@ fn full_register_auth_policy_lifecycle() {
     seed_two_policies(home.path());
 
     let port = free_port();
-    let mut daemon = start_daemon(home.path(), port);
+    let daemon = start_daemon(home.path(), port);
 
-    assert!(wait_for_health(port, Duration::from_secs(5)), "daemon should boot with two policies");
+    assert!(wait_for_health(port), "daemon should boot with two policies");
 
     // 1. Register two agents bound to different policies.
     let token_readonly = register_agent(port, "readonly-agent", "policy-readonly");
@@ -314,8 +295,10 @@ fn full_register_auth_policy_lifecycle() {
         "expected an agent-auth-denied audit event with token_prefix='agt_v1_g'"
     );
 
-    daemon.kill().unwrap();
-    let _ = daemon.wait();
+    // DaemonHandle Drop SIGKILLs on scope exit; explicit graceful
+    // shutdown is unnecessary for these tests (none of them assert
+    // on captured stdout/stderr after shutdown).
+    drop(daemon);
 }
 
 #[test]
@@ -325,9 +308,9 @@ fn register_with_unknown_policy_returns_422() {
     seed_two_policies(home.path());
 
     let port = free_port();
-    let mut daemon = start_daemon(home.path(), port);
+    let daemon = start_daemon(home.path(), port);
 
-    assert!(wait_for_health(port, Duration::from_secs(5)));
+    assert!(wait_for_health(port));
 
     let body = serde_json::json!({"name": "agent1", "policy_name": "nonexistent"}).to_string();
     let (status, resp_body) = http_post_loopback(port, "/v1/control/agent/register", &body, &[]);
@@ -336,8 +319,10 @@ fn register_with_unknown_policy_returns_422() {
     assert_eq!(parsed["status"], "error");
     assert_eq!(parsed["code"], "agent.unknown_policy");
 
-    daemon.kill().unwrap();
-    let _ = daemon.wait();
+    // DaemonHandle Drop SIGKILLs on scope exit; explicit graceful
+    // shutdown is unnecessary for these tests (none of them assert
+    // on captured stdout/stderr after shutdown).
+    drop(daemon);
 }
 
 #[test]
@@ -347,9 +332,9 @@ fn register_duplicate_name_returns_409() {
     seed_two_policies(home.path());
 
     let port = free_port();
-    let mut daemon = start_daemon(home.path(), port);
+    let daemon = start_daemon(home.path(), port);
 
-    assert!(wait_for_health(port, Duration::from_secs(5)));
+    assert!(wait_for_health(port));
 
     let _token = register_agent(port, "duplicate-test", "policy-readonly");
     let body =
@@ -359,8 +344,10 @@ fn register_duplicate_name_returns_409() {
     let parsed: serde_json::Value = serde_json::from_str(&resp_body).unwrap();
     assert_eq!(parsed["code"], "agent.duplicate_name");
 
-    daemon.kill().unwrap();
-    let _ = daemon.wait();
+    // DaemonHandle Drop SIGKILLs on scope exit; explicit graceful
+    // shutdown is unnecessary for these tests (none of them assert
+    // on captured stdout/stderr after shutdown).
+    drop(daemon);
 }
 
 /// Poll the audit directory for a JSON line matching `predicate`.

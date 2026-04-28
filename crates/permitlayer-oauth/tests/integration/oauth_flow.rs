@@ -3,8 +3,6 @@
 //! Uses an in-process axum mock OAuth server to test the full flow
 //! without hitting real Google endpoints.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;

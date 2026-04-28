@@ -3,8 +3,6 @@
 //! Validates that `builtin_rules()` produces a functional, stable, unique
 //! rule set that detects all 8 placeholder types.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use permitlayer_core::scrub::{ScrubEngine, builtin_rules};
 
 /// Build an engine with the full built-in rule set.

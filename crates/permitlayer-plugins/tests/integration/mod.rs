@@ -12,6 +12,11 @@
 //! one binary" auto-discovery, so forgetting to register a file here
 //! means it does not run — see `tests/README.md`.
 
+// Inner attribute hoisted from individual submodules (Story 8.8b
+// round-1 review): lint levels propagate down the module tree, so
+// allowing here covers every submodule without per-file boilerplate.
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+
 mod deny_toml_allowlist_extended;
 mod host_api_surface;
 mod loader;

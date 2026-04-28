@@ -12,8 +12,6 @@
 //! spawning hangs on a macOS keychain dialog when run interactively).
 //! Same constant + spawn pattern as `tests/agent_registry_e2e.rs`.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};

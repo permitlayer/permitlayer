@@ -21,8 +21,6 @@
 //! snapshots); the label drift is cosmetic. Tracked (and now closed)
 //! in `deferred-work.md:119` by Story 8.6 AC #7.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::path::PathBuf;
 
 use permitlayer_core::policy::{EvalRequest, PolicyCompileError, PolicySet};

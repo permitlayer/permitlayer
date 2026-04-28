@@ -12,8 +12,6 @@
 //! autostart + (when applicable) binary steps still run, so the
 //! observable end-state is what we assert on.
 
-#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-
 use std::path::Path;
 use std::process::{Command, Stdio};
 
