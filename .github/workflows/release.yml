@@ -349,6 +349,80 @@ jobs:
           name: artifacts-signatures
           path: target/distrib/*.minisig
 
+  # permitlayer-custom (Story 7.7 Task 3 / AC #4): NFR48 binary-size
+  # gate. Asserts every tarball/zip artifact stays under 30 MB
+  # compressed AND its inner binary stays under 80 MB uncompressed.
+  # Runs in parallel with `sign` after artifacts are built; gates
+  # `host` so a binary that breached either limit never lands in a
+  # real GitHub Release. Also prints per-artifact size lines on
+  # success so operators reading the release log get a free
+  # at-a-glance binary-size trend.
+  size-assert:
+    needs:
+      - plan
+      - build-local-artifacts
+      - build-global-artifacts
+    # Same gate as `sign`: only fire on real release runs (tag push),
+    # never on PR-time `dist plan`-only runs (no artifacts to size).
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch artifacts
+        uses: actions/download-artifact@v7
+        with:
+          pattern: artifacts-build-*
+          path: target/distrib/
+          merge-multiple: true
+      - name: Assert NFR48 size limits
+        # NFR48 (PRD line 1041): compressed <30 MB, uncompressed
+        # <80 MB on every platform. The compressed limit is checked
+        # against the .tar.xz / .tar.gz / .zip; the uncompressed
+        # limit is checked against the agentsso / agentsso.exe
+        # binary inside each archive.
+        run: |
+          set -euo pipefail
+          MAX_COMPRESSED=$((30 * 1000 * 1000))   # 30 MB (decimal — matches PRD copy)
+          MAX_UNCOMPRESSED=$((80 * 1000 * 1000)) # 80 MB
+          FAILED=0
+          for archive in target/distrib/*.tar.xz target/distrib/*.tar.gz target/distrib/*.zip; do
+            [ -f "$archive" ] || continue
+            COMPRESSED=$(stat -c '%s' "$archive")
+            if [ "$COMPRESSED" -gt "$MAX_COMPRESSED" ]; then
+              echo "::error file=$archive::Compressed size ${COMPRESSED} exceeds NFR48 limit (${MAX_COMPRESSED})"
+              FAILED=1
+            fi
+            # Extract to a per-archive tempdir so concurrent extraction
+            # of multiple targets can't collide on a shared name.
+            TMPDIR="$(mktemp -d)"
+            case "$archive" in
+              *.tar.xz)  tar -xJf "$archive" -C "$TMPDIR" ;;
+              *.tar.gz)  tar -xzf "$archive" -C "$TMPDIR" ;;
+              *.zip)     unzip -q "$archive" -d "$TMPDIR" ;;
+            esac
+            # Find the agentsso / agentsso.exe binary anywhere in the
+            # extracted tree (dist nests it under
+            # permitlayer-daemon-<target>/ on most platforms).
+            BIN=$(find "$TMPDIR" -type f \( -name agentsso -o -name agentsso.exe \) | head -1)
+            if [ -z "$BIN" ]; then
+              echo "::error file=$archive::Could not locate agentsso[.exe] inside archive"
+              FAILED=1
+              rm -rf "$TMPDIR"
+              continue
+            fi
+            UNCOMPRESSED=$(stat -c '%s' "$BIN")
+            if [ "$UNCOMPRESSED" -gt "$MAX_UNCOMPRESSED" ]; then
+              echo "::error file=$archive::Uncompressed binary size ${UNCOMPRESSED} exceeds NFR48 limit (${MAX_UNCOMPRESSED})"
+              FAILED=1
+            fi
+            echo "::notice::$(basename "$archive"): ${COMPRESSED} compressed, ${UNCOMPRESSED} uncompressed"
+            rm -rf "$TMPDIR"
+          done
+          if [ "$FAILED" = "1" ]; then
+            echo "::error::One or more artifacts exceeded NFR48 size limits"
+            exit 1
+          fi
+          echo "All artifacts within NFR48 size limits"
+
   # Determines if we should publish/announce
   host:
     needs:
@@ -356,9 +430,11 @@ jobs:
       - build-local-artifacts
       - build-global-artifacts
       - sign
-    # Only run if we're "publishing", sign succeeded, and plan/local/global
-    # didn't fail (skipped is fine for local/global).
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.sign.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+      - size-assert
+    # Only run if we're "publishing", sign + size-assert succeeded,
+    # and plan/local/global didn't fail (skipped is fine for
+    # local/global).
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.sign.result == 'success' && needs.size-assert.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"
