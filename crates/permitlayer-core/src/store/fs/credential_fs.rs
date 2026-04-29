@@ -406,8 +406,14 @@ pub fn atomic_write_bytes(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&tmp);
         return Err(e);
     }
-    let dir = std::fs::File::open(parent)?;
-    dir.sync_all()?;
+    // Parent-dir fsync is Unix-only — see agent_fs::atomic_write for
+    // the rationale (NTFS journals; opening a dir for read on
+    // Windows fails with PermissionDenied).
+    #[cfg(unix)]
+    {
+        let dir = std::fs::File::open(parent)?;
+        dir.sync_all()?;
+    }
     Ok(())
 }
 
@@ -723,8 +729,17 @@ impl CredentialFsIo for RealCredentialFsIo {
         std::fs::rename(tmp, target)
     }
     fn sync_parent_dir(&self, parent: &Path) -> std::io::Result<()> {
-        let dir = std::fs::File::open(parent)?;
-        dir.sync_all()
+        // Unix-only: see atomic_write_bytes for rationale.
+        #[cfg(unix)]
+        {
+            let dir = std::fs::File::open(parent)?;
+            dir.sync_all()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = parent;
+            Ok(())
+        }
     }
 }
 

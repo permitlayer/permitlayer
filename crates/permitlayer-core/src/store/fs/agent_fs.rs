@@ -454,6 +454,16 @@ fn parse_toml_to_identity(name: &str, bytes: &[u8]) -> Result<AgentIdentity, Sto
 }
 
 /// Atomic write: tempfile → fsync → rename → fsync parent dir.
+///
+/// The parent-dir fsync is Unix-only: ext4/xfs/btrfs need
+/// `fsync(parent)` after a rename for the dirent itself to be
+/// durable. Windows NTFS is journaled and `MoveFileEx`-class
+/// renames are atomic without an extra parent flush; opening the
+/// directory for read on Windows fails with `PermissionDenied`
+/// (`std::fs::File::open` requests `GENERIC_READ` which directories
+/// don't support without `FILE_FLAG_BACKUP_SEMANTICS`). Skipping the
+/// parent fsync on Windows is the standard pattern (also used by
+/// `tempfile`, `sled`, etc.).
 fn atomic_write(tmp: &Path, target: &Path, parent: &Path, bytes: &[u8]) -> Result<(), StoreError> {
     let mut file = create_tempfile_0600(tmp)?;
     let guard = TempfileGuard { path: tmp };
@@ -462,8 +472,15 @@ fn atomic_write(tmp: &Path, target: &Path, parent: &Path, bytes: &[u8]) -> Resul
     drop(file);
     std::fs::rename(tmp, target).map_err(StoreError::IoError)?;
     std::mem::forget(guard);
-    let dir = std::fs::File::open(parent).map_err(StoreError::IoError)?;
-    dir.sync_all().map_err(StoreError::IoError)?;
+    #[cfg(unix)]
+    {
+        let dir = std::fs::File::open(parent).map_err(StoreError::IoError)?;
+        dir.sync_all().map_err(StoreError::IoError)?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = parent;
+    }
     Ok(())
 }
 

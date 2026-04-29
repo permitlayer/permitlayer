@@ -148,8 +148,20 @@ impl CredentialFsIo for FaultyFsIo {
     }
     fn sync_parent_dir(&self, parent: &Path) -> io::Result<()> {
         self.maybe_fail(CrashPoint::BeforeSyncParentDir)?;
-        let dir = std::fs::File::open(parent)?;
-        dir.sync_all()
+        // Unix-only: NTFS doesn't support opening a directory for
+        // read via std::fs::File::open (PermissionDenied). The
+        // production atomic_write_bytes also cfg-gates this for the
+        // same reason — see credential_fs::atomic_write_bytes.
+        #[cfg(unix)]
+        {
+            let dir = std::fs::File::open(parent)?;
+            dir.sync_all()
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = parent;
+            Ok(())
+        }
     }
 }
 
