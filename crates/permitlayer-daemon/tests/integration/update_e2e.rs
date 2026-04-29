@@ -223,6 +223,12 @@ async fn check_only_network_failure_exits_four() {
 /// The stub-binary-doesn't-start-a-daemon expected outcome is the
 /// same shape as a real "swap completed but daemon refused to
 /// boot" failure — proving the rollback path also works.
+///
+/// Unix-only: the stub binary is a `#!/bin/sh` script. Building a
+/// minimal Windows stub `.exe` for the rollback exercise is non-
+/// trivial and out of scope for this test (Windows install / update
+/// smoke is exercised by `release.yml::windows-publish-smoke`).
+#[cfg(unix)]
 #[tokio::test]
 async fn apply_flow_signs_extracts_swaps_and_rolls_back_on_stub_binary() {
     let workspace_root = workspace_root();
