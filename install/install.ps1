@@ -442,9 +442,18 @@ function Install-AgentSso {
     # so a future regression OR a hand-crafted malicious zip would fail
     # loud. Resolve every extracted file's path and confirm it stays
     # inside $extractDir.
+    #
+    # P25 follow-up (Story 7.7 hosted-runner fix): both sides of the
+    # prefix-match must be the same path-form. Hosted Windows runners
+    # run as `runneradmin`, whose temp path resolves to the 8.3 short
+    # form `C:\Users\RUNNER~1\AppData\Local\Temp\...` via Resolve-Path
+    # but to the long form `C:\Users\runneradmin\AppData\Local\Temp\...`
+    # via Get-ChildItem. Comparing the two with StartsWith would
+    # falsely flag a benign extracted file as Zip Slip. Normalize
+    # BOTH sides via Resolve-Path before the prefix-match.
     $extractRoot = (Resolve-Path -LiteralPath $extractDir).ProviderPath.TrimEnd('\') + '\'
     Get-ChildItem -LiteralPath $extractDir -Recurse -File | ForEach-Object {
-        $resolved = $_.FullName
+        $resolved = (Resolve-Path -LiteralPath $_.FullName).ProviderPath
         if (-not $resolved.StartsWith($extractRoot, [StringComparison]::OrdinalIgnoreCase)) {
             Write-Err "Zip Slip detected: extracted file '$resolved' escapes '$extractRoot'. The downloaded zip is malformed or malicious."
         }

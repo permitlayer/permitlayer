@@ -335,10 +335,7 @@ fn detect_distro_package_owner(exe: &Path) -> Option<DistroPackage> {
             .map(|s| s.trim())
             .unwrap_or("agentsso")
             .to_owned();
-        return Some(DistroPackage {
-            manager: "dpkg",
-            remediation: format!("apt remove {pkg}"),
-        });
+        return Some(DistroPackage { manager: "dpkg", remediation: format!("apt remove {pkg}") });
     }
 
     // rpm — Fedora / RHEL.
