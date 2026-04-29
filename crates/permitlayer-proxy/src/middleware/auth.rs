@@ -900,7 +900,27 @@ mod tests {
         req.headers_mut()
             .insert("authorization", HeaderValue::from_str(&format!("Bearer {token}")).unwrap());
         let _resp: Response<Body> = svc.oneshot(req).await.unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        // Story 7.7 cross-platform CI fix: poll-with-deadline instead
+        // of a fixed 20ms sleep. The auth layer spawns the
+        // touch_last_seen call as a detached `tokio::task::spawn`;
+        // on a 4-CPU hosted Ubuntu runner under contention the
+        // spawn takes longer than 20ms to actually run, so the
+        // assertion fires before the touch call lands. Poll for up
+        // to 2 seconds — the test still completes fast on the happy
+        // path, only slower runners benefit from the higher ceiling.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            {
+                let touched = mock_agent_store.touched.lock().unwrap();
+                if !touched.is_empty() {
+                    break;
+                }
+            }
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
 
         let touched = mock_agent_store.touched.lock().unwrap();
         assert_eq!(touched.len(), 1);
