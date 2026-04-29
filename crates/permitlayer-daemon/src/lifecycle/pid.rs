@@ -133,6 +133,11 @@ impl Drop for PidFile {
 /// Safely convert a u32 PID to i32 for use with nix APIs.
 /// Returns `None` if the PID is 0 or exceeds `i32::MAX` (which would wrap
 /// negative and cause `kill()` to signal a process group).
+///
+/// Unix-only: nix's `Pid::from_raw` takes i32. Windows uses raw u32
+/// PIDs throughout the OpenProcess / TerminateProcess API surface so
+/// no conversion is needed there.
+#[cfg(unix)]
 fn pid_to_raw(pid: u32) -> Option<i32> {
     if pid == 0 || pid > i32::MAX as u32 { None } else { Some(pid as i32) }
 }

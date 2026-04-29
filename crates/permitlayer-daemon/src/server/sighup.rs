@@ -9,6 +9,7 @@ use permitlayer_core::agent::AgentRegistry;
 use permitlayer_core::audit::event::AuditEvent;
 use permitlayer_core::policy::{PolicyCompileError, PolicySet, PolicySetDiff};
 
+#[cfg(unix)]
 use crate::cli::start::clamp_approval_timeout_seconds;
 use crate::config::{CliOverrides, DaemonConfig};
 

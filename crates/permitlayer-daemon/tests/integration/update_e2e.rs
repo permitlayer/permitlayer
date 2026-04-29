@@ -240,6 +240,18 @@ async fn apply_flow_signs_extracts_swaps_and_rolls_back_on_stub_binary() {
         return;
     }
 
+    // On Windows we'd need a real .exe; skip the apply test on
+    // Windows for now per the same rationale as the rest of the
+    // file (manual smoke covers Windows). Skip BEFORE creating the
+    // stub binary so the rest of the function (which is Unix-only
+    // by virtue of the shell-script stub) can compile under
+    // `-D warnings` on Windows without unreachable-statement noise.
+    #[cfg(windows)]
+    {
+        eprintln!("skipping apply_flow integration test — Windows-host smoke is manual");
+        return;
+    }
+
     // Build the stub agentsso binary that the apply flow will swap
     // INTO place. It exits 0 immediately, so the daemon-restart
     // step's PID-file wait will time out → orchestrator rolls back.
@@ -250,14 +262,6 @@ async fn apply_flow_signs_extracts_swaps_and_rolls_back_on_stub_binary() {
         std::fs::write(&stub_binary, b"#!/bin/sh\nexit 0\n").unwrap();
         use std::os::unix::fs::PermissionsExt as _;
         std::fs::set_permissions(&stub_binary, std::fs::Permissions::from_mode(0o755)).unwrap();
-    }
-    #[cfg(windows)]
-    {
-        // On Windows we'd need a real .exe; skip the apply test on
-        // Windows for now per the same rationale as the rest of the
-        // file (manual smoke covers Windows).
-        eprintln!("skipping apply_flow integration test — Windows-host smoke is manual");
-        return;
     }
 
     // Build the archive: tar.gz containing the stub renamed to `agentsso`.

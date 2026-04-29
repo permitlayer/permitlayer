@@ -626,6 +626,7 @@ fn test_non_localhost_warning() {
         .spawn()
         .unwrap();
 
+    #[cfg(unix)]
     let child_id = child.id();
 
     // Wait for the daemon to start.

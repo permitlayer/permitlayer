@@ -135,6 +135,7 @@ fn send_sighup_fallback(home: &std::path::Path) -> Result<()> {
         use nix::unistd::Pid;
         kill(Pid::from_raw(raw_pid), Signal::SIGHUP)?;
         println!("configuration reload requested (PID {pid})");
+        Ok(())
     }
     #[cfg(not(unix))]
     {
@@ -144,6 +145,4 @@ fn send_sighup_fallback(home: &std::path::Path) -> Result<()> {
         );
         std::process::exit(1);
     }
-
-    Ok(())
 }

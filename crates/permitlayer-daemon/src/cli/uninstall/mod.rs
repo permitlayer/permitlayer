@@ -29,7 +29,9 @@
 //! earlier step warns.
 
 use std::path::Path;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
 use anyhow::Result;
 use clap::Args;

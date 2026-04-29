@@ -16,12 +16,18 @@
 //! tail of the event burst because the `tokio::spawn`ed tasks were
 //! orphaned when the 30-second graceful-shutdown deadline fired.
 
+// The only test in this file is `#[cfg(unix)]`-gated (SIGTERM
+// signal-handling is the actual coverage target). Cfg-gate the
+// imports + helpers so they don't trip dead-code on Windows.
+#[cfg(unix)]
 use crate::common::{DaemonTestConfig, free_port, http_get, start_daemon, wait_for_health};
 
+#[cfg(unix)]
 use std::time::Duration;
 
 /// Parse every `.jsonl` file under `<home>/audit/` and return all
 /// events whose `event_type` matches.
+#[cfg(unix)]
 fn count_events_of_type(home: &std::path::Path, event_type: &str) -> usize {
     let audit_dir = home.join("audit");
     if !audit_dir.exists() {
@@ -53,6 +59,7 @@ fn count_events_of_type(home: &std::path::Path, event_type: &str) -> usize {
 /// enforced at the kill layer which runs BEFORE auth — so no bearer
 /// token is needed and every request gets a clean 403 +
 /// `kill-blocked-request` audit event.
+#[cfg(unix)]
 fn fire_blocked_requests(port: u16, count: usize) {
     for _ in 0..count {
         let (status, _body) = http_get(port, "/health");

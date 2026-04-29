@@ -34,12 +34,6 @@ pub fn run() -> anyhow::Result<()> {
     };
 
     // Send SIGTERM.
-    #[cfg(unix)]
-    {
-        use nix::sys::signal::{Signal, kill};
-        use nix::unistd::Pid;
-        kill(Pid::from_raw(raw_pid), Signal::SIGTERM)?;
-    }
     #[cfg(not(unix))]
     {
         let _ = raw_pid;
@@ -47,19 +41,26 @@ pub fn run() -> anyhow::Result<()> {
         std::process::exit(1);
     }
 
-    // Wait for PID file to disappear (up to 10s).
-    let pid_path = home.join("agentsso.pid");
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-    loop {
-        if !pid_path.exists() {
-            println!("daemon stopped");
-            return Ok(());
+    #[cfg(unix)]
+    {
+        use nix::sys::signal::{Signal, kill};
+        use nix::unistd::Pid;
+        kill(Pid::from_raw(raw_pid), Signal::SIGTERM)?;
+
+        // Wait for PID file to disappear (up to 10s).
+        let pid_path = home.join("agentsso.pid");
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if !pid_path.exists() {
+                println!("daemon stopped");
+                return Ok(());
+            }
+            if std::time::Instant::now() > deadline {
+                eprintln!("warning: daemon did not shut down cleanly within 10 seconds");
+                std::process::exit(3);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
         }
-        if std::time::Instant::now() > deadline {
-            eprintln!("warning: daemon did not shut down cleanly within 10 seconds");
-            std::process::exit(3);
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 }
 
