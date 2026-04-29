@@ -514,6 +514,16 @@ impl RegistrySnapshot {
             };
             let recomputed = compute_lookup_key(daemon_subkey, agent.name().as_bytes());
             if stored_key != recomputed {
+                // Story 7.7 forensic instrumentation: dump the actual
+                // mismatch so we can see whether stored or recomputed
+                // is anomalous when this fires unexpectedly.
+                tracing::error!(
+                    agent_name = %agent.name(),
+                    stored_hex = %agent.lookup_key_hex,
+                    recomputed_hex = %lookup_key_to_hex(&recomputed),
+                    subkey_first_4 = ?&daemon_subkey[..4],
+                    "STALE-LOOKUP forensic dump (Story 7.7 register-then-auth flake hunt)"
+                );
                 stale.push(agent.name().to_owned());
                 // Still keep the agent visible to CRUD by name (so
                 // `agentsso agent list/remove` can act on it), but
