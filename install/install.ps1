@@ -440,21 +440,23 @@ function Install-AgentSso {
     # P25: Zip Slip defense-in-depth. Modern Expand-Archive is patched
     # against CVE-2018-1208-class path-traversal, but assert it ourselves
     # so a future regression OR a hand-crafted malicious zip would fail
-    # loud. Resolve every extracted file's path and confirm it stays
-    # inside $extractDir.
+    # loud.
     #
-    # P25 follow-up (Story 7.7 hosted-runner fix): both sides of the
-    # prefix-match must be the same path-form. Hosted Windows runners
-    # run as `runneradmin`, whose temp path resolves to the 8.3 short
-    # form `C:\Users\RUNNER~1\AppData\Local\Temp\...` via Resolve-Path
-    # but to the long form `C:\Users\runneradmin\AppData\Local\Temp\...`
-    # via Get-ChildItem. Comparing the two with StartsWith would
-    # falsely flag a benign extracted file as Zip Slip. Normalize
-    # BOTH sides via Resolve-Path before the prefix-match.
-    $extractRoot = (Resolve-Path -LiteralPath $extractDir).ProviderPath.TrimEnd('\') + '\'
+    # P25 follow-up (Story 7.7 hosted-runner fix): naive `StartsWith`
+    # path comparison is fragile on Windows because hosted runners
+    # (`runneradmin` user) can yield 8.3-short-name forms
+    # (`C:\Users\RUNNER~1\AppData\Local\Temp\...`) from one cmdlet
+    # and long-form (`C:\Users\runneradmin\AppData\Local\Temp\...`)
+    # from another for the same path. Compare via `GetRelativePath`
+    # instead: if the relative form starts with `..`, the file
+    # escaped the root. This works regardless of 8.3 vs long-form
+    # because .NET's GetRelativePath normalizes both inputs to a
+    # canonical form before computing the relationship.
+    $extractRoot = (Get-Item -LiteralPath $extractDir).FullName
     Get-ChildItem -LiteralPath $extractDir -Recurse -File | ForEach-Object {
-        $resolved = (Resolve-Path -LiteralPath $_.FullName).ProviderPath
-        if (-not $resolved.StartsWith($extractRoot, [StringComparison]::OrdinalIgnoreCase)) {
+        $resolved = $_.FullName
+        $rel = [System.IO.Path]::GetRelativePath($extractRoot, $resolved)
+        if ($rel.StartsWith('..') -or [System.IO.Path]::IsPathRooted($rel)) {
             Write-Err "Zip Slip detected: extracted file '$resolved' escapes '$extractRoot'. The downloaded zip is malformed or malicious."
         }
     }
