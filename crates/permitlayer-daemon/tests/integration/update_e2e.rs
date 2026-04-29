@@ -458,6 +458,10 @@ async fn apply_flow_signs_extracts_swaps_and_rolls_back_on_stub_binary() {
 
 /// Sign `archive_bytes` with the test secret key at `seckey_path` and
 /// write the resulting `.minisig` to `sig_path`.
+///
+/// Used only by the `#[cfg(unix)]` `apply_flow_signs_extracts_*`
+/// test; gated to match so Windows builds don't trip dead-code.
+#[cfg(unix)]
 fn sign_archive(seckey_path: &std::path::Path, archive_bytes: &[u8], sig_path: &std::path::Path) {
     use minisign::SecretKeyBox;
     use std::io::Cursor;
@@ -483,6 +487,10 @@ fn sign_archive(seckey_path: &std::path::Path, archive_bytes: &[u8], sig_path: &
 
 /// Resolve the workspace root by walking up from this test file's
 /// directory until we find a `Cargo.toml` with `[workspace]`.
+///
+/// Used only by the `#[cfg(unix)]` `apply_flow_signs_extracts_*`
+/// test; gated to match so Windows builds don't trip dead-code.
+#[cfg(unix)]
 fn workspace_root() -> std::path::PathBuf {
     let mut p = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     loop {
