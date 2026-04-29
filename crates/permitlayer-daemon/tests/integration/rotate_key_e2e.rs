@@ -501,6 +501,20 @@ fn collect_test_home_diagnostic(home: &std::path::Path, label: &str) -> String {
             out.push_str(&format!("  {} ({} bytes)\n", p.display(), len));
         }
     }
+    // Dump daemon log tail — the auth handler's tracing emit (denied
+    // tokens, registry-rebuild stale-warns) gives us the missing
+    // forensic data for register-time vs auth-time subkey divergence.
+    let log_path = home.join("logs/daemon.log");
+    if log_path.exists() {
+        out.push_str("\n--- logs/daemon.log (last 100 lines) ---\n");
+        if let Ok(s) = std::fs::read_to_string(&log_path) {
+            let lines: Vec<&str> = s.lines().collect();
+            let start = lines.len().saturating_sub(100);
+            for line in &lines[start..] {
+                out.push_str(&format!("    {line}\n"));
+            }
+        }
+    }
     out
 }
 
