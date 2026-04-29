@@ -125,17 +125,34 @@ fn vault_lock_excludes_across_processes() {
     let child_pid = child.id();
 
     // Now the lock is held by the child process. Our `try_acquire`
-    // MUST return `Busy` — and the holder_pid should match the
-    // child's pid (since the child wrote its own pid into the
-    // lock file's metadata).
+    // MUST return `Busy` — that's the actual safety guarantee
+    // (kernel-side mutual exclusion). On Unix, holder_pid/command
+    // also populate because POSIX flock is advisory: the parent
+    // can open + read the lock file's metadata even though the
+    // child holds the kernel lock.
+    //
+    // Story 7.7 / deferred-work.md:910 closure: on Windows
+    // `LockFileEx` is mandatory and excludes other handles from
+    // reading the locked file with a sharing violation, so
+    // `read_holder_metadata` returns `(None, None)` even though
+    // the lock is correctly held. Skip the metadata sub-assertions
+    // on Windows; the cross-process exclusion (the actual safety
+    // contract) is still enforced + verified via the Busy match.
     match VaultLock::try_acquire(&home) {
         Err(VaultLockError::Busy { holder_pid, holder_command }) => {
-            assert_eq!(
-                holder_pid,
-                Some(child_pid),
-                "expected child pid {child_pid} as holder, got {holder_pid:?}"
-            );
-            assert!(holder_command.is_some(), "holder_command should be populated");
+            #[cfg(unix)]
+            {
+                assert_eq!(
+                    holder_pid,
+                    Some(child_pid),
+                    "expected child pid {child_pid} as holder, got {holder_pid:?}"
+                );
+                assert!(holder_command.is_some(), "holder_command should be populated");
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = (holder_pid, holder_command, child_pid);
+            }
         }
         Err(other) => {
             let _ = child.kill();
