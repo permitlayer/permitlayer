@@ -424,6 +424,14 @@ mod tests {
         let _second = VaultLock::try_acquire(h.path()).expect("second acquire after drop");
     }
 
+    /// Unix-only: on Windows, `LockFileEx` excludes other handles
+    /// from reading the locked file, so `read_holder_metadata` returns
+    /// `(None, None)` even though the lock is correctly held. The
+    /// holder-metadata mechanism is best-effort forensic info; the
+    /// kernel-side mutual exclusion (validated by
+    /// `try_acquire_returns_busy_when_held`) is the actual safety
+    /// guarantee and works on all platforms.
+    #[cfg(unix)]
     #[test]
     fn holder_metadata_present_in_busy_error() {
         let h = home();
@@ -533,6 +541,13 @@ mod tests {
         );
     }
 
+    /// Unix-only: the test mutates the lock file via `std::fs::write`
+    /// while a `flock` is held on it. POSIX `flock` is advisory so
+    /// this works; Windows `LockFileEx` excludes the write with a
+    /// sharing violation, and the holder-metadata read pattern this
+    /// test exercises is itself Unix-only (see
+    /// `holder_metadata_present_in_busy_error`).
+    #[cfg(unix)]
     #[test]
     fn busy_holder_metadata_falls_back_to_none_on_unreadable_file() {
         // Acquire, then truncate the lock file behind the holder's
