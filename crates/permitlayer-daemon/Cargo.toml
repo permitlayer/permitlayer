@@ -158,6 +158,11 @@ mockito = { workspace = true }
 # (production-side dep at workspace level); zero impact on release
 # builds since this is dev-deps only.
 minisign = "0.9"
+# Story 7.7 Task 10 diagnostic: walk the test home dir on
+# `auth_round_trip_against_running_daemon` failure to dump agent
+# files + keystore-test presence so the next CI run gives us
+# forensic data instead of a bare panic message.
+walkdir.workspace = true
 
 [lints]
 workspace = true

@@ -371,10 +371,54 @@ fn auth_round_trip_against_running_daemon() {
     // require a 200 (the proxy may return upstream errors), but we
     // DO require it not to be `auth.invalid_token`.
     let pre_rotation_status = authed_get_status(port, &old_token);
-    assert!(
-        pre_rotation_status != "auth.invalid_token",
-        "pre-rotation auth with registered token must not be rejected; got {pre_rotation_status}"
-    );
+    if pre_rotation_status == "auth.invalid_token" {
+        // CI-only diagnostic (passes locally on macos-14 dev box,
+        // fails on hosted macos-14 runners — captured during Story
+        // 7.7 first matrix run). Dump the home dir layout + agent
+        // file contents + keystore-test contents so the next CI run
+        // gives us forensic data instead of just the panic message.
+        let mut diagnostic = String::from("\n=== DIAGNOSTIC: pre-rotation auth failed ===\n");
+        diagnostic.push_str(&format!("token: {old_token}\n"));
+        diagnostic.push_str(&format!("home: {}\n", home.path().display()));
+        diagnostic.push_str("\n--- home dir tree ---\n");
+        for entry in walkdir::WalkDir::new(home.path()).into_iter().flatten() {
+            let path = entry.path();
+            let rel = path.strip_prefix(home.path()).unwrap_or(path);
+            let kind = if path.is_dir() {
+                "DIR".to_string()
+            } else {
+                format!("FILE ({} bytes)", path.metadata().map(|m| m.len()).unwrap_or(0))
+            };
+            diagnostic.push_str(&format!("  {} {}\n", kind, rel.display()));
+        }
+        // Dump agent file contents (TOML, no secrets — lookup_key_hex
+        // and token_hash are non-reversible).
+        let agents_dir = home.path().join("agents");
+        if agents_dir.exists() {
+            diagnostic.push_str("\n--- agents/ contents ---\n");
+            for entry in std::fs::read_dir(&agents_dir).into_iter().flatten().flatten() {
+                let p = entry.path();
+                if let Ok(s) = std::fs::read_to_string(&p) {
+                    diagnostic.push_str(&format!("  === {} ===\n", p.display()));
+                    for line in s.lines() {
+                        diagnostic.push_str(&format!("    {line}\n"));
+                    }
+                }
+            }
+        }
+        // Dump keystore-test/ presence (NOT contents — those are
+        // raw key bytes).
+        let ks_dir = home.path().join("keystore-test");
+        if ks_dir.exists() {
+            diagnostic.push_str("\n--- keystore-test/ presence ---\n");
+            for entry in std::fs::read_dir(&ks_dir).into_iter().flatten().flatten() {
+                let p = entry.path();
+                let len = p.metadata().map(|m| m.len()).unwrap_or(0);
+                diagnostic.push_str(&format!("  {} ({} bytes)\n", p.display(), len));
+            }
+        }
+        panic!("pre-rotation auth with registered token must not be rejected; got {pre_rotation_status}{diagnostic}");
+    }
 
     // Phase 4 — stop the daemon. SIGTERM via wait_with_output; the
     // VaultLock + PidFile clean up on Drop.
