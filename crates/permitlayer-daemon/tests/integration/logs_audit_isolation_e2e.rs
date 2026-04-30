@@ -83,8 +83,8 @@ fn spawn_test_daemon() -> Option<(std::process::Child, tempfile::TempDir, u16)> 
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn agentsso start");
-    let port = crate::common::wait_for_bound_addr(&mut child, std::time::Duration::from_secs(10))
-        .port();
+    let port =
+        crate::common::wait_for_bound_addr(&mut child, std::time::Duration::from_secs(10)).port();
     Some((child, home, port))
 }
 

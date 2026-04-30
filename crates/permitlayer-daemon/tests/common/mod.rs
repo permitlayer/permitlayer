@@ -832,11 +832,7 @@ mod tests {
         let pid = child.id();
 
         {
-            let _handle = DaemonHandle {
-                child: Some(child),
-                port: 0,
-                captured_stdout: None,
-            };
+            let _handle = DaemonHandle { child: Some(child), port: 0, captured_stdout: None };
             // Confirm the process is alive via `kill -0 <pid>`.
             let alive = Command::new("kill").arg("-0").arg(pid.to_string()).status().unwrap();
             assert!(alive.success(), "sleep process should be alive before handle drop");

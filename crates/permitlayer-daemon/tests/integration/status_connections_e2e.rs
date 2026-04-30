@@ -526,6 +526,13 @@ fn status_watch_redraws_at_least_twice_then_clean_exits_on_kill() {
         "/v1/tools/gmail/users/me/messages",
         &[("authorization", &format!("Bearer {token}")), ("x-agentsso-scope", "gmail.readonly")],
     );
+    // ConnTrackLayer's DashMap insert can lag the response on busy
+    // CI runners; wait until /v1/control/connections sees the entry
+    // before letting the watch CLI subprocess sample.
+    assert!(
+        wait_for_connection_recorded(port, Duration::from_secs(5)),
+        "tracker did not record the request within 5s"
+    );
 
     let mut child = Command::new(agentsso_bin())
         .arg("status")
@@ -586,6 +593,12 @@ fn status_watch_sigint_exits_zero_with_clean_teardown() {
         port,
         "/v1/tools/gmail/users/me/messages",
         &[("authorization", &format!("Bearer {token}")), ("x-agentsso-scope", "gmail.readonly")],
+    );
+    // ConnTrackLayer's DashMap insert can lag the response on busy
+    // CI runners; wait until /v1/control/connections sees the entry.
+    assert!(
+        wait_for_connection_recorded(port, Duration::from_secs(5)),
+        "tracker did not record the request within 5s"
     );
 
     let child = Command::new(agentsso_bin())
