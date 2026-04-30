@@ -722,7 +722,16 @@ pub fn assert_daemon_pid_matches(handle: &DaemonHandle) {
 /// response as JSON and asserting `status == "healthy"` removes the
 /// ambiguity for zero ergonomic cost.
 pub fn wait_for_health(port: u16) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(10);
+    // 30s deadline — matches the local copy in `daemon_lifecycle.rs`.
+    // 10s was tight on macos-15-intel under nextest concurrency: the
+    // PassphraseKeyStore bootstrap path runs Argon2id (m=65536, t=3,
+    // p=4) twice (first daemon + second-daemon-restart in
+    // `master_key_bootstrap_e2e`), and Intel macOS GitHub runners
+    // contend for cores when sibling integration tests are also
+    // booting daemons. The CI-observed boundary was ~10.3s; 30s
+    // gives ample headroom without masking real boot regressions
+    // (which would still time out).
+    let deadline = Instant::now() + Duration::from_secs(30);
     let mut backoff = Duration::from_millis(50);
 
     while Instant::now() < deadline {
