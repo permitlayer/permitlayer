@@ -16,7 +16,7 @@ use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::common::{agentsso_bin, free_port};
+use crate::common::agentsso_bin;
 
 const TEST_MASTER_KEY_HEX: &str =
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -43,18 +43,102 @@ impl Drop for DaemonHandle {
     }
 }
 
-fn start_daemon(home: &std::path::Path, port: u16) -> DaemonHandle {
-    let child = Command::new(agentsso_bin())
+/// Start the daemon with `--bind-addr 127.0.0.1:0`, then read the
+/// OS-assigned port from the daemon's `AGENTSSO_BOUND_ADDR=<addr>`
+/// stdout marker (emitted by `cli/start.rs:2168`). Returns the guard,
+/// resolved port, and daemon PID for `assert_daemon_pid_matches`.
+///
+/// Story 7.7 register-then-auth flake mitigation: zero-port avoids
+/// the `free_port()` TOCTOU race entirely.
+fn start_daemon_zero_port(home: &std::path::Path) -> (DaemonHandle, u16, u32) {
+    let mut child = Command::new(agentsso_bin())
         .arg("start")
         .arg("--bind-addr")
-        .arg(format!("127.0.0.1:{port}"))
+        .arg("127.0.0.1:0")
         .env("AGENTSSO_PATHS__HOME", home.to_str().unwrap())
         .env("AGENTSSO_TEST_MASTER_KEY_HEX", TEST_MASTER_KEY_HEX)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .expect("failed to start daemon");
-    DaemonHandle(Some(child))
+    let pid = child.id();
+
+    let stdout =
+        child.stdout.take().expect("child.stdout must be Stdio::piped() for marker reading");
+    let mut reader = std::io::BufReader::new(stdout);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut line = String::new();
+    let mut port: Option<u16> = None;
+    use std::io::BufRead;
+    while Instant::now() < deadline {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => panic!("daemon stdout closed before AGENTSSO_BOUND_ADDR marker"),
+            Ok(_) => {
+                if let Some(rest) = line.trim_end().strip_prefix("AGENTSSO_BOUND_ADDR=") {
+                    let addr: std::net::SocketAddr = rest.parse().unwrap_or_else(|e| {
+                        panic!("malformed AGENTSSO_BOUND_ADDR={rest:?}: {e}")
+                    });
+                    port = Some(addr.port());
+                    break;
+                }
+            }
+            Err(e) => panic!("error reading daemon stdout: {e}"),
+        }
+    }
+    let port = port.expect("timed out waiting for AGENTSSO_BOUND_ADDR marker on daemon stdout");
+
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut reader, &mut std::io::sink());
+    });
+
+    (DaemonHandle(Some(child)), port, pid)
+}
+
+/// Poll `/v1/control/connections` until at least one connection is
+/// reported, or the deadline elapses. The proxy's `ConnTrackLayer`
+/// inserts asynchronously after an HTTP request crosses the layer; on
+/// a busy macOS scheduler the insert can lag the response by a few
+/// hundred milliseconds. Without this wait the CLI subprocess can
+/// race the tracker write and observe an empty DashMap.
+///
+/// Returns `true` once the response has at least one entry; `false`
+/// on deadline expiry. Tests should `assert!` on the return value.
+fn wait_for_connection_recorded(port: u16, timeout: Duration) -> bool {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        let (status, body) = http_get_loopback(port, "/v1/control/connections", &[]);
+        if status == 200 {
+            if let Ok(json) = serde_json::from_str::<serde_json::Value>(&body)
+                && let Some(arr) = json.get("connections").and_then(|c| c.as_array())
+                && !arr.is_empty()
+            {
+                return true;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    false
+}
+
+/// Story 7.7 register-then-auth flake guard: hit `/health` and assert
+/// the daemon's reported `pid` matches the spawned child PID.
+fn assert_daemon_pid_matches(port: u16, expected_pid: u32) {
+    let (status, body) = http_get_loopback(port, "/health", &[]);
+    assert_eq!(status, 200, "/health should return 200, got {status}: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("/health response not JSON: {e}\nbody: {body}"));
+    let reported_pid = json
+        .get("pid")
+        .and_then(|p| p.as_u64())
+        .unwrap_or_else(|| panic!("/health response missing numeric pid field: {body}"));
+    let expected_pid = u64::from(expected_pid);
+    assert_eq!(
+        reported_pid, expected_pid,
+        "free_port TOCTOU: /health on port {port} reported pid {reported_pid} but our \
+         spawned daemon is pid {expected_pid}. Another test's daemon stole this port \
+         between free_port() pre-allocation and our daemon's bind."
+    );
 }
 
 fn wait_for_health(port: u16, timeout: Duration) -> bool {
@@ -189,9 +273,9 @@ fn connections_endpoint_returns_empty_on_fresh_boot() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("config")).unwrap();
     seed_single_policy(home.path());
-    let port = free_port();
-    let _daemon = start_daemon(home.path(), port);
+    let (_daemon, port, daemon_pid) = start_daemon_zero_port(home.path());
     assert!(wait_for_health(port, Duration::from_secs(5)));
+    assert_daemon_pid_matches(port, daemon_pid);
 
     let (status, body) = http_get_loopback(port, "/v1/control/connections", &[]);
     assert_eq!(status, 200, "endpoint must respond 200 on fresh boot: {body}");
@@ -206,9 +290,9 @@ fn status_connections_renders_empty_state() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("config")).unwrap();
     seed_single_policy(home.path());
-    let port = free_port();
-    let _daemon = start_daemon(home.path(), port);
+    let (_daemon, port, daemon_pid) = start_daemon_zero_port(home.path());
     assert!(wait_for_health(port, Duration::from_secs(5)));
+    assert_daemon_pid_matches(port, daemon_pid);
 
     let (exit, stdout, _stderr) = run_status_cli(home.path(), port, &["--connections"]);
     assert_eq!(exit, 0, "status --connections must exit 0 with empty tracker");
@@ -228,9 +312,9 @@ fn status_connections_renders_table_after_request() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("config")).unwrap();
     seed_single_policy(home.path());
-    let port = free_port();
-    let _daemon = start_daemon(home.path(), port);
+    let (_daemon, port, daemon_pid) = start_daemon_zero_port(home.path());
     assert!(wait_for_health(port, Duration::from_secs(5)));
+    assert_daemon_pid_matches(port, daemon_pid);
 
     let token = register_agent(port, "test-agent", "policy-readonly");
 
@@ -242,6 +326,13 @@ fn status_connections_renders_table_after_request() {
         port,
         "/v1/tools/gmail/users/me/messages",
         &[("authorization", &format!("Bearer {token}")), ("x-agentsso-scope", "gmail.readonly")],
+    );
+    // ConnTrackLayer's DashMap insert can lag the response on macOS;
+    // wait until /v1/control/connections sees the entry before letting
+    // the CLI subprocess query it.
+    assert!(
+        wait_for_connection_recorded(port, Duration::from_secs(5)),
+        "tracker did not record the request within 5s"
     );
 
     let (exit, stdout, _stderr) = run_status_cli(home.path(), port, &["--connections"]);
@@ -256,15 +347,19 @@ fn status_connections_json_emits_valid_json() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("config")).unwrap();
     seed_single_policy(home.path());
-    let port = free_port();
-    let _daemon = start_daemon(home.path(), port);
+    let (_daemon, port, daemon_pid) = start_daemon_zero_port(home.path());
     assert!(wait_for_health(port, Duration::from_secs(5)));
+    assert_daemon_pid_matches(port, daemon_pid);
 
     let token = register_agent(port, "json-agent", "policy-readonly");
     let (_status, _body) = http_get_loopback(
         port,
         "/v1/tools/gmail/users/me/messages",
         &[("authorization", &format!("Bearer {token}")), ("x-agentsso-scope", "gmail.readonly")],
+    );
+    assert!(
+        wait_for_connection_recorded(port, Duration::from_secs(5)),
+        "tracker did not record the request within 5s"
     );
 
     let (exit, stdout, _stderr) = run_status_cli(home.path(), port, &["--connections", "--json"]);
@@ -282,9 +377,9 @@ fn status_watch_without_connections_rejected() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("config")).unwrap();
     seed_single_policy(home.path());
-    let port = free_port();
-    let _daemon = start_daemon(home.path(), port);
+    let (_daemon, port, daemon_pid) = start_daemon_zero_port(home.path());
     assert!(wait_for_health(port, Duration::from_secs(5)));
+    assert_daemon_pid_matches(port, daemon_pid);
 
     let (exit, stdout, stderr) = run_status_cli(home.path(), port, &["--watch"]);
     assert_ne!(exit, 0, "--watch alone must fail");
@@ -301,9 +396,9 @@ fn status_watch_with_json_rejected() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("config")).unwrap();
     seed_single_policy(home.path());
-    let port = free_port();
-    let _daemon = start_daemon(home.path(), port);
+    let (_daemon, port, daemon_pid) = start_daemon_zero_port(home.path());
     assert!(wait_for_health(port, Duration::from_secs(5)));
+    assert_daemon_pid_matches(port, daemon_pid);
 
     let (exit, stdout, stderr) =
         run_status_cli(home.path(), port, &["--connections", "--watch", "--json"]);
@@ -323,7 +418,10 @@ fn status_connections_no_daemon_returns_3() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("config")).unwrap();
 
-    let port = free_port(); // unused by the CLI when there's no daemon, but bind-addr env still gets resolved.
+    // No daemon: the CLI exits 3 before any port is used, but `bind-addr`
+    // env still gets resolved into a string. A literal placeholder port
+    // is fine; we are NOT going to bind it anywhere.
+    let port: u16 = 1;
     let (exit, _stdout, stderr) = run_status_cli(home.path(), port, &["--connections"]);
     assert_eq!(exit, 3, "no-daemon path must exit 3");
     assert!(stderr.contains("daemon not running"), "stderr must explain: {stderr:?}");
@@ -369,9 +467,13 @@ fn health_active_connections_reflects_tracker_count() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("config")).unwrap();
     seed_single_policy(home.path());
-    let port = free_port();
-    let _daemon = start_daemon(home.path(), port);
+    // Story 7.7: zero-port + PID match avoids the `free_port()` TOCTOU
+    // window. The 401-cascade described above is downstream of the
+    // wrong daemon answering on our port; PID match catches that
+    // upstream of the request loop.
+    let (_daemon, port, daemon_pid) = start_daemon_zero_port(home.path());
     assert!(wait_for_health(port, Duration::from_secs(5)));
+    assert_daemon_pid_matches(port, daemon_pid);
 
     // Fresh boot → zero.
     let (_, body) = http_get_loopback(port, "/health", &[]);
@@ -414,9 +516,9 @@ fn status_watch_redraws_at_least_twice_then_clean_exits_on_kill() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("config")).unwrap();
     seed_single_policy(home.path());
-    let port = free_port();
-    let _daemon = start_daemon(home.path(), port);
+    let (_daemon, port, daemon_pid) = start_daemon_zero_port(home.path());
     assert!(wait_for_health(port, Duration::from_secs(5)));
+    assert_daemon_pid_matches(port, daemon_pid);
 
     // Seed at least one entry so the table has a row to redraw.
     let token = register_agent(port, "watch-agent", "policy-readonly");
@@ -476,9 +578,9 @@ fn status_watch_sigint_exits_zero_with_clean_teardown() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("config")).unwrap();
     seed_single_policy(home.path());
-    let port = free_port();
-    let _daemon = start_daemon(home.path(), port);
+    let (_daemon, port, daemon_pid) = start_daemon_zero_port(home.path());
     assert!(wait_for_health(port, Duration::from_secs(5)));
+    assert_daemon_pid_matches(port, daemon_pid);
 
     let token = register_agent(port, "sigint-agent", "policy-readonly");
     let (_status, _body) = http_get_loopback(

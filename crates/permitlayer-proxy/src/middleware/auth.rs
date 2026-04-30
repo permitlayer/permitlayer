@@ -245,7 +245,26 @@ where
             Some((name, _random)) => {
                 let lookup_key = compute_lookup_key(&self.daemon_lookup_key, name.as_bytes());
                 let snapshot = self.registry.snapshot();
-                snapshot.lookup_by_key(&lookup_key).cloned()
+                let result = snapshot.lookup_by_key(&lookup_key).cloned();
+                if result.is_none() {
+                    // Story 7.7 register-then-auth flake forensic. Pair with
+                    // REGISTER-VISIBILITY-RACE in
+                    // `permitlayer-daemon::server::control::register_agent` —
+                    // matching `daemon_pid`+`registry_ptr` mean both calls
+                    // landed on the same daemon instance (so the bug is a
+                    // same-daemon registry-replacement somehow); mismatched
+                    // values mean a free_port() TOCTOU let auth land on a
+                    // different daemon than register did.
+                    tracing::error!(
+                        target: "auth-flake-forensic",
+                        requested_name = %name,
+                        registry_ptr = format!("{:p}", Arc::as_ptr(&self.registry)),
+                        daemon_pid = std::process::id(),
+                        snapshot_len = snapshot.len(),
+                        "AUTH-MISS-FORENSIC: lookup_by_key returned None for parse-success token"
+                    );
+                }
+                result
             }
             // Malformed token (wrong prefix, bad name, bad base64).
             // Treat indistinguishably from a registry miss to keep

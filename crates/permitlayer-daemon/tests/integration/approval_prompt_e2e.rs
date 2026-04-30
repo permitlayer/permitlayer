@@ -31,7 +31,7 @@ use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::common::{agentsso_bin, free_port};
+use crate::common::agentsso_bin;
 
 const TEST_MASTER_KEY_HEX: &str =
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
@@ -68,17 +68,30 @@ impl Drop for DaemonGuard {
     }
 }
 
-/// Start the daemon with custom environment. Each test seeds a fresh
-/// home dir and fresh env vars so tests don't cross-pollute each other.
-fn start_daemon_with_env(
+/// Start the daemon with `--bind-addr 127.0.0.1:0`, then read the
+/// OS-assigned port from the daemon's `AGENTSSO_BOUND_ADDR=<addr>`
+/// stdout marker (emitted by `cli/start.rs:2168`). Returns the guard,
+/// the resolved port, and the daemon's PID — the PID is used by
+/// `assert_pid_matches` to detect a stray foreign daemon answering on
+/// the same port.
+///
+/// The marker emit is on stdout via `println!`; we hand stdout off to
+/// a background thread that drains the rest into `io::sink()` so the
+/// daemon never blocks on a full pipe.
+///
+/// Story 7.7 register-then-auth flake mitigation: replaces the
+/// `free_port()` pre-allocation pattern, which has a TOCTOU window
+/// where another nextest worker can grab the freed port before our
+/// daemon's `bind`. With zero-port the OS assigns a port atomically
+/// with the daemon's actual `bind`, eliminating the race.
+fn start_daemon_with_env_zero_port(
     home: &std::path::Path,
-    port: u16,
     extra_env: &[(&str, &str)],
-) -> DaemonGuard {
+) -> (DaemonGuard, u16, u32) {
     let mut cmd = Command::new(agentsso_bin());
     cmd.arg("start")
         .arg("--bind-addr")
-        .arg(format!("127.0.0.1:{port}"))
+        .arg("127.0.0.1:0")
         .env("AGENTSSO_PATHS__HOME", home.to_str().unwrap())
         .env("AGENTSSO_TEST_MASTER_KEY_HEX", TEST_MASTER_KEY_HEX)
         .stdout(Stdio::piped())
@@ -87,8 +100,65 @@ fn start_daemon_with_env(
         cmd.env(k, v);
     }
     let mut child = cmd.spawn().expect("failed to start daemon");
+    let pid = child.id();
     let stderr = child.stderr.take();
-    DaemonGuard { child: Some(child), stderr }
+
+    let stdout =
+        child.stdout.take().expect("child.stdout must be Stdio::piped() for marker reading");
+    let mut reader = std::io::BufReader::new(stdout);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut line = String::new();
+    let mut port: Option<u16> = None;
+    use std::io::BufRead;
+    while Instant::now() < deadline {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => panic!("daemon stdout closed before AGENTSSO_BOUND_ADDR marker"),
+            Ok(_) => {
+                if let Some(rest) = line.trim_end().strip_prefix("AGENTSSO_BOUND_ADDR=") {
+                    let addr: std::net::SocketAddr = rest.parse().unwrap_or_else(|e| {
+                        panic!("malformed AGENTSSO_BOUND_ADDR={rest:?}: {e}")
+                    });
+                    port = Some(addr.port());
+                    break;
+                }
+            }
+            Err(e) => panic!("error reading daemon stdout: {e}"),
+        }
+    }
+    let port = port.expect("timed out waiting for AGENTSSO_BOUND_ADDR marker on daemon stdout");
+
+    // Drain the rest of stdout to /dev/null in a background thread so
+    // the daemon never blocks on a full kernel pipe.
+    std::thread::spawn(move || {
+        let _ = std::io::copy(&mut reader, &mut std::io::sink());
+    });
+
+    (DaemonGuard { child: Some(child), stderr }, port, pid)
+}
+
+/// Story 7.7 register-then-auth flake guard: hit `/health` and assert
+/// the daemon's reported `pid` matches the spawned child PID. If a
+/// stray foreign daemon (from another nextest worker) is answering on
+/// our port — the only surviving live hypothesis after the
+/// `free_port()` TOCTOU analysis — this fires loudly with both PIDs
+/// instead of cascading into a confusing 401-on-fresh-token failure.
+fn assert_daemon_pid_matches(port: u16, expected_pid: u32) {
+    let (status, body) = http_get(port, "/health", &[]);
+    assert_eq!(status, 200, "/health should return 200, got {status}: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("/health response not JSON: {e}\nbody: {body}"));
+    let reported_pid = json
+        .get("pid")
+        .and_then(|p| p.as_u64())
+        .unwrap_or_else(|| panic!("/health response missing numeric pid field: {body}"));
+    let expected_pid = u64::from(expected_pid);
+    assert_eq!(
+        reported_pid, expected_pid,
+        "free_port TOCTOU: /health on port {port} reported pid {reported_pid} but our \
+         spawned daemon is pid {expected_pid}. Another test's daemon stole this port \
+         between free_port() pre-allocation and our daemon's bind."
+    );
 }
 
 fn wait_for_health(port: u16, timeout: Duration) -> bool {
@@ -309,14 +379,13 @@ fn granted_canned_response_allows_request_and_writes_approval_granted_audit() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("config")).unwrap();
     seed_prompt_policy(home.path());
-    let port = free_port();
-    let _daemon = start_daemon_with_env(
+    let (_daemon, port, daemon_pid) = start_daemon_with_env_zero_port(
         home.path(),
-        port,
         &[("AGENTSSO_TEST_APPROVAL_CANNED_RESPONSES", "allow")],
     );
 
     assert!(wait_for_health(port, Duration::from_secs(5)));
+    assert_daemon_pid_matches(port, daemon_pid);
 
     let token = register_agent(port, "test-agent", "policy-prompt");
 
@@ -350,14 +419,13 @@ fn denied_canned_response_returns_403_and_writes_approval_denied_audit() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("config")).unwrap();
     seed_prompt_policy(home.path());
-    let port = free_port();
-    let _daemon = start_daemon_with_env(
+    let (_daemon, port, daemon_pid) = start_daemon_with_env_zero_port(
         home.path(),
-        port,
         &[("AGENTSSO_TEST_APPROVAL_CANNED_RESPONSES", "deny")],
     );
 
     assert!(wait_for_health(port, Duration::from_secs(5)));
+    assert_daemon_pid_matches(port, daemon_pid);
 
     let token = register_agent(port, "test-agent", "policy-prompt");
 
@@ -388,18 +456,17 @@ fn always_canned_response_populates_cache_second_request_served_from_cache() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("config")).unwrap();
     seed_prompt_policy(home.path());
-    let port = free_port();
     // Seed just one "always" decision. If the cache works, the
     // second request is served from the cache and does NOT consume
     // the next canned outcome (which there isn't — empty queue → Aborted
     // → Denied — so a missing cache would turn the second request into 403).
-    let _daemon = start_daemon_with_env(
+    let (_daemon, port, daemon_pid) = start_daemon_with_env_zero_port(
         home.path(),
-        port,
         &[("AGENTSSO_TEST_APPROVAL_CANNED_RESPONSES", "always")],
     );
 
     assert!(wait_for_health(port, Duration::from_secs(5)));
+    assert_daemon_pid_matches(port, daemon_pid);
 
     let token = register_agent(port, "test-agent", "policy-prompt");
 
@@ -463,14 +530,13 @@ fn never_canned_response_populates_cache_second_request_cached_deny() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("config")).unwrap();
     seed_prompt_policy(home.path());
-    let port = free_port();
-    let _daemon = start_daemon_with_env(
+    let (_daemon, port, daemon_pid) = start_daemon_with_env_zero_port(
         home.path(),
-        port,
         &[("AGENTSSO_TEST_APPROVAL_CANNED_RESPONSES", "never")],
     );
 
     assert!(wait_for_health(port, Duration::from_secs(5)));
+    assert_daemon_pid_matches(port, daemon_pid);
 
     let token = register_agent(port, "test-agent", "policy-prompt");
 
@@ -516,14 +582,13 @@ fn timeout_outcome_returns_403_approval_timeout_via_force_timeout_env() {
     std::fs::write(config_dir.join("daemon.toml"), "[approval]\ntimeout_seconds = 1\n").unwrap();
     seed_prompt_policy(home.path());
 
-    let port = free_port();
-    let _daemon = start_daemon_with_env(
+    let (_daemon, port, daemon_pid) = start_daemon_with_env_zero_port(
         home.path(),
-        port,
         &[("AGENTSSO_TEST_APPROVAL_FORCE_TIMEOUT_MS", "2000")],
     );
 
     assert!(wait_for_health(port, Duration::from_secs(5)));
+    assert_daemon_pid_matches(port, daemon_pid);
 
     let token = register_agent(port, "test-agent", "policy-prompt");
 
@@ -555,11 +620,13 @@ fn unavailable_no_tty_returns_503_approval_unavailable() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("config")).unwrap();
     seed_prompt_policy(home.path());
-    let port = free_port();
-    let mut daemon =
-        start_daemon_with_env(home.path(), port, &[("AGENTSSO_TEST_APPROVAL_FORCE_NO_TTY", "1")]);
+    let (mut daemon, port, daemon_pid) = start_daemon_with_env_zero_port(
+        home.path(),
+        &[("AGENTSSO_TEST_APPROVAL_FORCE_NO_TTY", "1")],
+    );
 
     assert!(wait_for_health(port, Duration::from_secs(5)));
+    assert_daemon_pid_matches(port, daemon_pid);
 
     // Story 4.5 Task 10.2: assert the literal startup banner text is
     // emitted to stderr. Read up to ~4 KB from the captured stderr
@@ -621,14 +688,13 @@ fn auto_approve_reads_bypasses_approval_service_for_readonly_scope() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("config")).unwrap();
     seed_prompt_with_reads_policy(home.path());
-    let port = free_port();
-    let _daemon = start_daemon_with_env(
+    let (_daemon, port, daemon_pid) = start_daemon_with_env_zero_port(
         home.path(),
-        port,
         &[("AGENTSSO_TEST_APPROVAL_CANNED_RESPONSES", "")],
     );
 
     assert!(wait_for_health(port, Duration::from_secs(5)));
+    assert_daemon_pid_matches(port, daemon_pid);
 
     let token = register_agent(port, "test-agent", "policy-prompt-reads");
 
@@ -669,17 +735,22 @@ fn reload_clears_approval_cache() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("config")).unwrap();
     seed_prompt_policy(home.path());
-    let port = free_port();
     // Canned list: one always, then a deny. Without reload, the
     // second request hits the cache and is allowed. After reload,
     // the cache is cleared and the second request consumes the deny.
-    let _daemon = start_daemon_with_env(
+    //
+    // Story 7.7: zero-port + PID match closes the `free_port()`
+    // TOCTOU window that surfaced as the "agent is not registered"
+    // 401 on macos-15-intel. The daemon binds atomically on port 0,
+    // emits `AGENTSSO_BOUND_ADDR=` on stdout, and we assert /health
+    // PID matches our spawned child PID before any auth call.
+    let (_daemon, port, daemon_pid) = start_daemon_with_env_zero_port(
         home.path(),
-        port,
         &[("AGENTSSO_TEST_APPROVAL_CANNED_RESPONSES", "always,deny")],
     );
 
     assert!(wait_for_health(port, Duration::from_secs(5)));
+    assert_daemon_pid_matches(port, daemon_pid);
 
     let token = register_agent(port, "test-agent", "policy-prompt");
 
@@ -730,14 +801,13 @@ fn auto_mode_dispatches_without_prompt_in_parallel_with_prompt_policy() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("config")).unwrap();
     seed_prompt_and_auto_policies(home.path());
-    let port = free_port();
-    let _daemon = start_daemon_with_env(
+    let (_daemon, port, daemon_pid) = start_daemon_with_env_zero_port(
         home.path(),
-        port,
         &[("AGENTSSO_TEST_APPROVAL_CANNED_RESPONSES", "allow")],
     );
 
     assert!(wait_for_health(port, Duration::from_secs(5)));
+    assert_daemon_pid_matches(port, daemon_pid);
 
     let prompt_token = register_agent(port, "prompt-agent", "policy-prompt");
     let auto_token = register_agent(port, "auto-agent", "policy-auto-cal");
@@ -838,14 +908,13 @@ fn approval_timeout_updates_via_sighup_without_restart() {
     std::fs::write(config_dir.join("daemon.toml"), "[approval]\ntimeout_seconds = 30\n").unwrap();
     seed_prompt_policy(home.path());
 
-    let port = free_port();
-    let _daemon = start_daemon_with_env(
+    let (_daemon, port, daemon_pid) = start_daemon_with_env_zero_port(
         home.path(),
-        port,
         &[("AGENTSSO_TEST_APPROVAL_FORCE_TIMEOUT_MS", "2500")],
     );
 
     assert!(wait_for_health(port, Duration::from_secs(5)));
+    assert_daemon_pid_matches(port, daemon_pid);
 
     let token = register_agent(port, "test-agent", "policy-prompt");
 
@@ -894,9 +963,9 @@ fn sighup_warns_on_stale_stub_branch_after_vault_appears() {
     // the 501-stub branch at boot.
     assert!(!home.path().join("vault").exists());
 
-    let port = free_port();
-    let _daemon = start_daemon_with_env(home.path(), port, &[]);
+    let (_daemon, port, daemon_pid) = start_daemon_with_env_zero_port(home.path(), &[]);
     assert!(wait_for_health(port, Duration::from_secs(5)));
+    assert_daemon_pid_matches(port, daemon_pid);
 
     // Create `vault/` after boot to simulate the operator running
     // `agentsso setup <svc>` between boot and the reload.

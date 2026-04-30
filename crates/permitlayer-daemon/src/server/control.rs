@@ -1257,13 +1257,14 @@ pub(crate) async fn register_agent_handler(
                 agent_name = %identity.name(),
                 lookup_key_first_4 = ?&lookup_key[..4],
                 registry_len = snapshot.len(),
+                registry_ptr = format!("{:p}", Arc::as_ptr(&state.agent_registry)),
+                daemon_pid = std::process::id(),
                 "REGISTER-VISIBILITY-RACE: agent stored to disk + replace_with completed, \
                  but snapshot.lookup_by_key returned None for the lookup_key we just \
-                 computed. Most likely cause: a concurrent `rotate-key` rotated the \
-                 daemon subkey between our compute_lookup_key call and the registry's \
-                 internal recompute. If that's NOT the case (no rotate-key in flight), \
-                 this is a previously-undocumented register-then-auth visibility race \
-                 — Story 7.7 smoking gun."
+                 computed. Pair daemon_pid + registry_ptr with the auth-side \
+                 AUTH-MISS-FORENSIC log to disambiguate: matching values mean \
+                 same-daemon registry-replacement; mismatched values mean a \
+                 free_port() TOCTOU let auth land on a different daemon."
             );
         }
     }
