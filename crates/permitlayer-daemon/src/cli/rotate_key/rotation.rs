@@ -111,10 +111,10 @@ pub(crate) async fn run_rotation(
                 crate::design::render::error_block(
                     "rotate_key_vault_busy",
                     &format!(
-                        "vault lock at ~/.agentsso/vault/.lock is held by {holder_text}; \
+                        "vault lock at ~/.agentsso/.vault.lock is held by {holder_text}; \
                          rotation cannot start while another process is writing the vault."
                     ),
-                    "wait for the other process to finish, or remove ~/.agentsso/vault/.lock if stale",
+                    "wait for the other process to finish, or remove ~/.agentsso/.vault.lock if stale",
                     None,
                 )
             );

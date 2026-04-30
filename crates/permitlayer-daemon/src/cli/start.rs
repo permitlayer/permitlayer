@@ -1545,21 +1545,21 @@ impl StartError {
                 };
                 format!(
                     "error: cannot start agentsso — the vault lock at \
-                     ~/.agentsso/vault/.lock is held by {holder_text}.\n\
+                     ~/.agentsso/.vault.lock is held by {holder_text}.\n\
                      \n\
                      remediation:\n\
                      - if you are running `agentsso rotate-key`, `agentsso setup`,\n\
                        or `agentsso update --apply`, wait for it to finish.\n\
                      - if no other agentsso process is actually running, the\n\
-                       lock file may be stale; remove ~/.agentsso/vault/.lock\n\
+                       lock file may be stale; remove ~/.agentsso/.vault.lock\n\
                        and retry.\n"
                 )
             }
             Self::VaultLockIo { source } => format!(
                 "error: failed to acquire the vault advisory lock at \
-                 ~/.agentsso/vault/.lock: {source}\n\
+                 ~/.agentsso/.vault.lock: {source}\n\
                  \n\
-                 check filesystem permissions on ~/.agentsso/vault/.\n"
+                 check filesystem permissions on ~/.agentsso/.\n"
             ),
             Self::BindFailed { addr, source } => {
                 format!("error: failed to bind TCP listener on {addr}: {source}\n")

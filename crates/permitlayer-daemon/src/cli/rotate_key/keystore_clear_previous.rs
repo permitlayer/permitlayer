@@ -127,11 +127,11 @@ pub async fn run(args: KeystoreClearPreviousArgs) -> Result<()> {
                 render::error_block(
                     "keystore_clear_previous_vault_busy",
                     &format!(
-                        "vault lock at ~/.agentsso/vault/.lock is held by {holder_text}; \
+                        "vault lock at ~/.agentsso/.vault.lock is held by {holder_text}; \
                          keystore-clear-previous cannot proceed while another process is \
                          writing the vault."
                     ),
-                    "wait for the other process to finish, or remove ~/.agentsso/vault/.lock if stale",
+                    "wait for the other process to finish, or remove ~/.agentsso/.vault.lock if stale",
                     None,
                 )
             );

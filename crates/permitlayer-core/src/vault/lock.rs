@@ -1,10 +1,13 @@
 //! Vault-level advisory file lock (Story 7.6a AC #1).
 //!
 //! [`VaultLock`] is an `flock(LOCK_EX)` (Unix) / `LockFileEx` (Windows)
-//! RAII guard around `~/.agentsso/vault/.lock`. It serializes every
-//! writer of the vault — the long-running daemon, every CLI subcommand
-//! that mutates credentials (`agentsso setup`, `agentsso rotate-key`),
-//! and the `cli::update::migrations` schema-upgrade path.
+//! RAII guard around `~/.agentsso/.vault.lock` (sibling of
+//! `~/.agentsso/vault/`, not inside it — Windows `LockFileEx` is
+//! mandatory and would block the v1 → v2 migration's
+//! `rename(vault/, vault.bak/)` step). It serializes every writer of
+//! the vault — the long-running daemon, every CLI subcommand that
+//! mutates credentials (`agentsso setup`, `agentsso rotate-key`), and
+//! the `cli::update::migrations` schema-upgrade path.
 //!
 //! # Why an advisory lock and not a mutex
 //!
@@ -70,10 +73,14 @@ use fs4::FileExt;
 use fs4::TryLockError;
 use thiserror::Error;
 
-/// Filename of the vault advisory-lock marker, relative to the vault
-/// directory. Persisted across boots — never deleted by `VaultLock`
-/// itself.
-const LOCK_FILENAME: &str = ".lock";
+/// Filename of the vault advisory-lock marker, **relative to the
+/// `<home>` directory** (sibling of `vault/`, NOT inside it).
+/// Persisted across boots — never deleted by `VaultLock` itself.
+///
+/// See the module docs for why the lock lives next to `vault/` rather
+/// than inside it (Windows mandatory `LockFileEx` vs the v1 → v2
+/// migration's `rename(vault/, vault.bak/)`).
+const LOCK_FILENAME: &str = ".vault.lock";
 
 /// Maximum number of bytes [`try_acquire`] reads from the lock file
 /// when reporting the holder's PID + command. Anything larger would
@@ -117,7 +124,7 @@ pub enum VaultLockError {
 /// See the module docs for the full discipline (deadlock-prevention,
 /// holder-metadata, cross-platform mapping).
 pub struct VaultLock {
-    /// Open handle to `<home>/vault/.lock`. The kernel-side lock is
+    /// Open handle to `<home>/.vault.lock`. The kernel-side lock is
     /// associated with this descriptor; `Drop` closes it via the
     /// `File`'s own `Drop` and releases the lock.
     file: File,
@@ -129,7 +136,7 @@ pub struct VaultLock {
 impl VaultLock {
     /// Acquire the vault lock, blocking until it becomes available.
     ///
-    /// Creates `<home>/vault/.lock` (and the `vault/` directory
+    /// Creates `<home>/.vault.lock` (and the `vault/` directory
     /// itself, mode `0o700` on Unix) if absent. Returns once the
     /// kernel grants the exclusive lock; the guard's [`Drop`]
     /// releases it.
@@ -252,13 +259,23 @@ impl Drop for VaultLock {
     }
 }
 
-/// Open the lock file (creating the vault dir + lock file if absent),
-/// returning the file handle + its absolute path. Does NOT acquire the
-/// kernel-side lock — callers do that next.
+/// Open the lock file (creating the home dir + vault subdir + lock
+/// file if absent), returning the file handle + its absolute path.
+/// Does NOT acquire the kernel-side lock — callers do that next.
+///
+/// The lock file lives at `<home>/.vault.lock` (sibling of the
+/// `<home>/vault/` directory). The vault subdir is still created
+/// here as a side effect because `cli/start.rs` daemon startup and
+/// `crate::store::fs::CredentialFsStore::put` both rely on
+/// `try_acquire` ensuring `vault/` exists before they read or write
+/// any credential file.
 fn open_lock_file(home: &Path) -> Result<(File, PathBuf), VaultLockError> {
-    let vault_dir = home.join("vault");
-    create_vault_dir_if_absent(&vault_dir)?;
-    let lock_path = vault_dir.join(LOCK_FILENAME);
+    // Ensure ~/.agentsso/ itself exists before we try to drop a file
+    // into it. `create_vault_dir_if_absent` handles `vault/` next,
+    // including the `0o700` permissions on Unix.
+    std::fs::create_dir_all(home)?;
+    create_vault_dir_if_absent(&home.join("vault"))?;
+    let lock_path = home.join(LOCK_FILENAME);
 
     // Reject symlinks at the lock-file path: a symlink could redirect
     // the lock to a writable-by-other-users path and silently break
@@ -502,7 +519,7 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let h = home();
         let _g = VaultLock::try_acquire(h.path()).expect("acquire");
-        let mode = std::fs::metadata(h.path().join("vault").join(".lock"))
+        let mode = std::fs::metadata(h.path().join(".vault.lock"))
             .expect("stat lock file")
             .permissions()
             .mode()
@@ -536,7 +553,7 @@ mod tests {
             let _g = VaultLock::try_acquire(h.path()).expect("first acquire");
         }
         assert!(
-            h.path().join("vault").join(".lock").exists(),
+            h.path().join(".vault.lock").exists(),
             "lock file must persist across acquire/release"
         );
     }
@@ -556,7 +573,7 @@ mod tests {
         // None.
         let h = home();
         let _first = VaultLock::try_acquire(h.path()).expect("first acquire");
-        let lock_path = h.path().join("vault").join(".lock");
+        let lock_path = h.path().join(".vault.lock");
         // Replace the holder metadata with empty bytes — the lock
         // itself stays held (kernel state, not file content).
         std::fs::write(&lock_path, b"").expect("truncate metadata");

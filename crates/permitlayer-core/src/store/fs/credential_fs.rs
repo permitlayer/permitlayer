@@ -50,7 +50,7 @@
 //! runtime is never held for a syscall. Story 7.6a added a
 //! vault-level advisory lock
 //! ([`crate::vault::lock::VaultLock`]): every `put` acquires
-//! `<home>/vault/.lock` for the duration of the atomic-write sequence.
+//! `<home>/.vault.lock` for the duration of the atomic-write sequence.
 //! Concurrent `put`s — same-service or different-service, same-
 //! process or cross-process — serialize via the kernel's `flock` /
 //! `LockFileEx`. Reads (`get`, `list_services`) do NOT acquire the
