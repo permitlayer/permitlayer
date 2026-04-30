@@ -136,13 +136,23 @@ const V2_TOKEN_RANDOM_B64_LEN: usize = 43;
 /// a tight equality check — legitimate tokens are always exactly 32
 /// bytes (`BEARER_TOKEN_BYTES`), so anything else is malformed.
 ///
-/// # Why reject leading `_` in the random suffix
+/// # Leading `_` in the random suffix is legitimate
 ///
-/// `agt_v2_my-agent__YWJj` would otherwise pass: `split_once('_')`
-/// returns `("my-agent", "_YWJj")` and `_` is in the URL-safe-base64
-/// alphabet so the decode succeeds. Two materially-different token
-/// strings would HMAC-hit the same agent. Reject leading `_` so the
-/// "first `_` separates name from random" invariant is unambiguous.
+/// `_` is a valid character in the URL-safe base64 alphabet (index 63).
+/// About 1 in 64 of the 32-byte random values minted by
+/// `register_agent_handler` encode to a base64 string starting with
+/// `_` — specifically, when the first byte's top six bits are
+/// `0b111111` (i.e. the first byte is in `0xFC..=0xFF`). The encoded
+/// token then looks like `agt_v2_<agent>__<rest>`. There is no
+/// ambiguity: agent names reject `_` (allowlist is `[a-z0-9-]`), and
+/// `split_once('_')` always splits on the first underscore — the one
+/// after `<agent>`. A pre-7.6b reading worried that two materially-
+/// different token strings could HMAC-hit the same agent, but that
+/// concern was wrong: the HMAC is keyed by the agent name only, and
+/// the parser deterministically produces the same `(name, random)`
+/// for any well-formed input. The previous rejection of leading `_`
+/// caused the daemon to mint legitimate tokens it would later refuse
+/// to authenticate (~1.5% of register-then-auth flake rate).
 ///
 /// # Why URL-safe base64 alphabet
 ///
@@ -157,16 +167,16 @@ pub fn parse_v2_token(token: &str) -> Option<(&str, Vec<u8>)> {
 
     // 2. Split on the FIRST `_` to extract `name` and `random`.
     //    Validated agent names allow `[a-z0-9-]` only — no underscores
-    //    — so the first `_` cleanly separates name from random.
+    //    — so the first `_` cleanly separates name from random. The
+    //    random suffix MAY itself begin with `_` (it's a valid base64-
+    //    url char); see the doc comment.
     let (name, random_b64) = body.split_once('_')?;
 
     // 3. Cheap structural rejects BEFORE the validator / decoder.
     if name.is_empty() || name.len() > MAX_V2_TOKEN_NAME_BYTES {
         return None;
     }
-    // Random must be exactly the canonical encoding length AND must not
-    // begin with `_` (which would mean the input had a `__` separator).
-    if random_b64.len() != V2_TOKEN_RANDOM_B64_LEN || random_b64.starts_with('_') {
+    if random_b64.len() != V2_TOKEN_RANDOM_B64_LEN {
         return None;
     }
 
@@ -859,20 +869,32 @@ mod tests {
     }
 
     #[test]
-    fn parse_v2_token_rejects_random_with_leading_underscore() {
-        // Story 7.6b round-1 review: `agt_v2_my-agent__YWJj...` must
-        // be rejected. Without this check, `split_once('_')` returns
-        // `("my-agent", "_YWJj...")` and `_` is in the URL-safe base64
-        // alphabet, so the decode succeeds — two materially-different
-        // token strings would HMAC-hit the same agent.
-        let random_bytes = [0u8; BEARER_TOKEN_BYTES - 1]; // 31 bytes
-        let mut encoded = base64_url_no_pad_encode(&random_bytes);
-        // Force a leading `_` by prepending it (and trim a char so
-        // the length still matches the canonical 43-char shape).
-        encoded.truncate(V2_TOKEN_RANDOM_B64_LEN - 1);
-        let with_underscore = format!("_{encoded}");
-        assert_eq!(with_underscore.len(), V2_TOKEN_RANDOM_B64_LEN);
-        assert!(parse_v2_token(&format!("agt_v2_my-agent{with_underscore}")).is_none());
+    fn parse_v2_token_accepts_random_with_leading_underscore() {
+        // ~1 in 64 of the 32-byte random values minted by
+        // `register_agent_handler` encode to a base64 string starting
+        // with `_` — specifically when the first byte's top six bits
+        // are 0b111111 (i.e. first byte ∈ 0xFC..=0xFF). The encoded
+        // token shape is `agt_v2_<agent>__<rest>`. There is no
+        // ambiguity: agent names reject `_` so `split_once('_')`
+        // always lands on the first underscore (the one after the
+        // agent name), and the parser produces a deterministic
+        // `(name, random)`. A pre-fix version of `parse_v2_token`
+        // rejected this shape, causing the daemon to mint legitimate
+        // tokens it would later 401 — surfaced as the
+        // `auth.invalid_token` flake during the v0.3.0-rc.2 release
+        // cycle on macos-15-intel/ubuntu/windows runners.
+        let mut random_bytes = [0u8; BEARER_TOKEN_BYTES];
+        random_bytes[0] = 0xFC;
+        let encoded = base64_url_no_pad_encode(&random_bytes);
+        assert_eq!(encoded.len(), V2_TOKEN_RANDOM_B64_LEN);
+        assert!(
+            encoded.starts_with('_'),
+            "test precondition: encoded random must start with `_` to exercise the bug"
+        );
+        let token = format!("agt_v2_my-agent_{encoded}");
+        let (name, decoded) = parse_v2_token(&token).expect("token must parse");
+        assert_eq!(name, "my-agent");
+        assert_eq!(decoded.as_slice(), &random_bytes);
     }
 
     #[test]
