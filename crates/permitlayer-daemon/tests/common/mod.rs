@@ -927,18 +927,18 @@ mod tests {
     fn wait_for_health_times_out_on_closed_port() {
         // Grab an ephemeral port + immediately drop the listener so
         // nobody is listening. `wait_for_health` should return false
-        // within its 10-second deadline.
+        // within its 30-second deadline.
         let port = free_port();
         let start = Instant::now();
         let healthy = wait_for_health(port);
         let elapsed = start.elapsed();
 
         assert!(!healthy, "wait_for_health should return false when nothing is listening");
-        // Upper bound includes the 10s deadline + up to one cycle of
-        // outstanding connect attempts. 11s is generous.
+        // Upper bound includes the 30s deadline + up to one cycle of
+        // outstanding connect attempts. 32s is generous.
         assert!(
-            elapsed < Duration::from_secs(11),
-            "wait_for_health should respect its 10s deadline, took {elapsed:?}",
+            elapsed < Duration::from_secs(32),
+            "wait_for_health should respect its 30s deadline, took {elapsed:?}",
         );
     }
 
