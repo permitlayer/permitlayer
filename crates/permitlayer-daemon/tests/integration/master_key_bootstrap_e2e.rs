@@ -152,14 +152,12 @@ fn fail_fast_exit_2_when_keystore_unavailable() {
 fn real_keystore_bootstrap_happy_path_persists_and_reuses_master_key() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("config")).unwrap();
-    let port_1 = free_port();
-
     // First daemon instance: fresh install. PassphraseKeyStore
     // generates a 16-byte salt, derives the key via Argon2id, and
     // persists both the salt and an HMAC verifier to
     // ~/.agentsso/keystore/passphrase.state.
     let mut daemon_1 = start_daemon(DaemonTestConfig {
-        port: port_1,
+        port: 0,
         home: home.path().to_path_buf(),
         hermetic: true,
         set_test_master_key: false,
@@ -169,6 +167,7 @@ fn real_keystore_bootstrap_happy_path_persists_and_reuses_master_key() {
         )],
         ..Default::default()
     });
+    let port_1 = daemon_1.port;
 
     // Wait for health to confirm the daemon made it past the
     // bootstrap. If `bootstrap_from_keystore` regressed, the daemon
@@ -177,6 +176,7 @@ fn real_keystore_bootstrap_happy_path_persists_and_reuses_master_key() {
         wait_for_health(port_1),
         "first daemon instance should boot successfully via PassphraseKeyStore"
     );
+    crate::common::assert_daemon_pid_matches(&daemon_1);
 
     // Confirm the persisted state file exists — proves the real
     // keystore adapter wrote to disk, not a mocked in-memory slot.
@@ -199,9 +199,8 @@ fn real_keystore_bootstrap_happy_path_persists_and_reuses_master_key() {
     // divergence (wrong passphrase, corrupted state, etc.) would
     // cause `bootstrap_from_keystore` to return
     // `KeyStoreError::PassphraseMismatch` and the daemon to exit 2.
-    let port_2 = free_port();
     let mut daemon_2 = start_daemon(DaemonTestConfig {
-        port: port_2,
+        port: 0,
         home: home.path().to_path_buf(),
         hermetic: true,
         set_test_master_key: false,
@@ -211,10 +210,12 @@ fn real_keystore_bootstrap_happy_path_persists_and_reuses_master_key() {
         )],
         ..Default::default()
     });
+    let port_2 = daemon_2.port;
     assert!(
         wait_for_health(port_2),
         "second daemon instance should boot successfully and re-use the persisted keystore state"
     );
+    crate::common::assert_daemon_pid_matches(&daemon_2);
     daemon_2.shutdown_graceful(Duration::from_secs(2));
     drop(daemon_2);
 

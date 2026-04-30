@@ -44,7 +44,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 #[cfg(not(windows))]
-use crate::common::{agentsso_bin, free_port};
+use crate::common::agentsso_bin;
 
 /// Build a fixture v1 envelope (23-byte header, no key_id) by
 /// sealing through `Vault::seal` with `key_id = 0`, then byte-
@@ -79,7 +79,7 @@ fn write_v1_envelope_fixture(vault_dir: &std::path::Path, service: &str, plainte
 /// the daemon's keystore route is the test seam (passphrase-derived,
 /// not OS keychain).
 #[cfg(not(windows))]
-fn spawn_daemon_hermetic(home: &std::path::Path, port: u16, extra_env: &[(&str, &str)]) -> Child {
+fn spawn_daemon_hermetic(home: &std::path::Path, extra_env: &[(&str, &str)]) -> (Child, u16) {
     let mut cmd = Command::new(agentsso_bin());
     cmd.env_clear()
         .envs(crate::common::forward_windows_required_env())
@@ -88,13 +88,15 @@ fn spawn_daemon_hermetic(home: &std::path::Path, port: u16, extra_env: &[(&str, 
         .env("AGENTSSO_PATHS__HOME", home.to_str().unwrap())
         .arg("start")
         .arg("--bind-addr")
-        .arg(format!("127.0.0.1:{port}"))
+        .arg("127.0.0.1:0")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     for (k, v) in extra_env {
         cmd.env(k, v);
     }
-    cmd.spawn().expect("failed to spawn daemon")
+    let mut child = cmd.spawn().expect("failed to spawn daemon");
+    let port = crate::common::wait_for_bound_addr(&mut child, Duration::from_secs(10)).port();
+    (child, port)
 }
 
 /// Wait for the daemon's HTTP listener to come up, polling every
@@ -157,10 +159,8 @@ fn daemon_boots_cleanly_with_v1_envelope_in_vault() {
     // Seed a v1 envelope into the vault BEFORE the daemon boots.
     write_v1_envelope_fixture(&home.path().join("vault"), "gmail", b"fake-token-v1");
 
-    let port = free_port();
-    let child = spawn_daemon_hermetic(
+    let (child, port) = spawn_daemon_hermetic(
         home.path(),
-        port,
         &[
             ("AGENTSSO_TEST_PASSPHRASE", "integration-test-passphrase"),
             // Disable plugin loader / scrub-rule pack download paths
@@ -218,10 +218,8 @@ fn daemon_boots_cleanly_with_v2_envelope_in_vault() {
     // Sanity: leading version bytes are v2.
     assert_eq!(u16::from_le_bytes([bytes[0], bytes[1]]), 2);
 
-    let port = free_port();
-    let child = spawn_daemon_hermetic(
+    let (child, port) = spawn_daemon_hermetic(
         home.path(),
-        port,
         &[
             ("AGENTSSO_TEST_PASSPHRASE", "integration-test-passphrase"),
             ("AGENTSSO_TEST_NO_PLUGINS", "1"),

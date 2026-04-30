@@ -25,18 +25,19 @@ use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::common::{agentsso_bin, free_port};
+use crate::common::agentsso_bin;
 
 const TEST_MASTER_KEY_HEX: &str =
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
 /// Start the daemon with `AGENTSSO_PLUGINS__WARN_ON_FIRST_LOAD=false`
 /// so the loader never blocks on a missing TTY during tests.
-fn start_daemon_headless(home: &std::path::Path, port: u16) -> Child {
-    Command::new(agentsso_bin())
+/// Story 7.7: zero-port + marker-read.
+fn start_daemon_headless(home: &std::path::Path) -> (Child, u16) {
+    let mut child = Command::new(agentsso_bin())
         .arg("start")
         .arg("--bind-addr")
-        .arg(format!("127.0.0.1:{port}"))
+        .arg("127.0.0.1:0")
         .env("AGENTSSO_PATHS__HOME", home.to_str().unwrap())
         .env("AGENTSSO_TEST_MASTER_KEY_HEX", TEST_MASTER_KEY_HEX)
         // Headless: user-installed plugins load as warn-user
@@ -46,16 +47,19 @@ fn start_daemon_headless(home: &std::path::Path, port: u16) -> Child {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("failed to start daemon")
+        .expect("failed to start daemon");
+    let port = crate::common::wait_for_bound_addr(&mut child, Duration::from_secs(10)).port();
+    (child, port)
 }
 
 /// Start the daemon with canned trust-prompt responses (Story 6.3
 /// AC #24 test seam). Used by `test_seam_drives_two_plugins_deterministically`.
-fn start_daemon_with_canned_trust(home: &std::path::Path, port: u16, canned: &str) -> Child {
-    Command::new(agentsso_bin())
+/// Story 7.7: zero-port + marker-read.
+fn start_daemon_with_canned_trust(home: &std::path::Path, canned: &str) -> (Child, u16) {
+    let mut child = Command::new(agentsso_bin())
         .arg("start")
         .arg("--bind-addr")
-        .arg(format!("127.0.0.1:{port}"))
+        .arg("127.0.0.1:0")
         .env("AGENTSSO_PATHS__HOME", home.to_str().unwrap())
         .env("AGENTSSO_TEST_MASTER_KEY_HEX", TEST_MASTER_KEY_HEX)
         .env("AGENTSSO_TEST_TRUST_PROMPT_CANNED_RESPONSES", canned)
@@ -64,7 +68,9 @@ fn start_daemon_with_canned_trust(home: &std::path::Path, port: u16, canned: &st
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("failed to start daemon")
+        .expect("failed to start daemon");
+    let port = crate::common::wait_for_bound_addr(&mut child, Duration::from_secs(10)).port();
+    (child, port)
 }
 
 fn wait_for_health_with_registry(port: u16, timeout: Duration) -> Option<u32> {
@@ -121,8 +127,7 @@ fn minimal_plugin_source(name: &str) -> String {
 #[test]
 fn boot_with_only_builtins_registers_three() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-    let mut child = start_daemon_headless(tmp.path(), port);
+    let (mut child, port) = start_daemon_headless(tmp.path());
     let registered = wait_for_health_with_registry(port, Duration::from_secs(10));
     // Shut down cleanly.
     let _ = child.kill();
@@ -142,8 +147,7 @@ fn boot_with_user_installed_plugin_registers_four() {
     let tmp = tempfile::TempDir::new().unwrap();
     write_user_plugin(tmp.path(), "notion", &minimal_plugin_source("notion"));
 
-    let port = free_port();
-    let mut child = start_daemon_headless(tmp.path(), port);
+    let (mut child, port) = start_daemon_headless(tmp.path());
     let registered = wait_for_health_with_registry(port, Duration::from_secs(10));
     let _ = child.kill();
     let _ = child.wait();
@@ -166,8 +170,7 @@ fn test_seam_drives_two_plugins_deterministically() {
     write_user_plugin(tmp.path(), "aaa-first", &minimal_plugin_source("aaa-first"));
     write_user_plugin(tmp.path(), "zzz-last", &minimal_plugin_source("zzz-last"));
 
-    let port = free_port();
-    let mut child = start_daemon_with_canned_trust(tmp.path(), port, "always,never");
+    let (mut child, port) = start_daemon_with_canned_trust(tmp.path(), "always,never");
     let registered = wait_for_health_with_registry(port, Duration::from_secs(10));
     let _ = child.kill();
     let _ = child.wait();
@@ -203,9 +206,8 @@ fn plugins_env_override() {
     let tmp = tempfile::TempDir::new().unwrap();
     write_user_plugin(tmp.path(), "env-test-plugin", &minimal_plugin_source("env-test-plugin"));
 
-    let port = free_port();
     // start_daemon_headless already sets AGENTSSO_PLUGINS__WARN_ON_FIRST_LOAD=false.
-    let mut child = start_daemon_headless(tmp.path(), port);
+    let (mut child, port) = start_daemon_headless(tmp.path());
     let registered = wait_for_health_with_registry(port, Duration::from_secs(10));
     let _ = child.kill();
     let _ = child.wait();

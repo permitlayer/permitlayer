@@ -39,7 +39,7 @@ use std::net::TcpStream;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::common::{agentsso_bin, free_port};
+use crate::common::agentsso_bin;
 
 // --------------------------------------------------------------------------
 // Subprocess harness — copied from daemon_lifecycle.rs.
@@ -51,17 +51,20 @@ use crate::common::{agentsso_bin, free_port};
 const TEST_MASTER_KEY_HEX: &str =
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-fn start_daemon(home: &std::path::Path, port: u16) -> Child {
-    Command::new(agentsso_bin())
+/// Story 7.7: zero-port + marker-read.
+fn start_daemon(home: &std::path::Path) -> (Child, u16) {
+    let mut child = Command::new(agentsso_bin())
         .arg("start")
         .arg("--bind-addr")
-        .arg(format!("127.0.0.1:{port}"))
+        .arg("127.0.0.1:0")
         .env("AGENTSSO_PATHS__HOME", home.to_str().unwrap())
         .env("AGENTSSO_TEST_MASTER_KEY_HEX", TEST_MASTER_KEY_HEX)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("failed to start daemon")
+        .expect("failed to start daemon");
+    let port = crate::common::wait_for_bound_addr(&mut child, Duration::from_secs(10)).port();
+    (child, port)
 }
 
 fn wait_for_health(port: u16, timeout: Duration) -> bool {
@@ -238,9 +241,7 @@ fn get_control(port: u16, path: &str) -> String {
 #[test]
 fn kill_then_resume_round_trip() {
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-
-    let child = start_daemon(home.path(), port);
+    let (child, port) = start_daemon(home.path());
     let _guard = DaemonGuard::new(child);
     assert!(wait_for_health(port, Duration::from_secs(5)), "daemon did not become healthy");
 
@@ -285,9 +286,7 @@ fn kill_then_resume_round_trip() {
 #[test]
 fn kill_respects_nfr6_budget() {
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-
-    let child = start_daemon(home.path(), port);
+    let (child, port) = start_daemon(home.path());
     let _guard = DaemonGuard::new(child);
     assert!(wait_for_health(port, Duration::from_secs(5)));
 
@@ -323,9 +322,7 @@ fn kill_respects_nfr6_budget() {
 #[test]
 fn kill_is_idempotent() {
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-
-    let child = start_daemon(home.path(), port);
+    let (child, port) = start_daemon(home.path());
     let _guard = DaemonGuard::new(child);
     assert!(wait_for_health(port, Duration::from_secs(5)));
 
@@ -346,9 +343,7 @@ fn kill_is_idempotent() {
 #[test]
 fn resume_is_idempotent() {
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-
-    let child = start_daemon(home.path(), port);
+    let (child, port) = start_daemon(home.path());
     let _guard = DaemonGuard::new(child);
     assert!(wait_for_health(port, Duration::from_secs(5)));
 
@@ -369,7 +364,9 @@ fn resume_is_idempotent() {
 #[test]
 fn kill_when_no_daemon_exits_3() {
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port(); // port is bound briefly by free_port() then released
+    // No daemon spawned: the CLI exits 3 before ever opening a TCP
+    // connection. A literal placeholder port is fine.
+    let port: u16 = 1;
 
     // No daemon running.
     let out = run_cli(home.path(), port, &["kill"]);
@@ -384,7 +381,7 @@ fn kill_when_no_daemon_exits_3() {
 #[test]
 fn resume_when_no_daemon_exits_3() {
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port();
+    let port: u16 = 1;
 
     let out = run_cli(home.path(), port, &["resume"]);
     assert_eq!(out.status, Some(3), "expected exit 3, got {:?}; stderr={}", out.status, out.stderr);
@@ -410,9 +407,7 @@ fn resume_when_no_daemon_exits_3() {
 #[test]
 fn control_resume_bypasses_kill_middleware() {
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-
-    let child = start_daemon(home.path(), port);
+    let (child, port) = start_daemon(home.path());
     let _guard = DaemonGuard::new(child);
     assert!(wait_for_health(port, Duration::from_secs(5)));
 
@@ -450,9 +445,7 @@ fn control_resume_bypasses_kill_middleware() {
 #[test]
 fn main_endpoints_still_blocked_while_killed() {
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-
-    let child = start_daemon(home.path(), port);
+    let (child, port) = start_daemon(home.path());
     let _guard = DaemonGuard::new(child);
     assert!(wait_for_health(port, Duration::from_secs(5)));
 
@@ -482,9 +475,7 @@ fn main_endpoints_still_blocked_while_killed() {
 #[test]
 fn control_state_endpoint_reports_active_while_killed() {
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-
-    let child = start_daemon(home.path(), port);
+    let (child, port) = start_daemon(home.path());
     let _guard = DaemonGuard::new(child);
     assert!(wait_for_health(port, Duration::from_secs(5)));
 
@@ -500,9 +491,7 @@ fn control_state_endpoint_reports_active_while_killed() {
 #[test]
 fn setup_blocked_when_killed() {
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-
-    let child = start_daemon(home.path(), port);
+    let (child, port) = start_daemon(home.path());
     let _guard = DaemonGuard::new(child);
     assert!(wait_for_health(port, Duration::from_secs(5)));
 
@@ -535,9 +524,7 @@ fn setup_blocked_when_killed() {
 #[test]
 fn control_state_endpoint_content_type_is_json() {
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-
-    let child = start_daemon(home.path(), port);
+    let (child, port) = start_daemon(home.path());
     let _guard = DaemonGuard::new(child);
     assert!(wait_for_health(port, Duration::from_secs(5)));
 
@@ -623,9 +610,7 @@ fn wait_for_audit_events(
 #[test]
 fn kill_resume_audit_narrative() {
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-
-    let child = start_daemon(home.path(), port);
+    let (child, port) = start_daemon(home.path());
     let _guard = DaemonGuard::new(child);
     assert!(wait_for_health(port, Duration::from_secs(5)));
 
@@ -775,9 +760,7 @@ fn kill_resume_audit_narrative() {
 #[test]
 fn kill_blocked_request_logs_even_for_health_probes() {
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-
-    let child = start_daemon(home.path(), port);
+    let (child, port) = start_daemon(home.path());
     let _guard = DaemonGuard::new(child);
     assert!(wait_for_health(port, Duration::from_secs(5)));
 

@@ -23,7 +23,8 @@ use std::io::{Read, Write};
 use std::time::{Duration, Instant};
 
 use crate::common::{
-    DaemonTestConfig, free_port, start_daemon as start_daemon_common, wait_for_health,
+    DaemonTestConfig, assert_daemon_pid_matches, start_daemon as start_daemon_common,
+    wait_for_health,
 };
 
 // Story 8.8b round-1 review: this file used to define its own
@@ -38,9 +39,13 @@ use crate::common::{
 /// dependency on a master-derived agent-lookup subkey), bind to
 /// `port`, point at `home`. Returns the canonical [`DaemonHandle`]
 /// so each test gets Drop-kill-on-panic for free.
-fn start_daemon(home: &std::path::Path, port: u16) -> crate::common::DaemonHandle {
+fn start_daemon(home: &std::path::Path) -> crate::common::DaemonHandle {
     start_daemon_common(DaemonTestConfig {
-        port,
+        // Story 7.7: `port: 0` lets the OS assign atomically with bind;
+        // `start_daemon_common` reads the actual port from the daemon's
+        // `AGENTSSO_BOUND_ADDR=` stdout marker and stores it on
+        // `DaemonHandle.port`.
+        port: 0,
         home: home.to_path_buf(),
         // `set_test_master_key: true` (default) wires
         // `AGENTSSO_TEST_MASTER_KEY_HEX` to the canonical
@@ -162,10 +167,11 @@ fn full_register_auth_policy_lifecycle() {
     std::fs::create_dir_all(home.path().join("config")).unwrap();
     seed_two_policies(home.path());
 
-    let port = free_port();
-    let daemon = start_daemon(home.path(), port);
+    let daemon = start_daemon(home.path());
+    let port = daemon.port;
 
     assert!(wait_for_health(port), "daemon should boot with two policies");
+    assert_daemon_pid_matches(&daemon);
 
     // 1. Register two agents bound to different policies.
     let token_readonly = register_agent(port, "readonly-agent", "policy-readonly");
@@ -310,10 +316,11 @@ fn register_with_unknown_policy_returns_422() {
     std::fs::create_dir_all(home.path().join("config")).unwrap();
     seed_two_policies(home.path());
 
-    let port = free_port();
-    let daemon = start_daemon(home.path(), port);
+    let daemon = start_daemon(home.path());
+    let port = daemon.port;
 
     assert!(wait_for_health(port));
+    assert_daemon_pid_matches(&daemon);
 
     let body = serde_json::json!({"name": "agent1", "policy_name": "nonexistent"}).to_string();
     let (status, resp_body) = http_post_loopback(port, "/v1/control/agent/register", &body, &[]);
@@ -334,10 +341,11 @@ fn register_duplicate_name_returns_409() {
     std::fs::create_dir_all(home.path().join("config")).unwrap();
     seed_two_policies(home.path());
 
-    let port = free_port();
-    let daemon = start_daemon(home.path(), port);
+    let daemon = start_daemon(home.path());
+    let port = daemon.port;
 
     assert!(wait_for_health(port));
+    assert_daemon_pid_matches(&daemon);
 
     let _token = register_agent(port, "duplicate-test", "policy-readonly");
     let body =

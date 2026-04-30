@@ -22,15 +22,16 @@ fn happy_path_seeds_default_toml_and_boots() {
     // Config dir required by figment's Toml::file loader.
     std::fs::create_dir_all(home.path().join("config")).unwrap();
 
-    let port = free_port();
     let daemon = start_daemon(DaemonTestConfig {
-        port,
+        port: 0,
         home: home.path().to_path_buf(),
         ..Default::default()
     });
+    let port = daemon.port;
 
     let booted = wait_for_health(port);
     assert!(booted, "daemon should have booted and served /health");
+    crate::common::assert_daemon_pid_matches(&daemon);
 
     // Now that health is confirmed, shut the daemon down gracefully
     // (SIGTERM → 2s grace → SIGKILL fallback, see DaemonHandle::wait_with_output)

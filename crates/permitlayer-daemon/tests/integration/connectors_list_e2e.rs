@@ -16,23 +16,29 @@ use std::io::{Read, Write};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::common::{agentsso_bin, free_port};
+use crate::common::{agentsso_bin, wait_for_bound_addr};
 
 const TEST_MASTER_KEY_HEX: &str =
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-fn start_daemon(home: &std::path::Path, port: u16) -> Child {
-    Command::new(agentsso_bin())
+/// Story 7.7: bind atomically on `:0` and read the OS-assigned port
+/// from the daemon's `AGENTSSO_BOUND_ADDR=` stdout marker. Returns
+/// `(child, port)` so callers can both reap the subprocess and know
+/// where to send HTTP.
+fn start_daemon(home: &std::path::Path) -> (Child, u16) {
+    let mut child = Command::new(agentsso_bin())
         .arg("start")
         .arg("--bind-addr")
-        .arg(format!("127.0.0.1:{port}"))
+        .arg("127.0.0.1:0")
         .env("AGENTSSO_PATHS__HOME", home.to_str().unwrap())
         .env("AGENTSSO_TEST_MASTER_KEY_HEX", TEST_MASTER_KEY_HEX)
         .env("AGENTSSO_PLUGINS__WARN_ON_FIRST_LOAD", "false")
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("failed to start daemon")
+        .expect("failed to start daemon");
+    let port = wait_for_bound_addr(&mut child, Duration::from_secs(10)).port();
+    (child, port)
 }
 
 fn wait_for_health(port: u16, timeout: Duration) -> bool {
@@ -97,8 +103,7 @@ fn http_get(port: u16, path: &str) -> (u16, String) {
 #[test]
 fn end_to_end_list_returns_three_builtins() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-    let mut child = start_daemon(tmp.path(), port);
+    let (mut child, port) = start_daemon(tmp.path());
     let healthy = wait_for_health(port, Duration::from_secs(10));
     if !healthy {
         let _ = child.kill();
@@ -146,8 +151,7 @@ fn end_to_end_list_returns_three_builtins() {
 #[test]
 fn list_json_mode_parses_as_valid_json() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-    let mut child = start_daemon(tmp.path(), port);
+    let (mut child, port) = start_daemon(tmp.path());
     let healthy = wait_for_health(port, Duration::from_secs(10));
     if !healthy {
         let _ = child.kill();
@@ -181,8 +185,7 @@ fn list_json_mode_parses_as_valid_json() {
 #[test]
 fn control_endpoint_returns_registry() {
     let tmp = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-    let mut child = start_daemon(tmp.path(), port);
+    let (mut child, port) = start_daemon(tmp.path());
     let healthy = wait_for_health(port, Duration::from_secs(10));
     if !healthy {
         let _ = child.kill();

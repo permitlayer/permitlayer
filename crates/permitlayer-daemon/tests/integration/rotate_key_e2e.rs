@@ -35,7 +35,7 @@ use crate::common::agentsso_bin;
 // (Story 7.7 follow-up). Gate the imports + helpers to the same cfg
 // so Windows builds don't trip dead-code / unused-import lints.
 #[cfg(not(windows))]
-use crate::common::{DaemonTestConfig, free_port, start_daemon, wait_for_health};
+use crate::common::{DaemonTestConfig, start_daemon, wait_for_health};
 
 /// Spawn `agentsso rotate-key --yes --non-interactive` headlessly
 /// against the file-backed test keystore. Returns the captured
@@ -373,9 +373,8 @@ fn auth_round_trip_against_running_daemon() {
     std::fs::create_dir_all(home.path().join("config")).unwrap();
 
     // Phase 1 — boot the daemon with the file-backed test keystore.
-    let port = free_port();
     let daemon_v1 = start_daemon(DaemonTestConfig {
-        port,
+        port: 0,
         home: home.path().to_path_buf(),
         // We use AGENTSSO_TEST_KEYSTORE_FILE_BACKED, NOT
         // AGENTSSO_TEST_MASTER_KEY_HEX, because rotate-key needs to
@@ -385,7 +384,9 @@ fn auth_round_trip_against_running_daemon() {
         extra_env: vec![("AGENTSSO_TEST_KEYSTORE_FILE_BACKED".to_owned(), "1".to_owned())],
         ..Default::default()
     });
+    let port = daemon_v1.port;
     assert!(wait_for_health(port), "daemon v1 should boot");
+    crate::common::assert_daemon_pid_matches(&daemon_v1);
 
     // Phase 2 — register an agent through the control plane.
     let old_token = register_agent(port, "round-trip-agent", "gmail-read-only");
@@ -433,15 +434,16 @@ fn auth_round_trip_against_running_daemon() {
     assert_ne!(old_token, new_token, "rotation must produce a different token");
 
     // Phase 7 — re-spawn the daemon with the rotated keystore.
-    let port2 = free_port();
     let daemon_v2 = start_daemon(DaemonTestConfig {
-        port: port2,
+        port: 0,
         home: home.path().to_path_buf(),
         set_test_master_key: false,
         extra_env: vec![("AGENTSSO_TEST_KEYSTORE_FILE_BACKED".to_owned(), "1".to_owned())],
         ..Default::default()
     });
+    let port2 = daemon_v2.port;
     assert!(wait_for_health(port2), "daemon v2 should boot post-rotation");
+    crate::common::assert_daemon_pid_matches(&daemon_v2);
 
     // Phase 8 — OLD token now returns auth.invalid_token (its
     // token_hash no longer matches the rerolled record).

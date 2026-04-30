@@ -19,7 +19,7 @@ use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::common::{agentsso_bin, free_port};
+use crate::common::agentsso_bin;
 
 /// Deterministic test master key so the daemon's `try_build_agent_runtime`
 /// short-circuits past the real OS keychain lookup. Without this, a dev
@@ -30,17 +30,20 @@ use crate::common::{agentsso_bin, free_port};
 const TEST_MASTER_KEY_HEX: &str =
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-fn start_daemon(home: &std::path::Path, port: u16) -> std::process::Child {
-    Command::new(agentsso_bin())
+/// Story 7.7: zero-port + marker-read.
+fn start_daemon(home: &std::path::Path) -> (std::process::Child, u16) {
+    let mut child = Command::new(agentsso_bin())
         .arg("start")
         .arg("--bind-addr")
-        .arg(format!("127.0.0.1:{port}"))
+        .arg("127.0.0.1:0")
         .env("AGENTSSO_PATHS__HOME", home.to_str().unwrap())
         .env("AGENTSSO_TEST_MASTER_KEY_HEX", TEST_MASTER_KEY_HEX)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("failed to start daemon")
+        .expect("failed to start daemon");
+    let port = crate::common::wait_for_bound_addr(&mut child, Duration::from_secs(10)).port();
+    (child, port)
 }
 
 fn wait_for_health(port: u16, timeout: Duration) -> bool {
@@ -115,8 +118,7 @@ fn unauthenticated_service_request_returns_401_missing_token() {
     std::fs::create_dir_all(&policies_dir).unwrap();
     std::fs::write(policies_dir.join("default.toml"), RESTRICTIVE_POLICY).unwrap();
 
-    let port = free_port();
-    let mut daemon = start_daemon(home.path(), port);
+    let (mut daemon, port) = start_daemon(home.path());
 
     assert!(
         wait_for_health(port, Duration::from_secs(5)),
@@ -162,8 +164,7 @@ fn empty_policies_directory_still_returns_401_unauthenticated() {
     let policies_dir = home.path().join("policies");
     std::fs::create_dir_all(&policies_dir).unwrap();
 
-    let port = free_port();
-    let mut daemon = start_daemon(home.path(), port);
+    let (mut daemon, port) = start_daemon(home.path());
 
     assert!(
         wait_for_health(port, Duration::from_secs(5)),

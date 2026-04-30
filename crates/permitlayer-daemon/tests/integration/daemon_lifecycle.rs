@@ -19,18 +19,22 @@ use crate::common::{agentsso_bin, free_port};
 const TEST_MASTER_KEY_HEX: &str =
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
-/// Start the daemon with a given home dir and port. Returns the child process.
-fn start_daemon(home: &std::path::Path, port: u16) -> std::process::Child {
-    Command::new(agentsso_bin())
+/// Story 7.7: spawn the daemon with `:0` and read the OS-assigned
+/// port from the `AGENTSSO_BOUND_ADDR=` stdout marker. Returns
+/// `(child, port)`.
+fn start_daemon(home: &std::path::Path) -> (std::process::Child, u16) {
+    let mut child = Command::new(agentsso_bin())
         .arg("start")
         .arg("--bind-addr")
-        .arg(format!("127.0.0.1:{port}"))
+        .arg("127.0.0.1:0")
         .env("AGENTSSO_PATHS__HOME", home.to_str().unwrap())
         .env("AGENTSSO_TEST_MASTER_KEY_HEX", TEST_MASTER_KEY_HEX)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .expect("failed to start daemon")
+        .expect("failed to start daemon");
+    let port = crate::common::wait_for_bound_addr(&mut child, Duration::from_secs(10)).port();
+    (child, port)
 }
 
 /// Wait for the daemon to be ready by polling /health.
@@ -181,9 +185,7 @@ fn send_sighup(pid: u32) {
 #[test]
 fn test_cold_start_and_health() {
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-
-    let mut child = start_daemon(home.path(), port);
+    let (mut child, port) = start_daemon(home.path());
 
     // Should become healthy within 500ms (AC #1: cold-start <500ms).
     let start = Instant::now();
@@ -222,9 +224,7 @@ fn test_cold_start_and_health() {
 #[test]
 fn test_graceful_shutdown() {
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-
-    let mut child = start_daemon(home.path(), port);
+    let (mut child, port) = start_daemon(home.path());
     assert!(wait_for_health(port, Duration::from_secs(30)));
 
     let pid_path = home.path().join("agentsso.pid");
@@ -245,9 +245,7 @@ fn test_graceful_shutdown() {
 #[test]
 fn test_status_json() {
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-
-    let mut child = start_daemon(home.path(), port);
+    let (mut child, port) = start_daemon(home.path());
     assert!(wait_for_health(port, Duration::from_secs(30)));
 
     // Run `agentsso status --json`.
@@ -282,9 +280,7 @@ fn test_status_json() {
 #[test]
 fn test_stop_command() {
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-
-    let mut child = start_daemon(home.path(), port);
+    let (mut child, port) = start_daemon(home.path());
     assert!(wait_for_health(port, Duration::from_secs(30)));
 
     // Run `agentsso stop`.
@@ -415,13 +411,12 @@ fn test_invalid_config_fails_fast() {
 #[test]
 fn test_stale_pid_recovery() {
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port();
 
     // Write a stale PID file (PID that doesn't exist).
     std::fs::write(home.path().join("agentsso.pid"), "999999999\n").unwrap();
 
     // Starting should succeed — stale PID is overwritten.
-    let mut child = start_daemon(home.path(), port);
+    let (mut child, port) = start_daemon(home.path());
     assert!(
         wait_for_health(port, Duration::from_secs(30)),
         "daemon did not recover from stale PID file"
@@ -434,10 +429,13 @@ fn test_stale_pid_recovery() {
 #[test]
 fn test_double_start_fails() {
     let home = tempfile::TempDir::new().unwrap();
-    let port1 = free_port();
+    // First daemon: zero-port (Story 7.7 — atomic OS bind, no TOCTOU).
+    let (mut child1, port1) = start_daemon(home.path());
+    // Second daemon attempt deliberately uses a fixed-port pre-allocation
+    // so the test exercises the `port already in use` failure path of
+    // the daemon's PID-file guard (the failing daemon never actually
+    // binds — `acquire_pid_file` errors first).
     let port2 = free_port();
-
-    let mut child1 = start_daemon(home.path(), port1);
     assert!(wait_for_health(port1, Duration::from_secs(30)));
 
     // Attempting to start a second daemon on the same home should fail.
@@ -461,9 +459,7 @@ fn test_double_start_fails() {
 #[test]
 fn test_sighup_reload() {
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-
-    let mut child = start_daemon(home.path(), port);
+    let (mut child, port) = start_daemon(home.path());
     assert!(wait_for_health(port, Duration::from_secs(30)));
 
     // Send SIGHUP — daemon should log "configuration reloaded" and stay running.
@@ -492,12 +488,7 @@ fn test_default_binds_localhost_3820() {
     // We validate by starting the daemon on an ephemeral port (to avoid port conflict)
     // and confirming the status JSON reports the correct bind address.
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-
-    // Write TOML config with no http section — daemon should use default.
-    // But we still need a known port for the test, so write one explicitly.
-    // The real default-port assertion is in the unit test `default_config_produces_localhost_3820`.
-    let mut child = start_daemon(home.path(), port);
+    let (mut child, port) = start_daemon(home.path());
     assert!(wait_for_health(port, Duration::from_secs(30)));
 
     // Verify the status JSON output includes the bind address we expect.
@@ -525,9 +516,7 @@ fn test_default_binds_localhost_3820() {
 #[test]
 fn test_request_id_header_echoed() {
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-
-    let mut child = start_daemon(home.path(), port);
+    let (mut child, port) = start_daemon(home.path());
     assert!(wait_for_health(port, Duration::from_secs(30)));
 
     let raw = send_http_request(
@@ -547,9 +536,7 @@ fn test_request_id_header_echoed() {
 #[test]
 fn test_dns_rebind_blocked() {
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-
-    let mut child = start_daemon(home.path(), port);
+    let (mut child, port) = start_daemon(home.path());
     assert!(wait_for_health(port, Duration::from_secs(30)));
 
     let raw = send_http_request(
@@ -573,9 +560,7 @@ fn test_dns_rebind_blocked() {
 #[test]
 fn test_dns_rebind_allowed_localhost() {
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-
-    let mut child = start_daemon(home.path(), port);
+    let (mut child, port) = start_daemon(home.path());
     assert!(wait_for_health(port, Duration::from_secs(30)));
 
     // Use ephemeral port (NOT hardcoded 3000).
@@ -594,9 +579,7 @@ fn test_dns_rebind_allowed_localhost() {
 #[test]
 fn test_dns_rebind_origin_blocked() {
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-
-    let mut child = start_daemon(home.path(), port);
+    let (mut child, port) = start_daemon(home.path());
     assert!(wait_for_health(port, Duration::from_secs(30)));
 
     let raw = send_http_request(
@@ -616,9 +599,7 @@ fn test_dns_rebind_origin_blocked() {
 #[test]
 fn test_health_traverses_middleware() {
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-
-    let mut child = start_daemon(home.path(), port);
+    let (mut child, port) = start_daemon(home.path());
     assert!(wait_for_health(port, Duration::from_secs(30)));
 
     let raw = send_http_request(
@@ -679,9 +660,7 @@ fn test_non_localhost_warning() {
 #[test]
 fn test_middleware_ordering() {
     let home = tempfile::TempDir::new().unwrap();
-    let port = free_port();
-
-    let mut child = start_daemon(home.path(), port);
+    let (mut child, port) = start_daemon(home.path());
     assert!(wait_for_health(port, Duration::from_secs(30)));
 
     let routes = ["/health", "/v1/health", "/mcp", "/v1/tools/test/test"];

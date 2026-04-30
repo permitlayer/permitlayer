@@ -167,7 +167,13 @@ pub fn forward_windows_required_env() -> impl Iterator<Item = (String, String)> 
 #[derive(Debug, Clone)]
 pub struct DaemonTestConfig {
     /// TCP port the daemon will bind. Usually sourced from [`free_port`].
-    /// Must be non-zero — `start_daemon` asserts this.
+    /// Pass `0` to let the OS assign an ephemeral port atomically with
+    /// the daemon's `bind` (Story 7.7 — closes the `free_port()` TOCTOU
+    /// window). `start_daemon` reads the OS-assigned port from the
+    /// daemon's `AGENTSSO_BOUND_ADDR=<addr>` stdout marker and stores
+    /// it on `DaemonHandle.port`. Pass a concrete port only when the
+    /// test specifically needs to control which port the daemon binds
+    /// (rare).
     pub port: u16,
     /// `AGENTSSO_PATHS__HOME` for the child process.
     /// Must be a path whose parent exists — `start_daemon` asserts this
@@ -225,19 +231,24 @@ pub const TEST_MASTER_KEY_HEX: &str =
 /// Spawn `agentsso start` per [`DaemonTestConfig`] and return a
 /// drop-safe handle.
 ///
+/// **Story 7.7:** when `config.port == 0` (the recommended default),
+/// the daemon binds atomically on an OS-assigned ephemeral port and
+/// `start_daemon` reads the actual port from the
+/// `AGENTSSO_BOUND_ADDR=<addr>` stdout marker. The resolved port is
+/// stored on `DaemonHandle.port`. This eliminates the `free_port()`
+/// TOCTOU race where a sibling nextest worker could grab a
+/// pre-allocated port between `free_port`'s drop and our daemon's
+/// bind. Tests that need to control the bound port (rare) can still
+/// pass a concrete `port`.
+///
 /// # Panics
 ///
-/// - If `config.port == 0` — caller forgot to assign a port from
-///   [`free_port`]. The OS would otherwise hand the daemon a random
-///   port that the test has no way to discover.
 /// - If `config.home` is the [`SENTINEL_HOME`] sentinel — caller
 ///   forgot to override the default home path; running with the
 ///   sentinel risks two parallel tests sharing state.
+/// - If the daemon's stdout closes before emitting
+///   `AGENTSSO_BOUND_ADDR=` (when `port == 0`).
 pub fn start_daemon(config: DaemonTestConfig) -> DaemonHandle {
-    assert!(
-        config.port != 0,
-        "DaemonTestConfig::port must be non-zero — allocate one via common::free_port()",
-    );
     assert!(
         config.home.as_path() != Path::new(SENTINEL_HOME),
         "DaemonTestConfig::home must be overridden from the default sentinel — \
@@ -269,10 +280,23 @@ pub fn start_daemon(config: DaemonTestConfig) -> DaemonHandle {
         cmd.arg(a);
     }
 
-    let child =
+    let mut child =
         cmd.stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().expect("failed to spawn daemon");
 
-    DaemonHandle { child: Some(child), port: config.port }
+    let (resolved_port, captured_stdout) = if config.port == 0 {
+        // Read the marker line from stdout, which is emitted
+        // synchronously by `cli/start.rs` immediately after `bind`
+        // returns. The post-marker stdout (tracing log lines etc.) is
+        // captured into a shared buffer so `wait_with_output` can
+        // surface it to tests that grep for tracing output (e.g.
+        // `policy_compile_startup` expects "policies compiled").
+        let (addr, buffer) = wait_for_bound_addr_capturing(&mut child, Duration::from_secs(10));
+        (addr.port(), Some(buffer))
+    } else {
+        (config.port, None)
+    };
+
+    DaemonHandle { child: Some(child), port: resolved_port, captured_stdout }
 }
 
 /// Drop-safe handle to a daemon subprocess.
@@ -287,6 +311,13 @@ pub struct DaemonHandle {
     /// The port the daemon is bound to. Convenience field so tests
     /// can do `handle.port` instead of threading a separate variable.
     pub port: u16,
+    /// Captured stdout buffer when `start_daemon` used zero-port mode
+    /// (Story 7.7). The marker reader has to take `child.stdout`, so
+    /// `Child::wait_with_output` would otherwise see an empty stdout.
+    /// We background-buffer the post-marker bytes here and surface
+    /// them on `wait_with_output`. `None` for the legacy fixed-port
+    /// path where stdout was never taken.
+    captured_stdout: Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>>,
 }
 
 impl DaemonHandle {
@@ -300,6 +331,7 @@ impl DaemonHandle {
     /// captured stdout for markers like `"policies compiled"`.
     pub fn wait_with_output(mut self) -> std::io::Result<std::process::Output> {
         let mut child = self.child.take().expect("child should be present until wait_with_output");
+        let captured_stdout = self.captured_stdout.take();
 
         #[cfg(unix)]
         {
@@ -316,7 +348,9 @@ impl DaemonHandle {
             let deadline = Instant::now() + Duration::from_secs(2);
             while Instant::now() < deadline {
                 match child.try_wait() {
-                    Ok(Some(_)) => return child.wait_with_output(),
+                    Ok(Some(_)) => {
+                        return finalize_output(child, captured_stdout);
+                    }
                     Ok(None) => std::thread::sleep(Duration::from_millis(50)),
                     Err(e) => return Err(e),
                 }
@@ -333,7 +367,7 @@ impl DaemonHandle {
             let _ = child.kill();
         }
 
-        child.wait_with_output()
+        finalize_output(child, captured_stdout)
     }
 
     /// Check if the daemon has exited without blocking.
@@ -418,6 +452,28 @@ impl Drop for DaemonHandle {
     }
 }
 
+/// Story 7.7: collect captured stdout (when zero-port mode took
+/// `Child::stdout` for marker reading) and merge with the child's
+/// own stderr. `Child::wait_with_output` would return empty stdout
+/// in zero-port mode because we already drained it into our shared
+/// buffer; this helper substitutes the captured bytes.
+fn finalize_output(
+    child: Child,
+    captured_stdout: Option<std::sync::Arc<std::sync::Mutex<Vec<u8>>>>,
+) -> std::io::Result<std::process::Output> {
+    let raw = child.wait_with_output()?;
+    if let Some(buffer) = captured_stdout {
+        // Wait briefly for the background reader to finish draining
+        // the now-closed pipe so its final bytes land in the buffer.
+        // 100ms is plenty for the kernel to flush a closed pipe.
+        std::thread::sleep(Duration::from_millis(100));
+        let captured = buffer.lock().map(|b| b.clone()).unwrap_or_default();
+        Ok(std::process::Output { stdout: captured, stderr: raw.stderr, status: raw.status })
+    } else {
+        Ok(raw)
+    }
+}
+
 /// Story 7.7: read the daemon's piped stdout until the
 /// `AGENTSSO_BOUND_ADDR=<addr>` marker line appears, then return the
 /// parsed [`SocketAddr`]. Drains the rest of stdout in a background
@@ -489,6 +545,63 @@ pub fn wait_for_bound_addr(child: &mut Child, timeout: Duration) -> SocketAddr {
                         let _ = std::io::copy(&mut reader, &mut std::io::sink());
                     });
                     return addr;
+                }
+                // Some other startup line (logs etc); keep scanning.
+            }
+            Err(e) => panic!("error reading daemon stdout: {e}"),
+        }
+    }
+    panic!("timed out after {timeout:?} waiting for AGENTSSO_BOUND_ADDR marker on daemon stdout");
+}
+
+/// Story 7.7: same as [`wait_for_bound_addr`], but instead of
+/// draining post-marker stdout to `io::sink()`, capture it into a
+/// shared buffer that `start_daemon` returns alongside the resolved
+/// address. `wait_with_output` reads from this buffer (since
+/// `Child::stdout` was already taken by the marker reader).
+fn wait_for_bound_addr_capturing(
+    child: &mut Child,
+    timeout: Duration,
+) -> (SocketAddr, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+    use std::io::BufRead;
+
+    let stdout =
+        child.stdout.take().expect("child.stdout must be Stdio::piped() for wait_for_bound_addr");
+    let mut reader = std::io::BufReader::new(stdout);
+    let deadline = Instant::now() + timeout;
+    let mut line = String::new();
+
+    while Instant::now() < deadline {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => panic!("daemon stdout closed before AGENTSSO_BOUND_ADDR marker"),
+            Ok(_) => {
+                if let Some(rest) = line.trim_end().strip_prefix("AGENTSSO_BOUND_ADDR=") {
+                    let addr: SocketAddr = rest
+                        .parse()
+                        .unwrap_or_else(|e| panic!("malformed AGENTSSO_BOUND_ADDR={rest:?}: {e}"));
+                    // Capture the post-marker stdout into a shared
+                    // buffer. `wait_with_output` drains it on test
+                    // teardown so grep-on-stdout patterns
+                    // (`policy_compile_startup`, etc.) keep working.
+                    let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+                    let buffer_thread = std::sync::Arc::clone(&buffer);
+                    std::thread::spawn(move || {
+                        use std::io::Read as _;
+                        let mut chunk = [0u8; 8192];
+                        loop {
+                            match reader.read(&mut chunk) {
+                                Ok(0) => break, // pipe closed
+                                Ok(n) => {
+                                    if let Ok(mut buf) = buffer_thread.lock() {
+                                        buf.extend_from_slice(&chunk[..n]);
+                                    }
+                                }
+                                Err(_) => break,
+                            }
+                        }
+                    });
+                    return (addr, buffer);
                 }
                 // Some other startup line (logs etc); keep scanning.
             }
@@ -719,7 +832,11 @@ mod tests {
         let pid = child.id();
 
         {
-            let _handle = DaemonHandle { child: Some(child), port: 0 };
+            let _handle = DaemonHandle {
+                child: Some(child),
+                port: 0,
+                captured_stdout: None,
+            };
             // Confirm the process is alive via `kill -0 <pid>`.
             let alive = Command::new("kill").arg("-0").arg(pid.to_string()).status().unwrap();
             assert!(alive.success(), "sleep process should be alive before handle drop");
@@ -764,18 +881,11 @@ mod tests {
         );
     }
 
-    #[test]
-    #[should_panic(expected = "port must be non-zero")]
-    fn start_daemon_asserts_port_nonzero() {
-        // Constructing a DaemonTestConfig with port=0 and calling
-        // start_daemon must panic — the assertion catches the common
-        // footgun of forgetting to set `port: free_port()` before
-        // `..Default::default()`.
-        let _ = start_daemon(DaemonTestConfig {
-            home: PathBuf::from("/tmp/start-daemon-assert-test-would-never-run"),
-            ..Default::default()
-        });
-    }
+    // start_daemon_asserts_port_nonzero (Story 7.6b precedent) was
+    // removed: Story 7.7 made `port: 0` the canonical value (the
+    // daemon binds atomically and emits `AGENTSSO_BOUND_ADDR=` so
+    // tests can read the resolved port). The "footgun" the assertion
+    // guarded against is now the recommended pattern.
 
     #[test]
     #[should_panic(expected = "home must be overridden")]

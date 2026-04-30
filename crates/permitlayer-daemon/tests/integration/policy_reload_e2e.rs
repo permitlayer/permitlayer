@@ -8,7 +8,7 @@
 //!   daemon returns an error and the old set is preserved.
 //! - Assert `policy-reloaded` audit event was written on the success reload.
 
-use crate::common::{DaemonTestConfig, free_port, http_post, start_daemon, wait_for_health};
+use crate::common::{DaemonTestConfig, http_post, start_daemon, wait_for_health};
 
 const POLICY_A: &str = r#"
 [[policies]]
@@ -36,13 +36,14 @@ fn reload_lifecycle_add_and_error_and_audit() {
     std::fs::create_dir_all(&policies_dir).unwrap();
     std::fs::write(policies_dir.join("a.toml"), POLICY_A).unwrap();
 
-    let port = free_port();
     let _daemon = start_daemon(DaemonTestConfig {
-        port,
+        port: 0,
         home: home.path().to_path_buf(),
         ..Default::default()
     });
+    let port = _daemon.port;
     assert!(wait_for_health(port), "daemon should boot with policy-a");
+    crate::common::assert_daemon_pid_matches(&_daemon);
 
     // --- Reload 1: no changes, should report unchanged=1 ---
     let (status, body) = http_post(port, "/v1/control/reload", None);

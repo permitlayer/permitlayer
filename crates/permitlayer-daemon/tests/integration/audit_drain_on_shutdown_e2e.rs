@@ -20,7 +20,7 @@
 // signal-handling is the actual coverage target). Cfg-gate the
 // imports + helpers so they don't trip dead-code on Windows.
 #[cfg(unix)]
-use crate::common::{DaemonTestConfig, free_port, http_get, start_daemon, wait_for_health};
+use crate::common::{DaemonTestConfig, http_get, start_daemon, wait_for_health};
 
 #[cfg(unix)]
 use std::time::Duration;
@@ -71,13 +71,14 @@ fn fire_blocked_requests(port: u16, count: usize) {
 #[test]
 fn audit_drain_on_shutdown_preserves_all_blocked_events() {
     let home = tempfile::tempdir().unwrap();
-    let port = free_port();
     let mut daemon = start_daemon(DaemonTestConfig {
-        port,
+        port: 0,
         home: home.path().to_path_buf(),
         ..Default::default()
     });
+    let port = daemon.port;
     assert!(wait_for_health(port), "daemon should boot");
+    crate::common::assert_daemon_pid_matches(&daemon);
 
     // Activate the kill switch via the CLI over loopback. The control
     // endpoint is POST /v1/control/kill (non-idempotent; returns 200

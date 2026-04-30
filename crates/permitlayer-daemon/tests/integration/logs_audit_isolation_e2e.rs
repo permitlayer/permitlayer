@@ -24,9 +24,6 @@ use std::process::{Command, Stdio};
 #[cfg(not(windows))]
 use std::time::{Duration, Instant};
 
-#[cfg(not(windows))]
-use crate::common::free_port;
-
 /// Poll raw-HTTP `/health` up to `timeout`. Returns `true` when the
 /// daemon responds with its healthy body. Matches the pattern in
 /// `master_key_bootstrap_e2e.rs::wait_for_health` (convention: no
@@ -68,12 +65,12 @@ fn spawn_test_daemon() -> Option<(std::process::Child, tempfile::TempDir, u16)> 
         return None;
     }
     let home = tempfile::tempdir().unwrap();
-    let port = free_port();
-    let bind = format!("127.0.0.1:{port}");
-    let child = Command::new(env!("CARGO_BIN_EXE_agentsso"))
+    // Story 7.7: zero-port — the daemon binds atomically and emits the
+    // OS-assigned port on stdout via `AGENTSSO_BOUND_ADDR=`.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_agentsso"))
         .arg("start")
         .arg("--bind-addr")
-        .arg(&bind)
+        .arg("127.0.0.1:0")
         .env_clear()
         .envs(crate::common::forward_windows_required_env())
         .env("PATH", std::env::var("PATH").unwrap_or_default())
@@ -86,6 +83,8 @@ fn spawn_test_daemon() -> Option<(std::process::Child, tempfile::TempDir, u16)> 
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn agentsso start");
+    let port = crate::common::wait_for_bound_addr(&mut child, std::time::Duration::from_secs(10))
+        .port();
     Some((child, home, port))
 }
 
