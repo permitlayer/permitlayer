@@ -659,6 +659,55 @@ fn unavailable_no_tty_returns_503_approval_unavailable() {
         "/v1/tools/gmail/users/me",
         &[("authorization", &format!("Bearer {token}")), ("x-agentsso-scope", "gmail.modify")],
     );
+    if status == 401 && body.contains("auth.invalid_token") {
+        // Story 7.7 self-diagnosing dump (Phase 4a).
+        //
+        // Register returned 200 above (assert_eq inside register_agent),
+        // and `assert_daemon_pid_matches` passed at boot — so the
+        // daemon serving auth IS the same daemon that registered the
+        // agent. Yet auth still rejects the freshly-minted token. No
+        // reachable code path explains this on the same daemon: the
+        // ArcSwap snapshot store is happens-before the next load,
+        // both `state.agent_lookup_key` and `daemon_subkey` are
+        // immutable copies of the same HKDF-derived bytes, and tests
+        // don't SIGHUP. Capture every piece of state that could
+        // explain it so the next CI failure surfaces deterministic
+        // evidence instead of a mystery.
+        let (list_status, list_body) = http_get(port, "/v1/control/agent/list", &[]);
+        let (health_status, health_body) = http_get(port, "/health", &[]);
+        let agents_dir = home.path().join("agents");
+        let mut on_disk: Vec<String> = Vec::new();
+        match std::fs::read_dir(&agents_dir) {
+            Ok(entries) => {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_owned();
+                    let content = std::fs::read_to_string(&path)
+                        .unwrap_or_else(|e| format!("<read error: {e}>"));
+                    let truncated: String = content.chars().take(500).collect();
+                    on_disk.push(format!("  {name}: {truncated}"));
+                }
+            }
+            Err(e) => {
+                on_disk.push(format!("  <unable to read {}: {e}>", agents_dir.display()));
+            }
+        }
+        if on_disk.is_empty() {
+            on_disk.push(format!("  <{} is empty>", agents_dir.display()));
+        }
+        let token_prefix: String = token.chars().take(12).collect();
+        panic!(
+            "AUTH-FLAKE-DUMP (Story 7.7 Phase 4a forensic):\n\
+             daemon_pid={daemon_pid}\n\
+             port={port}\n\
+             token_first_12={token_prefix}\n\
+             auth_response: status={status} body={body}\n\
+             /v1/control/agent/list: status={list_status} body={list_body}\n\
+             /health: status={health_status} body={health_body}\n\
+             on-disk agents/ contents:\n{}\n",
+            on_disk.join("\n"),
+        );
+    }
     assert_eq!(status, 503, "no-tty should 503: {body}");
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["error"]["code"], "policy.approval_unavailable");

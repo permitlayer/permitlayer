@@ -552,6 +552,15 @@ fn control_state_endpoint_content_type_is_json() {
 /// Parse every non-blank line in `<home>/audit/*.jsonl` as a
 /// `serde_json::Value`. Ignores malformed lines (they shouldn't happen,
 /// but the test is a forensic reader not a schema enforcer).
+/// Story 7.7 Phase 4b: parse an ISO-8601 timestamp like
+/// `2026-04-30T15:14:48.092Z` into wall-clock milliseconds since the
+/// Unix epoch, falling back to `0` on parse failure (the per-test
+/// invariant catches truly empty strings; a bad-but-not-empty string
+/// that parses to 0 will fail the ordering check loudly).
+fn parse_iso8601_ms(s: &str) -> i64 {
+    chrono::DateTime::parse_from_rfc3339(s).map(|dt| dt.timestamp_millis()).unwrap_or(0)
+}
+
 fn read_audit_events(home: &std::path::Path) -> Vec<serde_json::Value> {
     let audit_dir = home.join("audit");
     let mut out = Vec::new();
@@ -673,10 +682,25 @@ fn kill_resume_audit_narrative() {
         .iter()
         .map(|e| e.get("timestamp").and_then(|v| v.as_str()).unwrap_or(""))
         .collect();
+
+    // Story 7.7 Phase 4b: Windows `chrono::Utc::now()` is backed by
+    // `GetSystemTimeAsFileTime`, which has 15.6ms default resolution.
+    // The three concurrent `kill-blocked-request` events are
+    // generated on different tokio task threads and each call
+    // `Utc::now()` independently — within a single Windows tick,
+    // wall-clock-adjacent calls can return values that don't preserve
+    // submission order. Allow up to 20ms inversion on Windows
+    // (well above the 15.6ms tick, well below any failure mode that
+    // would mask a real seconds-scale ordering bug). Unix gets
+    // microsecond-resolution monotonic time and stays strict.
+    const TIMESTAMP_INVERSION_TOLERANCE_MS: i64 = if cfg!(windows) { 20 } else { 0 };
     for i in 1..timestamps.len() {
+        let prev_ms = parse_iso8601_ms(timestamps[i - 1]);
+        let curr_ms = parse_iso8601_ms(timestamps[i]);
         assert!(
-            timestamps[i - 1] <= timestamps[i],
-            "audit events must be in timestamp order; {} > {}",
+            curr_ms + TIMESTAMP_INVERSION_TOLERANCE_MS >= prev_ms,
+            "audit events must be in timestamp order (±{}ms on Windows); {} > {}",
+            TIMESTAMP_INVERSION_TOLERANCE_MS,
             timestamps[i - 1],
             timestamps[i],
         );
