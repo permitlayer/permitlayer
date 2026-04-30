@@ -164,9 +164,24 @@ fn is_process_alive(pid: u32) -> bool {
         // documented in `lifecycle::autostart::run_with_timeout`).
         //
         // `tasklist /FI "PID eq <n>" /NH /FO CSV` exits 0 either way;
-        // when the PID exists it prints one CSV row, when it doesn't
-        // it prints "INFO: No tasks are running...". We treat the
-        // "INFO:" prefix as "not alive", anything else as "alive".
+        // when the PID exists it emits one CSV row (a line containing
+        // a literal comma, since CSV format always quotes fields). When
+        // the PID doesn't exist, modern tasklist emits an empty stdout
+        // and a "no tasks are running" message on stderr — but the
+        // exact text is locale-translated ("INFORMACIÓN:" / "情報:" /
+        // etc.), so parsing the prefix is unreliable on non-English
+        // installs. P11/P12: rely solely on whether stdout contains a
+        // CSV row (presence of a comma in a non-empty line); ignore
+        // stderr and locale-prefixes entirely.
+        //
+        // Failure mode (P11): a tasklist invocation that errors (PATH
+        // issue, locked-down policy, etc.) is treated as "not alive."
+        // The previous "treat-as-alive on subprocess error" inverted
+        // the safety property: the function is called by stale-PID
+        // recovery, so claiming-alive-when-unsure permanently blocks a
+        // crashed-daemon's recovery path. Treating-as-dead lets the
+        // new daemon attempt PID-file acquisition; the OS-level lock
+        // is the actual mutual-exclusion guarantee, not this probe.
         // Liveness check runs once per daemon startup, so the ~50ms
         // subprocess spawn cost is irrelevant.
         if pid == 0 {
@@ -181,20 +196,16 @@ fn is_process_alive(pid: u32) -> bool {
             .output()
         {
             Ok(o) => o,
-            // If we can't even invoke tasklist (PATH issue, etc.) the
-            // safe failure mode is "treat as alive" — we'd rather
-            // refuse to start than claim a stale file we couldn't
-            // verify is actually stale.
-            Err(_) => return true,
+            Err(_) => return false,
         };
         if !output.status.success() {
-            return true;
+            return false;
         }
         let stdout = String::from_utf8_lossy(&output.stdout);
-        let trimmed = stdout.trim();
-        // Empty output OR "INFO: No tasks..." both mean "no such PID".
-        // Anything else is a CSV row for the live process.
-        !trimmed.is_empty() && !trimmed.starts_with("INFO:")
+        // CSV format with /NH always quotes every field; a real PID-row
+        // therefore contains both a `"` and a `,`. Locale-translated
+        // status messages have neither.
+        stdout.lines().any(|line| line.contains(',') && line.contains('"'))
     }
 }
 

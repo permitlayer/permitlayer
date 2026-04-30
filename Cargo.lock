@@ -2229,7 +2229,6 @@ dependencies = [
  "ulid",
  "unicode-width",
  "url",
- "walkdir",
  "zeroize",
 ]
 

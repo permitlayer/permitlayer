@@ -118,7 +118,14 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
 
     // Default: existing one-shot health summary.
     match fetch_health(bind_addr).await {
-        Ok(body) => {
+        Ok(mut body) => {
+            // Story 7.7 P19: `/health` no longer exposes PID (LAN-leak
+            // fix). The status CLI already has the PID from the local
+            // PID file; inject it into the JSON output so operator
+            // tooling that grepped `parsed["pid"]` keeps working.
+            if let Some(obj) = body.as_object_mut() {
+                obj.insert("pid".to_owned(), serde_json::json!(pid));
+            }
             if args.json {
                 println!("{}", serde_json::to_string_pretty(&body).unwrap_or_default());
             } else {

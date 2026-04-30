@@ -681,6 +681,40 @@ pub(crate) async fn connections_handler(
 }
 
 // --------------------------------------------------------------------------
+// Story 7.7 P19 — `/v1/control/whoami` identity beacon.
+//
+// Replaces the unauth'd `/health` PID field with a loopback-gated
+// identity endpoint. Test seams (e.g. `assert_daemon_pid_matches`)
+// use this to detect stale-daemon-on-port collisions without
+// exposing the daemon PID to anyone on the LAN when the daemon
+// binds `0.0.0.0`.
+//
+// Auth model matches every other `/v1/control/*` endpoint: peer
+// must be loopback (`require_loopback`), enforced by axum
+// `ConnectInfo`. A LAN peer hitting this endpoint on a `0.0.0.0`
+// bind gets 403 forbidden_not_loopback — same shape as
+// `/v1/control/connections`.
+//
+// Response is intentionally minimal (PID + version) for the test-
+// seam case. Future callers (`agentsso doctor`, smoke tests) can
+// extend with `started_at`, `bind_addr`, etc. when concrete needs
+// land — premature fields would just be noise.
+// --------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub(crate) struct WhoamiResponse {
+    pub pid: u32,
+    pub version: &'static str,
+}
+
+pub(crate) async fn whoami_handler(
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+) -> Result<Json<WhoamiResponse>, ControlError> {
+    require_loopback(peer)?;
+    Ok(Json(WhoamiResponse { pid: std::process::id(), version: env!("CARGO_PKG_VERSION") }))
+}
+
+// --------------------------------------------------------------------------
 // Policy reload handler (Story 4.2).
 // --------------------------------------------------------------------------
 
@@ -1220,55 +1254,6 @@ pub(crate) async fn register_agent_handler(
         );
     }
 
-    // TODO(story-7.7): delete this block once the register-then-auth
-    // flake root cause is proven (either by this firing in CI, or by
-    // many flake-free CI runs that elevate the free_port TOCTOU
-    // hypothesis by elimination). Forensic instrumentation only — no
-    // production behavior depends on it.
-    //
-    // Self-lookup assertion: we just wrote `identity` to disk and
-    // called `replace_with` on the in-memory registry. The very next
-    // thing the test will do is auth with the bearer token we're
-    // about to return, which goes through
-    // `snapshot.lookup_by_key(&compute_lookup_key(name))` in
-    // permitlayer-proxy::middleware::auth. That HMAC computation uses
-    // the same `state.agent_lookup_key` we used to derive `lookup_key`
-    // above, so a successful self-lookup here is a strict pre-
-    // condition for the bearer token to validate on its first use.
-    //
-    // Note on the race vector this catches: `RegistrySnapshot` is a
-    // single struct (containing both `by_name` and `by_lookup_key`
-    // HashMaps) installed via a single `ArcSwap::store` — there is no
-    // two-write window between the agent record and the lookup-key
-    // index. The narrow race that COULD fire this assertion is
-    // concurrent `rotate-key` rotating `state.agent_lookup_key`
-    // between our `compute_lookup_key` call above and the registry's
-    // own recompute inside `from_agents_checked` during `replace_with`
-    // — under that race, `from_agents_checked` would skip the agent
-    // (HMAC mismatch) and the snapshot would be missing it.
-    //
-    // Log-not-fail so the agent file (already on disk) stays valid
-    // and the next SIGHUP / control reload heals the registry; the
-    // forensic log is the value here.
-    {
-        let snapshot = state.agent_registry.snapshot();
-        if snapshot.lookup_by_key(&lookup_key).is_none() {
-            tracing::error!(
-                agent_name = %identity.name(),
-                lookup_key_first_4 = ?&lookup_key[..4],
-                registry_len = snapshot.len(),
-                registry_ptr = format!("{:p}", Arc::as_ptr(&state.agent_registry)),
-                daemon_pid = std::process::id(),
-                "REGISTER-VISIBILITY-RACE: agent stored to disk + replace_with completed, \
-                 but snapshot.lookup_by_key returned None for the lookup_key we just \
-                 computed. Pair daemon_pid + registry_ptr with the auth-side \
-                 AUTH-MISS-FORENSIC log to disambiguate: matching values mean \
-                 same-daemon registry-replacement; mismatched values mean a \
-                 free_port() TOCTOU let auth land on a different daemon."
-            );
-        }
-    }
-
     // 6. Audit event (best-effort).
     //
     // Story 4.4 review fix (B7): use the `scope="-", resource=<action>`
@@ -1729,6 +1714,7 @@ pub(crate) fn router(
         .route("/v1/control/agent/remove", post(remove_agent_handler))
         .route("/v1/control/connections", get(connections_handler))
         .route("/v1/control/connectors", get(connectors_handler))
+        .route("/v1/control/whoami", get(whoami_handler))
         .with_state(state)
         .layer(permitlayer_proxy::middleware::RequestTraceLayer::new())
 }
@@ -3019,5 +3005,35 @@ mod tests {
             assert!(row["connected_since"].as_str().unwrap().ends_with('Z'));
             assert!(row["last_request_at"].as_str().unwrap().ends_with('Z'));
         }
+    }
+
+    // ── Story 7.7 P19: /v1/control/whoami ───────────────────────────
+
+    #[tokio::test]
+    async fn whoami_handler_loopback_returns_pid_and_version() {
+        let switch = Arc::new(KillSwitch::new());
+        let app = build(Arc::clone(&switch));
+        let resp = app
+            .oneshot(req_with_peer(Method::GET, "/v1/control/whoami", loopback_v4()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        // PID matches this process; version matches Cargo.toml.
+        assert_eq!(json["pid"].as_u64().unwrap(), u64::from(std::process::id()));
+        assert_eq!(json["version"].as_str().unwrap(), env!("CARGO_PKG_VERSION"));
+    }
+
+    #[tokio::test]
+    async fn whoami_handler_non_loopback_returns_403() {
+        let switch = Arc::new(KillSwitch::new());
+        let app = build(Arc::clone(&switch));
+        let resp = app
+            .oneshot(req_with_peer(Method::GET, "/v1/control/whoami", non_loopback()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"]["code"], "forbidden_not_loopback");
     }
 }

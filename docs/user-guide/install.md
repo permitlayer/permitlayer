@@ -231,75 +231,34 @@ cp target/release/agentsso /usr/local/bin/agentsso
 
 ## Verifying your download
 
-Every release artifact is signed two ways: a **platform-native**
-signature your OS already trusts (Gatekeeper / GPG / Authenticode)
-and a **cross-platform `minisign` sentinel** anyone can verify with
-one tool regardless of OS. You don't have to verify by hand — the
-install scripts and your OS's trust chain do it automatically — but
-the option is there if you want defense-in-depth.
-
-### macOS
-
-Apple Gatekeeper validates the Developer ID signature + notarization
-ticket the first time you run `agentsso`. No manual step required.
-If you want to inspect the signature explicitly:
-
-```sh
-codesign -dv --verbose=4 $(which agentsso)
-spctl --assess --type execute --verbose=4 $(which agentsso)
-```
-
-`spctl --assess` exits 0 if the binary is properly signed,
-notarized, and stapled. A non-zero exit means Gatekeeper would
-refuse the binary at first launch — re-download and report it.
-
-### Linux
-
-The `.tar.xz` release artifact ships with a `.asc` GPG signature
-sibling. Verify it before extracting:
-
-```sh
-# Fetch the public key (one-time setup):
-gpg --keyserver hkps://keys.openpgp.org --recv-keys <FINGERPRINT>
-
-# Verify the download:
-gpg --verify agentsso-<version>-x86_64-unknown-linux-gnu.tar.xz.asc \
-             agentsso-<version>-x86_64-unknown-linux-gnu.tar.xz
-```
-
-The expected fingerprint is documented in `install/install.sh`'s
-download step and on the GitHub release page.
-
-### Windows
-
-Authenticode validation happens at download time via SmartScreen
-and at first run via Windows Defender. To inspect the signature
-manually: right-click `agentsso.exe` → **Properties** → **Digital
-Signatures** tab. The signer should be the permitlayer organization.
-
-If your Authenticode cert is non-EV and recently issued, SmartScreen
-may show "Windows protected your PC" until the cert builds reputation
-(typically 3-6 months). Click **More info** → **Run anyway** if
-you've independently verified the binary via `minisign`.
-
-### Cross-platform — `minisign`
-
-Every artifact ships with a `.minisig` sibling signed by the same
-ed25519 key embedded in `install/install.sh:31` and
-`install/install.ps1:67`. Verify on any OS:
+Every release artifact ships with a `.minisig` sibling signed by an
+ed25519 key embedded in `install/install.sh` and `install/install.ps1`.
+The install scripts verify it automatically on every install — there
+is no manual step you need to take in the curl-pipe-sh / iwr-iex flow.
+If you downloaded the tarball or zip directly from the GitHub Release
+page and want to verify it by hand:
 
 ```sh
 # Fetch the embedded public key from the install script (one-time):
 curl -sSL https://github.com/permitlayer/permitlayer/raw/main/install/install.sh \
-  | grep -A1 'PERMITLAYER_PUBKEY=' \
-  | tail -1 > permitlayer.pub
+  | sed -n 's/^PUBKEY="\([^"]*\)"/\1/p' > permitlayer.pub
 
 # Verify the download:
 minisign -Vm agentsso-<version>-<target>.tar.xz -p permitlayer.pub
 ```
 
-The OS-native signatures are the path your ecosystem expects;
-`minisign` is the cross-platform belt-and-suspenders option.
+permitlayer does not currently ship platform-native signatures
+(Apple Developer ID + notarization, GPG, Authenticode) — these are
+the trust paths each OS's GUI ecosystem expects, but they require
+paid certificate provisioning out of scope for the current release.
+Until that lands, minisign is the supported integrity guarantee, plus
+the sha256 sums GitHub publishes alongside every Release. macOS users
+who download the tarball directly will see a Gatekeeper "unidentified
+developer" warning; right-click → Open works around it, or install
+via Homebrew (no warning). Windows users who download the zip
+directly will see a SmartScreen warning; click **More info** →
+**Run anyway**, or use the `install.ps1` flow which verifies via
+sha256 + minisign.
 
 ## Autostart — two mechanisms, pick one
 

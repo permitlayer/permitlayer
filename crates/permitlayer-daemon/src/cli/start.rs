@@ -107,10 +107,17 @@ struct AppState {
     pub(crate) audit_dispatcher: Arc<permitlayer_core::audit::dispatcher::AuditDispatcher>,
 }
 
+/// Body of `GET /health` and `GET /v1/health`.
+///
+/// **Story 7.7 P19**: PID is intentionally NOT exposed here — it
+/// previously leaked daemon identity to any LAN peer when the daemon
+/// bound `0.0.0.0`. The PID-identity beacon now lives at the
+/// loopback-gated `/v1/control/whoami` (see
+/// `server::control::whoami_handler`); test seams that need to verify
+/// "I'm talking to the daemon I spawned" should call that endpoint.
 #[derive(Serialize)]
 struct HealthResponse {
     status: &'static str,
-    pid: u32,
     uptime_seconds: u64,
     bind_addr: String,
     version: &'static str,
@@ -193,7 +200,6 @@ impl<S: Send + Sync> axum::extract::FromRequestParts<S> for DebugEndpointEnabled
 async fn health_handler(State(state): State<AppState>) -> Json<HealthResponse> {
     Json(HealthResponse {
         status: "healthy",
-        pid: std::process::id(),
         uptime_seconds: state.started_at.elapsed().as_secs(),
         bind_addr: state.bind_addr.to_string(),
         version: env!("CARGO_PKG_VERSION"),
@@ -2165,10 +2171,15 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         tracing::error!(addr = %bind_addr, "failed to read local_addr after bind: {source}");
         StartError::BindFailed { addr: bind_addr, source }
     })?;
-    println!("AGENTSSO_BOUND_ADDR={bound_addr}");
+    // P16 — `println!` panics on EPIPE in some Rust configurations.
+    // Use writeln! and discard errors: if stdout is closed/dead, the
+    // test harness has already given up reading and panicking won't
+    // help. Operator-interactive runs always have a live stdout.
     {
         use std::io::Write;
-        let _ = std::io::stdout().flush();
+        let mut stdout = std::io::stdout().lock();
+        let _ = writeln!(stdout, "AGENTSSO_BOUND_ADDR={bound_addr}");
+        let _ = stdout.flush();
     }
 
     // 6. Set up shutdown channel.

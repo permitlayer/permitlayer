@@ -120,23 +120,28 @@ fn wait_for_connection_recorded(port: u16, timeout: Duration) -> bool {
     false
 }
 
-/// Story 7.7 register-then-auth flake guard: hit `/health` and assert
-/// the daemon's reported `pid` matches the spawned child PID.
+/// Story 7.7 register-then-auth flake guard: hit `/v1/control/whoami`
+/// and assert the daemon's reported `pid` matches the spawned child
+/// PID.
+///
+/// **Story 7.7 P19**: probes `/v1/control/whoami` (loopback-gated)
+/// rather than `/health` because `/health` no longer exposes PID
+/// (it leaked daemon identity to LAN peers under `0.0.0.0` binds).
 fn assert_daemon_pid_matches(port: u16, expected_pid: u32) {
-    let (status, body) = http_get_loopback(port, "/health", &[]);
-    assert_eq!(status, 200, "/health should return 200, got {status}: {body}");
+    let (status, body) = http_get_loopback(port, "/v1/control/whoami", &[]);
+    assert_eq!(status, 200, "/v1/control/whoami should return 200, got {status}: {body}");
     let json: serde_json::Value = serde_json::from_str(&body)
-        .unwrap_or_else(|e| panic!("/health response not JSON: {e}\nbody: {body}"));
+        .unwrap_or_else(|e| panic!("/v1/control/whoami response not JSON: {e}\nbody: {body}"));
     let reported_pid = json
         .get("pid")
         .and_then(|p| p.as_u64())
-        .unwrap_or_else(|| panic!("/health response missing numeric pid field: {body}"));
+        .unwrap_or_else(|| panic!("/v1/control/whoami response missing numeric pid field: {body}"));
     let expected_pid = u64::from(expected_pid);
     assert_eq!(
         reported_pid, expected_pid,
-        "free_port TOCTOU: /health on port {port} reported pid {reported_pid} but our \
-         spawned daemon is pid {expected_pid}. Another test's daemon stole this port \
-         between free_port() pre-allocation and our daemon's bind."
+        "free_port TOCTOU: /v1/control/whoami on port {port} reported pid {reported_pid} \
+         but our spawned daemon is pid {expected_pid}. Another test's daemon stole this \
+         port between free_port() pre-allocation and our daemon's bind."
     );
 }
 

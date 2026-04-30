@@ -399,12 +399,10 @@ fn auth_round_trip_against_running_daemon() {
     // require a 200 (the proxy may return upstream errors), but we
     // DO require it not to be `auth.invalid_token`.
     let pre_rotation_status = authed_get_status(port, &old_token);
-    if pre_rotation_status == "auth.invalid_token" {
-        let diagnostic = collect_test_home_diagnostic(home.path(), "pre-rotation auth failed");
-        panic!(
-            "pre-rotation auth with registered token must not be rejected; got {pre_rotation_status}{diagnostic}"
-        );
-    }
+    assert_ne!(
+        pre_rotation_status, "auth.invalid_token",
+        "pre-rotation auth with registered token must not be rejected"
+    );
 
     // Phase 4 — stop the daemon. SIGTERM via wait_with_output; the
     // VaultLock + PidFile clean up on Drop.
@@ -455,97 +453,11 @@ fn auth_round_trip_against_running_daemon() {
 
     // Phase 9 — NEW token authenticates (no auth.invalid_token).
     let post_new = authed_get_status(port2, &new_token);
-    if post_new == "auth.invalid_token" {
-        let diagnostic =
-            collect_test_home_diagnostic(home.path(), "post-rotation NEW-token auth failed");
-        let _ = daemon_v2.wait_with_output();
-        panic!(
-            "post-rotation, NEW token must NOT be rejected as invalid; got {post_new}{diagnostic}\nold_token={old_token}\nnew_token={new_token}"
-        );
-    }
-
     let _ = daemon_v2.wait_with_output();
-}
-
-/// Story 7.7 Task 10 diagnostic: walk the test home dir and dump
-/// agent file contents + keystore-test presence so a CI-only failure
-/// surfaces forensic data instead of a bare panic message. Called
-/// from the auth-round-trip test on either the pre-rotation or
-/// post-rotation auth-invalid_token assert.
-#[cfg(not(windows))]
-fn collect_test_home_diagnostic(home: &std::path::Path, label: &str) -> String {
-    let mut out = format!("\n=== DIAGNOSTIC: {label} ===\n");
-    out.push_str(&format!("home: {}\n", home.display()));
-    out.push_str("\n--- home dir tree ---\n");
-    for entry in walkdir::WalkDir::new(home).into_iter().flatten() {
-        let path = entry.path();
-        let rel = path.strip_prefix(home).unwrap_or(path);
-        let kind = if path.is_dir() {
-            "DIR".to_string()
-        } else {
-            format!("FILE ({} bytes)", path.metadata().map(|m| m.len()).unwrap_or(0))
-        };
-        out.push_str(&format!("  {} {}\n", kind, rel.display()));
-    }
-    // Dump agent file contents (TOML, no secrets — lookup_key_hex
-    // and token_hash are non-reversible).
-    let agents_dir = home.join("agents");
-    if agents_dir.exists() {
-        out.push_str("\n--- agents/ contents ---\n");
-        for entry in std::fs::read_dir(&agents_dir).into_iter().flatten().flatten() {
-            let p = entry.path();
-            if let Ok(s) = std::fs::read_to_string(&p) {
-                out.push_str(&format!("  === {} ===\n", p.display()));
-                for line in s.lines() {
-                    out.push_str(&format!("    {line}\n"));
-                }
-            }
-        }
-    }
-    // Dump rotate-key-output files (mode-0o600 token files written
-    // by Phase E.5; safe to dump because the test environment is
-    // throwaway and the diagnostic is the only path to root-cause
-    // a CI-only auth failure).
-    out.push_str("\n--- rotate-key-output.* files ---\n");
-    for entry in std::fs::read_dir(home).into_iter().flatten().flatten() {
-        let name = entry.file_name();
-        let name_str = name.to_string_lossy();
-        if name_str.starts_with("rotate-key-output.") {
-            let p = entry.path();
-            if let Ok(s) = std::fs::read_to_string(&p) {
-                out.push_str(&format!("  === {} ===\n", p.display()));
-                for line in s.lines() {
-                    out.push_str(&format!("    {line}\n"));
-                }
-            }
-        }
-    }
-    // Dump keystore-test/ presence (NOT contents — those are
-    // raw key bytes).
-    let ks_dir = home.join("keystore-test");
-    if ks_dir.exists() {
-        out.push_str("\n--- keystore-test/ presence ---\n");
-        for entry in std::fs::read_dir(&ks_dir).into_iter().flatten().flatten() {
-            let p = entry.path();
-            let len = p.metadata().map(|m| m.len()).unwrap_or(0);
-            out.push_str(&format!("  {} ({} bytes)\n", p.display(), len));
-        }
-    }
-    // Dump daemon log tail — the auth handler's tracing emit (denied
-    // tokens, registry-rebuild stale-warns) gives us the missing
-    // forensic data for register-time vs auth-time subkey divergence.
-    let log_path = home.join("logs/daemon.log");
-    if log_path.exists() {
-        out.push_str("\n--- logs/daemon.log (last 100 lines) ---\n");
-        if let Ok(s) = std::fs::read_to_string(&log_path) {
-            let lines: Vec<&str> = s.lines().collect();
-            let start = lines.len().saturating_sub(100);
-            for line in &lines[start..] {
-                out.push_str(&format!("    {line}\n"));
-            }
-        }
-    }
-    out
+    assert_ne!(
+        post_new, "auth.invalid_token",
+        "post-rotation, NEW token must NOT be rejected as invalid; old_token={old_token} new_token={new_token}"
+    );
 }
 
 /// Register an agent via the loopback control endpoint and return

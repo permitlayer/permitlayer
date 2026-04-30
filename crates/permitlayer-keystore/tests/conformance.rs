@@ -175,6 +175,21 @@ fn memmem(haystack: &[u8], needle: &[u8]) -> bool {
 // Native-adapter conformance (one test per OS)
 // ================================================================
 
+/// Story 7.7 P9 / AC #2: under CI, a `BackendUnavailable` skip is a
+/// FAIL — backend availability is the whole point of the four-OS
+/// matrix. Local-dev keeps the friendly skip behavior so a dev box
+/// without (e.g.) a running gnome-keyring doesn't fail the suite.
+fn handle_backend_unavailable(os: &str, backend: &str, source: impl std::fmt::Display) {
+    if std::env::var_os("CI").is_some() {
+        panic!(
+            "{os} conformance: backend '{backend}' unavailable in CI: {source}\n\
+             AC #2 forbids skip — the matrix leg's job is to validate the production backend.\n\
+             Check the workflow's backend-prep step (e.g. gnome-keyring-daemon for Linux)."
+        );
+    }
+    eprintln!("skipping {os} conformance: backend '{backend}' unavailable: {source}");
+}
+
 #[cfg(target_os = "macos")]
 #[tokio::test]
 async fn conformance_macos() {
@@ -183,7 +198,7 @@ async fn conformance_macos() {
     let ks = match MacKeyStore::new() {
         Ok(k) => k,
         Err(KeyStoreError::BackendUnavailable { backend, source }) => {
-            eprintln!("skipping macos conformance: backend '{backend}' unavailable: {source}");
+            handle_backend_unavailable("macos", backend, source);
             return;
         }
         Err(e) => panic!("unexpected error constructing MacKeyStore: {e}"),
@@ -199,7 +214,7 @@ async fn conformance_linux() {
     let ks = match LinuxKeyStore::new() {
         Ok(k) => k,
         Err(KeyStoreError::BackendUnavailable { backend, source }) => {
-            eprintln!("skipping linux conformance: backend '{backend}' unavailable: {source}");
+            handle_backend_unavailable("linux", backend, source);
             return;
         }
         Err(e) => panic!("unexpected error constructing LinuxKeyStore: {e}"),
@@ -215,7 +230,7 @@ async fn conformance_windows() {
     let ks = match WindowsKeyStore::new() {
         Ok(k) => k,
         Err(KeyStoreError::BackendUnavailable { backend, source }) => {
-            eprintln!("skipping windows conformance: backend '{backend}' unavailable: {source}");
+            handle_backend_unavailable("windows", backend, source);
             return;
         }
         Err(e) => panic!("unexpected error constructing WindowsKeyStore: {e}"),

@@ -349,531 +349,6 @@ jobs:
           name: artifacts-signatures
           path: target/distrib/*.minisig
 
-  # permitlayer-custom (Story 7.7 Task 3 / AC #4): NFR48 binary-size
-  # gate. Asserts every tarball/zip artifact stays under 30 MB
-  # compressed AND its inner binary stays under 80 MB uncompressed.
-  # Runs in parallel with `sign` after artifacts are built; gates
-  # `host` so a binary that breached either limit never lands in a
-  # real GitHub Release. Also prints per-artifact size lines on
-  # success so operators reading the release log get a free
-  # at-a-glance binary-size trend.
-  size-assert:
-    needs:
-      - plan
-      - build-local-artifacts
-      - build-global-artifacts
-    # Same gate as `sign`: only fire on real release runs (tag push),
-    # never on PR-time `dist plan`-only runs (no artifacts to size).
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Fetch artifacts
-        uses: actions/download-artifact@v7
-        with:
-          pattern: artifacts-build-*
-          path: target/distrib/
-          merge-multiple: true
-      - name: Assert NFR48 size limits
-        # NFR48 (PRD line 1041): compressed <30 MB, uncompressed
-        # <80 MB on every platform. The compressed limit is checked
-        # against the .tar.xz / .tar.gz / .zip; the uncompressed
-        # limit is checked against the agentsso / agentsso.exe
-        # binary inside each archive.
-        run: |
-          set -euo pipefail
-          MAX_COMPRESSED=$((30 * 1000 * 1000))   # 30 MB (decimal — matches PRD copy)
-          MAX_UNCOMPRESSED=$((80 * 1000 * 1000)) # 80 MB
-          FAILED=0
-          for archive in target/distrib/*.tar.xz target/distrib/*.tar.gz target/distrib/*.zip; do
-            [ -f "$archive" ] || continue
-            COMPRESSED=$(stat -c '%s' "$archive")
-            if [ "$COMPRESSED" -gt "$MAX_COMPRESSED" ]; then
-              echo "::error file=$archive::Compressed size ${COMPRESSED} exceeds NFR48 limit (${MAX_COMPRESSED})"
-              FAILED=1
-            fi
-            # Extract to a per-archive tempdir so concurrent extraction
-            # of multiple targets can't collide on a shared name.
-            TMPDIR="$(mktemp -d)"
-            case "$archive" in
-              *.tar.xz)  tar -xJf "$archive" -C "$TMPDIR" ;;
-              *.tar.gz)  tar -xzf "$archive" -C "$TMPDIR" ;;
-              *.zip)     unzip -q "$archive" -d "$TMPDIR" ;;
-            esac
-            # Find the agentsso / agentsso.exe binary anywhere in the
-            # extracted tree (dist nests it under
-            # permitlayer-daemon-<target>/ on most platforms).
-            BIN=$(find "$TMPDIR" -type f \( -name agentsso -o -name agentsso.exe \) | head -1)
-            if [ -z "$BIN" ]; then
-              echo "::error file=$archive::Could not locate agentsso[.exe] inside archive"
-              FAILED=1
-              rm -rf "$TMPDIR"
-              continue
-            fi
-            UNCOMPRESSED=$(stat -c '%s' "$BIN")
-            if [ "$UNCOMPRESSED" -gt "$MAX_UNCOMPRESSED" ]; then
-              echo "::error file=$archive::Uncompressed binary size ${UNCOMPRESSED} exceeds NFR48 limit (${MAX_UNCOMPRESSED})"
-              FAILED=1
-            fi
-            echo "::notice::$(basename "$archive"): ${COMPRESSED} compressed, ${UNCOMPRESSED} uncompressed"
-            rm -rf "$TMPDIR"
-          done
-          if [ "$FAILED" = "1" ]; then
-            echo "::error::One or more artifacts exceeded NFR48 size limits"
-            exit 1
-          fi
-          echo "All artifacts within NFR48 size limits"
-
-  # permitlayer-custom (Story 7.7 Task 4 / AC #5): Apple Developer ID
-  # signing + notarization via Apple's notarytool. Re-archives the
-  # signed binary back into the same .tar.xz name and uploads under
-  # `artifacts-signed-macos`; `host`'s download-artifact pattern
-  # `artifacts-*` with merge-multiple: true lets the signed copy win
-  # (alphabetical ordering — `artifacts-signed-*` sorts after
-  # `artifacts-build-local-*`).
-  #
-  # SECRETS REQUIRED (Austin provisions out-of-band):
-  # - APPLE_SIGNING_CERT_P12         base64 of the .p12 from Keychain Access
-  # - APPLE_SIGNING_CERT_PASSWORD    .p12 passphrase
-  # - APPLE_SIGNING_IDENTITY         "Developer ID Application: <Name> (<TEAM_ID>)"
-  # - APPLE_ID                       Austin's Apple ID email
-  # - APPLE_TEAM_ID                  10-char from developer.apple.com
-  # - APPLE_NOTARY_PASSWORD          app-specific password (not Apple ID password)
-  #
-  # No-op gracefully when secrets are absent: the secret-presence
-  # check at the top of the sign step skips the job with a `notice`
-  # instead of failing. This lets the workflow shape validate
-  # without all the Apple infrastructure provisioned.
-  sign-macos:
-    needs:
-      - plan
-      - build-local-artifacts
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
-    runs-on: macos-14
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - name: Fetch macOS build artifacts
-        uses: actions/download-artifact@v7
-        with:
-          pattern: artifacts-build-local-*-apple-darwin*
-          path: target/distrib/
-          merge-multiple: true
-      - name: Sign and notarize macOS binaries
-        env:
-          APPLE_SIGNING_CERT_P12: ${{ secrets.APPLE_SIGNING_CERT_P12 }}
-          APPLE_SIGNING_CERT_PASSWORD: ${{ secrets.APPLE_SIGNING_CERT_PASSWORD }}
-          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-          APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          APPLE_NOTARY_PASSWORD: ${{ secrets.APPLE_NOTARY_PASSWORD }}
-        run: |
-          set -euo pipefail
-          # Skip-cleanly when secrets are absent (workflow-shape
-          # validation runs without the Apple infrastructure).
-          if [ -z "${APPLE_SIGNING_CERT_P12:-}" ] || [ -z "${APPLE_SIGNING_IDENTITY:-}" ]; then
-            echo "::notice::Apple signing secrets not configured — skipping macOS sign+notarize"
-            exit 0
-          fi
-
-          # Set up an ephemeral keychain so we don't pollute the
-          # runner's default. Tear down on EXIT regardless of outcome.
-          KEYCHAIN="build.keychain"
-          KEYCHAIN_PW="$(openssl rand -base64 24)"
-          CERT_FILE="$(mktemp).p12"
-          trap '
-            security delete-keychain "$KEYCHAIN" 2>/dev/null || true
-            rm -f "$CERT_FILE"
-          ' EXIT
-
-          security create-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
-          # Add to the search list so codesign finds the cert; keep
-          # the user keychain in front so other tooling on the runner
-          # is unaffected.
-          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
-          security default-keychain -s "$KEYCHAIN"
-          security unlock-keychain -p "$KEYCHAIN_PW" "$KEYCHAIN"
-          # Auto-lock disabled so notarization (~1-15 min) doesn't
-          # re-lock mid-flight.
-          security set-keychain-settings "$KEYCHAIN"
-
-          # Decode the cert + import. -T allows codesign access without
-          # a UI prompt; set-key-partition-list grants programmatic
-          # access (codesign won't prompt for the keychain password).
-          printf '%s' "$APPLE_SIGNING_CERT_P12" | base64 --decode > "$CERT_FILE"
-          security import "$CERT_FILE" -k "$KEYCHAIN" \
-            -P "$APPLE_SIGNING_CERT_PASSWORD" \
-            -T /usr/bin/codesign -T /usr/bin/security
-          security set-key-partition-list -S apple-tool:,apple: -s -k "$KEYCHAIN_PW" "$KEYCHAIN"
-
-          # For each macOS archive: extract → codesign the inner
-          # binary → re-archive in place → notarize → staple → verify.
-          for archive in target/distrib/*-apple-darwin.tar.xz; do
-            [ -f "$archive" ] || continue
-            echo "::group::Signing $(basename "$archive")"
-            TMPDIR="$(mktemp -d)"
-            tar -xJf "$archive" -C "$TMPDIR"
-            BIN=$(find "$TMPDIR" -type f -name agentsso | head -1)
-            if [ -z "$BIN" ]; then
-              echo "::error::Could not locate agentsso binary in $archive"
-              exit 1
-            fi
-            # --options runtime enables hardened runtime (notarization
-            # requirement). --timestamp embeds a trusted timestamp so
-            # the signature stays valid past cert expiry.
-            codesign --sign "$APPLE_SIGNING_IDENTITY" \
-                     --options runtime --timestamp \
-                     --force "$BIN"
-            codesign --verify --deep --strict --verbose=2 "$BIN"
-
-            # Re-archive in place. Preserve the original parent dir
-            # name (dist nests the binary under
-            # permitlayer-daemon-<target>/) so the .tar.xz layout is
-            # byte-identical to the unsigned version except for the
-            # binary contents.
-            ARCHIVE_NAME="$(basename "$archive")"
-            (cd "$TMPDIR" && tar -cJf "/tmp/${ARCHIVE_NAME}" .)
-            mv "/tmp/${ARCHIVE_NAME}" "$archive"
-
-            # Notarize the re-archived tarball. --wait blocks until
-            # Apple returns a decision; failure aborts the job.
-            xcrun notarytool submit "$archive" \
-              --apple-id "$APPLE_ID" \
-              --team-id "$APPLE_TEAM_ID" \
-              --password "$APPLE_NOTARY_PASSWORD" \
-              --wait
-
-            # Stapler embeds the notarization receipt so the user's
-            # first-run check works offline. Stapling operates on
-            # the archive itself (Apple unrolls it).
-            xcrun stapler staple "$archive"
-
-            rm -rf "$TMPDIR"
-            echo "::endgroup::"
-          done
-      - name: Upload signed macOS artifacts
-        if: ${{ env.APPLE_SIGNING_CERT_P12 != '' }}
-        env:
-          APPLE_SIGNING_CERT_P12: ${{ secrets.APPLE_SIGNING_CERT_P12 }}
-        uses: actions/upload-artifact@v6
-        with:
-          # `artifacts-signed-*` sorts after `artifacts-build-local-*`
-          # alphabetically; host's download-artifact step uses
-          # merge-multiple: true so the signed copy wins on filename
-          # collision.
-          name: artifacts-signed-macos
-          path: target/distrib/*-apple-darwin.tar.xz
-
-  # permitlayer-custom (Story 7.7 Task 5 / AC #6): GPG detached
-  # signatures for Linux artifacts. Produces .asc siblings; uploads
-  # to the existing `artifacts-signatures` action artifact alongside
-  # minisigs.
-  #
-  # SECRETS REQUIRED:
-  # - LINUX_GPG_PRIVATE_KEY    ASCII-armored secret key
-  # - LINUX_GPG_PASSPHRASE     passphrase for the key
-  sign-linux:
-    needs:
-      - plan
-      - build-local-artifacts
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
-    runs-on: ubuntu-latest
-    steps:
-      - name: Fetch Linux build artifacts
-        uses: actions/download-artifact@v7
-        with:
-          pattern: artifacts-build-local-*-unknown-linux-gnu*
-          path: target/distrib/
-          merge-multiple: true
-      - name: Sign Linux artifacts with GPG
-        env:
-          LINUX_GPG_PRIVATE_KEY: ${{ secrets.LINUX_GPG_PRIVATE_KEY }}
-          LINUX_GPG_PASSPHRASE: ${{ secrets.LINUX_GPG_PASSPHRASE }}
-        run: |
-          set -euo pipefail
-          if [ -z "${LINUX_GPG_PRIVATE_KEY:-}" ]; then
-            echo "::notice::Linux GPG secrets not configured — skipping GPG signing"
-            exit 0
-          fi
-          sudo apt-get update
-          sudo apt-get install -y gnupg
-
-          # Isolate the GPG home so the runner's default is untouched.
-          export GNUPGHOME="$(mktemp -d)"
-          trap 'rm -rf "$GNUPGHOME"' EXIT
-          chmod 700 "$GNUPGHOME"
-
-          printf '%s' "$LINUX_GPG_PRIVATE_KEY" | gpg --batch --import
-
-          # Detach-sign every Linux .tar.xz; verify each signature
-          # against the just-imported public key.
-          for archive in target/distrib/*-unknown-linux-gnu.tar.xz; do
-            [ -f "$archive" ] || continue
-            echo "Signing $(basename "$archive")"
-            gpg --batch --yes --pinentry-mode loopback \
-                --passphrase "$LINUX_GPG_PASSPHRASE" \
-                --armor --detach-sign "$archive"
-            gpg --verify "${archive}.asc" "$archive"
-          done
-      - name: Upload Linux signatures
-        if: ${{ env.LINUX_GPG_PRIVATE_KEY != '' }}
-        env:
-          LINUX_GPG_PRIVATE_KEY: ${{ secrets.LINUX_GPG_PRIVATE_KEY }}
-        uses: actions/upload-artifact@v6
-        with:
-          # Joins the existing artifacts-signatures bucket alongside
-          # the .minisig files; both flow into the GitHub Release via
-          # host's `gh release create ... artifacts/*`.
-          name: artifacts-signatures-gpg
-          path: target/distrib/*-unknown-linux-gnu.tar.xz.asc
-
-  # permitlayer-custom (Story 7.7 Task 6 / AC #7): Authenticode
-  # signing for the Windows .zip's inner agentsso.exe. Must run on
-  # windows-latest because signtool.exe ships with the Windows SDK
-  # (no Linux equivalent worth using — osslsigncode produces
-  # signatures Windows accepts but is harder to script in CI).
-  #
-  # SECRETS REQUIRED:
-  # - WINDOWS_SIGNING_CERT_P12        base64 of the .pfx
-  # - WINDOWS_SIGNING_CERT_PASSWORD   .pfx passphrase
-  #
-  # EV vs standard cert is an out-of-band Austin decision; signtool
-  # invocation is identical for both. Standard certs trip SmartScreen
-  # warnings until reputation builds (3-6 months at moderate
-  # download volume).
-  sign-windows:
-    needs:
-      - plan
-      - build-local-artifacts
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
-    runs-on: windows-latest
-    steps:
-      - name: Fetch Windows build artifacts
-        uses: actions/download-artifact@v7
-        with:
-          pattern: artifacts-build-local-*-pc-windows-msvc*
-          path: target/distrib/
-          merge-multiple: true
-      - name: Sign Windows binaries with Authenticode
-        shell: pwsh
-        env:
-          WINDOWS_SIGNING_CERT_P12: ${{ secrets.WINDOWS_SIGNING_CERT_P12 }}
-          WINDOWS_SIGNING_CERT_PASSWORD: ${{ secrets.WINDOWS_SIGNING_CERT_PASSWORD }}
-        run: |
-          $ErrorActionPreference = 'Stop'
-          if (-not $env:WINDOWS_SIGNING_CERT_P12) {
-            Write-Host "::notice::Windows Authenticode secrets not configured — skipping Windows signing"
-            exit 0
-          }
-
-          # Decode the .pfx into a tempfile; clean up after.
-          $pfxPath = Join-Path $env:RUNNER_TEMP "agentsso-signing.pfx"
-          [System.IO.File]::WriteAllBytes(
-            $pfxPath,
-            [System.Convert]::FromBase64String($env:WINDOWS_SIGNING_CERT_P12)
-          )
-          try {
-            # Locate signtool (ships in the Windows SDK; the path
-            # varies between SDK versions — Get-Command + the
-            # -Resolve flag finds whichever the runner has).
-            $signtool = (Get-ChildItem `
-              "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" `
-              -Recurse | Sort-Object FullName -Descending | Select-Object -First 1).FullName
-            if (-not $signtool) {
-              Write-Error "signtool.exe not found on runner"
-              exit 1
-            }
-            Write-Host "Using signtool: $signtool"
-
-            foreach ($zip in Get-ChildItem "target/distrib/*-pc-windows-msvc.zip") {
-              Write-Host "::group::Signing $($zip.Name)"
-              $extractDir = Join-Path $env:RUNNER_TEMP "extract-$([guid]::NewGuid())"
-              Expand-Archive -Path $zip.FullName -DestinationPath $extractDir -Force
-              $exe = Get-ChildItem -Path $extractDir -Recurse -Filter agentsso.exe | Select-Object -First 1
-              if (-not $exe) {
-                Write-Error "agentsso.exe not found in $($zip.Name)"
-                exit 1
-              }
-              # /tr — trusted timestamp URL keeps the signature valid
-              # past cert expiry. /td + /fd pin SHA-256 (NIST current).
-              # /pa default policy at verify time.
-              & $signtool sign `
-                /f $pfxPath `
-                /p $env:WINDOWS_SIGNING_CERT_PASSWORD `
-                /tr http://timestamp.digicert.com `
-                /td sha256 /fd sha256 `
-                $exe.FullName
-              if ($LASTEXITCODE -ne 0) {
-                Write-Error "signtool sign failed (exit $LASTEXITCODE)"
-                exit 1
-              }
-              & $signtool verify /pa /v $exe.FullName
-              if ($LASTEXITCODE -ne 0) {
-                Write-Error "signtool verify failed (exit $LASTEXITCODE)"
-                exit 1
-              }
-              # Re-archive: dist's .zip layout is flat
-              # (permitlayer-daemon-<target>/agentsso.exe at root of
-              # the zip), so Compress-Archive of the extract dir
-              # contents preserves that.
-              Remove-Item -Force $zip.FullName
-              Compress-Archive -Path "$extractDir\*" -DestinationPath $zip.FullName
-              Remove-Item -Recurse -Force $extractDir
-              Write-Host "::endgroup::"
-            }
-          } finally {
-            Remove-Item -Force $pfxPath -ErrorAction SilentlyContinue
-          }
-      - name: Upload signed Windows artifacts
-        if: ${{ env.WINDOWS_SIGNING_CERT_P12 != '' }}
-        env:
-          WINDOWS_SIGNING_CERT_P12: ${{ secrets.WINDOWS_SIGNING_CERT_P12 }}
-        uses: actions/upload-artifact@v6
-        with:
-          name: artifacts-signed-windows
-          path: target/distrib/*-pc-windows-msvc.zip
-
-  # permitlayer-custom (Story 7.7 Task 7 / AC #8): end-to-end
-  # signature verification across all four signing chains. Final
-  # gate before `host` uploads to a real GitHub Release. A release
-  # that gets past this job is provably signed and verifiable
-  # end-to-end.
-  verify-signatures:
-    needs:
-      - plan
-      - sign
-      - sign-macos
-      - sign-linux
-      - sign-windows
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.sign.result == 'success' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, macos-14, windows-latest]
-    runs-on: ${{ matrix.os }}
-    steps:
-      - uses: actions/checkout@v6
-        with:
-          persist-credentials: false
-      - name: Fetch all signed artifacts
-        uses: actions/download-artifact@v7
-        with:
-          pattern: artifacts-*
-          path: target/distrib/
-          merge-multiple: true
-      - name: Verify minisigs (cross-platform sentinel — Linux only)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y minisign
-          # Extract embedded pubkey from install.sh (single source of
-          # truth — same one the curl|sh path verifies against).
-          PUB="$(grep -A1 'PERMITLAYER_PUBKEY=' install/install.sh | tail -1 | tr -d "'\\\\")"
-          echo "$PUB" > /tmp/permitlayer.pub
-          for sig in target/distrib/*.minisig; do
-            [ -f "$sig" ] || continue
-            archive="${sig%.minisig}"
-            echo "Verifying minisig: $(basename "$archive")"
-            minisign -Vm "$archive" -p /tmp/permitlayer.pub
-          done
-      - name: Verify Linux GPG signatures
-        if: matrix.os == 'ubuntu-latest'
-        env:
-          LINUX_GPG_PRIVATE_KEY: ${{ secrets.LINUX_GPG_PRIVATE_KEY }}
-        run: |
-          set -euo pipefail
-          # Skip if the GPG sign step was skipped (no secrets).
-          shopt -s nullglob
-          asc_files=(target/distrib/*-unknown-linux-gnu.tar.xz.asc)
-          if [ "${#asc_files[@]}" -eq 0 ]; then
-            echo "::notice::No Linux .asc signatures found — skipping GPG verify"
-            exit 0
-          fi
-          if [ -z "${LINUX_GPG_PRIVATE_KEY:-}" ]; then
-            echo "::warning::.asc files present but LINUX_GPG_PRIVATE_KEY missing; cannot import pubkey for verify"
-            exit 0
-          fi
-          sudo apt-get install -y gnupg
-          export GNUPGHOME="$(mktemp -d)"
-          trap 'rm -rf "$GNUPGHOME"' EXIT
-          chmod 700 "$GNUPGHOME"
-          # Import the same key that signed (we don't ship a separate
-          # pubkey distribution channel — keys.openpgp.org is the
-          # operator path; CI verifies against the secret it just used).
-          printf '%s' "$LINUX_GPG_PRIVATE_KEY" | gpg --batch --import
-          for asc in "${asc_files[@]}"; do
-            archive="${asc%.asc}"
-            echo "Verifying GPG: $(basename "$archive")"
-            gpg --verify "$asc" "$archive"
-          done
-      - name: Verify macOS Developer ID + notarization
-        if: matrix.os == 'macos-14'
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          archives=(target/distrib/*-apple-darwin.tar.xz)
-          if [ "${#archives[@]}" -eq 0 ]; then
-            echo "::notice::No macOS archives found — skipping codesign verify"
-            exit 0
-          fi
-          for archive in "${archives[@]}"; do
-            echo "Verifying $(basename "$archive")"
-            TMPDIR="$(mktemp -d)"
-            tar -xJf "$archive" -C "$TMPDIR"
-            BIN=$(find "$TMPDIR" -type f -name agentsso | head -1)
-            if [ -z "$BIN" ]; then
-              echo "::error::Could not locate agentsso binary in $archive"
-              exit 1
-            fi
-            # codesign verify: assert the binary IS signed (will
-            # work even on unsigned binaries' un-notarized state).
-            # spctl --assess: assert Gatekeeper would accept it
-            # (requires notarization).
-            if codesign --verify --deep --strict --verbose=2 "$BIN" 2>&1; then
-              echo "codesign verify passed for $(basename "$archive")"
-              # Only run spctl if the binary is signed (skip-clean
-              # when the sign-macos job was skipped due to absent
-              # secrets).
-              if spctl --assess --type execute --verbose=2 "$BIN" 2>&1; then
-                echo "spctl assess passed for $(basename "$archive")"
-              else
-                echo "::warning::spctl assess failed for $(basename "$archive") — notarization may be missing"
-              fi
-            else
-              echo "::notice::Binary in $(basename "$archive") is unsigned — sign-macos likely skipped (no secrets)"
-            fi
-            rm -rf "$TMPDIR"
-          done
-      - name: Verify Windows Authenticode
-        if: matrix.os == 'windows-latest'
-        shell: pwsh
-        run: |
-          $ErrorActionPreference = 'Stop'
-          $zips = Get-ChildItem "target/distrib/*-pc-windows-msvc.zip" -ErrorAction SilentlyContinue
-          if (-not $zips) {
-            Write-Host "::notice::No Windows zips found — skipping Authenticode verify"
-            exit 0
-          }
-          $signtool = (Get-ChildItem `
-            "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\signtool.exe" `
-            -Recurse | Sort-Object FullName -Descending | Select-Object -First 1).FullName
-          foreach ($zip in $zips) {
-            Write-Host "Verifying $($zip.Name)"
-            $extractDir = Join-Path $env:RUNNER_TEMP "verify-$([guid]::NewGuid())"
-            Expand-Archive -Path $zip.FullName -DestinationPath $extractDir -Force
-            $exe = Get-ChildItem -Path $extractDir -Recurse -Filter agentsso.exe | Select-Object -First 1
-            if (-not $exe) {
-              Write-Error "agentsso.exe not found in $($zip.Name)"
-              exit 1
-            }
-            & $signtool verify /pa /v $exe.FullName
-            if ($LASTEXITCODE -ne 0) {
-              Write-Host "::notice::Authenticode verify failed — sign-windows likely skipped (no secrets)"
-            }
-            Remove-Item -Recurse -Force $extractDir
-          }
-
   # Determines if we should publish/announce
   host:
     needs:
@@ -881,16 +356,8 @@ jobs:
       - build-local-artifacts
       - build-global-artifacts
       - sign
-      - size-assert
-      - sign-macos
-      - sign-linux
-      - sign-windows
-      - verify-signatures
-    # Only run if we're "publishing", sign + size-assert + all
-    # platform-native sign jobs + verify-signatures succeeded.
-    # Sign jobs that no-op (no secrets) still report `success` —
-    # only a real signing failure or verify mismatch blocks here.
-    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.sign.result == 'success' && needs.size-assert.result == 'success' && needs.sign-macos.result == 'success' && needs.sign-linux.result == 'success' && needs.sign-windows.result == 'success' && needs.verify-signatures.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
+    # Only run if we're "publishing" and minisign succeeded.
+    if: ${{ always() && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.sign.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.build-local-artifacts.result == 'skipped' || needs.build-local-artifacts.result == 'success') }}
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
     runs-on: "ubuntu-22.04"
@@ -1515,7 +982,7 @@ jobs:
           # install.sh defaults to ~/.local/bin; add to PATH for
           # subsequent steps.
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-      - name: Assert version + rotate-key --help
+      - name: Assert version + update-check + rotate-key --help
         run: |
           set -euo pipefail
           EXPECTED_VERSION="${TAG#v}"
@@ -1525,6 +992,13 @@ jobs:
             echo "::error::version mismatch — expected '$EXPECTED_LINE', got '$INSTALLED'"
             exit 1
           fi
+          # Story 7.7 P6 / AC #9 — agentsso update check-only smoke
+          # (Story 7.5 cross-story note in deferred-work.md:175-178).
+          # Check-only is the default when `--apply` is absent; we
+          # just installed the latest tag, so the report should be
+          # "already on latest" or equivalent. NEVER use --apply
+          # (staging a real new release is out of smoke-test scope).
+          agentsso update
           agentsso rotate-key --help > /dev/null
       - name: Uninstall smoke (keep binary)
         run: agentsso uninstall --yes --keep-binary || true
@@ -1560,7 +1034,15 @@ jobs:
           New-Item -ItemType Directory -Force -Path $sandbox | Out-Null
           $env:AGENTSSO_INSTALL_DIR = $sandbox
           iwr -useb "https://github.com/permitlayer/permitlayer/releases/download/$env:TAG/install.ps1" | iex
-          echo "$sandbox" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          # Story 7.7 P14 — append PATH without BOM. PS 5.1's `utf8`
+          # encoding writes a BOM that prefixes the first GITHUB_PATH
+          # entry and breaks subsequent cmd.exe / bash.exe steps.
+          # Use AppendAllText with explicit no-BOM UTF-8 instead.
+          [System.IO.File]::AppendAllText(
+            $env:GITHUB_PATH,
+            "$sandbox`r`n",
+            (New-Object System.Text.UTF8Encoding $false)
+          )
       - name: Assert version + rotate-key --help
         shell: pwsh
         run: |
@@ -1612,10 +1094,33 @@ jobs:
     steps:
       - name: Set up Node + Inspector
         run: |
-          # Pin a known-good version; revisit when the inspector
-          # evolves. Bumping is a deliberate one-line change here
-          # rather than a silent floating-version drift.
-          npm install -g @modelcontextprotocol/inspector@0.16.0
+          set -euo pipefail
+          # Story 7.7 P22 — pin by SHA-512 integrity, not just version.
+          # `npm install -g <name>@<version>` would silently accept a
+          # post-publish-overwrite (rare but happens). Download the
+          # tarball, verify the integrity hash matches the registry's
+          # published value at story-write time, then install from
+          # the verified local tarball. --ignore-scripts blocks any
+          # post-install hook from executing during release-time when
+          # GITHUB_TOKEN is in env.
+          #
+          # To bump: `npm view @modelcontextprotocol/inspector@<new-version> dist.integrity dist.tarball`
+          # then update both EXPECTED_INTEGRITY and TARBALL_URL below.
+          EXPECTED_INTEGRITY='sha512-/bPEZlH9Q6xHdSXFebLcc9GbPGrpZAqKgNKuK78L6PKZZQQAxjqeiq84w65t+zT1HH7fyg96smqkS82YStqyyg=='
+          TARBALL_URL='https://registry.npmjs.org/@modelcontextprotocol/inspector/-/inspector-0.16.0.tgz'
+          TARBALL="$RUNNER_TEMP/mcp-inspector.tgz"
+          curl -sSL --fail "$TARBALL_URL" -o "$TARBALL"
+          # Compute sha512 of the tarball; format as `sha512-<base64>`
+          # to match npm's integrity-string convention.
+          ACTUAL_INTEGRITY="sha512-$(openssl dgst -sha512 -binary "$TARBALL" | base64 -w 0)"
+          if [ "$ACTUAL_INTEGRITY" != "$EXPECTED_INTEGRITY" ]; then
+            echo "::error::Inspector tarball integrity mismatch"
+            echo "::error::expected: $EXPECTED_INTEGRITY"
+            echo "::error::actual:   $ACTUAL_INTEGRITY"
+            exit 1
+          fi
+          echo "Inspector tarball integrity verified: $ACTUAL_INTEGRITY"
+          npm install -g --ignore-scripts "$TARBALL"
       - name: Set up secret-service backend
         env:
           KEYRING_PW: test-passphrase-ci-only
@@ -1640,23 +1145,29 @@ jobs:
           agentsso start --foreground &
           DAEMON_PID=$!
           trap 'kill -TERM $DAEMON_PID 2>/dev/null || true; wait $DAEMON_PID 2>/dev/null || true' EXIT
-          # Wait up to 30s for the daemon to bind localhost:3820.
+          # Wait up to 30s for the daemon to bind 127.0.0.1:3820.
+          # Story 7.7 P20 — pin IPv4 explicitly. `nc -z localhost`
+          # prefers v4 but the resolver order varies; if the daemon
+          # bound IPv6 ::1 first (or a stale IPv6 listener exists),
+          # the v4-preferring nc returns false-negative on a working
+          # daemon. The daemon binds 127.0.0.1 by default so the
+          # explicit IPv4 address is the canonical probe target.
           for i in $(seq 1 60); do
-            if nc -z localhost 3820; then
-              echo "daemon bound localhost:3820 after $i × 0.5s"
+            if nc -z 127.0.0.1 3820; then
+              echo "daemon bound 127.0.0.1:3820 after $i × 0.5s"
               break
             fi
             sleep 0.5
           done
-          if ! nc -z localhost 3820; then
-            echo "::error::daemon did not bind localhost:3820 within 30s"
+          if ! nc -z 127.0.0.1 3820; then
+            echo "::error::daemon did not bind 127.0.0.1:3820 within 30s"
             exit 1
           fi
           # Run the Inspector conformance pass. The exact CLI shape
           # may evolve — confirm with `mcp-inspector --help` if this
           # breaks; capture the working invocation in story
           # Completion Notes.
-          mcp-inspector test --transport http --url http://localhost:3820 --conformance
+          mcp-inspector test --transport http --url http://127.0.0.1:3820 --conformance
       - name: Partial-failure issue on error
         if: failure()
         run: |

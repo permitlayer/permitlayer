@@ -510,48 +510,68 @@ fn finalize_output(
 /// the race) or refactor to read stdout themselves and parse the
 /// marker inline.
 pub fn wait_for_bound_addr(child: &mut Child, timeout: Duration) -> SocketAddr {
-    use std::io::BufRead;
-
     let stdout =
         child.stdout.take().expect("child.stdout must be Stdio::piped() for wait_for_bound_addr");
-    let mut reader = std::io::BufReader::new(stdout);
     let deadline = Instant::now() + timeout;
-    let mut line = String::new();
 
-    while Instant::now() < deadline {
-        line.clear();
-        // BufRead::read_line can't natively honor the deadline. We
-        // accept a worst-case "single line longer than `timeout`" hang
-        // because `agentsso start` writes the marker line synchronously
-        // immediately after `bind` returns, before any other stdout is
-        // generated — so the caller's timeout is effectively bounded by
-        // daemon-bind latency, not arbitrary stdout chatter.
-        match reader.read_line(&mut line) {
-            Ok(0) => panic!("daemon stdout closed before AGENTSSO_BOUND_ADDR marker"),
-            Ok(_) => {
+    // Story 7.7 P17 — read lines on a background thread with a
+    // bounded channel; main thread enforces the deadline via
+    // recv_timeout. This bounds per-line wait by the deadline rather
+    // than by `BufRead::read_line`'s unbounded blocking on a single
+    // long line. The reader thread keeps the BufReader alive after
+    // the marker arrives so post-marker stdout can be drained on
+    // close (via the same thread continuing to read into io::sink).
+    let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
+    std::thread::spawn(move || {
+        use std::io::BufRead;
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => break,
+                Ok(_) => {
+                    if tx.send(Ok(line.clone())).is_err() {
+                        // Receiver dropped (marker found); drain
+                        // remaining stdout to keep the daemon's pipe
+                        // unblocked, then exit.
+                        let _ = std::io::copy(&mut reader, &mut std::io::sink());
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            }
+        }
+    });
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!(
+                "timed out after {timeout:?} waiting for AGENTSSO_BOUND_ADDR marker on daemon stdout"
+            );
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(Ok(line)) => {
                 if let Some(rest) = line.trim_end().strip_prefix("AGENTSSO_BOUND_ADDR=") {
-                    let addr: SocketAddr = rest
+                    return rest
                         .parse()
                         .unwrap_or_else(|e| panic!("malformed AGENTSSO_BOUND_ADDR={rest:?}: {e}"));
-                    // Drain the remaining stdout to /dev/null so the
-                    // daemon never blocks on a full kernel pipe. Use
-                    // `io::sink()` (zero-alloc, swallows everything)
-                    // instead of a `Vec` — a chatty daemon would
-                    // otherwise grow the buffer unboundedly. The
-                    // background thread exits when the daemon's stdout
-                    // pipe closes, which DaemonHandle::Drop guarantees
-                    // via child.kill().
-                    std::thread::spawn(move || {
-                        let _ = std::io::copy(&mut reader, &mut std::io::sink());
-                    });
-                    return addr;
                 }
                 // Some other startup line (logs etc); keep scanning.
             }
-            Err(e) => panic!("error reading daemon stdout: {e}"),
+            Ok(Err(e)) => panic!("error reading daemon stdout: {e}"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                "timed out after {timeout:?} waiting for AGENTSSO_BOUND_ADDR marker on daemon stdout"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("daemon stdout closed before AGENTSSO_BOUND_ADDR marker")
+            }
         }
     }
-    panic!("timed out after {timeout:?} waiting for AGENTSSO_BOUND_ADDR marker on daemon stdout");
 }
 
 /// Story 7.7: same as [`wait_for_bound_addr`], but instead of
@@ -563,35 +583,40 @@ fn wait_for_bound_addr_capturing(
     child: &mut Child,
     timeout: Duration,
 ) -> (SocketAddr, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
-    use std::io::BufRead;
-
     let stdout =
         child.stdout.take().expect("child.stdout must be Stdio::piped() for wait_for_bound_addr");
-    let mut reader = std::io::BufReader::new(stdout);
     let deadline = Instant::now() + timeout;
-    let mut line = String::new();
 
-    while Instant::now() < deadline {
-        line.clear();
-        match reader.read_line(&mut line) {
-            Ok(0) => panic!("daemon stdout closed before AGENTSSO_BOUND_ADDR marker"),
-            Ok(_) => {
-                if let Some(rest) = line.trim_end().strip_prefix("AGENTSSO_BOUND_ADDR=") {
-                    let addr: SocketAddr = rest
-                        .parse()
-                        .unwrap_or_else(|e| panic!("malformed AGENTSSO_BOUND_ADDR={rest:?}: {e}"));
-                    // Capture the post-marker stdout into a shared
-                    // buffer. `wait_with_output` drains it on test
-                    // teardown so grep-on-stdout patterns
-                    // (`policy_compile_startup`, etc.) keep working.
-                    let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-                    let buffer_thread = std::sync::Arc::clone(&buffer);
-                    std::thread::spawn(move || {
-                        use std::io::Read as _;
+    // Story 7.7 P17 — same per-line deadline pattern as
+    // `wait_for_bound_addr`. Reader thread emits lines pre-marker
+    // over a channel; once the marker is found, we send a sentinel
+    // to the reader thread (via dropping the parsed-line receiver)
+    // and switch the same thread to capturing post-marker bytes
+    // into the shared buffer that `wait_with_output` drains on
+    // teardown.
+    let buffer = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let buffer_thread = std::sync::Arc::clone(&buffer);
+    let (tx, rx) = std::sync::mpsc::channel::<std::io::Result<String>>();
+    std::thread::spawn(move || {
+        use std::io::{BufRead, Read as _};
+        let mut reader = std::io::BufReader::new(stdout);
+        let mut line = String::new();
+        // Pre-marker phase: emit each line over the channel so the
+        // main thread can scan for the marker with a per-line
+        // deadline.
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => return,
+                Ok(_) => {
+                    if tx.send(Ok(line.clone())).is_err() {
+                        // Receiver dropped → marker found. Switch to
+                        // capture phase: read remaining bytes into
+                        // the shared buffer until the pipe closes.
                         let mut chunk = [0u8; 8192];
                         loop {
                             match reader.read(&mut chunk) {
-                                Ok(0) => break, // pipe closed
+                                Ok(0) => break,
                                 Ok(n) => {
                                     if let Ok(mut buf) = buffer_thread.lock() {
                                         buf.extend_from_slice(&chunk[..n]);
@@ -600,15 +625,43 @@ fn wait_for_bound_addr_capturing(
                                 Err(_) => break,
                             }
                         }
-                    });
+                        return;
+                    }
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e));
+                    return;
+                }
+            }
+        }
+    });
+
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            panic!(
+                "timed out after {timeout:?} waiting for AGENTSSO_BOUND_ADDR marker on daemon stdout"
+            );
+        }
+        match rx.recv_timeout(remaining) {
+            Ok(Ok(line)) => {
+                if let Some(rest) = line.trim_end().strip_prefix("AGENTSSO_BOUND_ADDR=") {
+                    let addr: SocketAddr = rest
+                        .parse()
+                        .unwrap_or_else(|e| panic!("malformed AGENTSSO_BOUND_ADDR={rest:?}: {e}"));
                     return (addr, buffer);
                 }
                 // Some other startup line (logs etc); keep scanning.
             }
-            Err(e) => panic!("error reading daemon stdout: {e}"),
+            Ok(Err(e)) => panic!("error reading daemon stdout: {e}"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => panic!(
+                "timed out after {timeout:?} waiting for AGENTSSO_BOUND_ADDR marker on daemon stdout"
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("daemon stdout closed before AGENTSSO_BOUND_ADDR marker")
+            }
         }
     }
-    panic!("timed out after {timeout:?} waiting for AGENTSSO_BOUND_ADDR marker on daemon stdout");
 }
 
 /// Story 7.7: assert that a `/health` response came from the daemon
@@ -623,18 +676,21 @@ fn wait_for_bound_addr_capturing(
 /// Cheap (one HTTP GET against loopback). Safe to call after
 /// [`wait_for_health`] in any test that uses [`start_daemon`].
 pub fn assert_daemon_pid_matches(handle: &DaemonHandle) {
-    let (status, body) = http_get(handle.port, "/health");
-    assert_eq!(status, 200, "/health should return 200, got {status}: {body}");
+    // Story 7.7 P19 — `/v1/control/whoami` is the loopback-gated
+    // identity beacon. `/health` no longer exposes PID (it leaked
+    // daemon identity to LAN peers when bound `0.0.0.0`).
+    let (status, body) = http_get(handle.port, "/v1/control/whoami");
+    assert_eq!(status, 200, "/v1/control/whoami should return 200, got {status}: {body}");
     let json: serde_json::Value = serde_json::from_str(&body)
-        .unwrap_or_else(|e| panic!("/health response not JSON: {e}\nbody: {body}"));
+        .unwrap_or_else(|e| panic!("/v1/control/whoami response not JSON: {e}\nbody: {body}"));
     let reported_pid = json
         .get("pid")
         .and_then(|p| p.as_u64())
-        .unwrap_or_else(|| panic!("/health response missing numeric pid field: {body}"));
+        .unwrap_or_else(|| panic!("/v1/control/whoami response missing numeric pid field: {body}"));
     let expected_pid = u64::from(handle.child_pid());
     assert_eq!(
         reported_pid, expected_pid,
-        "free_port TOCTOU: /health on port {} reported pid {reported_pid} but our \
+        "free_port TOCTOU: /v1/control/whoami on port {} reported pid {reported_pid} but our \
          spawned daemon is pid {expected_pid}. Another test's daemon stole this port \
          between free_port() pre-allocation and our daemon's bind. See Story 7.7 \
          dev notes for migration to wait_for_bound_addr.",
