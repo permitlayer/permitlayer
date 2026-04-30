@@ -155,49 +155,46 @@ fn is_process_alive(pid: u32) -> bool {
             None => false, // Invalid PID range — treat as not alive.
         }
     }
-    #[cfg(windows)]
+    #[cfg(not(unix))]
     {
-        // Windows: OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION) + GetExitCodeProcess.
-        // PROCESS_QUERY_LIMITED_INFORMATION is granted across most ACL boundaries
-        // (deliberately weaker than PROCESS_QUERY_INFORMATION) so we can probe
-        // foreign-user processes without elevating. If OpenProcess fails the
-        // process is either gone or unqueryable; treat both as "not alive" so
-        // the stale-PID branch can claim the file.
+        // Windows: shell out to `tasklist` because the crate root has
+        // `#![forbid(unsafe_code)]` and OpenProcess/GetExitCodeProcess
+        // both require unsafe blocks (`#[allow(unsafe_code)]` doesn't
+        // override `forbid` at child scope — same M13/D10 constraint
+        // documented in `lifecycle::autostart::run_with_timeout`).
         //
-        // GetExitCodeProcess returns STILL_ACTIVE (259) for a running process.
-        // A process that's exited cleanly with that exact code (rare but legal)
-        // would be misclassified as alive — acceptable since the worst case is
-        // we refuse to start, which is the safe failure mode for a liveness
-        // check. The PID was about to be reused by Windows anyway after exit.
-        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
-        use windows_sys::Win32::System::Threading::{
-            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-        };
+        // `tasklist /FI "PID eq <n>" /NH /FO CSV` exits 0 either way;
+        // when the PID exists it prints one CSV row, when it doesn't
+        // it prints "INFO: No tasks are running...". We treat the
+        // "INFO:" prefix as "not alive", anything else as "alive".
+        // Liveness check runs once per daemon startup, so the ~50ms
+        // subprocess spawn cost is irrelevant.
         if pid == 0 {
             return false;
         }
-        // SAFETY: OpenProcess is a thread-safe Win32 syscall; arguments are
-        // documented as primitive-safe.
-        let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
-        if handle.is_null() {
-            return false;
+        let output = match std::process::Command::new("tasklist")
+            .arg("/FI")
+            .arg(format!("PID eq {pid}"))
+            .arg("/NH")
+            .arg("/FO")
+            .arg("CSV")
+            .output()
+        {
+            Ok(o) => o,
+            // If we can't even invoke tasklist (PATH issue, etc.) the
+            // safe failure mode is "treat as alive" — we'd rather
+            // refuse to start than claim a stale file we couldn't
+            // verify is actually stale.
+            Err(_) => return true,
+        };
+        if !output.status.success() {
+            return true;
         }
-        let mut exit_code: u32 = 0;
-        // SAFETY: handle is non-null per the check above; exit_code is a
-        // stack-resident u32 owned by this frame.
-        let ok = unsafe { GetExitCodeProcess(handle, &mut exit_code as *mut u32) };
-        // SAFETY: handle came from a successful OpenProcess; CloseHandle
-        // accepts any non-null process handle.
-        unsafe { CloseHandle(handle) };
-        ok != 0 && exit_code == STILL_ACTIVE as u32
-    }
-    #[cfg(not(any(unix, windows)))]
-    {
-        // No supported liveness probe on this platform; conservatively
-        // treat the PID as alive so we never claim a stale file we can't
-        // verify is actually stale.
-        let _ = pid;
-        true
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let trimmed = stdout.trim();
+        // Empty output OR "INFO: No tasks..." both mean "no such PID".
+        // Anything else is a CSV row for the live process.
+        !trimmed.is_empty() && !trimmed.starts_with("INFO:")
     }
 }
 

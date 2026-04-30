@@ -126,18 +126,6 @@ flate2 = "1.0"
 tar = { workspace = true }
 semver = { workspace = true }
 
-[target.'cfg(windows)'.dependencies]
-# Story 7.7: Win32 OpenProcess + GetExitCodeProcess for the PID
-# liveness check in `lifecycle::pid::is_process_alive`. Without this
-# the previous `cfg(not(unix))` branch always returned `true`, which
-# both broke the `stale_pid_is_cleaned_up` test on windows-latest
-# AND meant a crashed daemon's PID file would permanently block
-# every subsequent startup until the operator manually removed it.
-windows-sys = { version = "0.59", features = [
-    "Win32_Foundation",
-    "Win32_System_Threading",
-] }
-
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
 # Story 7.6b round-2 review: rotation-state marker file uses

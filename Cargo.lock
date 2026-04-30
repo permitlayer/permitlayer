@@ -2230,7 +2230,6 @@ dependencies = [
  "unicode-width",
  "url",
  "walkdir",
- "windows-sys 0.59.0",
  "zeroize",
 ]
 
