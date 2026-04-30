@@ -332,6 +332,63 @@ fn wait_for_audit_event(
     None
 }
 
+/// Wait for an audit event matching `predicate`, or panic with a forensic
+/// audit-dir dump.
+///
+/// **Why this wrapper exists.** The audit dispatcher
+/// (`crates/permitlayer-core/src/audit/dispatcher.rs:120`) is fire-and-track:
+/// `dispatch().await` returns once the producer-edge semaphore permit is held,
+/// before the spawned write task has done any I/O. The HTTP response is sent
+/// before the JSONL line is durable. Audit-polling tests like the ones in this
+/// file race that gap and intermittently flake on hosted runners (macOS-14,
+/// Linux, Windows) — the event sometimes appears 30-60s after the request
+/// completes when the runner is heavily loaded.
+///
+/// The mitigation pattern ships in two parts:
+/// 1. **60s timeout** — comfortably above the observed 30-40s outliers, well
+///    below any failure mode that would mask a real product regression.
+/// 2. **Forensic audit-dir dump on miss** — every JSONL file body is included
+///    in the panic message so the next CI failure surfaces the actual events
+///    that landed (with whatever divergent fields they have) instead of just
+///    "didn't appear in N seconds." This is what catches "did the event land
+///    with the wrong outcome_detail?" vs. "did it just not land?"
+///
+/// Origin: Story 7.7 cross-platform CI (the original 60s + dump pattern was
+/// inlined at this file's `always_canned_response_populates_cache_second_request_served_from_cache`).
+/// Rolled out across the family during the v0.3.0-rc.2 release cycle when
+/// other tests in this file started hitting the same flake on Windows
+/// (CI run 25187061552).
+///
+/// **Do not change the production dispatcher contract** — `JoinSet`-based
+/// fire-and-track is intentional (Story 8.2 D1 / `dispatcher.rs:24-30`):
+/// switching to `mpsc → single-consumer` would re-serialize all audit writes
+/// through one point and undo the design. The right durability barrier in
+/// production is `drain()` on shutdown; the right durability barrier in tests
+/// is this helper.
+#[track_caller]
+fn assert_audit_event_or_dump(
+    audit_dir: &std::path::Path,
+    predicate: impl Fn(&serde_json::Value) -> bool,
+    timeout: Duration,
+    not_found_message: &str,
+) -> serde_json::Value {
+    if let Some(event) = wait_for_audit_event(audit_dir, predicate, timeout) {
+        return event;
+    }
+    let mut audit_events = Vec::new();
+    if audit_dir.exists() {
+        for entry in std::fs::read_dir(audit_dir).into_iter().flatten().flatten() {
+            if let Ok(content) = std::fs::read_to_string(entry.path()) {
+                audit_events.push(format!("=== {} ===\n{content}", entry.path().display()));
+            }
+        }
+    }
+    panic!(
+        "{not_found_message} (waited {timeout:?}). Audit dir contents:\n{}",
+        audit_events.join("\n\n")
+    );
+}
+
 /// Positive contract for "PolicyLayer allowed this request through."
 ///
 /// Once PolicyLayer allows a request, it is forwarded to the upstream
@@ -404,18 +461,15 @@ fn granted_canned_response_allows_request_and_writes_approval_granted_audit() {
 
     // Audit event for the approval-granted path.
     let audit_dir = home.path().join("audit");
-    let found = wait_for_audit_event(
+    assert_audit_event_or_dump(
         &audit_dir,
         |e| {
             e["event_type"] == "approval-granted"
                 && e["extra"]["outcome_detail"] == "operator-y"
                 && e["extra"]["cached"] == false
         },
-        Duration::from_secs(30),
-    );
-    assert!(
-        found.is_some(),
-        "expected approval-granted audit event with outcome_detail=operator-y"
+        Duration::from_secs(60),
+        "expected approval-granted audit event with outcome_detail=operator-y",
     );
 }
 
@@ -444,16 +498,16 @@ fn denied_canned_response_returns_403_and_writes_approval_denied_audit() {
     assert_eq!(json["error"]["code"], "policy.approval_required");
 
     let audit_dir = home.path().join("audit");
-    let found = wait_for_audit_event(
+    assert_audit_event_or_dump(
         &audit_dir,
         |e| {
             e["event_type"] == "approval-denied"
                 && e["extra"]["outcome_detail"] == "operator-n"
                 && e["extra"]["cached"] == false
         },
-        Duration::from_secs(30),
+        Duration::from_secs(60),
+        "expected approval-denied audit event with outcome_detail=operator-n",
     );
-    assert!(found.is_some(), "expected approval-denied audit event with outcome_detail=operator-n");
 }
 
 #[test]
@@ -493,17 +547,11 @@ fn always_canned_response_populates_cache_second_request_served_from_cache() {
     assert_policy_allowed(status2, &body2, "second request via cache hit");
 
     // Audit: the second request emitted `approval-granted cached=true
-    // outcome_detail=operator-a-cached`.
-    //
-    // Story 7.7 CI-flakiness note: this audit-event poll is
-    // intermittently flaky on hosted runners (macOS-14, Linux)
-    // — the cache HIT itself works (status2 != 403), but the
-    // `cached=true` event sometimes doesn't appear within 30s.
-    // Retry pattern: the dispatcher may flush after the test
-    // gives up. Giving this 60s + structured failure message to
-    // dump audit dir on flake.
+    // outcome_detail=operator-a-cached`. See `assert_audit_event_or_dump`
+    // doc comment for why audit-polling assertions in this file use 60s
+    // + forensic dump.
     let audit_dir = home.path().join("audit");
-    let found = wait_for_audit_event(
+    assert_audit_event_or_dump(
         &audit_dir,
         |e| {
             e["event_type"] == "approval-granted"
@@ -511,23 +559,8 @@ fn always_canned_response_populates_cache_second_request_served_from_cache() {
                 && e["extra"]["cached"] == true
         },
         Duration::from_secs(60),
+        "expected approval-granted cached=true event from second (cache-hit) request",
     );
-    if found.is_none() {
-        // Forensic dump on flake — list every audit event so we can
-        // see whether the event landed with different fields.
-        let mut audit_events = Vec::new();
-        if audit_dir.exists() {
-            for entry in std::fs::read_dir(&audit_dir).into_iter().flatten().flatten() {
-                if let Ok(content) = std::fs::read_to_string(entry.path()) {
-                    audit_events.push(format!("=== {} ===\n{content}", entry.path().display()));
-                }
-            }
-        }
-        panic!(
-            "expected approval-granted cached=true event from second (cache-hit) request — none found within 60s. Audit dir contents:\n{}",
-            audit_events.join("\n\n")
-        );
-    }
 }
 
 #[test]
@@ -563,16 +596,16 @@ fn never_canned_response_populates_cache_second_request_cached_deny() {
 
     // Audit: cached deny emitted on the second request.
     let audit_dir = home.path().join("audit");
-    let found = wait_for_audit_event(
+    assert_audit_event_or_dump(
         &audit_dir,
         |e| {
             e["event_type"] == "approval-denied"
                 && e["extra"]["outcome_detail"] == "operator-never-cached"
                 && e["extra"]["cached"] == true
         },
-        Duration::from_secs(30),
+        Duration::from_secs(60),
+        "expected approval-denied cached=true event from never-cache hit",
     );
-    assert!(found.is_some(), "expected approval-denied cached=true event from never-cache hit");
 }
 
 #[test]
@@ -609,15 +642,15 @@ fn timeout_outcome_returns_403_approval_timeout_via_force_timeout_env() {
     assert_eq!(json["error"]["code"], "policy.approval_timeout");
 
     let audit_dir = home.path().join("audit");
-    let found = wait_for_audit_event(
+    assert_audit_event_or_dump(
         &audit_dir,
         |e| {
             e["event_type"] == "approval-timeout"
                 && e["extra"]["outcome_detail"].as_str().is_some_and(|s| s.starts_with("timeout-"))
         },
-        Duration::from_secs(3),
+        Duration::from_secs(60),
+        "expected approval-timeout event",
     );
-    assert!(found.is_some(), "expected approval-timeout event");
 }
 
 #[test]
@@ -673,12 +706,12 @@ fn unavailable_no_tty_returns_503_approval_unavailable() {
     // (matching the HTTP error code) instead of being conflated with
     // approval-timeout. Operators grepping for `approval-unavailable`
     // in audit.jsonl find these events directly.
-    let found = wait_for_audit_event(
+    assert_audit_event_or_dump(
         &audit_dir,
         |e| e["event_type"] == "approval-unavailable" && e["extra"]["outcome_detail"] == "no-tty",
-        Duration::from_secs(30),
+        Duration::from_secs(60),
+        "expected approval-unavailable outcome_detail=no-tty event",
     );
-    assert!(found.is_some(), "expected approval-unavailable outcome_detail=no-tty event");
 }
 
 #[test]
@@ -720,18 +753,15 @@ fn auto_approve_reads_bypasses_approval_service_for_readonly_scope() {
     // analytics. The `outcome_detail = "auto-approve-reads"` sentinel
     // is the unique discriminator.
     let audit_dir = home.path().join("audit");
-    let found = wait_for_audit_event(
+    assert_audit_event_or_dump(
         &audit_dir,
         |e| {
             e["event_type"] == "approval-granted"
                 && e["extra"]["outcome_detail"] == "auto-approve-reads"
                 && e["extra"]["cached"] == false
         },
-        Duration::from_secs(30),
-    );
-    assert!(
-        found.is_some(),
-        "expected approval-granted outcome_detail=auto-approve-reads cached=false audit event"
+        Duration::from_secs(60),
+        "expected approval-granted outcome_detail=auto-approve-reads cached=false audit event",
     );
 }
 
@@ -852,18 +882,15 @@ fn auto_mode_dispatches_without_prompt_in_parallel_with_prompt_policy() {
     let audit_dir = home.path().join("audit");
 
     // Prompt-mode agent MUST produce an approval-granted event.
-    let prompt_event = wait_for_audit_event(
+    assert_audit_event_or_dump(
         &audit_dir,
         |e| {
             e["event_type"] == "approval-granted"
                 && e["agent_id"] == "prompt-agent"
                 && e["extra"]["outcome_detail"] == "operator-y"
         },
-        Duration::from_secs(3),
-    );
-    assert!(
-        prompt_event.is_some(),
-        "expected approval-granted event for prompt-agent (outcome_detail=operator-y)"
+        Duration::from_secs(60),
+        "expected approval-granted event for prompt-agent (outcome_detail=operator-y)",
     );
 
     // Auto-mode agent MUST NOT produce any `approval-*` event. The
@@ -980,7 +1007,7 @@ fn sighup_warns_on_stale_stub_branch_after_vault_appears() {
     assert_eq!(status, 200, "reload should succeed: {body}");
 
     let audit_dir = home.path().join("audit");
-    let found = wait_for_audit_event(
+    assert_audit_event_or_dump(
         &audit_dir,
         |e| {
             e["event_type"] == "config-reload-stub-detected"
@@ -988,10 +1015,7 @@ fn sighup_warns_on_stale_stub_branch_after_vault_appears() {
                 && e["extra"]["proxy_service_active"] == false
                 && e["extra"]["remediation"] == "restart daemon"
         },
-        Duration::from_secs(3),
-    );
-    assert!(
-        found.is_some(),
-        "expected config-reload-stub-detected audit event after reload with vault/ present"
+        Duration::from_secs(60),
+        "expected config-reload-stub-detected audit event after reload with vault/ present",
     );
 }
