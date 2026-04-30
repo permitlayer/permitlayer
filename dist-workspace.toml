@@ -24,8 +24,13 @@ installers = ["homebrew"]
 #   a separate future-story consideration. NFR49 requires glibc 2.31+
 #   (Ubuntu 20.04+, Debian 11+, Fedora 34+, Arch).
 targets = ["aarch64-apple-darwin", "x86_64-apple-darwin", "x86_64-pc-windows-msvc", "x86_64-unknown-linux-gnu"]
-# Extra files to include in each release artifact
-include = ["LICENSE", "README.md", "install/install.sh"]
+# Extra files to include in each release artifact. install.ps1 is
+# bundled alongside install.sh because the Windows post-publish smoke
+# job (release.yml::smoke-min-os-windows-2022) downloads it from the
+# release asset URL via `iwr`. Without this, that URL 404s with
+# GitHub's HTML error page (surfaced in run 25194276163 as
+# `iwr | iex` choking on the page-not-found body).
+include = ["LICENSE", "README.md", "install/install.sh", "install/install.ps1"]
 # Homebrew tap configuration (Story 7.1): dist emits Formula/agentsso.rb
 # targeting this tap. Our homebrew-publish job in release.yml patches the
 # generated formula (adds service + caveats blocks — dist's template

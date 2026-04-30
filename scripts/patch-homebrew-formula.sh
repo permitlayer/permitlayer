@@ -151,4 +151,13 @@ if [ "$OUTPUT" = "/dev/stdout" ]; then
     cat "$TMP_OUTPUT"
 else
     mv "$TMP_OUTPUT" "$OUTPUT"
+    # mktemp on macOS creates files mode 0600. mv preserves source
+    # permissions, so the patched output inherits 0600 — which
+    # `brew style` rejects via FormulaAudit/Files
+    # ("Incorrect file permissions (600): chmod a+r ...")
+    # because Homebrew formulae must be world-readable.
+    # Surfaced when v0.3.0-rc.3's homebrew-publish job failed at
+    # `brew style` (run 25194276163 / job 73872359863). Make the
+    # script self-correct so callers don't need to know about this.
+    chmod a+r "$OUTPUT"
 fi

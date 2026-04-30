@@ -539,6 +539,11 @@ jobs:
           scripts/patch-homebrew-formula.sh \
               dist-formula/agentsso.rb \
               Formula/agentsso.rb
+          # Defense in depth: the patch script already chmods a+r,
+          # but a regression there would block tap publish at
+          # `brew style` (FormulaAudit/Files refuses 0600). Belt
+          # and suspenders — the file MUST be world-readable.
+          chmod a+r Formula/agentsso.rb
           echo "--- Patched formula ---"
           cat Formula/agentsso.rb
 
