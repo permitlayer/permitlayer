@@ -14,7 +14,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.0-rc.2"
+version = "0.3.0-rc.3"
 edition = "2024"
 rust-version = "1.94.1"
 license = "MIT"
@@ -36,14 +36,14 @@ authors = ["permitlayer contributors"]
 # hand-editing every consuming crate. Per-crate features (e.g. the
 # `test-seam` extension on permitlayer-core in proxy's dev-deps) use
 # `{ workspace = true, features = [...] }` at the call site.
-permitlayer-credential = { path = "crates/permitlayer-credential", version = "0.3.0-rc.2" }
-permitlayer-keystore   = { path = "crates/permitlayer-keystore",   version = "0.3.0-rc.2" }
-permitlayer-vault      = { path = "crates/permitlayer-vault",      version = "0.3.0-rc.2" }
-permitlayer-core       = { path = "crates/permitlayer-core",       version = "0.3.0-rc.2" }
-permitlayer-oauth      = { path = "crates/permitlayer-oauth",      version = "0.3.0-rc.2" }
-permitlayer-proxy      = { path = "crates/permitlayer-proxy",      version = "0.3.0-rc.2" }
-permitlayer-plugins    = { path = "crates/permitlayer-plugins",    version = "0.3.0-rc.2" }
-permitlayer-connectors = { path = "crates/permitlayer-connectors", version = "0.3.0-rc.2" }
+permitlayer-credential = { path = "crates/permitlayer-credential", version = "0.3.0-rc.3" }
+permitlayer-keystore   = { path = "crates/permitlayer-keystore",   version = "0.3.0-rc.3" }
+permitlayer-vault      = { path = "crates/permitlayer-vault",      version = "0.3.0-rc.3" }
+permitlayer-core       = { path = "crates/permitlayer-core",       version = "0.3.0-rc.3" }
+permitlayer-oauth      = { path = "crates/permitlayer-oauth",      version = "0.3.0-rc.3" }
+permitlayer-proxy      = { path = "crates/permitlayer-proxy",      version = "0.3.0-rc.3" }
+permitlayer-plugins    = { path = "crates/permitlayer-plugins",    version = "0.3.0-rc.3" }
+permitlayer-connectors = { path = "crates/permitlayer-connectors", version = "0.3.0-rc.3" }
 
 # Credential type discipline
 zeroize = { version = "1.8", features = ["zeroize_derive"] }

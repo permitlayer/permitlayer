@@ -40,3 +40,22 @@ publish-prereleases = false
 # (we add minisign signing steps + a homebrew-publish job that dist doesn't
 # know about).
 allow-dirty = ["ci"]
+
+# Linux build-time system deps. The keystore crate's
+# `linux-native-sync-persistent` feature pulls `libdbus-sys`, whose
+# build script links against libdbus-1 via pkg-config. Without the
+# `-dev` headers + pkg-config on the runner, `cargo build` fails
+# during `build-local-artifacts (x86_64-unknown-linux-gnu)`. dist
+# threads this map into the matrix's `packages_install` step
+# (release.yml:198), so the runner runs `apt-get install -y
+# libdbus-1-dev pkg-config` before invoking `dist build`. macOS uses
+# the Apple keychain (no extra deps); Windows uses Win32 (no extra
+# deps).
+#
+# Surfaced when v0.3.0-rc.2 was the first tag to actually trigger
+# the Linux build leg post-Story-7.7 target addition; v0.3.0-rc.1
+# shipped without Linux artifacts because the gap hadn't been hit
+# yet.
+[dist.dependencies.apt]
+libdbus-1-dev = "*"
+pkg-config = "*"
