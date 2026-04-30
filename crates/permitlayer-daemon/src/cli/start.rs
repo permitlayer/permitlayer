@@ -2151,6 +2151,26 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         StartError::BindFailed { addr: bind_addr, source }
     })?;
 
+    // Story 7.7: emit the actually-bound address on stdout so test
+    // harnesses that pass `--bind-addr 127.0.0.1:0` can read the
+    // OS-assigned ephemeral port without the TOCTOU pre-allocation
+    // race that `free_port()` admits to in its own doc-comment.
+    // Format is single-line `AGENTSSO_BOUND_ADDR=<addr>\n`, grep-stable
+    // for parsing without the test having to swallow the rest of
+    // startup chatter. Operators running `agentsso start` interactively
+    // see one extra info line; production scripts ignore unknown
+    // stdout. Flush is explicit because Windows pipes are line-buffered
+    // and the test harness blocks on this line before continuing.
+    let bound_addr = listener.local_addr().map_err(|source| {
+        tracing::error!(addr = %bind_addr, "failed to read local_addr after bind: {source}");
+        StartError::BindFailed { addr: bind_addr, source }
+    })?;
+    println!("AGENTSSO_BOUND_ADDR={bound_addr}");
+    {
+        use std::io::Write;
+        let _ = std::io::stdout().flush();
+    }
+
     // 6. Set up shutdown channel.
     let (shutdown_fut, _shutdown_tx) = shutdown::shutdown_channel();
     let cli_overrides = Arc::new(cli_overrides);

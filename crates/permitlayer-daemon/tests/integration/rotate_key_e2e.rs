@@ -23,7 +23,15 @@ use std::io::{Read, Write};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::common::{DaemonTestConfig, agentsso_bin, free_port, start_daemon, wait_for_health};
+use crate::common::agentsso_bin;
+// `auth_round_trip_against_running_daemon` (and its helper cluster) is
+// the only consumer of the daemon-spawn / loopback-HTTP machinery in
+// this file, and it is `cfg(not(windows))` because the daemon's
+// in-process Tokio + ArcSwap auth path doesn't yet pass on Windows
+// (Story 7.7 follow-up). Gate the imports + helpers to the same cfg
+// so Windows builds don't trip dead-code / unused-import lints.
+#[cfg(not(windows))]
+use crate::common::{DaemonTestConfig, free_port, start_daemon, wait_for_health};
 
 /// Spawn `agentsso rotate-key --yes --non-interactive` headlessly
 /// against the file-backed test keystore. Returns the captured
@@ -458,6 +466,7 @@ fn auth_round_trip_against_running_daemon() {
 /// surfaces forensic data instead of a bare panic message. Called
 /// from the auth-round-trip test on either the pre-rotation or
 /// post-rotation auth-invalid_token assert.
+#[cfg(not(windows))]
 fn collect_test_home_diagnostic(home: &std::path::Path, label: &str) -> String {
     let mut out = format!("\n=== DIAGNOSTIC: {label} ===\n");
     out.push_str(&format!("home: {}\n", home.display()));
@@ -538,6 +547,7 @@ fn collect_test_home_diagnostic(home: &std::path::Path, label: &str) -> String {
 /// but inlined here so this file is self-contained per the round-1
 /// helper-discipline fence (each integration file may have its own
 /// thin wrappers if they don't duplicate canonical logic).
+#[cfg(not(windows))]
 fn register_agent(port: u16, name: &str, policy: &str) -> String {
     let body = format!(r#"{{"name":"{name}","policy_name":"{policy}"}}"#);
     let (status, resp_body) = http_post_loopback(port, "/v1/control/agent/register", &body);
@@ -553,6 +563,7 @@ fn register_agent(port: u16, name: &str, policy: &str) -> String {
 /// JSON `error.code` if present, or "ok" otherwise. Returning the
 /// code (not the status) lets callers branch on auth-vs-policy-vs-
 /// upstream errors uniformly.
+#[cfg(not(windows))]
 fn authed_get_status(port: u16, token: &str) -> String {
     let auth_header = format!("Bearer {token}");
     let (status, body) = http_get_loopback(
@@ -570,6 +581,7 @@ fn authed_get_status(port: u16, token: &str) -> String {
 /// Read the rotate-key-output.<pid> file and extract the rerolled
 /// bearer token for the named agent. Format is
 /// `<agent_name>=<token>` per line.
+#[cfg(not(windows))]
 fn read_new_token_for_agent(home: &std::path::Path, agent_name: &str) -> String {
     let candidates: Vec<_> = std::fs::read_dir(home)
         .unwrap()
@@ -587,14 +599,17 @@ fn read_new_token_for_agent(home: &std::path::Path, agent_name: &str) -> String 
         .unwrap_or_else(|| panic!("tokens file missing line for {agent_name}; contents:\n{body}"))
 }
 
+#[cfg(not(windows))]
 fn http_get_loopback(port: u16, path: &str, headers: &[(&str, &str)]) -> (u16, String) {
     http_request(port, "GET", path, headers, None)
 }
 
+#[cfg(not(windows))]
 fn http_post_loopback(port: u16, path: &str, body: &str) -> (u16, String) {
     http_request(port, "POST", path, &[], Some(body))
 }
 
+#[cfg(not(windows))]
 fn http_request(
     port: u16,
     method: &str,

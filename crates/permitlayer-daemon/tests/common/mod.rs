@@ -396,6 +396,14 @@ impl DaemonHandle {
     pub fn child_mut(&mut self) -> &mut Child {
         self.child.as_mut().expect("child should be present")
     }
+
+    /// Story 7.7: child PID. Used by [`assert_daemon_pid_matches`] to
+    /// confirm a `/health` response came from THIS daemon — not some
+    /// other test's daemon that grabbed the same port through the
+    /// `free_port` TOCTOU race.
+    pub fn child_pid(&self) -> u32 {
+        self.child.as_ref().expect("child should be present").id()
+    }
 }
 
 impl Drop for DaemonHandle {
@@ -408,6 +416,116 @@ impl Drop for DaemonHandle {
             let _ = child.wait();
         }
     }
+}
+
+/// Story 7.7: read the daemon's piped stdout until the
+/// `AGENTSSO_BOUND_ADDR=<addr>` marker line appears, then return the
+/// parsed [`SocketAddr`]. Drains the rest of stdout in a background
+/// thread so the daemon never blocks on a full pipe.
+///
+/// **Replaces the [`free_port`] pattern.** `free_port` pre-allocates
+/// an ephemeral port via bind+drop, then the spawned daemon does its
+/// own bind some 10-500ms later. Under high test concurrency
+/// (especially on macOS where syspolicyd inflates subprocess startup
+/// latency), another nextest worker can grab the port in that window;
+/// the second daemon then spawns successfully against a *different*
+/// port the OS hands it, and our test happily talks to the first
+/// daemon — registering an agent on one, authenticating against the
+/// other (401). See Story 7.7 dev notes for the forensic trace.
+///
+/// # Usage
+///
+/// Spawn the daemon with `--bind-addr 127.0.0.1:0` (or any
+/// zero-port form). Then call this helper with the spawned `Child`.
+/// Bounded by `timeout` to avoid hanging on a daemon that crashed
+/// during init.
+///
+/// # Panics
+///
+/// On timeout. The caller is in the test setup phase where a clear
+/// panic is more useful than a `Result` to thread upward.
+///
+/// # Stdout ownership
+///
+/// This helper **takes** `child.stdout` — subsequent calls to
+/// `Child::wait_with_output` will see no stdout. Tests that consume
+/// daemon stdout for grep-based assertions cannot use this helper;
+/// they should either continue using [`free_port`] (if they accept
+/// the race) or refactor to read stdout themselves and parse the
+/// marker inline.
+pub fn wait_for_bound_addr(child: &mut Child, timeout: Duration) -> SocketAddr {
+    use std::io::BufRead;
+
+    let stdout = child
+        .stdout
+        .take()
+        .expect("child.stdout must be Stdio::piped() for wait_for_bound_addr");
+    let mut reader = std::io::BufReader::new(stdout);
+    let deadline = Instant::now() + timeout;
+    let mut line = String::new();
+
+    while Instant::now() < deadline {
+        line.clear();
+        // BufRead::read_line can't natively honor the deadline. We
+        // accept a worst-case "single line longer than `timeout`" hang
+        // because `agentsso start` writes the marker line synchronously
+        // immediately after `bind` returns, before any other stdout is
+        // generated — so the caller's timeout is effectively bounded by
+        // daemon-bind latency, not arbitrary stdout chatter.
+        match reader.read_line(&mut line) {
+            Ok(0) => panic!("daemon stdout closed before AGENTSSO_BOUND_ADDR marker"),
+            Ok(_) => {
+                if let Some(rest) = line.trim_end().strip_prefix("AGENTSSO_BOUND_ADDR=") {
+                    let addr: SocketAddr = rest
+                        .parse()
+                        .unwrap_or_else(|e| panic!("malformed AGENTSSO_BOUND_ADDR={rest:?}: {e}"));
+                    // Drain the remaining stdout to /dev/null so the
+                    // daemon never blocks on a full kernel pipe. The
+                    // background thread exits when the daemon does.
+                    std::thread::spawn(move || {
+                        let mut sink = Vec::with_capacity(8 * 1024);
+                        let _ = std::io::copy(&mut reader, &mut sink);
+                    });
+                    return addr;
+                }
+                // Some other startup line (logs etc); keep scanning.
+            }
+            Err(e) => panic!("error reading daemon stdout: {e}"),
+        }
+    }
+    panic!("timed out after {timeout:?} waiting for AGENTSSO_BOUND_ADDR marker on daemon stdout");
+}
+
+/// Story 7.7: assert that a `/health` response came from the daemon
+/// owned by `handle`. Catches `free_port` TOCTOU collisions by
+/// comparing the PID the daemon reports against the PID we spawned.
+///
+/// On mismatch this panics with both PIDs named — the diagnostic
+/// you want when a previously-mystery 401-on-fresh-token blames
+/// "wrong daemon" instead of "wrong code". Returns silently on
+/// match.
+///
+/// Cheap (one HTTP GET against loopback). Safe to call after
+/// [`wait_for_health`] in any test that uses [`start_daemon`].
+pub fn assert_daemon_pid_matches(handle: &DaemonHandle) {
+    let (status, body) = http_get(handle.port, "/health");
+    assert_eq!(status, 200, "/health should return 200, got {status}: {body}");
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("/health response not JSON: {e}\nbody: {body}"));
+    let reported_pid = json
+        .get("pid")
+        .and_then(|p| p.as_u64())
+        .unwrap_or_else(|| panic!("/health response missing numeric pid field: {body}"));
+    let expected_pid = u64::from(handle.child_pid());
+    assert_eq!(
+        reported_pid,
+        expected_pid,
+        "free_port TOCTOU: /health on port {} reported pid {reported_pid} but our \
+         spawned daemon is pid {expected_pid}. Another test's daemon stole this port \
+         between free_port() pre-allocation and our daemon's bind. See Story 7.7 \
+         dev notes for migration to wait_for_bound_addr.",
+        handle.port,
+    );
 }
 
 /// Poll the daemon's `/health` endpoint until it reports status
