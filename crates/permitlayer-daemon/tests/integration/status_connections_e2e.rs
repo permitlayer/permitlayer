@@ -95,29 +95,195 @@ fn start_daemon_zero_port(home: &std::path::Path) -> (DaemonHandle, u16, u32) {
     (DaemonHandle(Some(child)), port, pid)
 }
 
-/// Poll `/v1/control/connections` until at least one connection is
-/// reported, or the deadline elapses. The proxy's `ConnTrackLayer`
-/// inserts asynchronously after an HTTP request crosses the layer; on
-/// a busy macOS scheduler the insert can lag the response by a few
-/// hundred milliseconds. Without this wait the CLI subprocess can
-/// race the tracker write and observe an empty DashMap.
+/// Fire one authenticated proxy request to seed a tracker entry for
+/// `agent_name`, then poll `/v1/control/connections` until that
+/// specific agent name appears, or panic with a self-diagnosing dump.
 ///
-/// Returns `true` once the response has at least one entry; `false`
-/// on deadline expiry. Tests should `assert!` on the return value.
-fn wait_for_connection_recorded(port: u16, timeout: Duration) -> bool {
-    let deadline = Instant::now() + timeout;
+/// **Why this helper exists.** The earlier `wait_for_connection_recorded`
+/// pattern silently masked three different failure modes as a single
+/// `tracker did not record the request within Ns` panic:
+///   1. The proxied request returned 401 `auth.invalid_token` — the
+///      register-then-auth flake captured by Story 7.7 Phase 4a
+///      (`2bf572b`). The request never reached `ConnTrackLayer` because
+///      `AuthLayer` rejected it.
+///   2. The TCP read timed out (`http_request` swallows read errors and
+///      returns `status == 0`) — the request never completed end-to-end.
+///   3. The request reached `ConnTrackLayer`, recorded synchronously
+///      via `DashMap::entry`, but the snapshot at `/v1/control/connections`
+///      didn't see it under sufficient delay (genuinely the case the
+///      original deadline guarded — if this is what we're seeing,
+///      something deeper is wrong than just timing).
+///
+/// **What the production middleware actually does.** Contrary to the
+/// previous comment ("ConnTrackLayer's DashMap insert can lag the
+/// response"), `ConnTrackService::call` records *synchronously* before
+/// forwarding to the inner service (`conn_track.rs:107-109`), and
+/// `ConnTracker::record_request` uses `DashMap::entry` which holds the
+/// shard write-lock for the full lookup-or-create
+/// (`conn_tracker.rs:151-185`). There is no async insert path. The
+/// previous helper's comment was wrong — the real risk is auth /
+/// request scheduling under CI load, which this helper now diagnoses
+/// rather than retries.
+///
+/// On the originally-failing path (`status_watch_sigint_exits_zero_with_clean_teardown`
+/// hitting `tracker did not record the request within 5s` on
+/// macos-15-intel in CI run 25189312574), the previous helper provided
+/// no evidence to distinguish (1)/(2)/(3). This helper makes the next
+/// failure self-diagnosing.
+fn seed_tracked_connection_or_dump(
+    port: u16,
+    daemon_pid: u32,
+    home: &std::path::Path,
+    token: &str,
+    agent_name: &str,
+    scope: &str,
+) {
+    // 1. Fire the proxied request. Don't discard the status/body — they
+    //    are the first piece of forensic evidence.
+    let (proxy_status, proxy_body) = http_get_loopback(
+        port,
+        "/v1/tools/gmail/users/me/messages",
+        &[("authorization", &format!("Bearer {token}")), ("x-agentsso-scope", scope)],
+    );
+
+    // 2. Refuse to proceed on the auth-flake signature. The helper's
+    //    job is to seed a tracker entry; if the auth lookup didn't see
+    //    the just-registered agent, the request never reached
+    //    `ConnTrackLayer`. Pretending otherwise wastes the poll budget
+    //    and mints a misleading panic message.
+    if proxy_status == 401 && proxy_body.contains("auth.invalid_token") {
+        dump_and_panic(
+            "AUTH-FLAKE pre-tracker (401 auth.invalid_token)",
+            port,
+            daemon_pid,
+            home,
+            token,
+            agent_name,
+            proxy_status,
+            &proxy_body,
+        );
+    }
+
+    // 3. Refuse to proceed on a TCP read failure. `http_request` swallows
+    //    read errors and returns `status == 0` with empty body — that
+    //    means the daemon socket connect succeeded but the response read
+    //    hit the 5s timeout or a connection reset. The request may or
+    //    may not have reached `ConnTrackLayer`; we can't tell without
+    //    the response status. Dump and bail rather than poll.
+    if proxy_status == 0 {
+        dump_and_panic(
+            "PROXY-REQUEST-TIMEOUT-OR-RESET (status=0; http_request swallowed a read error)",
+            port,
+            daemon_pid,
+            home,
+            token,
+            agent_name,
+            proxy_status,
+            &proxy_body,
+        );
+    }
+
+    // 4. Poll `/v1/control/connections` looking for the specific agent
+    //    we just seeded. Polling for "any non-empty array" used to
+    //    permit false positives from leftover state on shared-port
+    //    runs; with zero-port + PID-match (Story 7.7) that's no longer
+    //    a vector, but the per-agent check is still the correct
+    //    invariant — the tracker has THIS agent's entry, not just SOME
+    //    entry.
+    let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
         let (status, body) = http_get_loopback(port, "/v1/control/connections", &[]);
         if status == 200
             && let Ok(json) = serde_json::from_str::<serde_json::Value>(&body)
             && let Some(arr) = json.get("connections").and_then(|c| c.as_array())
-            && !arr.is_empty()
+            && arr
+                .iter()
+                .any(|conn| conn.get("agent_name").and_then(|v| v.as_str()) == Some(agent_name))
         {
-            return true;
+            return;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    false
+
+    // 5. Tracker poll exhausted. By now we've ruled out the auth-flake
+    //    and a fully-failed proxy request, so the question becomes
+    //    "where between `ConnTrackLayer::call` and the snapshot read
+    //    did this go?" — capture every relevant piece of state.
+    dump_and_panic(
+        "TRACKER-EMPTY-FOR-AGENT (proxy returned successfully but tracker has no entry for the seeded agent within 5s)",
+        port,
+        daemon_pid,
+        home,
+        token,
+        agent_name,
+        proxy_status,
+        &proxy_body,
+    );
+}
+
+/// Forensic-dump panic helper for `seed_tracked_connection_or_dump`.
+///
+/// Captures every piece of state that distinguishes the candidate
+/// failure modes: was the proxy response 401? did the tracker see this
+/// agent? does the registry know about the agent? is the daemon the
+/// one we spawned? are the on-disk agent files what we expect?
+///
+/// 8 args is genuinely the right shape — each is independent forensic
+/// state and bundling them in a struct would be theater. Allow the
+/// clippy lint locally.
+#[allow(clippy::too_many_arguments)]
+#[track_caller]
+fn dump_and_panic(
+    failure_kind: &str,
+    port: u16,
+    daemon_pid: u32,
+    home: &std::path::Path,
+    token: &str,
+    agent_name: &str,
+    proxy_status: u16,
+    proxy_body: &str,
+) -> ! {
+    let (conn_status, conn_body) = http_get_loopback(port, "/v1/control/connections", &[]);
+    let (list_status, list_body) = http_get_loopback(port, "/v1/control/agent/list", &[]);
+    let (whoami_status, whoami_body) = http_get_loopback(port, "/v1/control/whoami", &[]);
+    let (health_status, health_body) = http_get_loopback(port, "/health", &[]);
+
+    let agents_dir = home.join("agents");
+    let mut on_disk: Vec<String> = Vec::new();
+    match std::fs::read_dir(&agents_dir) {
+        Ok(entries) => {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("?").to_owned();
+                let content =
+                    std::fs::read_to_string(&path).unwrap_or_else(|e| format!("<read error: {e}>"));
+                let truncated: String = content.chars().take(500).collect();
+                on_disk.push(format!("  {name}: {truncated}"));
+            }
+        }
+        Err(e) => {
+            on_disk.push(format!("  <unable to read {}: {e}>", agents_dir.display()));
+        }
+    }
+    if on_disk.is_empty() {
+        on_disk.push(format!("  <{} is empty>", agents_dir.display()));
+    }
+    let token_prefix: String = token.chars().take(12).collect();
+
+    panic!(
+        "TRACKER-FLAKE-DUMP ({failure_kind}):\n\
+         seeded_agent_name={agent_name}\n\
+         daemon_pid={daemon_pid}\n\
+         port={port}\n\
+         token_first_12={token_prefix}\n\
+         proxy_response: status={proxy_status} body={proxy_body}\n\
+         /v1/control/connections: status={conn_status} body={conn_body}\n\
+         /v1/control/agent/list: status={list_status} body={list_body}\n\
+         /v1/control/whoami: status={whoami_status} body={whoami_body}\n\
+         /health: status={health_status} body={health_body}\n\
+         on-disk agents/ contents:\n{}\n",
+        on_disk.join("\n"),
+    );
 }
 
 /// Story 7.7 register-then-auth flake guard: hit `/v1/control/whoami`
@@ -322,21 +488,18 @@ fn status_connections_renders_table_after_request() {
 
     let token = register_agent(port, "test-agent", "policy-readonly");
 
-    // Fire one authenticated request through the proxy. The upstream
-    // handler will return some non-2xx because credentials aren't
-    // configured, but `ConnTrackLayer` runs BEFORE policy/upstream so
-    // the tracker entry lands either way.
-    let (_status, _body) = http_get_loopback(
+    // Fire one authenticated request through the proxy and confirm the
+    // tracker has THIS agent's entry. `seed_tracked_connection_or_dump`
+    // distinguishes auth-flake (401), proxy-timeout (status=0), and
+    // tracker-empty failures with a forensic dump on miss — see its
+    // doc comment for the candidate-cause mapping.
+    seed_tracked_connection_or_dump(
         port,
-        "/v1/tools/gmail/users/me/messages",
-        &[("authorization", &format!("Bearer {token}")), ("x-agentsso-scope", "gmail.readonly")],
-    );
-    // ConnTrackLayer's DashMap insert can lag the response on macOS;
-    // wait until /v1/control/connections sees the entry before letting
-    // the CLI subprocess query it.
-    assert!(
-        wait_for_connection_recorded(port, Duration::from_secs(5)),
-        "tracker did not record the request within 5s"
+        daemon_pid,
+        home.path(),
+        &token,
+        "test-agent",
+        "gmail.readonly",
     );
 
     let (exit, stdout, _stderr) = run_status_cli(home.path(), port, &["--connections"]);
@@ -356,14 +519,13 @@ fn status_connections_json_emits_valid_json() {
     assert_daemon_pid_matches(port, daemon_pid);
 
     let token = register_agent(port, "json-agent", "policy-readonly");
-    let (_status, _body) = http_get_loopback(
+    seed_tracked_connection_or_dump(
         port,
-        "/v1/tools/gmail/users/me/messages",
-        &[("authorization", &format!("Bearer {token}")), ("x-agentsso-scope", "gmail.readonly")],
-    );
-    assert!(
-        wait_for_connection_recorded(port, Duration::from_secs(5)),
-        "tracker did not record the request within 5s"
+        daemon_pid,
+        home.path(),
+        &token,
+        "json-agent",
+        "gmail.readonly",
     );
 
     let (exit, stdout, _stderr) = run_status_cli(home.path(), port, &["--connections", "--json"]);
@@ -526,17 +688,13 @@ fn status_watch_redraws_at_least_twice_then_clean_exits_on_kill() {
 
     // Seed at least one entry so the table has a row to redraw.
     let token = register_agent(port, "watch-agent", "policy-readonly");
-    let (_status, _body) = http_get_loopback(
+    seed_tracked_connection_or_dump(
         port,
-        "/v1/tools/gmail/users/me/messages",
-        &[("authorization", &format!("Bearer {token}")), ("x-agentsso-scope", "gmail.readonly")],
-    );
-    // ConnTrackLayer's DashMap insert can lag the response on busy
-    // CI runners; wait until /v1/control/connections sees the entry
-    // before letting the watch CLI subprocess sample.
-    assert!(
-        wait_for_connection_recorded(port, Duration::from_secs(5)),
-        "tracker did not record the request within 5s"
+        daemon_pid,
+        home.path(),
+        &token,
+        "watch-agent",
+        "gmail.readonly",
     );
 
     let mut child = Command::new(agentsso_bin())
@@ -594,16 +752,13 @@ fn status_watch_sigint_exits_zero_with_clean_teardown() {
     assert_daemon_pid_matches(port, daemon_pid);
 
     let token = register_agent(port, "sigint-agent", "policy-readonly");
-    let (_status, _body) = http_get_loopback(
+    seed_tracked_connection_or_dump(
         port,
-        "/v1/tools/gmail/users/me/messages",
-        &[("authorization", &format!("Bearer {token}")), ("x-agentsso-scope", "gmail.readonly")],
-    );
-    // ConnTrackLayer's DashMap insert can lag the response on busy
-    // CI runners; wait until /v1/control/connections sees the entry.
-    assert!(
-        wait_for_connection_recorded(port, Duration::from_secs(5)),
-        "tracker did not record the request within 5s"
+        daemon_pid,
+        home.path(),
+        &token,
+        "sigint-agent",
+        "gmail.readonly",
     );
 
     let child = Command::new(agentsso_bin())
