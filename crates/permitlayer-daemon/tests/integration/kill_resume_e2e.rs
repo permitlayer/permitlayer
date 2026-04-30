@@ -676,33 +676,42 @@ fn kill_resume_audit_narrative() {
         })
         .collect();
 
-    // Extract timestamps as strings — lexicographic order on ISO 8601
-    // with Z suffix matches chronological order for all sensible values.
-    let timestamps: Vec<&str> = kill_narrative
-        .iter()
-        .map(|e| e.get("timestamp").and_then(|v| v.as_str()).unwrap_or(""))
-        .collect();
-
-    // Story 7.7 Phase 4b: Windows `chrono::Utc::now()` is backed by
-    // `GetSystemTimeAsFileTime`, which has 15.6ms default resolution.
-    // The three concurrent `kill-blocked-request` events are
-    // generated on different tokio task threads and each call
-    // `Utc::now()` independently — within a single Windows tick,
-    // wall-clock-adjacent calls can return values that don't preserve
-    // submission order. Allow up to 20ms inversion on Windows
-    // (well above the 15.6ms tick, well below any failure mode that
-    // would mask a real seconds-scale ordering bug). Unix gets
-    // microsecond-resolution monotonic time and stays strict.
-    const TIMESTAMP_INVERSION_TOLERANCE_MS: i64 = if cfg!(windows) { 20 } else { 0 };
-    for i in 1..timestamps.len() {
-        let prev_ms = parse_iso8601_ms(timestamps[i - 1]);
-        let curr_ms = parse_iso8601_ms(timestamps[i]);
+    // The narrative invariant we actually need: `kill-activated`
+    // happens before any `kill-blocked-request`, and `kill-resumed`
+    // happens after all of them. The three blocks themselves are
+    // concurrent (separate tokio tasks, each calling `Utc::now()`
+    // independently) and have no inter-block submission order to
+    // assert. `chrono::Utc::now()` is wall-clock on every platform
+    // (`CLOCK_REALTIME` on Unix, `GetSystemTimeAsFileTime` on
+    // Windows) — neither monotonic — so even microsecond-resolution
+    // Unix clocks can report adjacent concurrent calls out of order
+    // when the kernel scheduler and tokio task ordering disagree.
+    // Tolerance covers Windows's 15.6ms tick plus normal jitter; the
+    // bound check (vs. pairwise) makes the assertion match what the
+    // narrative actually proves.
+    const BOUND_TOLERANCE_MS: i64 = 25;
+    let ts_for = |kind: &str| -> Vec<i64> {
+        kill_narrative
+            .iter()
+            .filter(|e| e.get("event_type").and_then(|v| v.as_str()) == Some(kind))
+            .map(|e| parse_iso8601_ms(e.get("timestamp").and_then(|v| v.as_str()).unwrap_or("")))
+            .collect()
+    };
+    let activated_ts = ts_for("kill-activated");
+    let blocked_ts = ts_for("kill-blocked-request");
+    let resumed_ts = ts_for("kill-resumed");
+    if let (Some(&activated_ms), Some(&min_blocked)) =
+        (activated_ts.first(), blocked_ts.iter().min())
+    {
         assert!(
-            curr_ms + TIMESTAMP_INVERSION_TOLERANCE_MS >= prev_ms,
-            "audit events must be in timestamp order (±{}ms on Windows); {} > {}",
-            TIMESTAMP_INVERSION_TOLERANCE_MS,
-            timestamps[i - 1],
-            timestamps[i],
+            activated_ms <= min_blocked + BOUND_TOLERANCE_MS,
+            "kill-activated must precede earliest kill-blocked-request (±{BOUND_TOLERANCE_MS}ms); activated_ms={activated_ms} earliest_blocked_ms={min_blocked}",
+        );
+    }
+    if let (Some(&max_blocked), Some(&resumed_ms)) = (blocked_ts.iter().max(), resumed_ts.first()) {
+        assert!(
+            max_blocked <= resumed_ms + BOUND_TOLERANCE_MS,
+            "kill-resumed must follow latest kill-blocked-request (±{BOUND_TOLERANCE_MS}ms); latest_blocked_ms={max_blocked} resumed_ms={resumed_ms}",
         );
     }
 
