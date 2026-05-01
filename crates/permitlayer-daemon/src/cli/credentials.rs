@@ -42,6 +42,36 @@ mod cli_exit {
     pub const TRANSIENT: i32 = 75;
 }
 
+// ── Story 7.6c: typed exit-code marker for the daemon-running
+// pre-flight on `credentials refresh` ──────────────────────────────
+//
+// Same shape as `SetupExitCode3` in `cli::setup` and
+// `RotateKeyExitCode3` in `cli::rotate_key`. Mirrors the typed-marker
+// pattern so `main.rs::credentials_refresh_to_exit_code` can downcast
+// the chain. Note this marker uses exit code 3 (resource conflict) —
+// distinct from the `cli_exit::{BUG, MISCONFIG, TRANSIENT}` codes
+// above, which classify *post-refusal* failures during the actual
+// refresh flow. The daemon-running refusal is a pre-flight that
+// fires before any flow runs.
+
+/// Exit-code 3 marker — resource conflict (daemon running and
+/// holding the vault flock; refresh would block indefinitely on
+/// `acquire()`).
+#[derive(Debug)]
+pub(crate) struct CredentialsRefreshExitCode3;
+
+impl std::fmt::Display for CredentialsRefreshExitCode3 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("credentials refresh: resource conflict")
+    }
+}
+
+impl std::error::Error for CredentialsRefreshExitCode3 {}
+
+pub(crate) fn refresh_exit3() -> anyhow::Error {
+    anyhow::Error::new(CredentialsRefreshExitCode3).context(crate::cli::SilentCliError)
+}
+
 /// Arguments for `agentsso credentials <subcommand>`.
 #[derive(Args)]
 pub struct CredentialsArgs {
@@ -333,6 +363,49 @@ async fn refresh_credentials(args: RefreshArgs) -> anyhow::Result<()> {
     use permitlayer_proxy::refresh_flow::{self, RefreshFlowError, RefreshOutcome};
     use permitlayer_vault::Vault;
 
+    // ── Story 7.6c: daemon-running pre-flight ──────────────────────
+    //
+    // `credentials refresh` writes to the vault via
+    // `CredentialFsStore::put` (refresh_flow.rs:495,531) which
+    // acquires the exclusive vault `flock` (Story 7.6a). The daemon
+    // holds the same lock for its entire runtime — without this guard
+    // refresh would block indefinitely on `flock(2)`.
+    //
+    // Replaces the old soft `eprintln!` warning ("do not run while
+    // daemon is active") with a structured refusal that actually
+    // prevents the deadlock instead of just hoping the operator
+    // notices the warning. Mirrors `cli::setup::run`'s pre-flight and
+    // `cli::rotate_key::run` Pre-flight 2 verbatim.
+    //
+    // Pre-flight runs BEFORE the audit-store carve-out below so a
+    // refused-to-run refresh does not emit audit events for an action
+    // that did not happen.
+    let preflight_home = super::agentsso_home()?;
+    let daemon_running = crate::lifecycle::pid::PidFile::is_daemon_running(&preflight_home)
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "PID-file probe failed; treating daemon as running for safety");
+            true
+        });
+    if daemon_running {
+        let pid_hint = match crate::lifecycle::pid::PidFile::read(&preflight_home) {
+            Ok(Some(pid)) => format!(" (PID {pid})"),
+            _ => String::new(),
+        };
+        eprint!(
+            "{}",
+            render::error_block(
+                "credentials_refresh_daemon_running",
+                &format!(
+                    "agentsso daemon is running{pid_hint}; credentials refresh writes to \
+                     the vault and would block on the daemon's exclusive lock."
+                ),
+                "agentsso stop && agentsso credentials refresh <service>",
+                None,
+            )
+        );
+        return Err(refresh_exit3());
+    }
+
     // ── Phase 1: Pre-audit-store carve-out ─────────────────────────
     //
     // Story 1.14b code-review M3: the three failures below CANNOT
@@ -433,19 +506,12 @@ async fn refresh_credentials(args: RefreshArgs) -> anyhow::Result<()> {
         std::process::exit(cli_exit::MISCONFIG);
     }
 
-    // 6b: Warn about daemon concurrency. We do NOT detect a running
-    // daemon; the warning is the contract.
-    //
-    // Story 1.14b code-review n8 fix: previously this warning was
-    // printed before the `vault_dir.exists()` check, so fresh
-    // installs (where there's no daemon to race with because there's
-    // no vault) would see a scary warning followed by a no_vault
-    // error. Now the warning fires only when we're actually about
-    // to do something that might race.
-    eprintln!(
-        "warning: agentsso credentials refresh should not be run while the daemon is active; \
-         credential store and audit log writes may interleave"
-    );
+    // Story 7.6c: the prior soft eprintln warning ("do not run while
+    // daemon is active") is now superseded by the structured
+    // `credentials_refresh_daemon_running` refusal at the top of this
+    // function. The warning was a contract; the refusal is enforcement.
+    // The vault_dir.exists() carve-out (Story 1.14b code-review n8) is
+    // moot because the refusal also fires before vault checks.
 
     // Keystore → master key → vault.
     let keystore_config = permitlayer_keystore::KeystoreConfig {
