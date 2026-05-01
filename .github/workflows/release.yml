@@ -587,17 +587,26 @@ jobs:
         run: |
           TAP_DIR="$(mktemp -d)"
           trap 'rm -rf "$TAP_DIR"' EXIT
-          # Authenticate via the bearer-header form rather than embedding
-          # the PAT in the remote URL — the URL-form persists the secret
-          # in $TAP_DIR/.git/config and would leak if the dir were ever
-          # uploaded as an artifact or inspected in a downstream step.
-          git -c "http.https://github.com/.extraheader=AUTHORIZATION: bearer ${TAP_TOKEN}" \
-              clone "https://github.com/permitlayer/homebrew-tap.git" "$TAP_DIR"
+          # URL-form auth: embed the PAT in the clone URL. We previously
+          # used `git -c http.https://github.com/.extraheader=...` to
+          # avoid persisting the secret in `.git/config`, but that path
+          # broke between v0.3.0-rc.1 (worked) and v0.3.0-rc.4 (failed
+          # with `could not read Username for 'https://github.com'` on
+          # macos-14, git 2.53.0 / Homebrew). The `-c extraheader` form
+          # is intermittently ineffective on the runner: `actions/checkout`
+          # leaves system-level credential config that interacts badly
+          # with the per-command `-c` override on a fresh clone of a
+          # different repo, and modern git's clone path resolves auth
+          # before the override applies.
+          #
+          # URL-form is the well-known reliable pattern. Risk of
+          # secret-in-config is mitigated by: (a) TAP_DIR is mktemp -d
+          # cleaned by trap on exit; (b) the repo is never uploaded as
+          # an artifact and no downstream step reads its contents; (c)
+          # post-push we strip the credentialed URL from `origin`.
+          git clone "https://x-access-token:${TAP_TOKEN}@github.com/permitlayer/homebrew-tap.git" "$TAP_DIR"
           cp Formula/agentsso.rb "$TAP_DIR/Formula/agentsso.rb"
           cd "$TAP_DIR"
-          # Persist the bearer header on this clone for the push below
-          # (without writing it into the URL).
-          git config "http.https://github.com/.extraheader" "AUTHORIZATION: bearer ${TAP_TOKEN}"
           git config user.name "permitlayer release bot"
           git config user.email "release-bot@permitlayer.dev"
           # Stage the file first — new files are untracked and don't
@@ -607,6 +616,9 @@ jobs:
           git add Formula/agentsso.rb
           if git diff --cached --quiet -- Formula/agentsso.rb; then
             echo "::notice::Formula unchanged vs tap; nothing to push"
+            # Still strip credentials from origin so the trap doesn't
+            # leave them in place if the trap firing-order changes.
+            git remote set-url origin "https://github.com/permitlayer/homebrew-tap.git"
             exit 0
           fi
           git commit -m "agentsso ${TAG}"
@@ -616,6 +628,11 @@ jobs:
           # the partial-failure issue fires.
           git pull --rebase origin main
           git push origin main
+          # Strip the credentialed URL from origin BEFORE we capture the
+          # SHA or run any further git ops; defense in depth against the
+          # token being read out of `.git/config` by anything that
+          # touches this dir before the trap cleans it.
+          git remote set-url origin "https://github.com/permitlayer/homebrew-tap.git"
           # Capture the SHA we just pushed so the smoke-test step can
           # confirm GitHub's git replicas have converged to it before
           # invoking `brew tap`. Without this, the smoke test races a
@@ -983,7 +1000,13 @@ jobs:
       - name: Install via curl|sh
         run: |
           set -euo pipefail
-          curl -sSL "https://github.com/permitlayer/permitlayer/releases/download/${TAG}/install.sh" | sh
+          # Fetch install.sh from raw.githubusercontent at the tag (NOT
+          # from the GitHub Release assets — dist's `include` field
+          # bundles install.sh INSIDE each platform tarball, not as a
+          # standalone release asset, so the releases/download URL
+          # 404s with an HTML page that `sh` then tries to execute as
+          # `Not Found` → exit 127. Surfaced in run 25194276163.).
+          curl -sSL "https://raw.githubusercontent.com/permitlayer/permitlayer/${TAG}/install/install.sh" | sh
           # install.sh defaults to ~/.local/bin; add to PATH for
           # subsequent steps.
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
@@ -1038,7 +1061,12 @@ jobs:
           $sandbox = Join-Path $env:RUNNER_TEMP 'agentsso-min-os-smoke'
           New-Item -ItemType Directory -Force -Path $sandbox | Out-Null
           $env:AGENTSSO_INSTALL_DIR = $sandbox
-          iwr -useb "https://github.com/permitlayer/permitlayer/releases/download/$env:TAG/install.ps1" | iex
+          # Same release-asset → raw.githubusercontent fix as the
+          # ubuntu smoke step. install.ps1 is bundled inside each
+          # tarball by dist's `include` field, not a standalone
+          # release asset; fetching from releases/download returns
+          # GitHub's 404 HTML which `iex` chokes on.
+          iwr -useb "https://raw.githubusercontent.com/permitlayer/permitlayer/$env:TAG/install/install.ps1" | iex
           # Story 7.7 P14 — append PATH without BOM. PS 5.1's `utf8`
           # encoding writes a BOM that prefixes the first GITHUB_PATH
           # entry and breaks subsequent cmd.exe / bash.exe steps.
@@ -1140,7 +1168,9 @@ jobs:
       - name: Download release binary
         run: |
           set -euo pipefail
-          curl -sSL "https://github.com/permitlayer/permitlayer/releases/download/${TAG}/install.sh" | sh
+          # Same release-asset → raw.githubusercontent fix as the
+          # ubuntu smoke step.
+          curl -sSL "https://raw.githubusercontent.com/permitlayer/permitlayer/${TAG}/install/install.sh" | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Run daemon + Inspector conformance
         run: |
