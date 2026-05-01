@@ -116,8 +116,14 @@ async fn main() -> ExitCode {
         Some(Commands::Stop) => anyhow_to_exit_code(cli::stop::run()),
         Some(Commands::Status(args)) => anyhow_to_exit_code(cli::status::run(args).await),
         Some(Commands::Reload) => anyhow_to_exit_code(cli::reload::run().await),
-        Some(Commands::Setup(args)) => anyhow_to_exit_code(cli::setup::run(args).await),
-        Some(Commands::Credentials(args)) => anyhow_to_exit_code(cli::credentials::run(args).await),
+        Some(Commands::Setup(args)) => setup_to_exit_code(cli::setup::run(args).await),
+        // `credentials_refresh_to_exit_code` is shape-compatible with
+        // `list`/`status` outcomes (the typed-marker downcast is a
+        // no-op for those variants). Only `refresh` ever produces
+        // `CredentialsRefreshExitCode3`. Story 7.6c.
+        Some(Commands::Credentials(args)) => {
+            credentials_refresh_to_exit_code(cli::credentials::run(args).await)
+        }
         Some(Commands::Config(args)) => anyhow_to_exit_code(cli::config::run(args)),
         Some(Commands::Audit(args)) => anyhow_to_exit_code(cli::audit::run(args).await),
         Some(Commands::Logs(args)) => anyhow_to_exit_code(cli::logs::run(args).await),
@@ -264,6 +270,62 @@ fn rotate_key_to_exit_code(result: anyhow::Result<()>) -> ExitCode {
             } else {
                 1
             };
+            if e.downcast_ref::<cli::SilentCliError>().is_some()
+                || e.chain().any(|s| s.is::<cli::SilentCliError>())
+            {
+                return ExitCode::from(resolved_code);
+            }
+            eprintln!("error: {e:#}");
+            ExitCode::from(resolved_code)
+        }
+    }
+}
+
+/// `agentsso setup`-specific dispatch (Story 7.6c). Single typed
+/// marker (`SetupExitCode3`) covering the daemon-running pre-flight
+/// refusal. Mirrors [`rotate_key_to_exit_code`] above.
+///
+/// **Architecture note:** with this PR there are now four
+/// `*_to_exit_code` dispatchers with the same shape (uninstall +
+/// update + rotate-key + setup + credentials_refresh). The
+/// `cli::common::exit_code::dispatch_with_markers` extraction
+/// tracked in deferred-work.md becomes correspondingly more
+/// attractive — see Story 7.6c's deferred-work entry.
+fn setup_to_exit_code(result: anyhow::Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            let exit_three = e.downcast_ref::<cli::setup::SetupExitCode3>().is_some();
+            let resolved_code = if exit_three { 3 } else { 1 };
+            if e.downcast_ref::<cli::SilentCliError>().is_some()
+                || e.chain().any(|s| s.is::<cli::SilentCliError>())
+            {
+                return ExitCode::from(resolved_code);
+            }
+            eprintln!("error: {e:#}");
+            ExitCode::from(resolved_code)
+        }
+    }
+}
+
+/// `agentsso credentials refresh`-specific dispatch (Story 7.6c).
+/// Single typed marker (`CredentialsRefreshExitCode3`) covering the
+/// daemon-running pre-flight refusal. Same shape as
+/// [`setup_to_exit_code`].
+///
+/// Note: pre-existing `cli_exit::{BUG, MISCONFIG, TRANSIENT}` codes
+/// in `cli::credentials` are emitted directly via `std::process::exit`
+/// inside `refresh_credentials`, NOT routed through this dispatcher.
+/// This dispatcher only needs to surface the new exit-code-3 marker
+/// for the pre-flight refusal — the legacy `process::exit` paths
+/// short-circuit before the `anyhow::Result` returns to `main`.
+fn credentials_refresh_to_exit_code(result: anyhow::Result<()>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            let exit_three =
+                e.downcast_ref::<cli::credentials::CredentialsRefreshExitCode3>().is_some();
+            let resolved_code = if exit_three { 3 } else { 1 };
             if e.downcast_ref::<cli::SilentCliError>().is_some()
                 || e.chain().any(|s| s.is::<cli::SilentCliError>())
             {

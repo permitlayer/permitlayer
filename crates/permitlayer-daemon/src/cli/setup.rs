@@ -30,6 +30,32 @@ use crate::design::render;
 use crate::design::terminal::{ColorSupport, styled};
 use crate::design::theme::Theme;
 
+// ── Story 7.6c: typed exit-code marker for the daemon-running
+// pre-flight ───────────────────────────────────────────────────────
+//
+// Mirrors `RotateKeyExitCode3` (cli/rotate_key/mod.rs:90-101). Typed
+// struct (not stringly-typed `.context("setup_exit_code:3")`) so
+// `main.rs::setup_to_exit_code` can downcast the chain without
+// colliding with operator-visible remediation text. See Story 7.5
+// `UpdateExitCode3/4/5` for the original precedent.
+
+/// Exit-code 3 marker — resource conflict (daemon running and holding
+/// the vault flock; setup would block indefinitely on `acquire()`).
+#[derive(Debug)]
+pub(crate) struct SetupExitCode3;
+
+impl std::fmt::Display for SetupExitCode3 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("setup: resource conflict")
+    }
+}
+
+impl std::error::Error for SetupExitCode3 {}
+
+pub(crate) fn exit3() -> anyhow::Error {
+    anyhow::Error::new(SetupExitCode3).context(crate::cli::SilentCliError)
+}
+
 /// RAII guard that ensures an [`indicatif::ProgressBar`] spinner is
 /// `finish_and_clear`'d when the guard drops, even on panic or early
 /// return.
@@ -145,6 +171,57 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
     // other than "daemon reports active: true", setup also proceeds — a
     // broken probe must NOT block the user from running setup.
     probe_daemon_kill_state_or_exit().await?;
+
+    // ── Story 7.6c: daemon-running pre-flight ──────────────────────
+    //
+    // setup writes to the vault via `CredentialFsStore::put` which
+    // acquires the exclusive vault `flock` (Story 7.6a). The daemon
+    // holds the same lock for its entire runtime — without this guard,
+    // setup blocks indefinitely on `flock(2)` with no operator-visible
+    // message. Surfaced 2026-05-01 during onboarding when
+    // `brew services start agentsso` was active.
+    //
+    // **Ordering note:** this pre-flight runs AFTER the kill-state
+    // probe above, not before. Both refusals are correct when the
+    // daemon is up, but the kill-state check is more specific (the
+    // user's correct next action is `agentsso resume`, not stopping
+    // the daemon entirely). Letting the kill-state probe win when
+    // applicable preserves the more-specific remediation. When the
+    // daemon is up and NOT killed, the kill-state probe returns
+    // `Ok(())` and this pre-flight then refuses with the vault-lock
+    // remediation. Mirrors `cli::rotate_key::run` Pre-flight 2 body
+    // (mod.rs:206-225) but ordering is shifted because rotate-key
+    // does not have a kill-state probe.
+    //
+    // The `home` resolution + PID-file probe uses the same fail-closed
+    // posture as rotate-key: if the probe itself errors, treat as
+    // "daemon running for safety" rather than letting setup proceed
+    // into a flock deadlock.
+    let preflight_home = super::agentsso_home()?;
+    let daemon_running = crate::lifecycle::pid::PidFile::is_daemon_running(&preflight_home)
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "PID-file probe failed; treating daemon as running for safety");
+            true
+        });
+    if daemon_running {
+        let pid_hint = match crate::lifecycle::pid::PidFile::read(&preflight_home) {
+            Ok(Some(pid)) => format!(" (PID {pid})"),
+            _ => String::new(),
+        };
+        eprint!(
+            "{}",
+            render::error_block(
+                "setup_daemon_running",
+                &format!(
+                    "agentsso daemon is running{pid_hint}; setup writes to the vault \
+                     and would block on the daemon's exclusive lock."
+                ),
+                "agentsso stop && agentsso setup <service> --oauth-client <path>",
+                None,
+            )
+        );
+        return Err(exit3());
+    }
 
     // Story 2.7 AC #8: fail fast if stdout is piped but --non-interactive
     // was not set. The old silent-fallthrough behavior (skipping Phase 2's
