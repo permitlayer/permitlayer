@@ -924,7 +924,19 @@ jobs:
     needs:
       - plan
       - host
-    if: ${{ always() && needs.host.result == 'success' && !github.event.pull_request }}
+      # The macOS smoke installs via `brew install permitlayer/tap/agentsso`,
+      # which reads from the tap repo. Without depending on
+      # `homebrew-publish`, this job races the tap push and can install
+      # the previous release's formula (e.g. v0.2.1) before the new
+      # formula has landed. The bounded `brew tap` retry inside this
+      # job (10×10s) is not sufficient — `brew tap` succeeds even on
+      # stale content, and `brew install` then resolves to the cached
+      # formula version. Make the dependency explicit. Note: the
+      # ubuntu and windows smokes don't need this dep because they
+      # install via curl|sh from raw.githubusercontent (the tarball
+      # URL doesn't go through the tap).
+      - homebrew-publish
+    if: ${{ always() && needs.host.result == 'success' && needs.homebrew-publish.result == 'success' && !github.event.pull_request }}
     runs-on: macos-15-intel
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
