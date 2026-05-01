@@ -33,6 +33,10 @@ fn run_credentials_refresh(home: &std::path::Path) -> std::process::Output {
     cmd.output().expect("failed to spawn agentsso credentials refresh")
 }
 
+// Only callers of `write_pid_file` are the cfg-gated daemon-running
+// test below. Gate the helper too so Windows builds (where the test
+// is excluded) don't trip `-D dead_code`.
+#[cfg(not(windows))]
 fn write_pid_file(home: &std::path::Path, pid: u32) {
     std::fs::write(home.join("agentsso.pid"), format!("{pid}\n")).expect("write PID file fixture");
 }
