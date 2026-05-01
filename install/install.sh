@@ -225,7 +225,18 @@ download_release() {
     # non-interactive mode — avoids wasting a large tarball download when
     # the install is going to abort anyway. A dropped .minisig (MITM, cache
     # poisoning, partial release) MUST NOT silently bypass verification.
-    curl -fsSL --connect-timeout 10 --max-time 30 -o "$SIG_PATH" "$SIG_URL" 2>/dev/null || SIG_PATH=""
+    #
+    # `--retry 5 --retry-delay 2` covers the brief asset-CDN propagation
+    # window after a fresh release (~10s on GitHub's edge). Without it,
+    # post-publish smoke tests that run within seconds of `dist host`
+    # uploading the assets get a transient 404 and abort with "no
+    # signature file available" — even though the asset exists and is
+    # reachable a few seconds later. Surfaced in run 25201997888 where
+    # both ubuntu-22.04 and mcp-inspector smoke jobs hit this race
+    # ~30s after `host` completed for v0.3.0-rc.5.
+    curl -fsSL --connect-timeout 10 --max-time 30 \
+        --retry 5 --retry-delay 2 \
+        -o "$SIG_PATH" "$SIG_URL" 2>/dev/null || SIG_PATH=""
     if [ -z "$SIG_PATH" ] && [ ! -t 0 ] && [ "$ALLOW_UNSIGNED" != "1" ]; then
         err "no signature file available for ${ARTIFACT_NAME} and non-interactive mode is in use. Re-run with \`--allow-unsigned\` to bypass (not recommended) or install interactively."
     fi
