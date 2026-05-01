@@ -3,8 +3,8 @@
 # POSIX sh compatible (no bashisms). Works on macOS /bin/sh and Linux dash.
 #
 # Usage:
-#   curl -fsSL https://raw.githubusercontent.com/botsdown/permitlayer/main/install/install.sh | sh
-#   curl -fsSL https://raw.githubusercontent.com/botsdown/permitlayer/main/install/install.sh | sh -s -- --version 0.2.0
+#   curl -fsSL https://raw.githubusercontent.com/permitlayer/permitlayer/main/install/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/permitlayer/permitlayer/main/install/install.sh | sh -s -- --version 0.2.0
 #
 # Environment:
 #   NO_COLOR=1  — disable ANSI color output
@@ -14,7 +14,7 @@ set -eu
 
 # --- Configuration -----------------------------------------------------------
 
-REPO_OWNER="botsdown"
+REPO_OWNER="permitlayer"
 REPO_NAME="permitlayer"
 BIN_NAME="agentsso"
 PKG_NAME="permitlayer-daemon"
