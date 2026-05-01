@@ -278,11 +278,30 @@ function Get-Release {
     $shaPath = "$zipPath.sha256"
     $sigPath = "$zipPath.minisig"
 
+    # Retry helper — covers the brief asset-CDN propagation window after
+    # a fresh release (~10s on GitHub's edge). PS 5.1 doesn't support
+    # Invoke-WebRequest's -MaximumRetryCount, so we hand-roll. See
+    # install.sh's matching curl --retry block for the equivalent
+    # mitigation. Surfaced when post-publish smoke tests hit transient
+    # 404s on minisig assets that exist seconds later.
+    function Get-WithRetry {
+        param([string]$Url, [string]$OutFile, [int]$Tries = 5, [int]$DelaySec = 2)
+        for ($i = 1; $i -le $Tries; $i++) {
+            try {
+                Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -TimeoutSec 30
+                return
+            } catch {
+                if ($i -eq $Tries) { throw }
+                Start-Sleep -Seconds $DelaySec
+            }
+        }
+    }
+
     # Fetch sha256 sidecar first — fail fast if missing (the spec requires
     # sha256 verification; a missing sidecar means the release is partial
     # or someone hand-published an unsigned binary).
     try {
-        Invoke-WebRequest -Uri $shaUrl -OutFile $shaPath -UseBasicParsing -TimeoutSec 30
+        Get-WithRetry -Url $shaUrl -OutFile $shaPath
     } catch {
         Write-Err ("sha256 sidecar not available at $shaUrl. Refusing to install " +
             "an unverified binary. Possible causes: partial release, network " +
@@ -293,7 +312,7 @@ function Get-Release {
     # silently skip minisig verification (sha256 is still mandatory). If
     # it's present, Verify-Minisig will use it when minisign.exe is on PATH.
     try {
-        Invoke-WebRequest -Uri $sigUrl -OutFile $sigPath -UseBasicParsing -TimeoutSec 30
+        Get-WithRetry -Url $sigUrl -OutFile $sigPath
     } catch {
         # No .minisig — fine, sha256-only path. Don't even warn (most
         # users won't have minisign.exe and the sha256 is the documented
