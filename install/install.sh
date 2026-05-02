@@ -226,16 +226,25 @@ download_release() {
     # the install is going to abort anyway. A dropped .minisig (MITM, cache
     # poisoning, partial release) MUST NOT silently bypass verification.
     #
-    # `--retry 5 --retry-delay 2` covers the brief asset-CDN propagation
-    # window after a fresh release (~10s on GitHub's edge). Without it,
-    # post-publish smoke tests that run within seconds of `dist host`
-    # uploading the assets get a transient 404 and abort with "no
-    # signature file available" — even though the asset exists and is
-    # reachable a few seconds later. Surfaced in run 25201997888 where
-    # both ubuntu-22.04 and mcp-inspector smoke jobs hit this race
-    # ~30s after `host` completed for v0.3.0-rc.5.
+    # `--retry 5 --retry-delay 2 --retry-all-errors` covers the brief
+    # asset-CDN propagation window after a fresh release (~10s on
+    # GitHub's edge). Without `--retry-all-errors`, curl's `--retry`
+    # only retries on a hardcoded list of transient codes (408, 429,
+    # 5xx) and network errors — NOT on the 404 that GitHub's edge
+    # returns during the ~5–10s window between `dist host` uploading
+    # the asset and the CDN serving it. Surfaced as a re-occurrence
+    # in v0.3.0-rc.6's smoke jobs (run 25239722738): the v0.3.0-rc.5
+    # round of this fix (PR #9) added `--retry` but missed
+    # `--retry-all-errors`, so curl exited 22 in <1s on the 404
+    # without retrying. Confirmed by direct curl ~25 minutes later
+    # to the same URL: 200 with valid 351-byte minisig content.
+    #
+    # `--retry-all-errors` requires curl >= 7.71.0 (June 2020).
+    # Targets: ubuntu-22.04 (curl 7.81.0), Apple silicon macOS
+    # default (Sonoma 8.4.0), Intel macOS recent (Big Sur 7.77.0).
+    # All in scope.
     curl -fsSL --connect-timeout 10 --max-time 30 \
-        --retry 5 --retry-delay 2 \
+        --retry 5 --retry-delay 2 --retry-all-errors \
         -o "$SIG_PATH" "$SIG_URL" 2>/dev/null || SIG_PATH=""
     if [ -z "$SIG_PATH" ] && [ ! -t 0 ] && [ "$ALLOW_UNSIGNED" != "1" ]; then
         err "no signature file available for ${ARTIFACT_NAME} and non-interactive mode is in use. Re-run with \`--allow-unsigned\` to bypass (not recommended) or install interactively."
