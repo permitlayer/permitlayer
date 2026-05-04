@@ -179,10 +179,16 @@ pub(crate) fn error_block_daemon_not_running(verb: &str) -> String {
 /// can diagnose further. The user-facing block stays structured and
 /// consistent regardless of the real error.
 pub(crate) fn error_block_daemon_unreachable(verb: &str, addr: SocketAddr) -> String {
+    // Remediation must be cross-user-safe. `agentsso status` is itself
+    // PID-gated against the calling user's home, so a cross-user caller
+    // (e.g., `angie` talking to a daemon running as `austinlowry`)
+    // would see "daemon not running" from `status` even though the
+    // daemon is up. Point at `start` (the genuine no-daemon fix) AND
+    // the bind-addr override (the cross-user fix).
     error_block(
         "daemon_unreachable",
         &format!("cannot reach daemon on {addr} (during {verb})"),
-        "agentsso status",
+        "agentsso start  (or, if the daemon is running under a different user, set AGENTSSO_HTTP__BIND_ADDR=<addr> to match)",
         None,
     )
 }
@@ -393,7 +399,10 @@ mod tests {
         assert!(out.contains("daemon_unreachable"), "out: {out}");
         assert!(out.contains("127.0.0.1:3820"), "out: {out}");
         assert!(out.contains("during kill"), "out: {out}");
-        assert!(out.contains("run:  agentsso status"), "out: {out}");
+        assert!(out.contains("agentsso start"), "out: {out}");
+        // Cross-user remediation hint must be present so a caller talking
+        // to a daemon owned by a different user has a path forward.
+        assert!(out.contains("AGENTSSO_HTTP__BIND_ADDR"), "out: {out}");
     }
 
     #[test]
