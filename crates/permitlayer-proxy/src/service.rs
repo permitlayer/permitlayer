@@ -971,18 +971,22 @@ async fn proxy_handler(
     // F6: Strip leading `/` from axum's {*path} extractor to prevent
     // Url::join from rebasing the path (RFC 3986 resolution).
     let path = raw_path.strip_prefix('/').unwrap_or(&raw_path).to_owned();
-    // TODO: reject with ProxyError::Unauthorized when auth middleware is wired (Epic 4).
-    let agent_id = request
-        .extensions()
-        .get::<AgentId>()
-        .map(|a| a.0.clone())
-        .unwrap_or_else(|| {
-            warn!("AgentId extension missing — defaulting to \"unknown\". Auth middleware not wired yet.");
-            "unknown".to_owned()
-        });
 
     let request_id =
         request.extensions().get::<RequestId>().map(|r| r.0.clone()).unwrap_or_default();
+
+    // AuthLayer is wired and runs before this handler for all
+    // /v1/tools/* routes. Missing AgentId here means the request
+    // bypassed auth (operational allowlist misconfigured) — refuse
+    // rather than fall back to the "unknown" default that masquerades
+    // as a real agent. Returns 401 with `auth.missing_agent_id`.
+    let agent_id = match request.extensions().get::<AgentId>() {
+        Some(a) => a.0.clone(),
+        None => {
+            warn!(request_id = %request_id, "AgentId extension missing on /v1/tools/* request — refusing");
+            return ProxyError::AuthMissingAgentId.into_response_with_request_id(Some(request_id));
+        }
+    };
 
     let scope = match request.headers().get("x-agentsso-scope") {
         Some(v) => match v.to_str() {

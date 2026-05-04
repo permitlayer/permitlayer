@@ -278,7 +278,11 @@ async fn mcp_messages_list_returns_upstream_json() {
     let mcp_server = GmailMcpServer::new(proxy);
 
     // Simulate a messages.list tool call by calling the dispatch helper.
-    let req = GmailMcpServer::gmail_request("users/me/messages".to_owned(), "gmail.readonly");
+    let req = GmailMcpServer::gmail_request(
+        "users/me/messages".to_owned(),
+        "gmail.readonly",
+        "test-agent".to_owned(),
+    );
     let result = mcp_server.dispatch(req).await;
     assert!(result.is_ok());
     let body = result.unwrap();
@@ -300,8 +304,11 @@ async fn mcp_messages_get_constructs_correct_path() {
     let (proxy, _audit) = build_service(&format!("{}/", server.url())).await;
     let mcp_server = GmailMcpServer::new(proxy);
 
-    let req =
-        GmailMcpServer::gmail_request("users/me/messages/abc123".to_owned(), "gmail.readonly");
+    let req = GmailMcpServer::gmail_request(
+        "users/me/messages/abc123".to_owned(),
+        "gmail.readonly",
+        "test-agent".to_owned(),
+    );
     let result = mcp_server.dispatch(req).await;
     assert!(result.is_ok());
     let body = result.unwrap();
@@ -323,8 +330,11 @@ async fn mcp_search_constructs_correct_query_string() {
     let (proxy, _audit) = build_service(&format!("{}/", server.url())).await;
     let mcp_server = GmailMcpServer::new(proxy);
 
-    let req =
-        GmailMcpServer::gmail_request("users/me/messages?q=from:me".to_owned(), "gmail.readonly");
+    let req = GmailMcpServer::gmail_request(
+        "users/me/messages?q=from:me".to_owned(),
+        "gmail.readonly",
+        "test-agent".to_owned(),
+    );
     let result = mcp_server.dispatch(req).await;
     assert!(result.is_ok());
 
@@ -357,7 +367,11 @@ async fn mcp_tool_error_returns_error_string_not_transport_error() {
     ));
 
     let mcp_server = GmailMcpServer::new(proxy);
-    let req = GmailMcpServer::gmail_request("users/me/messages".to_owned(), "gmail.readonly");
+    let req = GmailMcpServer::gmail_request(
+        "users/me/messages".to_owned(),
+        "gmail.readonly",
+        "test-agent".to_owned(),
+    );
 
     // Should return Err(message) — not panic or transport error.
     let result = mcp_server.dispatch(req).await;
@@ -384,7 +398,11 @@ async fn mcp_originated_call_writes_audit_event() {
     let (proxy, audit) = build_service(&format!("{}/", server.url())).await;
     let mcp_server = GmailMcpServer::new(proxy);
 
-    let req = GmailMcpServer::gmail_request("users/me/messages".to_owned(), "gmail.readonly");
+    let req = GmailMcpServer::gmail_request(
+        "users/me/messages".to_owned(),
+        "gmail.readonly",
+        "test-agent".to_owned(),
+    );
     let result = mcp_server.dispatch(req).await;
     assert!(result.is_ok());
 
@@ -416,7 +434,11 @@ async fn rest_and_mcp_return_equivalent_response_data() {
 
     // MCP path: GmailMcpServer::dispatch
     let mcp_server = GmailMcpServer::new(Arc::clone(&proxy));
-    let mcp_req = GmailMcpServer::gmail_request("users/me/messages".to_owned(), "gmail.readonly");
+    let mcp_req = GmailMcpServer::gmail_request(
+        "users/me/messages".to_owned(),
+        "gmail.readonly",
+        "test-agent".to_owned(),
+    );
     let mcp_result = mcp_server.dispatch(mcp_req).await.unwrap();
 
     // REST path: ProxyService::handle directly

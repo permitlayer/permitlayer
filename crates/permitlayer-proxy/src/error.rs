@@ -50,6 +50,25 @@ pub enum ProxyError {
     #[error("Bearer token is not registered")]
     AuthInvalidToken { token_prefix: Option<String> },
 
+    /// `AgentId` extension was not present on a request that requires
+    /// authenticated identity (any /mcp/* tool dispatch or any
+    /// /v1/tools/* REST call). Means either the request bypassed
+    /// `AuthLayer` (operational allowlist misconfigured) or a test
+    /// harness called the handler directly without setting up the
+    /// extension. Returns HTTP 401 with code `auth.missing_agent_id`
+    /// on the REST path, and surfaces as a `CallToolResult::error` on
+    /// the MCP path.
+    ///
+    /// Distinct from `AuthMissingToken`: that fires when no
+    /// `Authorization` header is present at all. This fires when the
+    /// header was present, AuthLayer ran, but the resulting `AgentId`
+    /// extension didn't reach the dispatch handler — a structural bug,
+    /// not a client error. The two error codes let operators
+    /// distinguish "client forgot the header" from "server-side
+    /// middleware chain is broken."
+    #[error("agent identity missing — request did not pass through AuthLayer")]
+    AuthMissingAgentId,
+
     /// Policy evaluation denied the request (FR36, FR53).
     ///
     /// Carries the full violation context so the response body names the
@@ -311,6 +330,7 @@ impl ProxyError {
             // matches the rest of the auth.* family.
             Self::AuthMissingToken => "auth.missing_token",
             Self::AuthInvalidToken { .. } => "auth.invalid_token",
+            Self::AuthMissingAgentId => "auth.missing_agent_id",
             // NOTE: The epic AC literal at epics.md:1421 uses
             // "policy_violation" (underscore). The codebase convention is
             // dotted codes. Keeping "policy.denied" for backward
@@ -347,7 +367,9 @@ impl ProxyError {
             Self::DnsRebindBlocked { .. } => StatusCode::BAD_REQUEST,
             Self::KillSwitchActive { .. } => StatusCode::FORBIDDEN,
             Self::Unauthorized { .. } => StatusCode::UNAUTHORIZED,
-            Self::AuthMissingToken | Self::AuthInvalidToken { .. } => StatusCode::UNAUTHORIZED,
+            Self::AuthMissingToken | Self::AuthInvalidToken { .. } | Self::AuthMissingAgentId => {
+                StatusCode::UNAUTHORIZED
+            }
             Self::PolicyDenied { .. } => StatusCode::FORBIDDEN,
             Self::PolicyEvalFailed => StatusCode::SERVICE_UNAVAILABLE,
             Self::ApprovalRequired { .. } | Self::ApprovalTimeout { .. } => StatusCode::FORBIDDEN,
@@ -494,6 +516,20 @@ impl ProxyError {
                       --policy=<policy>` to mint a fresh token. If no agents are \
                       registered, check the daemon startup logs for 'agent registry \
                       unavailable' — the registry may have failed to load."
+                        .to_owned(),
+                ),
+                None,
+            ),
+            Self::AuthMissingAgentId => (
+                None,
+                None,
+                Some(
+                    "agent identity missing on a request that requires it. This is \
+                      a server-side middleware error: AuthLayer should have populated \
+                      the agent extension before this handler ran. Check that the \
+                      route is not in the operational-path allowlist by mistake. If \
+                      you see this in production, file a bug — clients cannot trigger \
+                      it directly."
                         .to_owned(),
                 ),
                 None,

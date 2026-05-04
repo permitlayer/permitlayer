@@ -331,6 +331,12 @@ where
             req.extensions_mut().insert(AgentId(agent_name.clone()));
             req.extensions_mut().insert(AgentPolicyBinding(policy_name));
 
+            // Surface the resolved agent_id on the request-trace span
+            // (RequestTraceLayer at `middleware/trace.rs` initializes
+            // the span field with the literal "unknown" default; this
+            // updates it so tail-debugging logs show the real name).
+            tracing::Span::current().record("agent_id", agent_name.as_str());
+
             if let Some(store) = agent_store {
                 let mut updated = agent;
                 updated.last_seen_at = Some(chrono::Utc::now());
