@@ -408,10 +408,10 @@ fn wait_for_audit_event(
 /// exist. Post-fix, the PID short-circuit is gone for `register`, so
 /// the HTTP call proceeds and succeeds.
 ///
-/// This is `#[cfg(unix)]`-gated only because Windows `cmd.env_clear()`
-/// + Winsock interactions in the larger subprocess matrix have been
-/// flake-prone (see `kill_resume_e2e.rs::setup_blocked_when_killed`).
-/// The change being tested is platform-independent.
+/// `#[cfg(unix)]`-gated only because Windows `cmd.env_clear()` plus
+/// Winsock interactions in the larger subprocess matrix have been
+/// flake-prone (see `kill_resume_e2e.rs::setup_blocked_when_killed`);
+/// the change being tested is platform-independent.
 #[cfg(unix)]
 #[test]
 fn agent_register_works_cross_home() {
