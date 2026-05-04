@@ -159,8 +159,9 @@ Tracked as a follow-up to add proper operator-token authentication.
 - **OAuth broker** with PKCE + automatic refresh, backed by a sealed
   on-disk vault (AES-GCM + HKDF + Argon2) and the OS keychain.
 - **Scrub engine** — built-in rules for bearer tokens, OTPs, password-reset
-  links, and common PII patterns. Replaces matches with stable placeholders
-  that round-trip across the proxy boundary.
+  links, and common PII patterns. Replaces matches with one-way redaction
+  placeholders (`<REDACTED_BEARER>`, `<REDACTED_OTP>`, ...) before content
+  reaches the agent.
 - **Policy engine** — per-agent, per-resource, per-method allow/prompt/deny
   rules. Policy decisions are logged.
 - **Kill switch** — `agentsso kill` flips the daemon into a state where
@@ -181,6 +182,10 @@ details.
 - [docs/adrs/](docs/adrs/) — architecture decision records
 - [docs/agent-identity-memo.md](docs/agent-identity-memo.md) — identity
   model design
+- [docs/user-guide/agent-skill-permitlayer-mcp.md](docs/user-guide/agent-skill-permitlayer-mcp.md)
+  — drop-in skill / system prompt for LLM agents that talk to permitlayer's
+  MCP daemon (covers policy semantics, scrub placeholders, error retry rules,
+  audit expectations)
 - [CONTRIBUTING.md](CONTRIBUTING.md) — dev workflow, test gates,
   CODEOWNERS policy
 - [SECURITY.md](SECURITY.md) — vulnerability reporting
