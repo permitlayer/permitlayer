@@ -103,6 +103,32 @@ keeps tokens scoped to your Google account, not a shared app.
    agentsso audit --follow
    ```
 
+### Setup over SSH or under `su`
+
+If `agentsso setup` cannot reach a usable browser (SSH session, `su user`
+without GUI access, headless server, etc.), pass `--no-browser` to
+print the authorization URL instead of launching a browser:
+
+```sh
+agentsso setup gmail --oauth-client ./client_secret.json --no-browser
+```
+
+Open the printed URL in any browser that can reach `127.0.0.1` on this
+host (the local callback server is loopback-bound). After consent, the
+redirect lands automatically. If your browser is on a different
+machine, copy the resulting redirect URL and `curl` it from the host
+running setup.
+
+On macOS, `su`-ing to a user that is not the foreground GUI user also
+requires unlocking that user's login keychain in the same shell:
+
+```sh
+security unlock-keychain ~/Library/Keychains/login.keychain-db
+```
+
+Otherwise the keychain rejects the master-key probe with `User
+interaction is not allowed`.
+
 ## What's in the box
 
 - **OAuth broker** with PKCE + automatic refresh, backed by a sealed

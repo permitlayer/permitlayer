@@ -106,6 +106,14 @@ pub struct SetupArgs {
     /// Implied by `--non-interactive`.
     #[arg(long)]
     pub force: bool,
+    /// Print the authorization URL instead of launching a browser.
+    /// Use this when running over SSH, under `su` without GUI access,
+    /// or any context where `open::that()` cannot reach a usable
+    /// browser. The local callback server still binds to 127.0.0.1;
+    /// complete consent in any browser that can reach loopback on this
+    /// host.
+    #[arg(long = "no-browser")]
+    pub no_browser: bool,
 }
 
 /// Run the `setup` subcommand.
@@ -434,7 +442,11 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
                 .unwrap_or_else(|_| indicatif::ProgressStyle::default_spinner()),
         );
         spinner.enable_steady_tick(std::time::Duration::from_millis(120));
-        spinner.set_message("waiting for browser consent...");
+        spinner.set_message(if args.no_browser {
+            "waiting for consent (open URL above)..."
+        } else {
+            "waiting for browser consent..."
+        });
 
         // RAII: guarantee the spinner is cleared on normal return,
         // early return, or panic. Replaces the old manual
@@ -442,7 +454,7 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
         // thread on any non-happy-path exit (Story 1.8 defer closed).
         let guard = SpinnerGuard::new(spinner);
 
-        let authorize_result = client.authorize(scopes_owned.clone(), None).await;
+        let authorize_result = client.authorize(scopes_owned.clone(), None, args.no_browser).await;
         // Drop the guard explicitly BEFORE any output so the spinner
         // line is cleared from the terminal before we print an error
         // block or success message.
@@ -464,8 +476,12 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
             }
         }
     } else {
-        tracing::info!("opening browser for Google OAuth consent...");
-        match client.authorize(scopes_owned.clone(), None).await {
+        if args.no_browser {
+            tracing::info!("printing OAuth consent URL (--no-browser)");
+        } else {
+            tracing::info!("opening browser for Google OAuth consent...");
+        }
+        match client.authorize(scopes_owned.clone(), None, args.no_browser).await {
             Ok(r) => r,
             Err(e) => {
                 render_oauth_error(
@@ -1117,6 +1133,7 @@ async fn run_orchestrator(args: SetupArgs) -> anyhow::Result<()> {
         oauth_client: args.oauth_client,
         non_interactive: false,
         force: args.force,
+        no_browser: args.no_browser,
     };
     Box::pin(run(per_service_args)).await?;
 

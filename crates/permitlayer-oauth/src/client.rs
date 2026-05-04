@@ -126,14 +126,20 @@ impl OAuthClient {
     ///
     /// 1. Generates PKCE challenge + verifier
     /// 2. Spawns ephemeral callback server
-    /// 3. Opens browser to consent screen
+    /// 3. Opens browser to consent screen (or prints URL if `no_browser`)
     /// 4. Awaits callback with authorization code
     /// 5. Exchanges code for tokens
     /// 6. Returns tokens wrapped in credential types
+    ///
+    /// When `no_browser` is true, the URL is printed to stdout and the
+    /// caller (or end-user) is responsible for opening it. When false,
+    /// `open::that()` is invoked; on IO failure the URL is printed to
+    /// stderr as a fallback so the user can complete the flow manually.
     pub async fn authorize(
         &self,
         scopes: Vec<String>,
         timeout: Option<Duration>,
+        no_browser: bool,
     ) -> Result<AuthorizeResult, OAuthError> {
         // Generate PKCE.
         let (pkce_challenge, pkce_verifier) = pkce::generate_pkce();
@@ -166,18 +172,29 @@ impl OAuthClient {
 
         let (auth_url, _csrf_token) = auth_request.url();
 
-        // Open browser — open::that() is blocking on some platforms, so use
-        // spawn_blocking to avoid blocking the async executor.
+        // Open browser — or print URL if --no-browser was requested.
+        // open::that() is blocking on some platforms, so we use
+        // spawn_blocking to avoid stalling the async executor.
         let url_string = auth_url.to_string();
-        let open_result = tokio::task::spawn_blocking(move || open::that(&url_string)).await;
-
-        match open_result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => return Err(OAuthError::BrowserOpenFailed { source: e }),
-            Err(e) => {
-                return Err(OAuthError::BrowserOpenFailed {
-                    source: std::io::Error::other(e.to_string()),
-                });
+        if no_browser {
+            print_manual_auth_url(&url_string);
+        } else {
+            let url_for_open = url_string.clone();
+            let open_result = tokio::task::spawn_blocking(move || open::that(&url_for_open)).await;
+            match open_result {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    // Auto-fallback: if open::that() can't reach a usable
+                    // browser (no DISPLAY, headless SSH, `su` without GUI
+                    // context, etc.), print the URL so the user can
+                    // complete the flow manually instead of dead-ending.
+                    print_browser_fallback_message(&url_string, &e);
+                }
+                Err(e) => {
+                    return Err(OAuthError::BrowserOpenFailed {
+                        source: std::io::Error::other(e.to_string()),
+                    });
+                }
             }
         }
 
@@ -264,6 +281,60 @@ impl OAuthClient {
     ) -> Result<crate::refresh::RefreshResult, crate::error::OAuthError> {
         crate::refresh::refresh_with_retry(&self.inner, &self.http_client, refresh_token).await
     }
+}
+
+/// Render the manual-paste consent message to the given writer.
+///
+/// Extracted as a writer-injected helper so unit tests can assert the
+/// rendered text without capturing global stdout. Production callers
+/// pipe through [`print_manual_auth_url`].
+pub(crate) fn render_manual_auth_url(w: &mut dyn std::io::Write, url: &str) -> std::io::Result<()> {
+    writeln!(w)?;
+    writeln!(w, "  Open this URL in any browser to grant consent:")?;
+    writeln!(w)?;
+    writeln!(w, "    {url}")?;
+    writeln!(w)?;
+    writeln!(w, "  After approving, you'll be redirected to a 127.0.0.1 page on this host.")?;
+    writeln!(w, "  If you completed consent in a browser on the SAME machine, the redirect")?;
+    writeln!(w, "  lands here automatically. If you used a DIFFERENT machine, copy the full")?;
+    writeln!(w, "  redirected URL (starting with http://127.0.0.1:...) and curl it from this")?;
+    writeln!(w, "  host:")?;
+    writeln!(w)?;
+    writeln!(w, "    curl '<paste-redirect-url-here>'")?;
+    writeln!(w)?;
+    Ok(())
+}
+
+/// Render the auto-fallback "browser launch failed" message to the
+/// given writer. See [`render_manual_auth_url`] for the writer-injection
+/// rationale.
+pub(crate) fn render_browser_fallback_message(
+    w: &mut dyn std::io::Write,
+    url: &str,
+    err: &std::io::Error,
+) -> std::io::Result<()> {
+    writeln!(w)?;
+    writeln!(w, "  Could not open browser ({err}). Open this URL manually:")?;
+    writeln!(w)?;
+    writeln!(w, "    {url}")?;
+    writeln!(w)?;
+    Ok(())
+}
+
+/// Print the manual-paste consent message to stdout. The callback
+/// server is already listening before this is called.
+fn print_manual_auth_url(url: &str) {
+    let mut stdout = std::io::stdout();
+    // Best-effort: a stdout write failure here is unrecoverable for the
+    // user-facing flow but shouldn't fail the OAuth call. The auth URL
+    // is also available in trace logs at INFO level.
+    let _ = render_manual_auth_url(&mut stdout, url);
+}
+
+/// Print the auto-fallback message to stderr when `open::that()` fails.
+fn print_browser_fallback_message(url: &str, err: &std::io::Error) {
+    let mut stderr = std::io::stderr();
+    let _ = render_browser_fallback_message(&mut stderr, url, err);
 }
 
 #[cfg(test)]
@@ -354,5 +425,29 @@ mod tests {
             .map(|rt| OAuthRefreshToken::from_trusted_bytes(rt.secret().as_bytes().to_vec()));
         assert!(refresh.is_some());
         assert_eq!(refresh.as_ref().unwrap().reveal(), b"1//test-refresh-token-placeholder");
+    }
+
+    #[test]
+    fn render_manual_auth_url_includes_url_and_instructions() {
+        let mut buf = Vec::new();
+        render_manual_auth_url(&mut buf, "https://example.test/auth?foo=bar")
+            .expect("write into Vec cannot fail");
+        let out = String::from_utf8(buf).expect("ascii output");
+        assert!(out.contains("https://example.test/auth?foo=bar"), "URL must appear in output");
+        assert!(out.contains("Open this URL"), "primary instruction must appear");
+        assert!(out.contains("127.0.0.1"), "loopback note must appear");
+        assert!(out.contains("curl"), "curl-fallback note must appear for cross-host case");
+    }
+
+    #[test]
+    fn render_browser_fallback_includes_url_and_error() {
+        let err = std::io::Error::other("simulated open failure");
+        let mut buf = Vec::new();
+        render_browser_fallback_message(&mut buf, "https://example.test/auth", &err)
+            .expect("write into Vec cannot fail");
+        let out = String::from_utf8(buf).expect("ascii output");
+        assert!(out.contains("https://example.test/auth"), "URL must appear in fallback output");
+        assert!(out.contains("Could not open browser"), "fallback header must appear");
+        assert!(out.contains("simulated open failure"), "underlying error must appear");
     }
 }
