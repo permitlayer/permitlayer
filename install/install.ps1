@@ -278,14 +278,19 @@ function Get-Release {
     $shaPath = "$zipPath.sha256"
     $sigPath = "$zipPath.minisig"
 
-    # Retry helper — covers the brief asset-CDN propagation window after
-    # a fresh release (~10s on GitHub's edge). PS 5.1 doesn't support
-    # Invoke-WebRequest's -MaximumRetryCount, so we hand-roll. See
-    # install.sh's matching curl --retry block for the equivalent
-    # mitigation. Surfaced when post-publish smoke tests hit transient
-    # 404s on minisig assets that exist seconds later.
+    # Retry helper — covers the asset-CDN propagation window after
+    # a fresh release. PS 5.1 doesn't support Invoke-WebRequest's
+    # -MaximumRetryCount, so we hand-roll. See install.sh's matching
+    # curl --retry block for the equivalent mitigation.
+    #
+    # Bumped from 5 × 2s = 10s to 15 × 3s = 45s after rc.7's smoke
+    # (run 25324891575) showed CDN propagation taking >40s on the
+    # Ubuntu smoke job (Linux fetches release assets directly;
+    # macOS dodges this via the brew tap delay). 45s comfortably
+    # covers observed propagation while still failing fast on
+    # genuine 404s post-window.
     function Get-WithRetry {
-        param([string]$Url, [string]$OutFile, [int]$Tries = 5, [int]$DelaySec = 2)
+        param([string]$Url, [string]$OutFile, [int]$Tries = 15, [int]$DelaySec = 3)
         for ($i = 1; $i -le $Tries; $i++) {
             try {
                 Invoke-WebRequest -Uri $Url -OutFile $OutFile -UseBasicParsing -TimeoutSec 30
