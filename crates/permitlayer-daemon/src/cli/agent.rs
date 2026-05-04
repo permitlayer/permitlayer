@@ -82,15 +82,21 @@ pub async fn run(args: AgentArgs) -> Result<()> {
 
 async fn register_agent(args: RegisterArgs) -> Result<()> {
     let config = load_daemon_config_or_default_with_warn("agent register");
-    let home = config.paths.home.clone();
 
-    // 1. Daemon must be running.
-    if PidFile::read(&home)?.is_none() || !PidFile::is_daemon_running(&home)? {
-        eprint!("{}", error_block_daemon_not_running("agent register"));
-        std::process::exit(3);
-    }
+    // No PID-file pre-check here. The daemon may be running under a
+    // different OS user (intentional architecture: vault-holder runs as
+    // a privileged user; agent operators connect over loopback). The
+    // PID file lives at the *daemon owner's* `~/.agentsso/` and isn't
+    // readable cross-user. Defer the "is the daemon up?" decision to
+    // the HTTP call below — the existing `error_block_daemon_unreachable`
+    // path renders the same outcome for a single-user user with no
+    // daemon running, and works correctly for the cross-user case.
+    //
+    // Destructive control endpoints (`agent remove`, `kill`, `resume`,
+    // `reload`) keep the PID-file gate until the control plane gains
+    // proper auth — see deferred-work.md "control-plane authentication".
 
-    // 2. POST the request.
+    // POST the request.
     let body = serde_json::json!({
         "name": args.name,
         "policy_name": args.policy,
@@ -169,10 +175,10 @@ async fn list_agents() -> Result<()> {
     let config = load_daemon_config_or_default_with_warn("agent list");
     let home = config.paths.home.clone();
 
-    if PidFile::read(&home)?.is_none() || !PidFile::is_daemon_running(&home)? {
-        eprint!("{}", error_block_daemon_not_running("agent list"));
-        std::process::exit(3);
-    }
+    // No PID-file pre-check — see `register_agent` for the rationale.
+    // Read-only metadata; safe to defer reachability check to the HTTP
+    // call's existing error-block path. `home` is still resolved
+    // because it's used by `Theme::load` further down for rendering.
 
     let bind_addr = config.http.bind_addr;
     let response = match http_get(bind_addr, "/v1/control/agent/list").await {

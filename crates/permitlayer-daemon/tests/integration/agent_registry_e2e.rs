@@ -388,3 +388,79 @@ fn wait_for_audit_event(
     }
     None
 }
+
+/// Cross-user / cross-home `agentsso agent register` works.
+///
+/// Pins the architectural property "any caller on loopback who can reach
+/// the daemon's bind address may register an agent" by simulating the
+/// "different OS user" scenario without actually needing two real users:
+///
+/// - Daemon home: `home_daemon` (tempdir A) — daemon writes its PID file
+///   here.
+/// - Caller home: `home_caller` (tempdir B) — the CLI is invoked with
+///   `AGENTSSO_PATHS__HOME=<home_caller>`, so its config-loader thinks
+///   it's a different user with no PID file in its own home.
+/// - The CLI is told the daemon's bind address via
+///   `AGENTSSO_HTTP__BIND_ADDR`.
+///
+/// Pre-this-fix, the CLI's PID-file pre-check would short-circuit with
+/// `daemon_not_running` because `home_caller/agentsso.pid` doesn't
+/// exist. Post-fix, the PID short-circuit is gone for `register`, so
+/// the HTTP call proceeds and succeeds.
+///
+/// `#[cfg(unix)]`-gated only because Windows `cmd.env_clear()` plus
+/// Winsock interactions in the larger subprocess matrix have been
+/// flake-prone (see `kill_resume_e2e.rs::setup_blocked_when_killed`);
+/// the change being tested is platform-independent.
+#[cfg(unix)]
+#[test]
+fn agent_register_works_cross_home() {
+    use std::process::Command;
+
+    let home_daemon = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home_daemon.path().join("config")).unwrap();
+    seed_two_policies(home_daemon.path());
+
+    let daemon = start_daemon(home_daemon.path());
+    let port = daemon.port;
+    assert!(wait_for_health(port), "daemon should boot");
+
+    // Caller's home is a *separate* tempdir with NO PID file.
+    let home_caller = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home_caller.path().join("policies")).unwrap();
+
+    let bind_addr = format!("127.0.0.1:{port}");
+    let output = Command::new(crate::common::agentsso_bin())
+        .env_clear()
+        .envs(crate::common::forward_windows_required_env())
+        .env("PATH", std::env::var("PATH").unwrap_or_default())
+        .env("HOME", home_caller.path())
+        .env("AGENTSSO_PATHS__HOME", home_caller.path())
+        .env("AGENTSSO_HTTP__BIND_ADDR", &bind_addr)
+        .arg("agent")
+        .arg("register")
+        .arg("cross-home-agent")
+        .arg("--policy")
+        .arg("policy-readonly")
+        .output()
+        .expect("failed to spawn agentsso agent register");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "register should succeed cross-home (the daemon under home_daemon serves loopback). \
+         exit={:?}\nstdout={stdout}\nstderr={stderr}",
+        output.status.code(),
+    );
+    assert!(stdout.contains("cross-home-agent"), "expected agent name in stdout; stdout={stdout}",);
+    assert!(stdout.contains("agt_v2_"), "expected bearer token in stdout; stdout={stdout}",);
+    // Negative pin: must NOT have rendered the pre-fix `daemon_not_running` banner
+    // just because the caller's home had no PID file.
+    assert!(
+        !stderr.contains("daemon_not_running"),
+        "daemon_not_running should not fire for cross-home register; stderr={stderr}",
+    );
+}

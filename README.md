@@ -129,6 +129,31 @@ security unlock-keychain ~/Library/Keychains/login.keychain-db
 Otherwise the keychain rejects the master-key probe with `User
 interaction is not allowed`.
 
+### Running the daemon and the agent under different OS users
+
+A common multi-user pattern: run the daemon as one user (e.g.
+`vault-keeper`) so the OAuth refresh token and master key live in a
+filesystem the agent's OS user (e.g. `agent`) cannot read. The agent
+talks to the daemon over loopback with a bearer token issued by
+`agentsso agent register`.
+
+`agent register` and `agent list` work cross-user as long as the
+caller can reach the daemon's bind address. If the daemon owner has
+overridden the default `127.0.0.1:3820`, point the caller at it
+explicitly:
+
+```sh
+# As the agent user, talking to a daemon owned by a different user:
+AGENTSSO_HTTP__BIND_ADDR=127.0.0.1:3820 \
+  agentsso agent register angie --policy gmail-read-only
+```
+
+The destructive control endpoints (`agentsso kill`, `agentsso resume`,
+`agentsso reload`, `agentsso agent remove`) currently still refuse
+cross-user — they're loopback-only without bearer-token auth, so we
+keep an implicit owner-only gate via the daemon owner's PID file.
+Tracked as a follow-up to add proper operator-token authentication.
+
 ## What's in the box
 
 - **OAuth broker** with PKCE + automatic refresh, backed by a sealed
