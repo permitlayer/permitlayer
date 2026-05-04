@@ -19,6 +19,7 @@ use permitlayer_core::audit::event::AuditEvent;
 use permitlayer_core::scrub::{ScrubEngine, builtin_rules};
 use permitlayer_core::store::{AuditStore, CredentialStore, StoreError};
 use permitlayer_credential::{OAuthToken, SealedCredential};
+use permitlayer_proxy::error::AgentId;
 use permitlayer_proxy::service::ProxyService;
 use permitlayer_proxy::token::ScopedTokenIssuer;
 use permitlayer_proxy::transport::mcp::mcp_service;
@@ -75,6 +76,10 @@ impl MockAuditStore {
     fn new() -> Self {
         Self { events: Mutex::new(Vec::new()) }
     }
+
+    fn snapshot(&self) -> Vec<AuditEvent> {
+        self.events.lock().unwrap().clone()
+    }
 }
 
 #[async_trait::async_trait]
@@ -86,14 +91,28 @@ impl AuditStore for MockAuditStore {
 }
 
 /// Start an in-process axum server with the MCP service on an ephemeral port.
-/// Returns the base URL (e.g., "http://127.0.0.1:12345").
+/// Returns the base URL, the JoinHandle for the server task, and a clone of
+/// the audit store so tests can read back the events the proxy wrote.
+///
+/// `agent_name` is the synthetic AgentId injected by the test middleware.
+/// Production gets this from AuthLayer; we stand in for it.
 async fn start_mcp_server(upstream_url: &str) -> (String, tokio::task::JoinHandle<()>) {
+    let (base_url, handle, _audit) = start_mcp_server_with_agent(upstream_url, "test-agent").await;
+    (base_url, handle)
+}
+
+async fn start_mcp_server_with_agent(
+    upstream_url: &str,
+    agent_name: &'static str,
+) -> (String, tokio::task::JoinHandle<()>, Arc<MockAuditStore>) {
     let mut cred_store = MockCredentialStore::new(TEST_MASTER_KEY);
     cred_store.add_service("gmail", b"test-oauth-access-token");
 
     let client = reqwest::Client::builder().build().unwrap();
     let mut base_urls = HashMap::new();
     base_urls.insert("gmail".to_owned(), Url::parse(upstream_url).unwrap());
+
+    let audit_store = Arc::new(MockAuditStore::new());
 
     let proxy = Arc::new(ProxyService::new(
         Arc::new(cred_store) as Arc<dyn CredentialStore>,
@@ -104,13 +123,23 @@ async fn start_mcp_server(upstream_url: &str) -> (String, tokio::task::JoinHandl
             ScopedTokenIssuer::new(Zeroizing::new(key))
         }),
         Arc::new(UpstreamClient::with_client_and_urls(client, base_urls)),
-        Arc::new(MockAuditStore::new()) as Arc<dyn AuditStore>,
+        Arc::clone(&audit_store) as Arc<dyn AuditStore>,
         Arc::new(ScrubEngine::new(builtin_rules().to_vec()).unwrap()),
         std::env::temp_dir(),
     ));
 
     let mcp = mcp_service(proxy);
-    let app = Router::new().nest_service("/mcp", mcp);
+    // Test-only: inject the AgentId extension that AuthLayer would
+    // populate in production. The MCP service rejects requests
+    // without AgentId (auth.missing_agent_id), so we stand in for
+    // AuthLayer here. Layered BEFORE nest_service so the extension
+    // lives on the inbound request that rmcp captures into Parts.
+    let app = Router::new().nest_service("/mcp", mcp).layer(axum::middleware::from_fn(
+        move |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
+            req.extensions_mut().insert(AgentId(agent_name.to_owned()));
+            next.run(req).await
+        },
+    ));
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
@@ -123,7 +152,7 @@ async fn start_mcp_server(upstream_url: &str) -> (String, tokio::task::JoinHandl
     // Give the server a moment to bind.
     tokio::time::sleep(Duration::from_millis(50)).await;
 
-    (base_url, handle)
+    (base_url, handle, audit_store)
 }
 
 #[tokio::test]
@@ -355,6 +384,113 @@ async fn mcp_tools_call_gmail_messages_list_returns_valid_response() {
         body.contains("conformance-test"),
         "tools/call response should contain upstream data, got: {body}"
     );
+
+    handle.abort();
+}
+
+/// Pin the regression: when an authenticated MCP request reaches a tool
+/// handler, the audit event for the upstream call MUST be attributed to
+/// the bearer-bound agent name, not a sentinel.
+///
+/// Pre-fix, every MCP tool call wrote `agent_id="mcp-client-unattributed"`
+/// because the agent identity was carried in a tokio task-local that
+/// did not survive rmcp's session-worker `tokio::spawn`. The fix routes
+/// identity via `RequestContext.extensions[Parts].extensions[AgentId]`,
+/// which DOES survive the spawn. This test exercises the full
+/// initialize → notifications/initialized → tools/call dance and reads
+/// the audit event back to confirm the bug is gone.
+#[tokio::test]
+async fn mcp_tool_call_attributes_audit_event_to_real_agent() {
+    let mut upstream = mockito::Server::new_async().await;
+    let _mock = upstream
+        .mock("GET", "/users/me/messages")
+        .with_status(200)
+        .with_body(r#"{"messages":[{"id":"audit-test"}]}"#)
+        .create_async()
+        .await;
+
+    let (base_url, handle, audit_store) =
+        start_mcp_server_with_agent(&format!("{}/", upstream.url()), "real-agent").await;
+    let client = reqwest::Client::new();
+
+    // 1. initialize
+    let init_request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": { "name": "test-client", "version": "1.0.0" }
+        }
+    });
+    let init_resp = client
+        .post(format!("{base_url}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .json(&init_request)
+        .send()
+        .await
+        .unwrap();
+    let session_id =
+        init_resp.headers().get("mcp-session-id").map(|v| v.to_str().unwrap().to_owned());
+
+    // 2. notifications/initialized
+    let initialized = serde_json::json!({
+        "jsonrpc": "2.0",
+        "method": "notifications/initialized"
+    });
+    let mut req = client
+        .post(format!("{base_url}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream");
+    if let Some(ref sid) = session_id {
+        req = req.header("Mcp-Session-Id", sid);
+    }
+    let _ = req.json(&initialized).send().await.unwrap();
+
+    // 3. tools/call → invokes gmail.messages.list, which dispatches an
+    //    upstream call that the proxy will write an audit event for.
+    let tool_call = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": { "name": "gmail.messages.list", "arguments": {} }
+    });
+    let mut call_req = client
+        .post(format!("{base_url}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream");
+    if let Some(ref sid) = session_id {
+        call_req = call_req.header("Mcp-Session-Id", sid);
+    }
+    let call_resp = call_req.json(&tool_call).send().await.unwrap();
+    assert!(call_resp.status().is_success());
+
+    // Audit dispatch is fire-and-forget; give it a tick to drain.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    // 4. Assert the audit event is attributed to the real agent name.
+    let events = audit_store.snapshot();
+    assert!(
+        !events.is_empty(),
+        "expected at least one audit event for the upstream call; got none",
+    );
+    let api_call = events
+        .iter()
+        .find(|e| e.event_type == "api-call")
+        .expect("expected an api-call audit event");
+    assert_eq!(
+        api_call.agent_id, "real-agent",
+        "api-call audit event must be attributed to the bearer-bound agent, not a sentinel",
+    );
+    // Defense in depth — make sure the sentinel string is nowhere.
+    for e in &events {
+        assert_ne!(
+            e.agent_id, "mcp-client-unattributed",
+            "found sentinel agent_id in audit log — regression of the rmcp task-local bug",
+        );
+    }
 
     handle.abort();
 }

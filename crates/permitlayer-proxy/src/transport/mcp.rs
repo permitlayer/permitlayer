@@ -11,157 +11,73 @@
 //! The raw OAuth access token is NEVER returned to the agent — only the
 //! upstream API response body.
 
-use std::convert::Infallible;
-use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 
-use axum::body::{Body, Bytes};
-use axum::http::{HeaderMap, Method, Request, Response};
-use rmcp::handler::server::tool::ToolRouter;
+use axum::body::Bytes;
+use axum::http::{HeaderMap, Method};
+use rmcp::handler::server::tool::{Extension, ToolRouter};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::{Implementation, ServerCapabilities, ServerInfo};
 use rmcp::{tool, tool_handler, tool_router};
-use tower::Service;
 use tracing::debug;
 
-use crate::error::AgentId;
+use crate::error::{AgentId, ProxyError};
 use crate::request::ProxyRequest;
 use crate::service::ProxyService;
 
 // ─────────────────────────────────────────────────────────────────────
-// Story 4.4 Patch #29: real `AgentId` plumbing through rmcp.
+// Per-tool-call agent identity propagation.
 // ─────────────────────────────────────────────────────────────────────
 //
-// rmcp's `StreamableHttpService::handle` receives the raw axum
-// `Request<Body>` but its tool-dispatch machinery does not expose the
-// request extensions to tool method bodies (`gmail.messages.list`,
-// `calendar.events.create`, etc.). Those method bodies only see
-// `&self` and the deserialized `Parameters<P>`. The inbound request
-// and its `AgentId` extension are dropped before the tool sees them.
+// rmcp's `StreamableHttpService` deserializes the inbound HTTP request
+// and inserts the `http::request::Parts` (with our extensions) into the
+// JSON-RPC message's extensions (`tower.rs:476/479/534`). The session
+// worker — spawned via `tokio::spawn` (`tower.rs:542`) — swaps those
+// extensions into `RequestContext.extensions` before dispatching to the
+// tool method (`service.rs:954`).
 //
-// The fix is a tower adapter [`AgentIdScopedMcpService`] that:
-//   1. Reads `AgentId` from the inbound request's extensions.
-//   2. Stashes it in a tokio task-local `CURRENT_AGENT_ID`.
-//   3. Calls the inner rmcp service inside `CURRENT_AGENT_ID.scope(...)`.
-//   4. Tool method bodies read the task-local when they build a
-//      `ProxyRequest` via [`current_mcp_agent_id`].
+// `AuthLayer` populates `req.extensions_mut().insert(AgentId(...))` on
+// successful bearer validation (`auth.rs:331`), so the chain is:
 //
-// Tokio task-locals are inherited across `.await` points within the
-// same task, so they survive rmcp's internal futures machinery. Unlike
-// thread-locals, they are also inherited correctly when rmcp spawns
-// child tasks via `tokio::spawn` inside a scope — the child observes
-// the parent's task-local value at spawn time.
+//   inbound HTTP   ── AuthLayer.insert(AgentId)
+//                     │
+//                     ▼
+//   StreamableHttpService.call ── extracts Parts, stuffs into JSON-RPC
+//                     │           message.extensions
+//                     ▼
+//   tokio::spawn(session worker) ── swaps message.extensions into
+//                                   RequestContext.extensions
+//                     │
+//                     ▼
+//   tool handler ── Extension<Parts> extractor pulls Parts back out;
+//                   `parts.extensions.get::<AgentId>()` is the agent.
 //
-// The previous story shipped a literal `"mcp-client-unattributed"`
-// sentinel at three call sites and deferred the real plumbing. The
-// sentinel is retained here ONLY for the genuinely unreachable path
-// (tool called outside any `AgentIdScopedMcpService::call` scope —
-// which should never happen in production because the canonical
-// middleware chain routes every MCP request through the adapter).
-// An audit event with `agent_id="mcp-client-unattributed"` is a
-// grep-distinguishable red flag rather than a silent panic.
+// We previously used a tokio task-local for this, which was structurally
+// broken: task-locals do not propagate across `tokio::spawn`, and rmcp
+// spawns the session worker, so every tool call read the task-local
+// from a fresh task that had never been scoped. The sentinel
+// "mcp-client-unattributed" was firing on every authenticated request.
+//
+// The Extension extractor is the supported escape hatch.
 
-tokio::task_local! {
-    /// The agent ID stamped onto the inbound rmcp request by the
-    /// outer [`AgentIdScopedMcpService`] adapter. Read by tool method
-    /// bodies via [`current_mcp_agent_id`] when they build a
-    /// `ProxyRequest`.
-    ///
-    /// ONLY set while a request is in flight inside the adapter's
-    /// `call`. Outside a scope, [`current_mcp_agent_id`] returns the
-    /// `"mcp-client-unattributed"` sentinel — see the module-level
-    /// comment for why the fallback exists.
-    static CURRENT_AGENT_ID: String;
-}
-
-/// The `agent_id` value used by the MCP tool dispatch path when no
-/// `AgentId` extension was threaded through (via the
-/// [`AgentIdScopedMcpService`] adapter). This should NEVER appear in
-/// a production audit log — `AuthLayer` populates `AgentId` on every
-/// authenticated request and the adapter stamps it into the
-/// task-local before calling rmcp. Seeing this sentinel in the wild
-/// means either the middleware chain was misassembled or the tool
-/// was invoked outside the adapter (e.g., from a test harness that
-/// bypasses the transport layer).
-pub(crate) const MCP_UNATTRIBUTED_SENTINEL: &str = "mcp-client-unattributed";
-
-/// Read the current agent ID from the task-local set by
-/// [`AgentIdScopedMcpService`]. Returns `MCP_UNATTRIBUTED_SENTINEL`
-/// when the task-local is unset (tool invoked outside a scope).
-fn current_mcp_agent_id() -> String {
-    CURRENT_AGENT_ID.try_with(Clone::clone).unwrap_or_else(|_| MCP_UNATTRIBUTED_SENTINEL.to_owned())
-}
-
-/// Tower adapter that threads the `AgentId` extension from an inbound
-/// axum `Request<Body>` into a tokio task-local so that rmcp tool
-/// dispatch method bodies can read it when they build a `ProxyRequest`.
+/// Pull the `AgentId` out of the per-call HTTP `Parts` that rmcp
+/// preserves in `RequestContext.extensions`.
 ///
-/// Wraps any inner `tower::Service<Request<Body>>` — in practice
-/// rmcp's `StreamableHttpService`. The wrapper is transparent
-/// (same `Response`, `Error`, `Future` types) so it drops in to
-/// `axum::Router::nest_service(...)` without any call-site changes.
-pub struct AgentIdScopedMcpService<S> {
-    inner: S,
-}
-
-impl<S: Clone> Clone for AgentIdScopedMcpService<S> {
-    fn clone(&self) -> Self {
-        Self { inner: self.inner.clone() }
-    }
-}
-
-impl<S> AgentIdScopedMcpService<S> {
-    /// Wrap an inner rmcp tower service with the task-local scoping
-    /// adapter.
-    #[must_use]
-    pub fn new(inner: S) -> Self {
-        Self { inner }
-    }
-}
-
-impl<S, ResBody> Service<Request<Body>> for AgentIdScopedMcpService<S>
-where
-    S: Service<Request<Body>, Response = Response<ResBody>, Error = Infallible>
-        + Clone
-        + Send
-        + 'static,
-    S::Future: Send + 'static,
-    ResBody: Send + 'static,
-{
-    type Response = Response<ResBody>;
-    type Error = Infallible;
-    type Future =
-        Pin<Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-
-    fn poll_ready(&mut self, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        self.inner.poll_ready(cx)
-    }
-
-    fn call(&mut self, req: Request<Body>) -> Self::Future {
-        // Read the agent ID from the inbound request's extensions.
-        // `AuthLayer` populates `AgentId` on every authenticated
-        // request before the middleware chain reaches the nested
-        // rmcp service. Missing means the request bypassed auth
-        // (operational path) or the middleware chain was misassembled
-        // — either way we fall through to the sentinel.
-        let agent_id = req.extensions().get::<AgentId>().map(|a| a.0.clone());
-
-        // Swap inner services to satisfy Service's "call after
-        // poll_ready" contract — the standard tower pattern for
-        // cloneable inner services. See `AuthService::call` for the
-        // same pattern.
-        let inner_clone = self.inner.clone();
-        let mut inner = std::mem::replace(&mut self.inner, inner_clone);
-
-        Box::pin(async move {
-            let fut = inner.call(req);
-            match agent_id {
-                Some(id) => CURRENT_AGENT_ID.scope(id, fut).await,
-                None => fut.await,
-            }
-        })
-    }
+/// `AuthLayer` is the source of truth: it inserts `AgentId(name)`
+/// into the inbound HTTP request's extensions. rmcp surfaces the
+/// whole `Parts` struct (with that extension) to tool handlers via
+/// the `Extension<Parts>` extractor.
+///
+/// Returns [`ProxyError::AuthMissingAgentId`] if the extension is
+/// absent. That should never happen for a real client request: the
+/// `/mcp/*` route is not in the operational allowlist, so AuthLayer
+/// runs and either rejects with `auth.missing_token` /
+/// `auth.invalid_token` OR populates `AgentId`. A caller that
+/// reaches a tool handler with no `AgentId` is necessarily a
+/// misconfigured route or a test harness mounting the MCP service
+/// without middleware.
+fn agent_id_from_parts(parts: &axum::http::request::Parts) -> Result<String, ProxyError> {
+    parts.extensions.get::<AgentId>().map(|a| a.0.clone()).ok_or(ProxyError::AuthMissingAgentId)
 }
 
 /// Strip the `$schema` meta-schema declaration from every tool's
@@ -278,16 +194,10 @@ impl GmailMcpServer {
 
     /// Build a `ProxyRequest` for a Gmail GET endpoint.
     ///
-    /// # `agent_id` discipline (Story 4.4 Patch #29)
-    ///
-    /// Reads the real `AgentId` from the `CURRENT_AGENT_ID`
-    /// task-local stamped by [`AgentIdScopedMcpService`]. If the
-    /// task-local is unset (tool called outside an adapter scope —
-    /// should be structurally impossible in production), falls
-    /// through to `MCP_UNATTRIBUTED_SENTINEL` so the event shows
-    /// up in audit logs as an obvious red flag rather than
-    /// panicking.
-    pub fn gmail_request(path: String, scope: &str) -> ProxyRequest {
+    /// `agent_id` is the bearer-authenticated agent identity for the
+    /// inbound MCP call. Callers extract it from the per-call HTTP
+    /// `Parts` via [`agent_id_from_parts`] and pass it in.
+    pub fn gmail_request(path: String, scope: &str, agent_id: String) -> ProxyRequest {
         ProxyRequest {
             service: "gmail".to_owned(),
             scope: scope.to_owned(),
@@ -296,7 +206,7 @@ impl GmailMcpServer {
             path,
             headers: HeaderMap::new(),
             body: Bytes::new(),
-            agent_id: current_mcp_agent_id(),
+            agent_id,
             request_id: ulid::Ulid::new().to_string(),
         }
     }
@@ -427,8 +337,10 @@ impl GmailMcpServer {
     async fn messages_list(
         &self,
         Parameters(params): Parameters<MessagesListParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         debug!(tool = "gmail.messages.list", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         let qs = build_query_string(&[
             ("maxResults", params.max_results.map(|n| n.to_string())),
             ("pageToken", params.page_token),
@@ -437,7 +349,7 @@ impl GmailMcpServer {
             ("includeSpamTrash", params.include_spam_trash.map(|b| b.to_string())),
         ]);
         let path = format!("users/me/messages{qs}");
-        let req = Self::gmail_request(path, "gmail.readonly");
+        let req = Self::gmail_request(path, "gmail.readonly", agent_id);
         self.dispatch(req).await
     }
 
@@ -448,15 +360,17 @@ impl GmailMcpServer {
     async fn messages_get(
         &self,
         Parameters(params): Parameters<MessagesGetParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         debug!(tool = "gmail.messages.get", id = %params.id, "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         validate_resource_id(&params.id)?;
         let qs = build_query_string(&[
             ("format", params.format),
             ("metadataHeaders", params.metadata_headers.map(|h| h.join(","))),
         ]);
         let path = format!("users/me/messages/{}{qs}", params.id);
-        let req = Self::gmail_request(path, "gmail.readonly");
+        let req = Self::gmail_request(path, "gmail.readonly", agent_id);
         self.dispatch(req).await
     }
 
@@ -467,8 +381,10 @@ impl GmailMcpServer {
     async fn threads_list(
         &self,
         Parameters(params): Parameters<ThreadsListParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         debug!(tool = "gmail.threads.list", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         let qs = build_query_string(&[
             ("maxResults", params.max_results.map(|n| n.to_string())),
             ("pageToken", params.page_token),
@@ -476,7 +392,7 @@ impl GmailMcpServer {
             ("q", params.q),
         ]);
         let path = format!("users/me/threads{qs}");
-        let req = Self::gmail_request(path, "gmail.readonly");
+        let req = Self::gmail_request(path, "gmail.readonly", agent_id);
         self.dispatch(req).await
     }
 
@@ -487,12 +403,14 @@ impl GmailMcpServer {
     async fn threads_get(
         &self,
         Parameters(params): Parameters<ThreadsGetParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         debug!(tool = "gmail.threads.get", id = %params.id, "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         validate_resource_id(&params.id)?;
         let qs = build_query_string(&[("format", params.format)]);
         let path = format!("users/me/threads/{}{qs}", params.id);
-        let req = Self::gmail_request(path, "gmail.readonly");
+        let req = Self::gmail_request(path, "gmail.readonly", agent_id);
         self.dispatch(req).await
     }
 
@@ -500,15 +418,20 @@ impl GmailMcpServer {
         name = "gmail.search",
         description = "Search Gmail messages using Gmail search syntax. Returns matching message IDs."
     )]
-    async fn search(&self, Parameters(params): Parameters<SearchParams>) -> Result<String, String> {
+    async fn search(
+        &self,
+        Parameters(params): Parameters<SearchParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
         debug!(tool = "gmail.search", query = %params.query, "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         let qs = build_query_string(&[
             ("q", Some(params.query)),
             ("maxResults", params.max_results.map(|n| n.to_string())),
             ("pageToken", params.page_token),
         ]);
         let path = format!("users/me/messages{qs}");
-        let req = Self::gmail_request(path, "gmail.readonly");
+        let req = Self::gmail_request(path, "gmail.readonly", agent_id);
         self.dispatch(req).await
     }
 }
@@ -521,32 +444,32 @@ impl rmcp::ServerHandler for GmailMcpServer {
     }
 }
 
-/// Build an MCP service for the Gmail connector, wrapped in the
-/// [`AgentIdScopedMcpService`] adapter so tool method bodies see the
-/// real bearer agent via the `CURRENT_AGENT_ID` task-local.
+/// Build an MCP service for the Gmail connector.
+///
+/// Tool method bodies extract the bearer-authenticated agent identity
+/// directly from the per-call HTTP `Parts` that rmcp surfaces via the
+/// `Extension<http::request::Parts>` extractor — see
+/// [`agent_id_from_parts`].
 ///
 /// The returned service implements `tower::Service<Request<Body>>`
 /// and can be mounted into axum via
 /// `Router::new().nest_service("/mcp", service)`.
 pub fn mcp_service(
     proxy_service: Arc<ProxyService>,
-) -> AgentIdScopedMcpService<
-    rmcp::transport::streamable_http_server::tower::StreamableHttpService<
-        GmailMcpServer,
-        rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
-    >,
+) -> rmcp::transport::streamable_http_server::tower::StreamableHttpService<
+    GmailMcpServer,
+    rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
 > {
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager,
         tower::{StreamableHttpServerConfig, StreamableHttpService},
     };
 
-    let inner = StreamableHttpService::new(
+    StreamableHttpService::new(
         move || Ok(GmailMcpServer::new(Arc::clone(&proxy_service))),
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default(),
-    );
-    AgentIdScopedMcpService::new(inner)
+    )
 }
 
 // -- Calendar tool parameter structs ------------------------------------------
@@ -639,10 +562,16 @@ impl CalendarMcpServer {
 
     /// Build a `ProxyRequest` for a Calendar endpoint.
     ///
-    /// Reads the real `AgentId` from the `CURRENT_AGENT_ID`
-    /// task-local (see Story 4.4 Patch #29 and the `gmail_request`
-    /// doc comment for the full rationale).
-    fn calendar_request(path: String, scope: &str, method: Method, body: Bytes) -> ProxyRequest {
+    /// `agent_id` is the bearer-authenticated agent identity for the
+    /// inbound MCP call. Callers extract it from the per-call HTTP
+    /// `Parts` via [`agent_id_from_parts`] and pass it in.
+    fn calendar_request(
+        path: String,
+        scope: &str,
+        method: Method,
+        body: Bytes,
+        agent_id: String,
+    ) -> ProxyRequest {
         let mut headers = HeaderMap::new();
         if !body.is_empty() {
             #[allow(clippy::expect_used)]
@@ -659,7 +588,7 @@ impl CalendarMcpServer {
             path,
             headers,
             body,
-            agent_id: current_mcp_agent_id(),
+            agent_id,
             request_id: ulid::Ulid::new().to_string(),
         }
     }
@@ -674,14 +603,17 @@ impl CalendarMcpServer {
     async fn calendars_list(
         &self,
         Parameters(params): Parameters<CalendarsListParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         debug!(tool = "calendar.calendars.list", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         let qs = build_query_string(&[
             ("maxResults", params.max_results.map(|n| n.to_string())),
             ("pageToken", params.page_token),
         ]);
         let path = format!("users/me/calendarList{qs}");
-        let req = Self::calendar_request(path, "calendar.readonly", Method::GET, Bytes::new());
+        let req =
+            Self::calendar_request(path, "calendar.readonly", Method::GET, Bytes::new(), agent_id);
         self.dispatch(req).await
     }
 
@@ -692,9 +624,11 @@ impl CalendarMcpServer {
     async fn events_list(
         &self,
         Parameters(params): Parameters<EventsListParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         let cal_id = params.calendar_id.as_deref().unwrap_or("primary");
         debug!(tool = "calendar.events.list", calendar_id = %cal_id, "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         validate_calendar_id(cal_id, "calendar_id")?;
         let qs = build_query_string(&[
             ("maxResults", params.max_results.map(|n| n.to_string())),
@@ -707,7 +641,8 @@ impl CalendarMcpServer {
         ]);
         let encoded_cal_id = urlencoding::encode(cal_id);
         let path = format!("calendars/{encoded_cal_id}/events{qs}");
-        let req = Self::calendar_request(path, "calendar.readonly", Method::GET, Bytes::new());
+        let req =
+            Self::calendar_request(path, "calendar.readonly", Method::GET, Bytes::new(), agent_id);
         self.dispatch(req).await
     }
 
@@ -715,15 +650,18 @@ impl CalendarMcpServer {
     async fn events_get(
         &self,
         Parameters(params): Parameters<EventGetParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         let cal_id = params.calendar_id.as_deref().unwrap_or("primary");
         debug!(tool = "calendar.events.get", calendar_id = %cal_id, event_id = %params.event_id, "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         validate_calendar_id(cal_id, "calendar_id")?;
         validate_resource_id(&params.event_id)?;
         let encoded_cal_id = urlencoding::encode(cal_id);
         let encoded_event_id = urlencoding::encode(&params.event_id);
         let path = format!("calendars/{encoded_cal_id}/events/{encoded_event_id}");
-        let req = Self::calendar_request(path, "calendar.readonly", Method::GET, Bytes::new());
+        let req =
+            Self::calendar_request(path, "calendar.readonly", Method::GET, Bytes::new(), agent_id);
         self.dispatch(req).await
     }
 
@@ -734,16 +672,24 @@ impl CalendarMcpServer {
     async fn events_create(
         &self,
         Parameters(params): Parameters<EventCreateParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         let cal_id = params.calendar_id.as_deref().unwrap_or("primary");
         debug!(tool = "calendar.events.create", calendar_id = %cal_id, "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         validate_calendar_id(cal_id, "calendar_id")?;
         validate_json_object_body(&params.event, "event")?;
         let body =
             serde_json::to_vec(&params.event).map_err(|e| format!("invalid event JSON: {e}"))?;
         let encoded_cal_id = urlencoding::encode(cal_id);
         let path = format!("calendars/{encoded_cal_id}/events");
-        let req = Self::calendar_request(path, "calendar.events", Method::POST, Bytes::from(body));
+        let req = Self::calendar_request(
+            path,
+            "calendar.events",
+            Method::POST,
+            Bytes::from(body),
+            agent_id,
+        );
         self.dispatch(req).await
     }
 
@@ -754,9 +700,11 @@ impl CalendarMcpServer {
     async fn events_update(
         &self,
         Parameters(params): Parameters<EventUpdateParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         let cal_id = params.calendar_id.as_deref().unwrap_or("primary");
         debug!(tool = "calendar.events.update", calendar_id = %cal_id, event_id = %params.event_id, "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         validate_calendar_id(cal_id, "calendar_id")?;
         validate_resource_id(&params.event_id)?;
         validate_json_object_body(&params.event, "event")?;
@@ -765,7 +713,13 @@ impl CalendarMcpServer {
         let encoded_cal_id = urlencoding::encode(cal_id);
         let encoded_event_id = urlencoding::encode(&params.event_id);
         let path = format!("calendars/{encoded_cal_id}/events/{encoded_event_id}");
-        let req = Self::calendar_request(path, "calendar.events", Method::PUT, Bytes::from(body));
+        let req = Self::calendar_request(
+            path,
+            "calendar.events",
+            Method::PUT,
+            Bytes::from(body),
+            agent_id,
+        );
         self.dispatch(req).await
     }
 }
@@ -779,27 +733,24 @@ impl rmcp::ServerHandler for CalendarMcpServer {
     }
 }
 
-/// Build an MCP service for the Calendar connector, wrapped in the
-/// [`AgentIdScopedMcpService`] adapter.
+/// Build an MCP service for the Calendar connector. See [`mcp_service`]
+/// for the agent-identity propagation rationale.
 pub fn calendar_mcp_service(
     proxy_service: Arc<ProxyService>,
-) -> AgentIdScopedMcpService<
-    rmcp::transport::streamable_http_server::tower::StreamableHttpService<
-        CalendarMcpServer,
-        rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
-    >,
+) -> rmcp::transport::streamable_http_server::tower::StreamableHttpService<
+    CalendarMcpServer,
+    rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
 > {
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager,
         tower::{StreamableHttpServerConfig, StreamableHttpService},
     };
 
-    let inner = StreamableHttpService::new(
+    StreamableHttpService::new(
         move || Ok(CalendarMcpServer::new(Arc::clone(&proxy_service))),
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default(),
-    );
-    AgentIdScopedMcpService::new(inner)
+    )
 }
 
 // -- Drive tool parameter structs ---------------------------------------------
@@ -908,10 +859,16 @@ impl DriveMcpServer {
     /// Sets `Content-Type: application/json` automatically when `body` is
     /// non-empty (for POST/PATCH write tools).
     ///
-    /// Reads the real `AgentId` from the `CURRENT_AGENT_ID`
-    /// task-local (see Story 4.4 Patch #29 and the `gmail_request`
-    /// doc comment for the full rationale).
-    fn drive_request(path: String, scope: &str, method: Method, body: Bytes) -> ProxyRequest {
+    /// `agent_id` is the bearer-authenticated agent identity for the
+    /// inbound MCP call. Callers extract it from the per-call HTTP
+    /// `Parts` via [`agent_id_from_parts`] and pass it in.
+    fn drive_request(
+        path: String,
+        scope: &str,
+        method: Method,
+        body: Bytes,
+        agent_id: String,
+    ) -> ProxyRequest {
         let mut headers = HeaderMap::new();
         if !body.is_empty() {
             #[allow(clippy::expect_used)]
@@ -928,7 +885,7 @@ impl DriveMcpServer {
             path,
             headers,
             body,
-            agent_id: current_mcp_agent_id(),
+            agent_id,
             request_id: ulid::Ulid::new().to_string(),
         }
     }
@@ -943,8 +900,10 @@ impl DriveMcpServer {
     async fn files_list(
         &self,
         Parameters(params): Parameters<FilesListParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         debug!(tool = "drive.files.list", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         let qs = build_query_string(&[
             ("pageSize", params.page_size.map(|n| n.to_string())),
             ("pageToken", params.page_token),
@@ -953,7 +912,7 @@ impl DriveMcpServer {
             ("fields", params.fields),
         ]);
         let path = format!("files{qs}");
-        let req = Self::drive_request(path, "drive.readonly", Method::GET, Bytes::new());
+        let req = Self::drive_request(path, "drive.readonly", Method::GET, Bytes::new(), agent_id);
         self.dispatch(req).await
     }
 
@@ -964,13 +923,15 @@ impl DriveMcpServer {
     async fn files_get(
         &self,
         Parameters(params): Parameters<FileGetParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         debug!(tool = "drive.files.get", file_id = %params.file_id, "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         validate_resource_id(&params.file_id)?;
         let qs = build_query_string(&[("fields", params.fields), ("alt", params.alt)]);
         let encoded_file_id = urlencoding::encode(&params.file_id);
         let path = format!("files/{encoded_file_id}{qs}");
-        let req = Self::drive_request(path, "drive.readonly", Method::GET, Bytes::new());
+        let req = Self::drive_request(path, "drive.readonly", Method::GET, Bytes::new(), agent_id);
         self.dispatch(req).await
     }
 
@@ -981,8 +942,10 @@ impl DriveMcpServer {
     async fn files_search(
         &self,
         Parameters(params): Parameters<FilesSearchParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         debug!(tool = "drive.files.search", query = %params.q, "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         if params.q.trim().is_empty() {
             return Err("q must not be empty or whitespace-only — use drive.files.list for unfiltered listing".to_owned());
         }
@@ -994,7 +957,7 @@ impl DriveMcpServer {
             ("fields", params.fields),
         ]);
         let path = format!("files{qs}");
-        let req = Self::drive_request(path, "drive.readonly", Method::GET, Bytes::new());
+        let req = Self::drive_request(path, "drive.readonly", Method::GET, Bytes::new(), agent_id);
         self.dispatch(req).await
     }
 
@@ -1005,14 +968,17 @@ impl DriveMcpServer {
     async fn files_create(
         &self,
         Parameters(params): Parameters<FileCreateParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         debug!(tool = "drive.files.create", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         validate_json_object_body(&params.file, "file")?;
         let body =
             serde_json::to_vec(&params.file).map_err(|e| format!("invalid file JSON: {e}"))?;
         let qs = build_query_string(&[("fields", params.fields)]);
         let path = format!("files{qs}");
-        let req = Self::drive_request(path, "drive.file", Method::POST, Bytes::from(body));
+        let req =
+            Self::drive_request(path, "drive.file", Method::POST, Bytes::from(body), agent_id);
         self.dispatch(req).await
     }
 
@@ -1023,8 +989,10 @@ impl DriveMcpServer {
     async fn files_update(
         &self,
         Parameters(params): Parameters<FileUpdateParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         debug!(tool = "drive.files.update", file_id = %params.file_id, "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         validate_resource_id(&params.file_id)?;
         validate_json_object_body(&params.file, "file")?;
         let body =
@@ -1032,7 +1000,8 @@ impl DriveMcpServer {
         let qs = build_query_string(&[("fields", params.fields)]);
         let encoded_file_id = urlencoding::encode(&params.file_id);
         let path = format!("files/{encoded_file_id}{qs}");
-        let req = Self::drive_request(path, "drive.file", Method::PATCH, Bytes::from(body));
+        let req =
+            Self::drive_request(path, "drive.file", Method::PATCH, Bytes::from(body), agent_id);
         self.dispatch(req).await
     }
 }
@@ -1045,27 +1014,24 @@ impl rmcp::ServerHandler for DriveMcpServer {
     }
 }
 
-/// Build an MCP service for the Drive connector, wrapped in the
-/// [`AgentIdScopedMcpService`] adapter.
+/// Build an MCP service for the Drive connector. See [`mcp_service`]
+/// for the agent-identity propagation rationale.
 pub fn drive_mcp_service(
     proxy_service: Arc<ProxyService>,
-) -> AgentIdScopedMcpService<
-    rmcp::transport::streamable_http_server::tower::StreamableHttpService<
-        DriveMcpServer,
-        rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
-    >,
+) -> rmcp::transport::streamable_http_server::tower::StreamableHttpService<
+    DriveMcpServer,
+    rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
 > {
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager,
         tower::{StreamableHttpServerConfig, StreamableHttpService},
     };
 
-    let inner = StreamableHttpService::new(
+    StreamableHttpService::new(
         move || Ok(DriveMcpServer::new(Arc::clone(&proxy_service))),
         Arc::new(LocalSessionManager::default()),
         StreamableHttpServerConfig::default(),
-    );
-    AgentIdScopedMcpService::new(inner)
+    )
 }
 
 #[cfg(test)]
@@ -1239,138 +1205,68 @@ mod tests {
 
     // ── Story 4.4 Patch #29: AgentIdScopedMcpService tests ─────────
 
-    #[tokio::test]
-    async fn current_mcp_agent_id_returns_sentinel_outside_scope() {
-        // No task-local set — builder falls through to the sentinel.
-        assert_eq!(current_mcp_agent_id(), MCP_UNATTRIBUTED_SENTINEL);
+    /// Build a `Parts` carrying an `AgentId` extension, mirroring what
+    /// the production middleware chain produces (AuthLayer inserts on
+    /// the inbound request; rmcp surfaces the resulting `Parts` to
+    /// tool handlers via the `Extension<Parts>` extractor).
+    fn parts_with_agent(name: &str) -> axum::http::request::Parts {
+        let mut req = axum::http::Request::builder().uri("/test").body(()).unwrap();
+        req.extensions_mut().insert(AgentId(name.to_owned()));
+        req.into_parts().0
     }
 
-    #[tokio::test]
-    async fn current_mcp_agent_id_reads_task_local_inside_scope() {
-        // Inside a scope, the builder sees the real agent name.
-        CURRENT_AGENT_ID
-            .scope("email-triage".to_owned(), async {
-                assert_eq!(current_mcp_agent_id(), "email-triage");
-            })
-            .await;
+    #[test]
+    fn agent_id_from_parts_returns_name_when_extension_present() {
+        let parts = parts_with_agent("research-agent");
+        assert_eq!(agent_id_from_parts(&parts).unwrap(), "research-agent");
     }
 
-    #[tokio::test]
-    async fn gmail_request_picks_up_task_local_agent_id() {
-        CURRENT_AGENT_ID
-            .scope("research-agent".to_owned(), async {
-                let req =
-                    GmailMcpServer::gmail_request("users/me/messages".to_owned(), "gmail.readonly");
-                assert_eq!(req.agent_id, "research-agent");
-                assert_eq!(req.service, "gmail");
-                assert_eq!(req.scope, "gmail.readonly");
-            })
-            .await;
+    #[test]
+    fn agent_id_from_parts_returns_error_when_extension_missing() {
+        let req = axum::http::Request::builder().uri("/test").body(()).unwrap();
+        let parts = req.into_parts().0;
+        assert!(matches!(
+            agent_id_from_parts(&parts),
+            Err(crate::error::ProxyError::AuthMissingAgentId)
+        ));
     }
 
-    #[tokio::test]
-    async fn gmail_request_outside_scope_falls_back_to_sentinel() {
-        // Invariant: tool invoked outside an adapter scope (should be
-        // structurally impossible in production) still produces a
-        // valid ProxyRequest, just with the grep-distinguishable
-        // sentinel agent_id.
-        let req = GmailMcpServer::gmail_request("users/me/messages".to_owned(), "gmail.readonly");
-        assert_eq!(req.agent_id, MCP_UNATTRIBUTED_SENTINEL);
+    #[test]
+    fn gmail_request_uses_passed_agent_id() {
+        let req = GmailMcpServer::gmail_request(
+            "users/me/messages".to_owned(),
+            "gmail.readonly",
+            "research-agent".to_owned(),
+        );
+        assert_eq!(req.agent_id, "research-agent");
+        assert_eq!(req.service, "gmail");
+        assert_eq!(req.scope, "gmail.readonly");
+        assert_eq!(req.path, "users/me/messages");
     }
 
-    #[tokio::test]
-    async fn calendar_request_picks_up_task_local_agent_id() {
-        CURRENT_AGENT_ID
-            .scope("calendar-agent".to_owned(), async {
-                let req = CalendarMcpServer::calendar_request(
-                    "users/me/calendarList".to_owned(),
-                    "https://www.googleapis.com/auth/calendar.readonly",
-                    Method::GET,
-                    Bytes::new(),
-                );
-                assert_eq!(req.agent_id, "calendar-agent");
-                assert_eq!(req.service, "calendar");
-            })
-            .await;
+    #[test]
+    fn calendar_request_uses_passed_agent_id() {
+        let req = CalendarMcpServer::calendar_request(
+            "users/me/calendarList".to_owned(),
+            "calendar.readonly",
+            Method::GET,
+            Bytes::new(),
+            "calendar-agent".to_owned(),
+        );
+        assert_eq!(req.agent_id, "calendar-agent");
+        assert_eq!(req.service, "calendar");
     }
 
-    #[tokio::test]
-    async fn drive_request_picks_up_task_local_agent_id() {
-        CURRENT_AGENT_ID
-            .scope("drive-agent".to_owned(), async {
-                let req = DriveMcpServer::drive_request(
-                    "files".to_owned(),
-                    "https://www.googleapis.com/auth/drive.readonly",
-                    Method::GET,
-                    Bytes::new(),
-                );
-                assert_eq!(req.agent_id, "drive-agent");
-                assert_eq!(req.service, "drive");
-            })
-            .await;
-    }
-
-    #[tokio::test]
-    async fn task_local_is_per_task_not_global() {
-        // Two concurrent tasks with different scoped agent IDs must
-        // not see each other's values. Proves tokio task-locals give
-        // us per-request isolation (the whole point of this design
-        // over `Arc<Mutex<Option<AgentId>>>`).
-        let task_a = tokio::spawn(CURRENT_AGENT_ID.scope("agent-a".to_owned(), async {
-            // Small yield so task B gets scheduled in between.
-            tokio::task::yield_now().await;
-            current_mcp_agent_id()
-        }));
-        let task_b = tokio::spawn(CURRENT_AGENT_ID.scope("agent-b".to_owned(), async {
-            tokio::task::yield_now().await;
-            current_mcp_agent_id()
-        }));
-        let a_result = task_a.await.unwrap();
-        let b_result = task_b.await.unwrap();
-        assert_eq!(a_result, "agent-a");
-        assert_eq!(b_result, "agent-b");
-    }
-
-    #[tokio::test]
-    async fn agent_id_scoped_service_stamps_task_local_from_extension() {
-        // Minimal inner service that reads CURRENT_AGENT_ID and
-        // returns it in the response body. Proves the adapter
-        // actually sets the task-local before calling the inner.
-        use axum::body::to_bytes;
-        use tower::ServiceExt as _;
-
-        #[derive(Clone)]
-        struct RecordingService;
-        impl Service<Request<Body>> for RecordingService {
-            type Response = Response<Body>;
-            type Error = Infallible;
-            type Future = Pin<
-                Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
-            >;
-            fn poll_ready(&mut self, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-                Poll::Ready(Ok(()))
-            }
-            fn call(&mut self, _req: Request<Body>) -> Self::Future {
-                Box::pin(async move {
-                    let observed = current_mcp_agent_id();
-                    Ok(Response::new(Body::from(observed)))
-                })
-            }
-        }
-
-        let mut svc = AgentIdScopedMcpService::new(RecordingService);
-
-        // (a) With AgentId extension → inner observes the real name.
-        let mut req = Request::builder().uri("/test").body(Body::empty()).unwrap();
-        req.extensions_mut().insert(AgentId("email-triage".to_owned()));
-        let resp = svc.ready().await.unwrap().call(req).await.unwrap();
-        let body_bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
-        assert_eq!(&body_bytes[..], b"email-triage");
-
-        // (b) Without AgentId extension → inner sees the sentinel.
-        let req = Request::builder().uri("/test").body(Body::empty()).unwrap();
-        let resp = svc.ready().await.unwrap().call(req).await.unwrap();
-        let body_bytes = to_bytes(resp.into_body(), 1024).await.unwrap();
-        assert_eq!(&body_bytes[..], MCP_UNATTRIBUTED_SENTINEL.as_bytes());
+    #[test]
+    fn drive_request_uses_passed_agent_id() {
+        let req = DriveMcpServer::drive_request(
+            "files".to_owned(),
+            "drive.readonly",
+            Method::GET,
+            Bytes::new(),
+            "drive-agent".to_owned(),
+        );
+        assert_eq!(req.agent_id, "drive-agent");
+        assert_eq!(req.service, "drive");
     }
 }
