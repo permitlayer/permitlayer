@@ -52,6 +52,54 @@ pub(crate) fn probe_backend(backend: &'static str, account: &str) -> Result<(), 
     }
 }
 
+/// Read back a value from a keychain entry that we just wrote,
+/// retrying briefly to absorb the keychain's read-after-write
+/// consistency window. On macOS specifically, an `entry.get_secret()`
+/// immediately following a successful `entry.set_secret()` can return
+/// `errSecItemNotFound` (`keyring::Error::NoEntry`) even though the
+/// write succeeded — usually the next attempt sees the entry. rc.10
+/// shipped without this retry and hard-failed daemon boot on a fresh
+/// install when the consistency window fired.
+///
+/// Returns:
+/// - `Ok(Some(bytes))` if any attempt saw the entry.
+/// - `Ok(None)` if every attempt returned `NoEntry`. The caller
+///   decides whether that's a recoverable race outcome or a fatal
+///   "set silently failed" platform error.
+/// - `Err(...)` for any non-`NoEntry` error from the keychain.
+fn read_after_write_with_retry(entry: &keyring::Entry) -> Result<Option<Vec<u8>>, keyring::Error> {
+    read_after_write_with_retry_inner(|| entry.get_secret())
+}
+
+/// Closure-form of [`read_after_write_with_retry`] for unit testing.
+/// Production callers thread `|| entry.get_secret()` through the
+/// public wrapper above; tests can supply a closure that fails the
+/// first N times and then succeeds, deterministically pinning the
+/// retry behavior on every CI leg without needing a real keychain.
+fn read_after_write_with_retry_inner<F>(
+    mut get_secret: F,
+) -> Result<Option<Vec<u8>>, keyring::Error>
+where
+    F: FnMut() -> Result<Vec<u8>, keyring::Error>,
+{
+    const ATTEMPTS: u32 = 3;
+    const SLEEP: std::time::Duration = std::time::Duration::from_millis(25);
+    for attempt in 0..ATTEMPTS {
+        match get_secret() {
+            Ok(bytes) => return Ok(Some(bytes)),
+            Err(keyring::Error::NoEntry) => {
+                if attempt + 1 < ATTEMPTS {
+                    std::thread::sleep(SLEEP);
+                    continue;
+                }
+                return Ok(None);
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(None)
+}
+
 /// Fetch the key at `account`, generating + persisting a fresh
 /// random key on first call if none exists. Used by `master_key()`
 /// at boot. Race-tolerant: if our `set_secret` fails (another
@@ -73,18 +121,36 @@ pub(crate) fn fetch_or_create_master_key_at_account(
             use rand::RngCore;
             let mut key = Zeroizing::new([0u8; MASTER_KEY_LEN]);
             rand::rngs::OsRng.fill_bytes(&mut *key);
-            match entry.set_secret(&*key) {
-                Ok(()) => {
-                    let mut bytes = entry.get_secret().map_err(|e| map_err(backend, e))?;
+            // Attempt to persist; whether this returns Ok or Err, we
+            // still need to read back from the keychain afterward —
+            // the persistence contract for `KeyStore::master_key` is
+            // that the returned key is what's on disk. The retry
+            // helper absorbs the Apple Keychain consistency window
+            // where a just-written entry can return `NoEntry` on the
+            // immediate readback. Race convergence is preserved: if
+            // another process raced us and won, we adopt their bytes
+            // here; if we won, we adopt our own bytes (round-tripped).
+            let _set_result = entry.set_secret(&*key);
+            match read_after_write_with_retry(&entry).map_err(|e| map_err(backend, e))? {
+                Some(mut bytes) => {
                     let result = read_key_from_bytes(&bytes);
                     bytes.zeroize();
                     result
                 }
-                Err(_) => {
-                    let mut bytes = entry.get_secret().map_err(|e| map_err(backend, e))?;
-                    let result = read_key_from_bytes(&bytes);
-                    bytes.zeroize();
-                    result
+                None => {
+                    // The keychain has no entry across every retry
+                    // attempt — neither our `set_secret` nor any racer's
+                    // persisted. Surface as a structured `PlatformError`
+                    // with operator-recognizable language instead of
+                    // leaking `keyring::Error::NoEntry`'s opaque
+                    // `Display` through `map_err`'s default arm.
+                    Err(KeyStoreError::PlatformError {
+                        backend,
+                        message: "set_secret on master-key entry succeeded-or-failed but \
+                                  the keychain has no entry on read-back; keychain may be \
+                                  rejecting writes silently (codesign/ACL state)"
+                            .into(),
+                    })
                 }
             }
         }
@@ -104,7 +170,24 @@ pub(crate) fn set_and_verify_at_account(
     let entry =
         keyring::Entry::new(crate::MASTER_KEY_SERVICE, account).map_err(|e| map_err(backend, e))?;
     entry.set_secret(key).map_err(|e| map_err(backend, e))?;
-    let mut read_back = entry.get_secret().map_err(|e| map_err(backend, e))?;
+    // Same Apple Keychain consistency window that bites the bootstrap
+    // path bites here too: a bare `entry.get_secret()` immediately
+    // after `set_secret` can return `NoEntry`. Use the retry helper.
+    // If every retry returns `NoEntry`, the write didn't persist —
+    // that's a fatal error for rotation (the daemon would proceed
+    // thinking the new key was committed when it wasn't).
+    let mut read_back =
+        match read_after_write_with_retry(&entry).map_err(|e| map_err(backend, e))? {
+            Some(bytes) => bytes,
+            None => {
+                return Err(KeyStoreError::PlatformError {
+                    backend,
+                    message: "set_secret returned Ok but the keychain has no entry on read-back \
+                          after retries — write did not persist"
+                        .into(),
+                });
+            }
+        };
     let eq = read_back.len() == MASTER_KEY_LEN && constant_time_eq(&read_back, key);
     read_back.zeroize();
     if !eq {
@@ -235,6 +318,62 @@ fn classify_macos_platform_failure(
 /// Used by every async wrapper that dispatches to `spawn_blocking`.
 pub(crate) fn join_err(backend: &'static str, e: tokio::task::JoinError) -> KeyStoreError {
     KeyStoreError::PlatformError { backend, message: format!("spawn_blocking join failed: {e}") }
+}
+
+#[cfg(test)]
+#[allow(clippy::panic)]
+mod read_after_write_tests {
+    use super::*;
+    use std::cell::Cell;
+
+    /// rc.10's load-bearing failure mode: Apple Keychain returns
+    /// `NoEntry` on a just-written entry within a brief consistency
+    /// window. The retry helper must absorb this. This test is
+    /// deterministic and runs on every CI leg (no real keychain
+    /// needed).
+    #[test]
+    fn retries_through_consistency_window() {
+        let attempts = Cell::new(0_u32);
+        let result = read_after_write_with_retry_inner(|| {
+            let n = attempts.get();
+            attempts.set(n + 1);
+            if n == 0 { Err(keyring::Error::NoEntry) } else { Ok(b"persisted-bytes".to_vec()) }
+        });
+        match result {
+            Ok(Some(bytes)) => assert_eq!(bytes, b"persisted-bytes"),
+            other => panic!("expected Ok(Some(bytes)), got {other:?}"),
+        }
+        assert_eq!(attempts.get(), 2, "should have retried exactly once");
+    }
+
+    /// Pathological case: NoEntry every time. The retry exhausts and
+    /// the helper signals "the keychain is empty after all attempts"
+    /// via `Ok(None)` so callers can route it to a structured error
+    /// instead of leaking the raw `keyring::Error::NoEntry` Display.
+    #[test]
+    fn returns_none_when_all_attempts_fail() {
+        let attempts = Cell::new(0_u32);
+        let result = read_after_write_with_retry_inner(|| {
+            let n = attempts.get();
+            attempts.set(n + 1);
+            Err(keyring::Error::NoEntry)
+        });
+        assert!(matches!(result, Ok(None)), "got {result:?}");
+        assert_eq!(attempts.get(), 3, "should have tried exactly ATTEMPTS times");
+    }
+
+    /// Non-NoEntry errors propagate immediately without retry — those
+    /// are real failures we shouldn't paper over with a sleep+loop.
+    #[test]
+    fn propagates_non_noentry_errors_without_retry() {
+        let attempts = Cell::new(0_u32);
+        let result = read_after_write_with_retry_inner(|| {
+            attempts.set(attempts.get() + 1);
+            Err(keyring::Error::Invalid("test-error".into(), "test-context".into()))
+        });
+        assert!(matches!(result, Err(keyring::Error::Invalid(..))), "got {result:?}");
+        assert_eq!(attempts.get(), 1, "non-NoEntry errors must not retry");
+    }
 }
 
 #[cfg(all(test, target_os = "macos"))]
