@@ -17,7 +17,7 @@ pub enum KeyStoreError {
     /// Linux Secret Service daemon is not running, or the keyring feature
     /// for this OS was compiled out. Callers typically fall back to the
     /// passphrase adapter.
-    #[error("keychain backend '{backend}' is unavailable")]
+    #[error("keychain backend '{backend}' is unavailable: {source}")]
     BackendUnavailable {
         /// Which backend failed: "apple", "libsecret", "windows", etc.
         backend: &'static str,

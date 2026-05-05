@@ -129,6 +129,39 @@ security unlock-keychain ~/Library/Keychains/login.keychain-db
 Otherwise the keychain rejects the master-key probe with `User
 interaction is not allowed`.
 
+#### Recovery after `brew upgrade agentsso`
+
+`brew upgrade agentsso` reinstalls the binary with a different codesign
+hash, which invalidates the macOS Keychain ACL on the existing
+master-key entry. Symptom: the next interactive `agentsso start &` logs
+`keychain backend 'apple' is unavailable: User interaction is not allowed.
+(OSStatus -25308)` and falls back to the passphrase prompt. The
+fallback derives a fresh master key, so existing sealed credentials
+will not unseal.
+
+Two recovery paths:
+
+1. **(Preferred)** Re-run `agentsso setup gmail --oauth-client ...`
+   under the new master key. Any other configured connectors must be
+   re-set-up too.
+2. **(Faster, but loses unrelated state)** Wipe the keychain entry and
+   the vault, then let the daemon mint a fresh master key on next boot:
+
+   ```sh
+   security delete-generic-password -s io.permitlayer.master-key -a master
+   rm -rf ~/.agentsso/vault
+   agentsso start &
+   ```
+
+For diagnostic detail, run with `AGENTSSO_LOG__LEVEL=debug` (the daemon
+does not honor `RUST_LOG`).
+
+> **Known gap:** `brew services start agentsso` cannot recover this
+> way — there is no controlling TTY for the passphrase prompt. Tracked
+> for v0.4 as headless / launchd-managed Keychain ACL recovery (vault
+> rekey on detected ACL break OR keychain partition-list authorization
+> on install OR a `--passphrase-from-env` flag).
+
 ### Running the daemon and the agent under different OS users
 
 A common multi-user pattern: run the daemon as one user (e.g.

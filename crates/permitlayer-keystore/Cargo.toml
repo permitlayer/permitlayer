@@ -25,6 +25,15 @@ zeroize.workspace = true
 tempfile.workspace = true
 subtle.workspace = true
 
+# macOS-only: downcast `keyring::Error::PlatformFailure`'s boxed source
+# to inspect the OSStatus and route ACL denials (-25308 / -25293) to
+# `BackendUnavailable` so the existing auto-fallback path engages
+# instead of hard-failing the keystore probe. Pinned to v3 to match the
+# version keyring 3.6 boxes (downcast checks type identity, so v2 in
+# our dep tree would silently miss).
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "time", "test-util"] }
 walkdir.workspace = true

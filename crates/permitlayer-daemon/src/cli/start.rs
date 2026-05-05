@@ -1518,12 +1518,19 @@ impl StartError {
                  request would return 401 and the vault cannot decrypt credentials.\n\
                  \n\
                  common causes:\n\
+                 - on macOS: the login keychain refused access. After\n\
+                   `brew upgrade agentsso`, the new binary's codesign hash no\n\
+                   longer matches the previously-authorized ACL on the existing\n\
+                   master-key entry — the daemon should have fallen back to the\n\
+                   passphrase prompt, so seeing this banner means either fallback\n\
+                   is disabled or the failure was a non-ACL platform error\n\
+                   (e.g., locked keychain → unlock and retry).\n\
                  - on linux: the secret-service daemon is not running\n\
                    (install `libsecret` / `gnome-keyring-daemon` and start a session)\n\
                  - on fresh CI containers: no keyring backend available —\n\
                    install a software keyring, or use a dev build.\n\
                  \n\
-                 run `agentsso` with `RUST_LOG=debug` for the underlying error.\n"
+                 run with `AGENTSSO_LOG__LEVEL=debug` for the underlying error.\n"
                     .to_owned()
             }
             Self::MasterKeyCall { .. } => "error: failed to provision the vault master key.\n\
@@ -1532,13 +1539,18 @@ impl StartError {
                  request would return 401 and the vault cannot decrypt credentials.\n\
                  \n\
                  common causes:\n\
-                 - on macOS: the login keychain is locked — unlock it and retry\n\
+                 - on macOS: the login keychain is locked — unlock it and retry.\n\
+                   If you just ran `brew upgrade agentsso`, the new binary's\n\
+                   codesign hash invalidated the keychain ACL on the existing\n\
+                   master-key entry; the auto-fallback should have dropped to a\n\
+                   passphrase prompt — if you saw this banner instead, the\n\
+                   keychain failure was a non-ACL platform error.\n\
                  - on linux: the secret-service daemon is not running\n\
                    (install `libsecret` / `gnome-keyring-daemon` and start a session)\n\
                  - on fresh CI containers: no keyring backend available —\n\
                    install a software keyring, or use a dev build.\n\
                  \n\
-                 run `agentsso` with `RUST_LOG=debug` for the underlying error.\n"
+                 run with `AGENTSSO_LOG__LEVEL=debug` for the underlying error.\n"
                 .to_owned(),
             Self::HkdfExpand => "error: HKDF expansion of the agent token lookup subkey failed \
                  unexpectedly.\n\
@@ -2297,7 +2309,26 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     // decrypt any credential. Booting into a half-alive state serves
     // no one.
     let master_key = ensure_master_key_bootstrapped(&config).await.inspect_err(|e| {
-        tracing::error!(error = %e, "master key bootstrap failed — refusing to boot");
+        // The compact stdout layer walks the source chain via
+        // `Visit::record_error` when the value is recorded as
+        // `&dyn Error`. The `%e` shorthand routes through
+        // `record_debug` and drops the chain, so the boxed
+        // `security_framework::base::Error` carrying the OSStatus
+        // (post-Plan-A) would never reach the operator's terminal.
+        // The pre-stringified `error_chain` field is for the JSON
+        // file layer, whose `JsonVisitor` does NOT walk source
+        // errors.
+        let chain: Vec<String> =
+            std::iter::successors(Some(e as &(dyn std::error::Error + 'static)), |err| {
+                err.source()
+            })
+            .map(|err| err.to_string())
+            .collect();
+        tracing::error!(
+            error = e as &(dyn std::error::Error + 'static),
+            error_chain = ?chain,
+            "master key bootstrap failed — refusing to boot",
+        );
     })?;
 
     // Story 7.6a AC #12: walk the vault and compute the active
