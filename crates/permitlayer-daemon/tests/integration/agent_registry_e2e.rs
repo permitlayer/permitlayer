@@ -130,12 +130,26 @@ fn seed_two_policies(home: &std::path::Path) {
     std::fs::write(policies_dir.join("write.toml"), TWO_POLICY_TOML_B).unwrap();
 }
 
+/// Read the daemon's minted control token from `<home>/control.token`.
+/// Plan B requires every `/v1/control/*` request to carry the
+/// `X-Agentsso-Control` header.
+fn read_test_control_token(home: &std::path::Path) -> String {
+    let path = home.join("control.token");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("control.token not readable at {}: {e}", path.display()))
+        .trim()
+        .to_owned()
+}
+
 /// Register an agent via the loopback control endpoint and return the
 /// minted bearer token. Panics on any failure — the test is hard-fail
 /// on the happy path because every assertion downstream depends on it.
-fn register_agent(port: u16, name: &str, policy: &str) -> String {
+fn register_agent(port: u16, home: &std::path::Path, name: &str, policy: &str) -> String {
     let body = serde_json::json!({"name": name, "policy_name": policy}).to_string();
-    let (status, resp_body) = http_post_loopback(port, "/v1/control/agent/register", &body, &[]);
+    let ctl = read_test_control_token(home);
+    let headers = [("X-Agentsso-Control", ctl.as_str())];
+    let (status, resp_body) =
+        http_post_loopback(port, "/v1/control/agent/register", &body, &headers);
     assert_eq!(
         status, 200,
         "agent register should succeed for {name} → {policy}, got {status}: {resp_body}"
@@ -147,16 +161,20 @@ fn register_agent(port: u16, name: &str, policy: &str) -> String {
     token
 }
 
-fn remove_agent(port: u16, name: &str) -> bool {
+fn remove_agent(port: u16, home: &std::path::Path, name: &str) -> bool {
     let body = serde_json::json!({"name": name}).to_string();
-    let (status, resp_body) = http_post_loopback(port, "/v1/control/agent/remove", &body, &[]);
+    let ctl = read_test_control_token(home);
+    let headers = [("X-Agentsso-Control", ctl.as_str())];
+    let (status, resp_body) = http_post_loopback(port, "/v1/control/agent/remove", &body, &headers);
     assert_eq!(status, 200, "agent remove should succeed for {name}, got {status}: {resp_body}");
     let parsed: serde_json::Value = serde_json::from_str(&resp_body).unwrap();
     parsed["removed"].as_bool().unwrap_or(false)
 }
 
-fn list_agents(port: u16) -> serde_json::Value {
-    let (status, resp_body) = http_get_loopback(port, "/v1/control/agent/list", &[]);
+fn list_agents(port: u16, home: &std::path::Path) -> serde_json::Value {
+    let ctl = read_test_control_token(home);
+    let headers = [("X-Agentsso-Control", ctl.as_str())];
+    let (status, resp_body) = http_get_loopback(port, "/v1/control/agent/list", &headers);
     assert_eq!(status, 200, "agent list should succeed, got {status}: {resp_body}");
     serde_json::from_str(&resp_body).unwrap()
 }
@@ -174,8 +192,8 @@ fn full_register_auth_policy_lifecycle() {
     assert_daemon_pid_matches(&daemon);
 
     // 1. Register two agents bound to different policies.
-    let token_readonly = register_agent(port, "readonly-agent", "policy-readonly");
-    let token_write = register_agent(port, "write-agent", "policy-write");
+    let token_readonly = register_agent(port, home.path(), "readonly-agent", "policy-readonly");
+    let token_write = register_agent(port, home.path(), "write-agent", "policy-write");
 
     // 2. Authenticated request matching the readonly agent's scope:
     //    PolicyLayer ALLOWS the request through. Without upstream
@@ -252,7 +270,7 @@ fn full_register_auth_policy_lifecycle() {
 
     // 8. List shows both agents and never leaks the bearer token or
     //    its hash.
-    let listing = list_agents(port);
+    let listing = list_agents(port, home.path());
     let agents = listing["agents"].as_array().unwrap();
     assert_eq!(agents.len(), 2);
     let raw = serde_json::to_string(&listing).unwrap();
@@ -261,7 +279,7 @@ fn full_register_auth_policy_lifecycle() {
     assert!(!raw.contains("argon2"), "list output must not leak the Argon2id hash material");
 
     // 9. Remove the readonly agent → its token stops working.
-    let removed = remove_agent(port, "readonly-agent");
+    let removed = remove_agent(port, home.path(), "readonly-agent");
     assert!(removed, "remove should report removed=true");
     let (status, body) = http_get_loopback(
         port,
@@ -323,7 +341,13 @@ fn register_with_unknown_policy_returns_422() {
     assert_daemon_pid_matches(&daemon);
 
     let body = serde_json::json!({"name": "agent1", "policy_name": "nonexistent"}).to_string();
-    let (status, resp_body) = http_post_loopback(port, "/v1/control/agent/register", &body, &[]);
+    let ctl = read_test_control_token(home.path());
+    let (status, resp_body) = http_post_loopback(
+        port,
+        "/v1/control/agent/register",
+        &body,
+        &[("X-Agentsso-Control", ctl.as_str())],
+    );
     assert_eq!(status, 422, "unknown policy should be 422, body: {resp_body}");
     let parsed: serde_json::Value = serde_json::from_str(&resp_body).unwrap();
     assert_eq!(parsed["status"], "error");
@@ -347,10 +371,16 @@ fn register_duplicate_name_returns_409() {
     assert!(wait_for_health(port));
     assert_daemon_pid_matches(&daemon);
 
-    let _token = register_agent(port, "duplicate-test", "policy-readonly");
+    let _token = register_agent(port, home.path(), "duplicate-test", "policy-readonly");
     let body =
         serde_json::json!({"name": "duplicate-test", "policy_name": "policy-readonly"}).to_string();
-    let (status, resp_body) = http_post_loopback(port, "/v1/control/agent/register", &body, &[]);
+    let ctl = read_test_control_token(home.path());
+    let (status, resp_body) = http_post_loopback(
+        port,
+        "/v1/control/agent/register",
+        &body,
+        &[("X-Agentsso-Control", ctl.as_str())],
+    );
     assert_eq!(status, 409, "duplicate name should be 409, body: {resp_body}");
     let parsed: serde_json::Value = serde_json::from_str(&resp_body).unwrap();
     assert_eq!(parsed["code"], "agent.duplicate_name");
@@ -430,6 +460,11 @@ fn agent_register_works_cross_home() {
     std::fs::create_dir_all(home_caller.path().join("policies")).unwrap();
 
     let bind_addr = format!("127.0.0.1:{port}");
+    // Plan B: CLI must carry an `X-Agentsso-Control` token. Cross-home
+    // callers can't read the daemon-owner's `<home>/control.token` file
+    // directly; they read from `AGENTSSO_CONTROL_TOKEN` env var. This
+    // mirrors the documented production usage.
+    let control_token = read_test_control_token(home_daemon.path());
     let output = Command::new(crate::common::agentsso_bin())
         .env_clear()
         .envs(crate::common::forward_windows_required_env())
@@ -437,6 +472,7 @@ fn agent_register_works_cross_home() {
         .env("HOME", home_caller.path())
         .env("AGENTSSO_PATHS__HOME", home_caller.path())
         .env("AGENTSSO_HTTP__BIND_ADDR", &bind_addr)
+        .env("AGENTSSO_CONTROL_TOKEN", &control_token)
         .arg("agent")
         .arg("register")
         .arg("cross-home-agent")

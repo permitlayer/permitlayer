@@ -1330,6 +1330,12 @@ pub(crate) enum StartError {
     #[error("failed to acquire PID file: {0}")]
     PidFileAcquire(String),
 
+    /// Plan B (operator-token auth): could not read or mint the
+    /// `<home>/control.token` file at startup. Causes: filesystem
+    /// permissions, malformed existing file, mode-other-than-0o600.
+    #[error("failed to bootstrap control token: {0}")]
+    ControlTokenBootstrap(String),
+
     /// Story 7.6a AC #3: vault-level advisory lock is held by another
     /// process — typically `agentsso rotate-key` mid-flight, an
     /// `agentsso setup` in progress, or a stale daemon that survived
@@ -1463,6 +1469,7 @@ impl StartError {
             // Exit 3 — another process holds a coordination resource.
             Self::DaemonAlreadyRunning { .. }
             | Self::PidFileAcquire(_)
+            | Self::ControlTokenBootstrap(_)
             | Self::DaemonStartVaultBusy { .. } => 3,
             // Exit 4 — filesystem-level failure on a coordination
             // resource (Story 7.6a round-1 review patch).
@@ -1542,6 +1549,15 @@ impl StartError {
                 format!("error: daemon is already running (pid {pid})\n")
             }
             Self::PidFileAcquire(msg) => format!("error: failed to acquire PID file: {msg}\n"),
+            Self::ControlTokenBootstrap(msg) => format!(
+                "error: failed to bootstrap control token: {msg}\n\
+                 \n\
+                 the daemon could not read or mint ~/.agentsso/control.token. \
+                 common causes:\n\
+                 - the file exists but has the wrong mode (must be 0o600)\n\
+                 - the file exists but is malformed (delete it and the daemon will mint fresh)\n\
+                 - filesystem permissions on ~/.agentsso/ block writing\n",
+            ),
             Self::DaemonStartVaultBusy { holder_pid, holder_command } => {
                 let holder_text = match (holder_pid, holder_command.as_deref()) {
                     (Some(pid), Some(cmd)) => format!("pid {pid} ({cmd})"),
@@ -1982,6 +1998,18 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
             return Err(StartError::PidFileAcquire(e.to_string()));
         }
     };
+
+    // Read or mint the operator-authentication token for /v1/control/*.
+    // Persists at <home>/control.token (mode 0o600). Survives across
+    // daemon restarts so ops automation doesn't break on every bounce.
+    let control_token =
+        match crate::lifecycle::control_token::ControlToken::read_or_mint(&config.paths.home) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(error = ?e, "control token bootstrap failed — refusing to boot");
+                return Err(StartError::ControlTokenBootstrap(e.to_string()));
+            }
+        };
 
     // 3a. Acquire the vault-level advisory lock (Story 7.6a AC #3).
     //
@@ -2639,6 +2667,7 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         Arc::clone(&cli_overrides),
         Arc::clone(&proxy_stub_branch_active),
         vault_dir_for_reload,
+        Arc::clone(&control_token),
     );
     // `agent_lookup_key` (the local binding) is moved into control::router
     // above — the middleware call earlier already `Arc::clone`d its

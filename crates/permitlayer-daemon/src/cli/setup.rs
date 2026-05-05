@@ -865,10 +865,13 @@ async fn probe_daemon_kill_state_or_exit() -> anyhow::Result<()> {
 
     let bind_addr = config.http.bind_addr;
     let probe_deadline = std::time::Duration::from_millis(500);
+    let control_token = crate::cli::kill::read_control_token(home);
 
     // 500ms deadline keeps setup snappy even when a misbehaving daemon
     // is on localhost. `probe_state_get` delegates to `kill::http_get`.
-    let probe_result = tokio::time::timeout(probe_deadline, probe_state_get(bind_addr)).await;
+    let probe_result =
+        tokio::time::timeout(probe_deadline, probe_state_get(bind_addr, control_token.as_deref()))
+            .await;
 
     let body = match probe_result {
         Ok(Ok(body)) => body,
@@ -930,12 +933,15 @@ async fn probe_daemon_kill_state_or_exit() -> anyhow::Result<()> {
 /// Invariant: the outer 500 ms timeout must always be ≤ `kill::HTTP_DEADLINE`
 /// (currently 1500 ms). The static assertion below enforces this — if
 /// `HTTP_DEADLINE` is ever reduced below 500 ms, this will fail to compile.
-async fn probe_state_get(addr: std::net::SocketAddr) -> anyhow::Result<String> {
+async fn probe_state_get(
+    addr: std::net::SocketAddr,
+    control_token: Option<&str>,
+) -> anyhow::Result<String> {
     const _: () = assert!(
         crate::cli::kill::HTTP_DEADLINE.as_millis() >= 500,
         "kill::HTTP_DEADLINE must be >= the 500ms probe_state_get outer timeout"
     );
-    crate::cli::kill::http_get(addr, "/v1/control/state").await
+    crate::cli::kill::http_get(addr, "/v1/control/state", control_token).await
 }
 
 /// Severity of an `OAuthError` for the non-interactive tracing-log
@@ -1252,7 +1258,7 @@ mod tests {
         // to connect (i.e., it calls the real http_get rather than short-circuiting).
         let rt = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
         let addr: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap(); // port 1 is always refused
-        let result = rt.block_on(probe_state_get(addr));
+        let result = rt.block_on(probe_state_get(addr, None));
         assert!(result.is_err(), "probe_state_get to port 1 must fail (connection refused)");
     }
 

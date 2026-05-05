@@ -11,9 +11,7 @@
 use anyhow::Result;
 use serde::Deserialize;
 
-use crate::cli::kill::{
-    error_block_daemon_not_running, http_post_empty_json, load_daemon_config_or_default_with_warn,
-};
+use crate::cli::kill::{http_post_empty_json, load_daemon_config_or_default_with_warn};
 use crate::lifecycle::pid::PidFile;
 
 /// Deserialization target for the JSON body of a successful
@@ -48,20 +46,14 @@ pub async fn run() -> Result<()> {
     let config = load_daemon_config_or_default_with_warn("reload");
     let home = config.paths.home.clone();
 
-    // 1. Check daemon is actually running.
-    if PidFile::read(&home)?.is_none() {
-        eprint!("{}", error_block_daemon_not_running("reload"));
-        std::process::exit(3);
-    }
-    if !PidFile::is_daemon_running(&home)? {
-        eprint!("{}", error_block_daemon_not_running("reload"));
-        let _ = std::fs::remove_file(home.join("agentsso.pid"));
-        std::process::exit(3);
-    }
+    // No PID-file pre-check — Plan B's operator-token auth on
+    // `/v1/control/*` is the canonical gate. The HTTP path's failure
+    // mode handles the genuine "no daemon" case (and the SIGHUP
+    // fallback below handles backward-compat with pre-Story-4.2 daemons).
 
-    // 2. POST /v1/control/reload to get a JSON diff response.
     let bind_addr = config.http.bind_addr;
-    match http_post_empty_json(bind_addr, "/v1/control/reload").await {
+    let token = crate::cli::kill::read_control_token(&home);
+    match http_post_empty_json(bind_addr, "/v1/control/reload", token.as_deref()).await {
         Ok(body) => handle_reload_response(&body)?,
         Err(_) => {
             // Control endpoint unavailable — fall back to SIGHUP.

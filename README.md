@@ -137,22 +137,43 @@ filesystem the agent's OS user (e.g. `agent`) cannot read. The agent
 talks to the daemon over loopback with a bearer token issued by
 `agentsso agent register`.
 
-`agent register` and `agent list` work cross-user as long as the
-caller can reach the daemon's bind address. If the daemon owner has
-overridden the default `127.0.0.1:3820`, point the caller at it
-explicitly:
+All control-plane CLI commands (`agent register`, `agent list`,
+`agent remove`, `kill`, `resume`, `reload`, `connectors list`,
+`status --connections`) require an operator authentication token.
+The daemon mints `<home>/control.token` (mode `0o600`) at startup
+and persists it across restarts.
+
+**Same-user invocation** reads the token automatically from the
+daemon owner's home directory (the file is mode `0o600`, only
+readable by the owner):
 
 ```sh
-# As the agent user, talking to a daemon owned by a different user:
+# As the daemon-owner user:
+agentsso agent list
+agentsso kill
+```
+
+**Cross-user invocation** requires the operator to share the token
+explicitly via the `AGENTSSO_CONTROL_TOKEN` env var. The calling user
+cannot read `<home>/control.token` from a different user's home (mode
+`0o600` blocks it):
+
+```sh
+# As the agent user, against a daemon owned by a different user:
+AGENTSSO_CONTROL_TOKEN=$(sudo cat /Users/<svc-user>/.agentsso/control.token) \
 AGENTSSO_HTTP__BIND_ADDR=127.0.0.1:3820 \
   agentsso agent register angie --policy gmail-read-only
 ```
 
-The destructive control endpoints (`agentsso kill`, `agentsso resume`,
-`agentsso reload`, `agentsso agent remove`) currently still refuse
-cross-user — they're loopback-only without bearer-token auth, so we
-keep an implicit owner-only gate via the daemon owner's PID file.
-Tracked as a follow-up to add proper operator-token authentication.
+If the daemon owner has overridden the default `127.0.0.1:3820`,
+point the caller at the right port via `AGENTSSO_HTTP__BIND_ADDR`.
+
+**Token rotation.** The token survives daemon restarts (Codex review
+finding from 2026-05-05: rotating on every restart would break ops
+automation that holds the token). To rotate explicitly, stop the
+daemon, delete `<home>/control.token`, and start the daemon again —
+it'll mint a fresh token. All in-flight tokens lose access as soon
+as the file is replaced.
 
 ## What's in the box
 

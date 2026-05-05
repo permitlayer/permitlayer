@@ -181,6 +181,17 @@ pub(crate) struct ControlState {
     /// Story 8.7 AC #4: vault directory path to consult when the
     /// stub-active flag fires. Typically `{config.paths.home}/vault`.
     pub vault_dir: PathBuf,
+    /// Operator authentication token for `/v1/control/*` endpoints.
+    /// The middleware layer at the router level (`require_control_token`)
+    /// reads `X-Agentsso-Control` from each inbound request and
+    /// constant-time-compares against this token. Loopback enforcement
+    /// remains in each handler (`require_loopback`); two gates are
+    /// kept for defense in depth.
+    ///
+    /// Minted (or read from disk) at daemon startup; persists across
+    /// daemon restarts. See [`crate::lifecycle::control_token`] for the
+    /// rotation policy and file-mode invariants.
+    pub control_token: Arc<crate::lifecycle::control_token::ControlToken>,
 }
 
 /// Cap on concurrent agent CRUD operations. The number is small
@@ -297,11 +308,21 @@ pub(crate) struct StateResponse {
 /// Errors the control router can return.
 ///
 /// Story 3.2 ships `ForbiddenNotLoopback`. Story 8.3 adds
-/// `ConnectorsPayloadTooLarge` (AC #8).
+/// `ConnectorsPayloadTooLarge` (AC #8). Plan B (operator-token auth)
+/// adds `ForbiddenMissingControlToken` and `ForbiddenInvalidControlToken`.
 #[derive(Debug, thiserror::Error)]
 pub(crate) enum ControlError {
     #[error("control endpoints are loopback-only")]
     ForbiddenNotLoopback,
+    /// Request did not carry an `X-Agentsso-Control` header.
+    /// Distinct from `ForbiddenInvalidControlToken` so operators can
+    /// distinguish "client forgot the header" from "client guessed wrong."
+    #[error("X-Agentsso-Control header is required on /v1/control/* endpoints")]
+    ForbiddenMissingControlToken,
+    /// Request carried an `X-Agentsso-Control` header but it did not
+    /// match the daemon's stored token.
+    #[error("X-Agentsso-Control token did not match")]
+    ForbiddenInvalidControlToken,
     /// `GET /v1/control/connectors` JSON exceeds the 1 MiB cap.
     #[error("connector registry JSON exceeds 1 MiB")]
     ConnectorsPayloadTooLarge { size_bytes: usize, limit_bytes: usize },
@@ -335,6 +356,24 @@ impl IntoResponse for ControlError {
                     error: ControlErrorDetail {
                         code: "forbidden_not_loopback",
                         message: "control endpoints are loopback-only",
+                    },
+                };
+                (StatusCode::FORBIDDEN, Json(body)).into_response()
+            }
+            Self::ForbiddenMissingControlToken => {
+                let body = ControlErrorBody {
+                    error: ControlErrorDetail {
+                        code: "forbidden_missing_control_token",
+                        message: "X-Agentsso-Control header is required on /v1/control/* endpoints",
+                    },
+                };
+                (StatusCode::FORBIDDEN, Json(body)).into_response()
+            }
+            Self::ForbiddenInvalidControlToken => {
+                let body = ControlErrorBody {
+                    error: ControlErrorDetail {
+                        code: "forbidden_invalid_control_token",
+                        message: "X-Agentsso-Control token did not match",
                     },
                 };
                 (StatusCode::FORBIDDEN, Json(body)).into_response()
@@ -373,6 +412,66 @@ fn require_loopback(peer: SocketAddr) -> Result<(), ControlError> {
         );
         Err(ControlError::ForbiddenNotLoopback)
     }
+}
+
+/// Header name carried by the CLI to authenticate against
+/// `/v1/control/*`. Distinct from `Authorization: Bearer <agt_v2_*>`
+/// (the agent-identity tokens used by /mcp/* and /v1/tools/*) so the
+/// proxy's `AuthLayer` can't accidentally route operator tokens
+/// through agent-identity validation.
+const CONTROL_TOKEN_HEADER: &str = "x-agentsso-control";
+
+/// Axum `from_fn_with_state` middleware that gates every `/v1/control/*`
+/// request on a valid operator token.
+///
+/// Runs at the router level (NOT inline in each handler) so that auth
+/// rejection happens before axum extracts the JSON body, the
+/// `ConnectInfo`, or any other handler-side state. This is why the
+/// fix uses `from_fn_with_state` rather than per-handler
+/// `require_control_token(headers, &state)?` calls — Codex review
+/// caught that handler-side checks happen after body extraction, so a
+/// 1 GB JSON POST without the token would still consume server memory.
+///
+/// Constant-time comparison against the daemon's stored token is
+/// defense in depth (`subtle::ConstantTimeEq`); the primary security
+/// boundary is the `0o600` mode on `<home>/control.token`. See the
+/// module-level doc on `ControlToken` for the full threat model.
+pub(crate) async fn require_control_token(
+    State(state): State<ControlState>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Response {
+    let header_value = match req.headers().get(CONTROL_TOKEN_HEADER) {
+        Some(v) => v,
+        None => {
+            tracing::warn!(
+                target: "control",
+                path = %req.uri().path(),
+                "rejecting /v1/control/* request: missing X-Agentsso-Control header",
+            );
+            return ControlError::ForbiddenMissingControlToken.into_response();
+        }
+    };
+    let candidate = match header_value.to_str() {
+        Ok(s) => s,
+        Err(_) => {
+            tracing::warn!(
+                target: "control",
+                path = %req.uri().path(),
+                "rejecting /v1/control/* request: X-Agentsso-Control header is not valid UTF-8",
+            );
+            return ControlError::ForbiddenInvalidControlToken.into_response();
+        }
+    };
+    if !state.control_token.matches(candidate) {
+        tracing::warn!(
+            target: "control",
+            path = %req.uri().path(),
+            "rejecting /v1/control/* request: X-Agentsso-Control token did not match",
+        );
+        return ControlError::ForbiddenInvalidControlToken.into_response();
+    }
+    next.run(req).await
 }
 
 pub(crate) async fn kill_handler(
@@ -1679,6 +1778,7 @@ pub(crate) fn router(
     cli_overrides: Arc<crate::config::CliOverrides>,
     proxy_stub_branch_active: Arc<AtomicBool>,
     vault_dir: PathBuf,
+    control_token: Arc<crate::lifecycle::control_token::ControlToken>,
 ) -> Router {
     // The caller owns the `Arc<Zeroizing<_>>` and shares the same
     // backing allocation with `AuthLayer` in the middleware chain —
@@ -1703,6 +1803,7 @@ pub(crate) fn router(
         cli_overrides,
         proxy_stub_branch_active,
         vault_dir,
+        control_token,
     };
     Router::new()
         .route("/v1/control/kill", post(kill_handler))
@@ -1715,6 +1816,10 @@ pub(crate) fn router(
         .route("/v1/control/connections", get(connections_handler))
         .route("/v1/control/connectors", get(connectors_handler))
         .route("/v1/control/whoami", get(whoami_handler))
+        // `from_fn_with_state` runs BEFORE the route handler reads the
+        // body or extracts ConnectInfo, so a request with no token can't
+        // consume server memory by sending a large JSON payload.
+        .layer(axum::middleware::from_fn_with_state(state.clone(), require_control_token))
         .with_state(state)
         .layer(permitlayer_proxy::middleware::RequestTraceLayer::new())
 }
@@ -1795,6 +1900,26 @@ mod tests {
         )
     }
 
+    /// Construct a ControlToken with deterministic bytes so test
+    /// helpers can produce request headers that match. Production
+    /// callers must always go through `ControlToken::read_or_mint`.
+    pub(crate) const TEST_CONTROL_TOKEN_BYTES: [u8; 32] = [0x37u8; 32];
+
+    fn test_control_token() -> Arc<crate::lifecycle::control_token::ControlToken> {
+        Arc::new(crate::lifecycle::control_token::ControlToken::from_raw_bytes_for_test(
+            TEST_CONTROL_TOKEN_BYTES,
+        ))
+    }
+
+    /// Encoded form of the test token. Use as the `X-Agentsso-Control`
+    /// header value in router tests.
+    fn test_control_token_header() -> String {
+        crate::lifecycle::control_token::ControlToken::from_raw_bytes_for_test(
+            TEST_CONTROL_TOKEN_BYTES,
+        )
+        .encoded_for_test()
+    }
+
     fn build(kill_switch: Arc<KillSwitch>) -> Router {
         let policy_set = Arc::new(ArcSwap::from_pointee(PolicySet::empty()));
         let policies_dir = tempfile::tempdir().unwrap().keep();
@@ -1826,6 +1951,7 @@ mod tests {
             co,
             stub,
             vault,
+            test_control_token(),
         )
     }
 
@@ -1862,6 +1988,7 @@ mod tests {
             co,
             stub,
             vault,
+            test_control_token(),
         )
     }
 
@@ -1896,14 +2023,52 @@ mod tests {
             co,
             stub,
             vault,
+            test_control_token(),
         )
     }
 
     /// Build a `Request` carrying a `ConnectInfo(addr)` extension so the
     /// `ConnectInfo` extractor sees the provided peer address when the
-    /// router is driven via `ServiceExt::oneshot`.
+    /// router is driven via `ServiceExt::oneshot`. Also attaches the
+    /// test-fixture `X-Agentsso-Control` header — every test routes
+    /// through the auth layer, and Plan-B tests that need to exercise
+    /// missing-/invalid-token cases use [`req_with_peer_no_token`] or
+    /// [`req_with_peer_and_custom_token`] instead.
     fn req_with_peer(method: Method, path: &str, peer: SocketAddr) -> Request<Body> {
+        let mut r = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("x-agentsso-control", test_control_token_header())
+            .body(Body::empty())
+            .unwrap();
+        r.extensions_mut().insert(ConnectInfo(peer));
+        r
+    }
+
+    /// Build a request without an `X-Agentsso-Control` header — used by
+    /// Plan-B tests that pin the missing-token rejection.
+    #[allow(dead_code)]
+    fn req_with_peer_no_token(method: Method, path: &str, peer: SocketAddr) -> Request<Body> {
         let mut r = Request::builder().method(method).uri(path).body(Body::empty()).unwrap();
+        r.extensions_mut().insert(ConnectInfo(peer));
+        r
+    }
+
+    /// Build a request with a caller-specified `X-Agentsso-Control`
+    /// value — used by Plan-B tests that pin the invalid-token branch.
+    #[allow(dead_code)]
+    fn req_with_peer_and_custom_token(
+        method: Method,
+        path: &str,
+        peer: SocketAddr,
+        token: &str,
+    ) -> Request<Body> {
+        let mut r = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("x-agentsso-control", token)
+            .body(Body::empty())
+            .unwrap();
         r.extensions_mut().insert(ConnectInfo(peer));
         r
     }
@@ -2058,6 +2223,7 @@ mod tests {
             co,
             stub,
             vault,
+            test_control_token(),
         )
     }
 
@@ -2194,6 +2360,48 @@ mod tests {
     }
 
     // --- Loopback guard ---
+
+    /// Plan B regression test: a request to `/v1/control/kill` with
+    /// no `X-Agentsso-Control` header must be rejected with the
+    /// `forbidden_missing_control_token` error code, even from
+    /// loopback. The auth layer runs BEFORE the loopback check, so
+    /// missing-token should fire first.
+    #[tokio::test]
+    async fn forbidden_when_no_control_token_header_on_kill() {
+        let switch = Arc::new(KillSwitch::new());
+        let app = build(Arc::clone(&switch));
+        let resp = app
+            .oneshot(req_with_peer_no_token(Method::POST, "/v1/control/kill", loopback_v4()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"]["code"], "forbidden_missing_control_token");
+        assert!(!switch.is_active(), "missing-token request must NOT flip the switch");
+    }
+
+    /// Plan B regression test: a request with a malformed
+    /// `X-Agentsso-Control` value must be rejected with
+    /// `forbidden_invalid_control_token` even when the value is the
+    /// right shape but doesn't match.
+    #[tokio::test]
+    async fn forbidden_when_wrong_control_token_on_kill() {
+        let switch = Arc::new(KillSwitch::new());
+        let app = build(Arc::clone(&switch));
+        let resp = app
+            .oneshot(req_with_peer_and_custom_token(
+                Method::POST,
+                "/v1/control/kill",
+                loopback_v4(),
+                "agt_ctl_definitelynotthistokenagt_ctl_definitely",
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+        let json = body_json(resp).await;
+        assert_eq!(json["error"]["code"], "forbidden_invalid_control_token");
+        assert!(!switch.is_active(), "wrong-token request must NOT flip the switch");
+    }
 
     #[tokio::test]
     async fn forbidden_when_non_loopback_on_kill() {

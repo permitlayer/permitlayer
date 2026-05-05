@@ -192,7 +192,7 @@ fn seed_tracked_connection_or_dump(
     //    entry.
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
-        let (status, body) = http_get_loopback(port, "/v1/control/connections", &[]);
+        let (status, body) = http_get_control(port, home, "/v1/control/connections", &[]);
         if status == 200
             && let Ok(json) = serde_json::from_str::<serde_json::Value>(&body)
             && let Some(arr) = json.get("connections").and_then(|c| c.as_array())
@@ -243,9 +243,9 @@ fn dump_and_panic(
     proxy_status: u16,
     proxy_body: &str,
 ) -> ! {
-    let (conn_status, conn_body) = http_get_loopback(port, "/v1/control/connections", &[]);
-    let (list_status, list_body) = http_get_loopback(port, "/v1/control/agent/list", &[]);
-    let (whoami_status, whoami_body) = http_get_loopback(port, "/v1/control/whoami", &[]);
+    let (conn_status, conn_body) = http_get_control(port, home, "/v1/control/connections", &[]);
+    let (list_status, list_body) = http_get_control(port, home, "/v1/control/agent/list", &[]);
+    let (whoami_status, whoami_body) = http_get_control(port, home, "/v1/control/whoami", &[]);
     let (health_status, health_body) = http_get_loopback(port, "/health", &[]);
 
     let agents_dir = home.join("agents");
@@ -293,8 +293,8 @@ fn dump_and_panic(
 /// **Story 7.7 P19**: probes `/v1/control/whoami` (loopback-gated)
 /// rather than `/health` because `/health` no longer exposes PID
 /// (it leaked daemon identity to LAN peers under `0.0.0.0` binds).
-fn assert_daemon_pid_matches(port: u16, expected_pid: u32) {
-    let (status, body) = http_get_loopback(port, "/v1/control/whoami", &[]);
+fn assert_daemon_pid_matches(port: u16, home: &std::path::Path, expected_pid: u32) {
+    let (status, body) = http_get_control(port, home, "/v1/control/whoami", &[]);
     assert_eq!(status, 200, "/v1/control/whoami should return 200, got {status}: {body}");
     let json: serde_json::Value = serde_json::from_str(&body)
         .unwrap_or_else(|e| panic!("/v1/control/whoami response not JSON: {e}\nbody: {body}"));
@@ -380,6 +380,21 @@ fn http_get_loopback(port: u16, path: &str, headers: &[(&str, &str)]) -> (u16, S
     http_request(port, "GET", path, headers, None)
 }
 
+/// `http_get_loopback` variant that auto-adds the `X-Agentsso-Control`
+/// header read from `<home>/control.token`. Use this for any
+/// `/v1/control/*` endpoint call (Plan B).
+fn http_get_control(
+    port: u16,
+    home: &std::path::Path,
+    path: &str,
+    extra_headers: &[(&str, &str)],
+) -> (u16, String) {
+    let ctl = crate::common::read_test_control_token(home);
+    let mut all = vec![("X-Agentsso-Control", ctl.as_str())];
+    all.extend_from_slice(extra_headers);
+    http_request(port, "GET", path, &all, None)
+}
+
 fn http_post_loopback(
     port: u16,
     path: &str,
@@ -406,9 +421,15 @@ fn seed_single_policy(home: &std::path::Path) {
 /// Register an agent via the loopback control endpoint and return the
 /// minted bearer token. Panics on any failure — this helper is on the
 /// happy path of every test that exercises the tracker.
-fn register_agent(port: u16, name: &str, policy: &str) -> String {
+fn register_agent(port: u16, home: &std::path::Path, name: &str, policy: &str) -> String {
     let body = serde_json::json!({"name": name, "policy_name": policy}).to_string();
-    let (status, resp_body) = http_post_loopback(port, "/v1/control/agent/register", &body, &[]);
+    let ctl = crate::common::read_test_control_token(home);
+    let (status, resp_body) = http_post_loopback(
+        port,
+        "/v1/control/agent/register",
+        &body,
+        &[("X-Agentsso-Control", ctl.as_str())],
+    );
     assert_eq!(status, 200, "agent register should succeed for {name}: {resp_body}");
     let parsed: serde_json::Value = serde_json::from_str(&resp_body).unwrap();
     parsed["bearer_token"].as_str().unwrap().to_owned()
@@ -445,9 +466,9 @@ fn connections_endpoint_returns_empty_on_fresh_boot() {
     seed_single_policy(home.path());
     let (_daemon, port, daemon_pid) = start_daemon_zero_port(home.path());
     assert!(wait_for_health(port, Duration::from_secs(5)));
-    assert_daemon_pid_matches(port, daemon_pid);
+    assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
-    let (status, body) = http_get_loopback(port, "/v1/control/connections", &[]);
+    let (status, body) = http_get_control(port, home.path(), "/v1/control/connections", &[]);
     assert_eq!(status, 200, "endpoint must respond 200 on fresh boot: {body}");
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert!(json["connections"].is_array());
@@ -462,7 +483,7 @@ fn status_connections_renders_empty_state() {
     seed_single_policy(home.path());
     let (_daemon, port, daemon_pid) = start_daemon_zero_port(home.path());
     assert!(wait_for_health(port, Duration::from_secs(5)));
-    assert_daemon_pid_matches(port, daemon_pid);
+    assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
     let (exit, stdout, _stderr) = run_status_cli(home.path(), port, &["--connections"]);
     assert_eq!(exit, 0, "status --connections must exit 0 with empty tracker");
@@ -484,9 +505,9 @@ fn status_connections_renders_table_after_request() {
     seed_single_policy(home.path());
     let (_daemon, port, daemon_pid) = start_daemon_zero_port(home.path());
     assert!(wait_for_health(port, Duration::from_secs(5)));
-    assert_daemon_pid_matches(port, daemon_pid);
+    assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
-    let token = register_agent(port, "test-agent", "policy-readonly");
+    let token = register_agent(port, home.path(), "test-agent", "policy-readonly");
 
     // Fire one authenticated request through the proxy and confirm the
     // tracker has THIS agent's entry. `seed_tracked_connection_or_dump`
@@ -516,9 +537,9 @@ fn status_connections_json_emits_valid_json() {
     seed_single_policy(home.path());
     let (_daemon, port, daemon_pid) = start_daemon_zero_port(home.path());
     assert!(wait_for_health(port, Duration::from_secs(5)));
-    assert_daemon_pid_matches(port, daemon_pid);
+    assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
-    let token = register_agent(port, "json-agent", "policy-readonly");
+    let token = register_agent(port, home.path(), "json-agent", "policy-readonly");
     seed_tracked_connection_or_dump(
         port,
         daemon_pid,
@@ -545,7 +566,7 @@ fn status_watch_without_connections_rejected() {
     seed_single_policy(home.path());
     let (_daemon, port, daemon_pid) = start_daemon_zero_port(home.path());
     assert!(wait_for_health(port, Duration::from_secs(5)));
-    assert_daemon_pid_matches(port, daemon_pid);
+    assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
     let (exit, stdout, stderr) = run_status_cli(home.path(), port, &["--watch"]);
     assert_ne!(exit, 0, "--watch alone must fail");
@@ -564,7 +585,7 @@ fn status_watch_with_json_rejected() {
     seed_single_policy(home.path());
     let (_daemon, port, daemon_pid) = start_daemon_zero_port(home.path());
     assert!(wait_for_health(port, Duration::from_secs(5)));
-    assert_daemon_pid_matches(port, daemon_pid);
+    assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
     let (exit, stdout, stderr) =
         run_status_cli(home.path(), port, &["--connections", "--watch", "--json"]);
@@ -639,7 +660,7 @@ fn health_active_connections_reflects_tracker_count() {
     // upstream of the request loop.
     let (_daemon, port, daemon_pid) = start_daemon_zero_port(home.path());
     assert!(wait_for_health(port, Duration::from_secs(5)));
-    assert_daemon_pid_matches(port, daemon_pid);
+    assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
     // Fresh boot → zero.
     let (_, body) = http_get_loopback(port, "/health", &[]);
@@ -647,7 +668,7 @@ fn health_active_connections_reflects_tracker_count() {
     assert_eq!(json["active_connections"], 0, "fresh boot should report 0: {body}");
 
     // Register + fire one request → one entry.
-    let token = register_agent(port, "health-agent", "policy-readonly");
+    let token = register_agent(port, home.path(), "health-agent", "policy-readonly");
     let (status, body) = http_get_loopback(
         port,
         "/v1/tools/gmail/users/me/messages",
@@ -684,10 +705,10 @@ fn status_watch_redraws_at_least_twice_then_clean_exits_on_kill() {
     seed_single_policy(home.path());
     let (_daemon, port, daemon_pid) = start_daemon_zero_port(home.path());
     assert!(wait_for_health(port, Duration::from_secs(5)));
-    assert_daemon_pid_matches(port, daemon_pid);
+    assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
     // Seed at least one entry so the table has a row to redraw.
-    let token = register_agent(port, "watch-agent", "policy-readonly");
+    let token = register_agent(port, home.path(), "watch-agent", "policy-readonly");
     seed_tracked_connection_or_dump(
         port,
         daemon_pid,
@@ -749,9 +770,9 @@ fn status_watch_sigint_exits_zero_with_clean_teardown() {
     seed_single_policy(home.path());
     let (_daemon, port, daemon_pid) = start_daemon_zero_port(home.path());
     assert!(wait_for_health(port, Duration::from_secs(5)));
-    assert_daemon_pid_matches(port, daemon_pid);
+    assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
-    let token = register_agent(port, "sigint-agent", "policy-readonly");
+    let token = register_agent(port, home.path(), "sigint-agent", "policy-readonly");
     seed_tracked_connection_or_dump(
         port,
         daemon_pid,

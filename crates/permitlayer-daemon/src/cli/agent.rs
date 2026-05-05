@@ -22,13 +22,12 @@ use anyhow::Result;
 use clap::{Args, Subcommand};
 
 use crate::cli::kill::{
-    error_block_daemon_not_running, error_block_daemon_unreachable, error_block_protocol_error,
-    http_get, http_post_json, load_daemon_config_or_default_with_warn,
+    error_block_daemon_unreachable, error_block_protocol_error, http_get, http_post_json,
+    load_daemon_config_or_default_with_warn,
 };
 use crate::design::render::{TableCell, empty_state, error_block, table};
 use crate::design::terminal::{ColorSupport, TableLayout};
 use crate::design::theme::Theme;
-use crate::lifecycle::pid::PidFile;
 
 /// Top-level `agent` subcommand wrapper.
 #[derive(Args)]
@@ -103,7 +102,15 @@ async fn register_agent(args: RegisterArgs) -> Result<()> {
     })
     .to_string();
     let bind_addr = config.http.bind_addr;
-    let response = match http_post_json(bind_addr, "/v1/control/agent/register", &body).await {
+    let token = crate::cli::kill::read_control_token(&config.paths.home);
+    let response = match http_post_json(
+        bind_addr,
+        "/v1/control/agent/register",
+        &body,
+        token.as_deref(),
+    )
+    .await
+    {
         Ok(b) => b,
         Err(e) => {
             tracing::debug!(error = %e, addr = %bind_addr, "agent register request failed");
@@ -181,7 +188,8 @@ async fn list_agents() -> Result<()> {
     // because it's used by `Theme::load` further down for rendering.
 
     let bind_addr = config.http.bind_addr;
-    let response = match http_get(bind_addr, "/v1/control/agent/list").await {
+    let token = crate::cli::kill::read_control_token(&home);
+    let response = match http_get(bind_addr, "/v1/control/agent/list", token.as_deref()).await {
         Ok(b) => b,
         Err(e) => {
             tracing::debug!(error = %e, addr = %bind_addr, "agent list request failed");
@@ -209,6 +217,25 @@ async fn list_agents() -> Result<()> {
         let suggested = match code.as_str() {
             "agent.store_unavailable" => {
                 "check daemon logs for agent-store errors and verify ~/.agentsso/agents/ permissions"
+                    .to_owned()
+            }
+            _ => "see message above".to_owned(),
+        };
+        eprint!("{}", error_block(&code, &message, &suggested, None));
+        std::process::exit(3);
+    }
+    // Plan B: control-plane auth errors come back with a different
+    // top-level shape: `{"error":{"code":"forbidden_*", "message":...}}`.
+    // Surface them so the operator sees the actual cause instead of a
+    // misleading "no agents registered" empty state.
+    if let Some(err) = parsed.get("error") {
+        let code = err["code"].as_str().unwrap_or("control.unknown_error").to_owned();
+        let message = err["message"].as_str().unwrap_or("(no message)").to_owned();
+        let suggested = match code.as_str() {
+            "forbidden_missing_control_token" | "forbidden_invalid_control_token" => {
+                "set AGENTSSO_CONTROL_TOKEN or run as the daemon-owner user. \
+                 If you cannot read the daemon's <home>/control.token, ask the operator \
+                 to share it explicitly (e.g. via `sudo cat`)."
                     .to_owned()
             }
             _ => "see message above".to_owned(),
@@ -275,14 +302,20 @@ async fn remove_agent(args: RemoveArgs) -> Result<()> {
     let config = load_daemon_config_or_default_with_warn("agent remove");
     let home = config.paths.home.clone();
 
-    if PidFile::read(&home)?.is_none() || !PidFile::is_daemon_running(&home)? {
-        eprint!("{}", error_block_daemon_not_running("agent remove"));
-        std::process::exit(3);
-    }
+    // No PID-file pre-check — Plan B's operator-token auth on
+    // `/v1/control/*` is the canonical gate.
 
     let body = serde_json::json!({"name": args.name}).to_string();
     let bind_addr = config.http.bind_addr;
-    let response = match http_post_json(bind_addr, "/v1/control/agent/remove", &body).await {
+    let token = crate::cli::kill::read_control_token(&home);
+    let response = match http_post_json(
+        bind_addr,
+        "/v1/control/agent/remove",
+        &body,
+        token.as_deref(),
+    )
+    .await
+    {
         Ok(b) => b,
         Err(e) => {
             tracing::debug!(error = %e, addr = %bind_addr, "agent remove request failed");

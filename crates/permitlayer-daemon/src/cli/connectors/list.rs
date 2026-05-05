@@ -14,13 +14,12 @@ use anyhow::Result;
 use clap::Args;
 
 use crate::cli::kill::{
-    error_block_daemon_not_running, error_block_daemon_unreachable, error_block_protocol_error,
-    http_get, load_daemon_config_or_default_with_warn,
+    error_block_daemon_unreachable, error_block_protocol_error, http_get,
+    load_daemon_config_or_default_with_warn,
 };
 use crate::design::render::{TableCell, empty_state, error_block, table, truncate_field};
 use crate::design::terminal::{ColorSupport, TableLayout, styled};
 use crate::design::theme::Theme;
-use crate::lifecycle::pid::PidFile;
 
 #[derive(Args)]
 pub struct ListArgs {
@@ -35,13 +34,12 @@ pub async fn list_connectors(args: ListArgs) -> Result<()> {
     let config = load_daemon_config_or_default_with_warn("connectors list");
     let home = config.paths.home.clone();
 
-    if PidFile::read(&home)?.is_none() || !PidFile::is_daemon_running(&home)? {
-        eprint!("{}", error_block_daemon_not_running("connectors list"));
-        std::process::exit(3);
-    }
+    // No PID-file pre-check — Plan B's operator-token auth on
+    // `/v1/control/*` is the canonical gate.
 
     let bind_addr = config.http.bind_addr;
-    let response = match http_get(bind_addr, "/v1/control/connectors").await {
+    let token = crate::cli::kill::read_control_token(&home);
+    let response = match http_get(bind_addr, "/v1/control/connectors", token.as_deref()).await {
         Ok(b) => b,
         Err(e) => {
             tracing::debug!(error = %e, addr = %bind_addr, "connectors list request failed");

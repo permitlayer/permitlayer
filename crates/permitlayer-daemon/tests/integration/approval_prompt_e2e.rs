@@ -148,8 +148,10 @@ fn start_daemon_with_env_zero_port(
 /// **Story 7.7 P19**: probes `/v1/control/whoami` (loopback-gated)
 /// rather than `/health` because `/health` no longer exposes PID
 /// (it leaked daemon identity to LAN peers under `0.0.0.0` binds).
-fn assert_daemon_pid_matches(port: u16, expected_pid: u32) {
-    let (status, body) = http_get(port, "/v1/control/whoami", &[]);
+fn assert_daemon_pid_matches(port: u16, home: &std::path::Path, expected_pid: u32) {
+    let ctl = crate::common::read_test_control_token(home);
+    let (status, body) =
+        http_get(port, "/v1/control/whoami", &[("X-Agentsso-Control", ctl.as_str())]);
     assert_eq!(status, 200, "/v1/control/whoami should return 200, got {status}: {body}");
     let json: serde_json::Value = serde_json::from_str(&body)
         .unwrap_or_else(|e| panic!("/v1/control/whoami response not JSON: {e}\nbody: {body}"));
@@ -293,9 +295,15 @@ approval-mode = "auto"
     std::fs::write(policies_dir.join("auto.toml"), POLICY_AUTO_CAL_TOML).unwrap();
 }
 
-fn register_agent(port: u16, name: &str, policy: &str) -> String {
+fn register_agent(port: u16, home: &std::path::Path, name: &str, policy: &str) -> String {
     let body = serde_json::json!({"name": name, "policy_name": policy}).to_string();
-    let (status, resp_body) = http_post(port, "/v1/control/agent/register", &body, &[]);
+    let ctl = crate::common::read_test_control_token(home);
+    let (status, resp_body) = http_post(
+        port,
+        "/v1/control/agent/register",
+        &body,
+        &[("X-Agentsso-Control", ctl.as_str())],
+    );
     assert_eq!(status, 200, "register should succeed: {resp_body}");
     let parsed: serde_json::Value = serde_json::from_str(&resp_body).unwrap();
     parsed["bearer_token"].as_str().unwrap().to_owned()
@@ -447,9 +455,9 @@ fn granted_canned_response_allows_request_and_writes_approval_granted_audit() {
     );
 
     assert!(wait_for_health(port, Duration::from_secs(5)));
-    assert_daemon_pid_matches(port, daemon_pid);
+    assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
-    let token = register_agent(port, "test-agent", "policy-prompt");
+    let token = register_agent(port, home.path(), "test-agent", "policy-prompt");
 
     let (status, body) = http_get(
         port,
@@ -484,9 +492,9 @@ fn denied_canned_response_returns_403_and_writes_approval_denied_audit() {
     );
 
     assert!(wait_for_health(port, Duration::from_secs(5)));
-    assert_daemon_pid_matches(port, daemon_pid);
+    assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
-    let token = register_agent(port, "test-agent", "policy-prompt");
+    let token = register_agent(port, home.path(), "test-agent", "policy-prompt");
 
     let (status, body) = http_get(
         port,
@@ -525,9 +533,9 @@ fn always_canned_response_populates_cache_second_request_served_from_cache() {
     );
 
     assert!(wait_for_health(port, Duration::from_secs(5)));
-    assert_daemon_pid_matches(port, daemon_pid);
+    assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
-    let token = register_agent(port, "test-agent", "policy-prompt");
+    let token = register_agent(port, home.path(), "test-agent", "policy-prompt");
 
     // First request consumes the "always" canned decision.
     let (status1, body1) = http_get(
@@ -574,9 +582,9 @@ fn never_canned_response_populates_cache_second_request_cached_deny() {
     );
 
     assert!(wait_for_health(port, Duration::from_secs(5)));
-    assert_daemon_pid_matches(port, daemon_pid);
+    assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
-    let token = register_agent(port, "test-agent", "policy-prompt");
+    let token = register_agent(port, home.path(), "test-agent", "policy-prompt");
 
     let (status1, _) = http_get(
         port,
@@ -626,9 +634,9 @@ fn timeout_outcome_returns_403_approval_timeout_via_force_timeout_env() {
     );
 
     assert!(wait_for_health(port, Duration::from_secs(5)));
-    assert_daemon_pid_matches(port, daemon_pid);
+    assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
-    let token = register_agent(port, "test-agent", "policy-prompt");
+    let token = register_agent(port, home.path(), "test-agent", "policy-prompt");
 
     let (status, body) = http_get(
         port,
@@ -664,7 +672,7 @@ fn unavailable_no_tty_returns_503_approval_unavailable() {
     );
 
     assert!(wait_for_health(port, Duration::from_secs(5)));
-    assert_daemon_pid_matches(port, daemon_pid);
+    assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
     // Story 4.5 Task 10.2: assert the literal startup banner text is
     // emitted to stderr. Read up to ~4 KB from the captured stderr
@@ -690,7 +698,7 @@ fn unavailable_no_tty_returns_503_approval_unavailable() {
         "expected no-TTY startup banner on stderr; saw: {stderr_text:?}"
     );
 
-    let token = register_agent(port, "test-agent", "policy-prompt");
+    let token = register_agent(port, home.path(), "test-agent", "policy-prompt");
 
     let (status, body) = http_get(
         port,
@@ -732,9 +740,9 @@ fn auto_approve_reads_bypasses_approval_service_for_readonly_scope() {
     );
 
     assert!(wait_for_health(port, Duration::from_secs(5)));
-    assert_daemon_pid_matches(port, daemon_pid);
+    assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
-    let token = register_agent(port, "test-agent", "policy-prompt-reads");
+    let token = register_agent(port, home.path(), "test-agent", "policy-prompt-reads");
 
     let (status, body) = http_get(
         port,
@@ -785,9 +793,9 @@ fn reload_clears_approval_cache() {
     );
 
     assert!(wait_for_health(port, Duration::from_secs(5)));
-    assert_daemon_pid_matches(port, daemon_pid);
+    assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
-    let token = register_agent(port, "test-agent", "policy-prompt");
+    let token = register_agent(port, home.path(), "test-agent", "policy-prompt");
 
     // First request: always → populates cache, should allow.
     let (status1, body1) = http_get(
@@ -798,7 +806,13 @@ fn reload_clears_approval_cache() {
     assert_policy_allowed(status1, &body1, "first request populates cache via always");
 
     // POST /v1/control/reload to clear the cache.
-    let (reload_status, reload_body) = http_post(port, "/v1/control/reload", "", &[]);
+    let ctl_for_reload = crate::common::read_test_control_token(home.path());
+    let (reload_status, reload_body) = http_post(
+        port,
+        "/v1/control/reload",
+        "",
+        &[("X-Agentsso-Control", ctl_for_reload.as_str())],
+    );
     assert_eq!(reload_status, 200, "reload should succeed: {reload_body}");
 
     // Second request after reload: cache was cleared, so this
@@ -842,10 +856,10 @@ fn auto_mode_dispatches_without_prompt_in_parallel_with_prompt_policy() {
     );
 
     assert!(wait_for_health(port, Duration::from_secs(5)));
-    assert_daemon_pid_matches(port, daemon_pid);
+    assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
-    let prompt_token = register_agent(port, "prompt-agent", "policy-prompt");
-    let auto_token = register_agent(port, "auto-agent", "policy-auto-cal");
+    let prompt_token = register_agent(port, home.path(), "prompt-agent", "policy-prompt");
+    let auto_token = register_agent(port, home.path(), "auto-agent", "policy-auto-cal");
 
     // Dispatch both requests in parallel. `std::thread::spawn` suffices —
     // the test's http client is blocking, and the two agents route
@@ -946,13 +960,19 @@ fn approval_timeout_updates_via_sighup_without_restart() {
     );
 
     assert!(wait_for_health(port, Duration::from_secs(5)));
-    assert_daemon_pid_matches(port, daemon_pid);
+    assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
-    let token = register_agent(port, "test-agent", "policy-prompt");
+    let token = register_agent(port, home.path(), "test-agent", "policy-prompt");
 
     // Swap the config to a 2-second timeout and hit the HTTP reload.
     std::fs::write(config_dir.join("daemon.toml"), "[approval]\ntimeout_seconds = 2\n").unwrap();
-    let (reload_status, reload_body) = http_post(port, "/v1/control/reload", "", &[]);
+    let ctl_for_reload = crate::common::read_test_control_token(home.path());
+    let (reload_status, reload_body) = http_post(
+        port,
+        "/v1/control/reload",
+        "",
+        &[("X-Agentsso-Control", ctl_for_reload.as_str())],
+    );
     assert_eq!(reload_status, 200, "reload should succeed: {reload_body}");
 
     // Fire the prompt-required request and measure walltime.
@@ -997,13 +1017,19 @@ fn sighup_warns_on_stale_stub_branch_after_vault_appears() {
 
     let (_daemon, port, daemon_pid) = start_daemon_with_env_zero_port(home.path(), &[]);
     assert!(wait_for_health(port, Duration::from_secs(5)));
-    assert_daemon_pid_matches(port, daemon_pid);
+    assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
     // Create `vault/` after boot to simulate the operator running
     // `agentsso setup <svc>` between boot and the reload.
     std::fs::create_dir_all(home.path().join("vault")).unwrap();
 
-    let (status, body) = http_post(port, "/v1/control/reload", "", &[]);
+    let ctl_for_reload = crate::common::read_test_control_token(home.path());
+    let (status, body) = http_post(
+        port,
+        "/v1/control/reload",
+        "",
+        &[("X-Agentsso-Control", ctl_for_reload.as_str())],
+    );
     assert_eq!(status, 200, "reload should succeed: {body}");
 
     let audit_dir = home.path().join("audit");
