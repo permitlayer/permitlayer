@@ -22,8 +22,7 @@
 #   - `homebrew-publish` — patches the dist-generated Formula/agentsso.rb
 #     (dist's template emits neither `service do` nor `caveats`), runs
 #     brew audit + brew style, pushes to permitlayer/homebrew-tap
-#     using HOMEBREW_TAP_TOKEN, smoke-tests `brew tap && brew install`,
-#     and opens an automated PR to refresh install/Formula/agentsso.rb.
+#     using HOMEBREW_TAP_TOKEN, smoke-tests `brew tap && brew install`.
 #     Pre-release tags (contain a hyphen in the version) skip the tap
 #     push unless the HOMEBREW_PUBLISH_PRERELEASES repo variable is set
 #     to "1". See Story 7.1 (_bmad-output/implementation-artifacts/
@@ -36,10 +35,6 @@
 name: Release
 permissions:
   contents: write
-  # homebrew-publish opens an automated PR against main to refresh
-  # install/Formula/agentsso.rb (the reference copy; the tap is the
-  # source of truth).
-  pull-requests: write
 
 # Triggered by:
 # - Any git tag matching `**[0-9]+.[0-9]+.[0-9]+*` (e.g. v0.2.0,
@@ -459,9 +454,19 @@ jobs:
   #      (direct-push, Homebrew tap convention) via HOMEBREW_TAP_TOKEN.
   #   4. Smoke-tests `brew tap && brew install && agentsso --version` on
   #      the runner (AC #1). Job fails if install or version check fails.
-  #   5. Opens an automated PR against main to refresh the reference copy
-  #      at install/Formula/agentsso.rb (AC #7) — PR uses default
-  #      GITHUB_TOKEN; auto-merge is off, human reviews.
+  #
+  # Story 7.1's AC #7 originally added a fifth step that opened an
+  # automated PR back to main to refresh `install/Formula/agentsso.rb`
+  # (a developer-convenience reference copy). Dropped after rc.10
+  # (run 25384973256) when it failed with "GitHub Actions is not
+  # permitted to create or approve pull requests" — the org/enterprise
+  # plan tier doesn't expose the toggle that allows it. The reference
+  # file at `install/Formula/agentsso.rb` is functionally dead weight
+  # (zero in-repo consumers, zero human commits across its history)
+  # so the simplest fix was deletion. Devs who want a local formula
+  # can `gh release view <tag> -R permitlayer/homebrew-tap` or clone
+  # the tap. The tap repo itself remains the source-of-truth for
+  # brew users.
   #
   # Pre-release gate: tags with a hyphen in the version part (v0.2.0-rc.1)
   # skip the tap push unless the HOMEBREW_PUBLISH_PRERELEASES repo
@@ -681,54 +686,22 @@ jobs:
             exit 1
           fi
 
-      - name: Open automated PR to refresh install/Formula/agentsso.rb
-        if: ${{ steps.gate.outputs.skip == '0' }}
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          BRANCH="automated/homebrew-formula-${TAG}"
-          git config user.name "permitlayer release bot"
-          git config user.email "release-bot@permitlayer.dev"
-          # Avoid collision if the branch already exists (re-run case).
-          if git ls-remote --exit-code --heads origin "$BRANCH" >/dev/null 2>&1; then
-            echo "::notice::Branch $BRANCH already exists upstream; skipping PR creation"
-            exit 0
-          fi
-          git checkout -b "$BRANCH"
-          mkdir -p install/Formula
-          cp Formula/agentsso.rb install/Formula/agentsso.rb
-          # Stage before diff — new files don't show in `git diff` until
-          # staged. `git diff --cached --quiet` catches both first-time
-          # creation and subsequent modifications.
-          git add install/Formula/agentsso.rb
-          if git diff --cached --quiet -- install/Formula/agentsso.rb; then
-            echo "::notice::Reference formula unchanged; no PR needed"
-            exit 0
-          fi
-          git commit -m "chore(release): refresh install/Formula/agentsso.rb for ${TAG}"
-          git push --set-upstream origin "$BRANCH"
-          gh pr create \
-            --title "chore(release): refresh install/Formula/agentsso.rb for ${TAG}" \
-            --body "Automated PR from the release pipeline ($TAG). This copies the latest released Homebrew formula into install/Formula/ as a reference — the tap repo (permitlayer/homebrew-tap) is the source-of-truth served to brew users. Review and merge at your convenience; this is not a release blocker." \
-            --label automated-release \
-            --base main \
-            --head "$BRANCH"
-
       - name: Partial-failure issue on error
         if: ${{ failure() && steps.gate.outputs.skip == '0' }}
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # The tap push may have succeeded before a later step failed;
-          # surface that possibility on the created issue so a human can
-          # confirm or roll back manually.
+          # The tap push may have succeeded before the install
+          # smoke step failed; surface that possibility on the
+          # created issue so a human can confirm or roll back the
+          # tap commit manually.
           #
           # The `release-issue` label is created as a one-off admin step
           # via `gh label create release-issue --repo permitlayer/permitlayer
           # --color FF6B6B --description "Release pipeline partial
           # failure — needs triage"`.
           TITLE="Release ${TAG}: Homebrew publish partial failure"
-          BODY="The homebrew-publish job for tag \`${TAG}\` failed. If the tap push step ran before the failure, \`permitlayer/homebrew-tap\`'s Formula/agentsso.rb may be out of sync with the main repo. Job logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          BODY="The homebrew-publish job for tag \`${TAG}\` failed. If the tap push step ran before the failure, \`permitlayer/homebrew-tap\` may have a commit referencing artifacts that the smoke step rejected — review the tap and roll back if needed. Job logs: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           # Idempotency: if an open issue with this exact title already
           # exists for this tag, do not duplicate. A re-run of the same
           # failing pipeline would otherwise spam new issues.
