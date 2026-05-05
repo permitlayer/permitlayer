@@ -64,6 +64,10 @@ pub enum ControlTokenError {
     #[error("control token at {path} is malformed (expected {TOKEN_PREFIX}<base64>)")]
     Malformed { path: PathBuf },
 
+    /// File mode is not 0o600 — only meaningful on Unix where the mode
+    /// gate is the actual security boundary. cfg-gated to keep
+    /// Windows builds free of an unused-field warning.
+    #[cfg(unix)]
     #[error("control token at {path} has unsafe mode {mode:#o} (expected 0o600)")]
     UnsafeMode { path: PathBuf, mode: u32 },
 }

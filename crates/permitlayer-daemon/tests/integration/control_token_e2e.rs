@@ -10,6 +10,13 @@
 //! startup. Same-user CLI reads the file directly; cross-user CLI uses
 //! the env var.
 
+// Every test in this file is `#[cfg(unix)]`-gated (subprocess CLI
+// drives + env-clear plumbing + Winsock interactions are flake-prone
+// on Windows). Gating the helpers too keeps `cargo clippy --all-targets
+// --all-features -D warnings` happy on Windows where nothing in this
+// module gets called.
+#![cfg(unix)]
+
 use std::process::Command;
 use std::time::Duration;
 
@@ -58,7 +65,6 @@ fn seed_policy(home: &std::path::Path) {
 
 /// **Happy path.** CLI reads the daemon's local `<home>/control.token`,
 /// sends it as `X-Agentsso-Control`, daemon accepts, command succeeds.
-#[cfg(unix)]
 #[test]
 fn control_command_succeeds_with_token() {
     let home = tempfile::tempdir().unwrap();
@@ -94,7 +100,6 @@ fn control_command_succeeds_with_token() {
 /// 403 `forbidden_missing_control_token`, which the CLI's existing
 /// error path renders as a generic "unreachable" block — that's a
 /// minor UX improvement for a follow-up).
-#[cfg(unix)]
 #[test]
 fn control_command_fails_without_token() {
     let home_daemon = tempfile::tempdir().unwrap();
@@ -122,7 +127,6 @@ fn control_command_fails_without_token() {
 /// **Wrong token.** CLI sets a syntactically-valid but mismatched
 /// `AGENTSSO_CONTROL_TOKEN`. Daemon rejects with
 /// `forbidden_invalid_control_token`.
-#[cfg(unix)]
 #[test]
 fn control_command_fails_with_wrong_token() {
     let home_daemon = tempfile::tempdir().unwrap();
@@ -155,7 +159,6 @@ fn control_command_fails_with_wrong_token() {
 /// daemon-owner's `control.token` (via the operator's `sudo cat` or
 /// equivalent in real life) and exports it as `AGENTSSO_CONTROL_TOKEN`.
 /// Should work.
-#[cfg(unix)]
 #[test]
 fn control_command_works_cross_home_via_env_var() {
     let home_daemon = tempfile::tempdir().unwrap();
@@ -209,7 +212,6 @@ fn control_command_works_cross_home_via_env_var() {
 /// cron jobs and other automation. This test pins the persistence
 /// invariant: shut down the daemon, restart, the token file content
 /// is byte-identical.
-#[cfg(unix)]
 #[test]
 fn control_token_persists_across_daemon_restart() {
     let home = tempfile::tempdir().unwrap();
