@@ -328,8 +328,24 @@ pub(crate) enum ControlError {
     ConnectorsPayloadTooLarge { size_bytes: usize, limit_bytes: usize },
 }
 
+/// Wire shape for control-plane 4xx responses.
+///
+/// Carries both shapes simultaneously:
+/// - **Top-level `status: "error"`** routes flat-shape parsers (e.g.,
+///   `cli/connectors/list.rs`, which checks `parsed["status"] ==
+///   "error"`) to the structured-error path. Without it, a 403 would
+///   fall through to the empty-state success branch and the user who
+///   forgot `AGENTSSO_CONTROL_TOKEN` would see "no connectors
+///   registered" instead of "forbidden: control token required".
+/// - **Nested `error.code` / `error.message`** is what the
+///   structured-error parsers in `cli/agent.rs` and `cli/status.rs`
+///   already expect, plus what the existing unit tests assert on
+///   (`json["error"]["code"] == "forbidden_*"`). Keeping the nested
+///   shape preserves backward-compat with every test and consumer
+///   that already exists.
 #[derive(Debug, Serialize)]
 struct ControlErrorBody {
+    status: &'static str,
     error: ControlErrorDetail,
 }
 
@@ -353,6 +369,7 @@ impl IntoResponse for ControlError {
         match self {
             Self::ForbiddenNotLoopback => {
                 let body = ControlErrorBody {
+                    status: "error",
                     error: ControlErrorDetail {
                         code: "forbidden_not_loopback",
                         message: "control endpoints are loopback-only",
@@ -362,6 +379,7 @@ impl IntoResponse for ControlError {
             }
             Self::ForbiddenMissingControlToken => {
                 let body = ControlErrorBody {
+                    status: "error",
                     error: ControlErrorDetail {
                         code: "forbidden_missing_control_token",
                         message: "X-Agentsso-Control header is required on /v1/control/* endpoints",
@@ -371,6 +389,7 @@ impl IntoResponse for ControlError {
             }
             Self::ForbiddenInvalidControlToken => {
                 let body = ControlErrorBody {
+                    status: "error",
                     error: ControlErrorDetail {
                         code: "forbidden_invalid_control_token",
                         message: "X-Agentsso-Control token did not match",
@@ -2366,6 +2385,13 @@ mod tests {
     /// `forbidden_missing_control_token` error code, even from
     /// loopback. The auth layer runs BEFORE the loopback check, so
     /// missing-token should fire first.
+    ///
+    /// Also asserts the top-level `status: "error"` field, which
+    /// flat-shape CLI parsers (`cli/connectors/list.rs` checks
+    /// `parsed["status"] == "error"`) rely on. Without it, a 403
+    /// would fall through to the empty-state success branch and
+    /// users who forgot the env var would see "no connectors
+    /// registered" instead of a real error.
     #[tokio::test]
     async fn forbidden_when_no_control_token_header_on_kill() {
         let switch = Arc::new(KillSwitch::new());
@@ -2376,6 +2402,10 @@ mod tests {
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let json = body_json(resp).await;
+        assert_eq!(
+            json["status"], "error",
+            "missing top-level status field — flat-shape CLI parsers depend on it"
+        );
         assert_eq!(json["error"]["code"], "forbidden_missing_control_token");
         assert!(!switch.is_active(), "missing-token request must NOT flip the switch");
     }

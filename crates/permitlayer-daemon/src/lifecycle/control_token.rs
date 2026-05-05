@@ -125,10 +125,14 @@ impl ControlToken {
     pub fn matches(&self, candidate: &str) -> bool {
         let observed = candidate.as_bytes();
         let expected = self.encoded.as_bytes();
-        // ConstantTimeEq on differing-length inputs returns false, which
-        // is what we want — but the *length comparison itself* is not
-        // constant-time. Pad to the longer length so the timing of the
-        // mismatched-length case doesn't leak observed length.
+        // Token format is fixed-length-public (`agt_ctl_` prefix +
+        // 43 base64url chars = 51 bytes); the length is documented in
+        // this module's header. So an early return on length mismatch
+        // leaks no secret information — the only thing an attacker
+        // learns from timing is whether their candidate happened to be
+        // 51 bytes, which is also visible in any error response. The
+        // constant-time compare on the equal-length case is what
+        // matters, and that's what `ct_eq` provides.
         if observed.len() != expected.len() {
             return false;
         }
@@ -178,8 +182,42 @@ impl ControlToken {
         let tmp_path = path.with_extension("token.tmp");
         {
             use std::io::Write as _;
-            let mut f = std::fs::File::create(&tmp_path)
-                .map_err(|source| ControlTokenError::Io { path: tmp_path.clone(), source })?;
+            // Open the tmp file with mode 0o600 from the start on Unix
+            // so the restrictive permissions travel through `rename`
+            // atomically. The earlier shape (`File::create` then a
+            // post-rename `set_permissions`) left a window where
+            // `<home>/control.token` existed at its final path with the
+            // umask-derived (typically world-readable) mode before the
+            // chmod ran — exactly the privilege-escalation Plan B is
+            // supposed to close. The post-rename `set_permissions`
+            // below stays as defense-in-depth in case a future code
+            // path bypasses this minting helper.
+            let mut f = {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create(true)
+                        .truncate(true)
+                        .mode(0o600)
+                        .open(&tmp_path)
+                        .map_err(|source| ControlTokenError::Io {
+                            path: tmp_path.clone(),
+                            source,
+                        })?
+                }
+                #[cfg(not(unix))]
+                {
+                    // Windows ACLs default to user-scoped on files
+                    // created inside `%USERPROFILE%\.agentsso\`, which
+                    // is itself ACLed to the owner. No mode bits.
+                    std::fs::File::create(&tmp_path).map_err(|source| ControlTokenError::Io {
+                        path: tmp_path.clone(),
+                        source,
+                    })?
+                }
+            };
             f.write_all(encoded.as_bytes())
                 .map_err(|source| ControlTokenError::Io { path: tmp_path.clone(), source })?;
             f.write_all(b"\n")
@@ -193,6 +231,10 @@ impl ControlToken {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
+            // Defense-in-depth — the tmp file was already opened with
+            // mode 0o600, so this should be a no-op. Re-asserting is
+            // cheap and protects against a regression that bypasses
+            // the atomic-mode codepath above.
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
                 .map_err(|source| ControlTokenError::Io { path: path.to_owned(), source })?;
         }
@@ -321,5 +363,49 @@ mod tests {
         let path = ControlToken::path(dir.path());
         let mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    /// Pin the atomicity property: even with a permissive umask that
+    /// would otherwise produce mode 0o666, the tmp file the daemon
+    /// writes the token into is opened with explicit mode 0o600. So
+    /// the post-rename `set_permissions` defense-in-depth is never the
+    /// thing closing the world-readable window — the mode bits travel
+    /// through the `rename` atomically.
+    ///
+    /// Why this matters: an earlier shape (`File::create` then
+    /// post-rename chmod) left a window where `<home>/control.token`
+    /// existed at its final path with mode 0o666 (or 0o644 under a
+    /// typical umask) before the chmod ran. A local process polling
+    /// the parent directory could read the token in that window —
+    /// defeating Plan B's whole purpose.
+    ///
+    /// `umask` is process-global, but nextest runs each test in a
+    /// separate process (the workspace's documented discipline), so
+    /// this won't poison sibling tests. We still restore the prior
+    /// umask after the assertion via `catch_unwind` so any future
+    /// in-process test runner doesn't inherit `0`.
+    #[cfg(unix)]
+    #[test]
+    fn newly_minted_file_is_0o600_under_permissive_umask() {
+        use nix::sys::stat::{Mode, umask};
+        use std::os::unix::fs::MetadataExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let prior_umask = umask(Mode::empty());
+        let result = std::panic::catch_unwind(|| {
+            let _ = ControlToken::read_or_mint(dir.path()).unwrap();
+            let path = ControlToken::path(dir.path());
+            let mode = std::fs::metadata(&path).unwrap().mode() & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "tmp file must be opened with mode 0o600 — not derived \
+                 from umask, otherwise there's a world-readable window \
+                 between rename and post-rename chmod"
+            );
+        });
+        umask(prior_umask);
+        if let Err(panic) = result {
+            std::panic::resume_unwind(panic);
+        }
     }
 }

@@ -238,7 +238,7 @@ pub(crate) fn join_err(backend: &'static str, e: tokio::task::JoinError) -> KeyS
 }
 
 #[cfg(all(test, target_os = "macos"))]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+#[allow(clippy::panic)]
 mod macos_routing_tests {
     use super::*;
     use crate::error::KeyStoreError;
