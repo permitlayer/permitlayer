@@ -2,22 +2,28 @@
 class Agentsso < Formula
   desc "Binary: axum server, CLI, lifecycle management"
   homepage "https://github.com/permitlayer/permitlayer"
-  version "0.2.1"
+  version "0.3.0-rc.9"
   if OS.mac?
     if Hardware::CPU.arm?
-      url "https://github.com/permitlayer/permitlayer/releases/download/v0.2.1/permitlayer-daemon-aarch64-apple-darwin.tar.xz"
-      sha256 "72b7400c5dd0bf925d55b71dce60eda04d3cc54392b5a3f18e65af189f41107e"
+      url "https://github.com/permitlayer/permitlayer/releases/download/v0.3.0-rc.9/permitlayer-daemon-aarch64-apple-darwin.tar.xz"
+      sha256 "8d4a7dcc4528f1068d0429f8b04332eb8418392d0fc71296469c9ec2005a36aa"
     end
     if Hardware::CPU.intel?
-      url "https://github.com/permitlayer/permitlayer/releases/download/v0.2.1/permitlayer-daemon-x86_64-apple-darwin.tar.xz"
-      sha256 "4ffd432ea95106fe6fab25ea10bcc04316cabcdbd02252546a6f42d6df9890ae"
+      url "https://github.com/permitlayer/permitlayer/releases/download/v0.3.0-rc.9/permitlayer-daemon-x86_64-apple-darwin.tar.xz"
+      sha256 "9f5c0119a967e20c9bf4f194bd6d9569081dd204624a247ba0495520f19a8032"
     end
+  end
+  if OS.linux? && Hardware::CPU.intel?
+    url "https://github.com/permitlayer/permitlayer/releases/download/v0.3.0-rc.9/permitlayer-daemon-x86_64-unknown-linux-gnu.tar.xz"
+    sha256 "7463d1d4d7ea7a1082a3863200d5b78fe343dd10d1b537cf4dde9cac519c9dc1"
   end
   license "MIT"
 
   BINARY_ALIASES = {
-    "aarch64-apple-darwin": {},
-    "x86_64-apple-darwin":  {},
+    "aarch64-apple-darwin":     {},
+    "x86_64-apple-darwin":      {},
+    "x86_64-pc-windows-gnu":    {},
+    "x86_64-unknown-linux-gnu": {},
   }.freeze
 
   def target_triple
@@ -38,6 +44,7 @@ class Agentsso < Formula
   def install
     bin.install "agentsso" if OS.mac? && Hardware::CPU.arm?
     bin.install "agentsso" if OS.mac? && Hardware::CPU.intel?
+    bin.install "agentsso" if OS.linux? && Hardware::CPU.intel?
 
     install_binary_aliases!
 
