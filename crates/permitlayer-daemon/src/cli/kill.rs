@@ -162,6 +162,15 @@ fn default_reason_label() -> String {
 
 /// Error text for the "daemon_not_running" condition, shaped via
 /// `design::render::error_block`.
+///
+/// **Currently unused in production** — Plan B replaced the PID-file
+/// pre-checks that emitted this with the new `forbidden_*` control-
+/// token errors. Retained behind `#[allow(dead_code)]` because
+/// (a) the unit test below is still meaningful and (b) future CLI
+/// commands that legitimately need a same-user PID gate (e.g.,
+/// `agentsso stop`, which is owner-scoped by definition) can reuse
+/// this without re-introducing the formatter.
+#[allow(dead_code)]
 pub(crate) fn error_block_daemon_not_running(verb: &str) -> String {
     error_block("daemon_not_running", &format!("no daemon to {verb}"), "agentsso start", None)
 }

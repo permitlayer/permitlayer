@@ -206,7 +206,12 @@ fn decode_token(s: &str) -> Option<[u8; TOKEN_RAW_BYTES]> {
     bytes.try_into().ok()
 }
 
+// Test-only constructors. Cfg-gated so they don't ship in release
+// builds. `#[allow(dead_code)]` because clippy's --all-targets pass
+// runs against the bin compilation where these aren't called (the
+// callers live in the integration test target).
 #[cfg(any(test, feature = "test-seam"))]
+#[allow(dead_code)]
 impl ControlToken {
     /// Construct a `ControlToken` from a fixed byte array, bypassing
     /// the file-IO path. Test-only — production callers must always
