@@ -108,12 +108,13 @@ pub async fn run(args: StatusArgs) -> anyhow::Result<()> {
     }
 
     let bind_addr = config.http.bind_addr;
+    let control_token = crate::cli::kill::read_control_token(&home);
 
     if args.connections && args.watch {
-        return run_watch_loop(args.json, bind_addr).await;
+        return run_watch_loop(args.json, bind_addr, control_token).await;
     }
     if args.connections {
-        return run_connections_once(args.json, bind_addr).await;
+        return run_connections_once(args.json, bind_addr, control_token).await;
     }
 
     // Default: existing one-shot health summary.
@@ -241,9 +242,13 @@ pub(crate) struct ConnectionsResponse {
 /// bind address is misconfigured to a non-loopback interface) is
 /// surfaced as the daemon's actual error, not as a `serde_json`
 /// "missing field" deserialization failure.
-async fn fetch_connections(addr: SocketAddr) -> anyhow::Result<ConnectionsResponse> {
+async fn fetch_connections(
+    addr: SocketAddr,
+    control_token: Option<&str>,
+) -> anyhow::Result<ConnectionsResponse> {
     let (status, body) =
-        crate::cli::kill::http_get_with_status(addr, "/v1/control/connections").await?;
+        crate::cli::kill::http_get_with_status(addr, "/v1/control/connections", control_token)
+            .await?;
     if !(200..300).contains(&status) {
         // Try to extract the daemon's structured error code; fall
         // back to the raw body if unparseable. The control plane's
@@ -263,8 +268,12 @@ async fn fetch_connections(addr: SocketAddr) -> anyhow::Result<ConnectionsRespon
     Ok(response)
 }
 
-async fn run_connections_once(json: bool, addr: SocketAddr) -> anyhow::Result<()> {
-    let response = match fetch_connections(addr).await {
+async fn run_connections_once(
+    json: bool,
+    addr: SocketAddr,
+    control_token: Option<String>,
+) -> anyhow::Result<()> {
+    let response = match fetch_connections(addr, control_token.as_deref()).await {
         Ok(r) => r,
         Err(e) => {
             eprint!(
@@ -439,7 +448,11 @@ const WATCH_INTERVAL_SECS: u64 = 2;
 /// **L4 review patch.**
 const SEP: &str = " · ";
 
-async fn run_watch_loop(_json: bool, addr: SocketAddr) -> anyhow::Result<()> {
+async fn run_watch_loop(
+    _json: bool,
+    addr: SocketAddr,
+    control_token: Option<String>,
+) -> anyhow::Result<()> {
     use std::io::{ErrorKind, IsTerminal, Write};
 
     // `_json` is always false here (Args dispatcher rejects --watch
@@ -469,7 +482,7 @@ async fn run_watch_loop(_json: bool, addr: SocketAddr) -> anyhow::Result<()> {
                 // tick so SIGWINCH terminal resizes adapt without a
                 // restart.
                 let layout = TableLayout::detect();
-                match fetch_connections(addr).await {
+                match fetch_connections(addr, control_token.as_deref()).await {
                     Ok(response) => {
                         let rendered = render_connections_table(
                             &response.connections,

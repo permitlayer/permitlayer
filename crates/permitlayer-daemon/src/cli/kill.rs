@@ -35,7 +35,6 @@ use crate::design::kill_banner::{ActivationSummaryView, BannerInputs, render_kil
 use crate::design::render::error_block;
 use crate::design::terminal::{ColorSupport, terminal_width};
 use crate::design::theme::Theme;
-use crate::lifecycle::pid::PidFile;
 
 /// HTTP round-trip deadline for the kill POST. Leaves plenty of headroom
 /// inside the NFR6 2000ms budget (CLI startup + banner render is well
@@ -53,29 +52,24 @@ pub async fn run(_args: KillArgs) -> Result<()> {
     let config = load_daemon_config_or_default_with_warn("kill");
     let home = config.paths.home.clone();
 
-    // 1. Check daemon is actually running.
-    if PidFile::read(&home)?.is_none() {
-        eprint!("{}", error_block_daemon_not_running("kill"));
-        std::process::exit(3);
-    }
-    if !PidFile::is_daemon_running(&home)? {
-        eprint!("{}", error_block_daemon_not_running("kill"));
-        // Clean up stale PID file so subsequent commands don't repeat the
-        // same diagnosis forever.
-        let _ = std::fs::remove_file(home.join("agentsso.pid"));
-        std::process::exit(3);
-    }
+    // No PID-file pre-check. Plan B (operator-token auth) replaces
+    // the implicit owner-check with a real bearer-style token on
+    // `/v1/control/*`. The HTTP path's `error_block_daemon_unreachable`
+    // handles the genuine "no daemon" case below.
 
-    // 2. POST /v1/control/kill.
+    // POST /v1/control/kill with the operator token from <home>/control.token
+    // (or from AGENTSSO_CONTROL_TOKEN env for cross-user invocation).
     let bind_addr = config.http.bind_addr;
-    let response_body = match http_post_empty_json(bind_addr, "/v1/control/kill").await {
-        Ok(body) => body,
-        Err(e) => {
-            tracing::debug!(error = %e, addr = %bind_addr, "kill request failed");
-            eprint!("{}", error_block_daemon_unreachable("kill", bind_addr));
-            std::process::exit(3);
-        }
-    };
+    let token = read_control_token(&home);
+    let response_body =
+        match http_post_empty_json(bind_addr, "/v1/control/kill", token.as_deref()).await {
+            Ok(body) => body,
+            Err(e) => {
+                tracing::debug!(error = %e, addr = %bind_addr, "kill request failed");
+                eprint!("{}", error_block_daemon_unreachable("kill", bind_addr));
+                std::process::exit(3);
+            }
+        };
 
     // 3. Parse the response.
     let parsed: KillResponseView = match serde_json::from_str(&response_body) {
@@ -168,6 +162,15 @@ fn default_reason_label() -> String {
 
 /// Error text for the "daemon_not_running" condition, shaped via
 /// `design::render::error_block`.
+///
+/// **Currently unused in production** — Plan B replaced the PID-file
+/// pre-checks that emitted this with the new `forbidden_*` control-
+/// token errors. Retained behind `#[allow(dead_code)]` because
+/// (a) the unit test below is still meaningful and (b) future CLI
+/// commands that legitimately need a same-user PID gate (e.g.,
+/// `agentsso stop`, which is owner-scoped by definition) can reuse
+/// this without re-introducing the formatter.
+#[allow(dead_code)]
 pub(crate) fn error_block_daemon_not_running(verb: &str) -> String {
     error_block("daemon_not_running", &format!("no daemon to {verb}"), "agentsso start", None)
 }
@@ -199,34 +202,74 @@ pub(crate) fn error_block_protocol_error() -> String {
     error_block("daemon_protocol_error", "unexpected response from daemon", "agentsso status", None)
 }
 
+/// Read the operator-authentication token for `/v1/control/*` calls.
+///
+/// Resolution order:
+/// 1. `AGENTSSO_CONTROL_TOKEN` env var (cross-user case — operator
+///    sets this when calling the daemon owned by another user).
+/// 2. `<home>/control.token` (same-user case — daemon owner's CLI
+///    reads it from the same home that minted it).
+///
+/// Returns `None` when neither source has a value. The CLI passes
+/// the result through to the HTTP helpers; the daemon will reject
+/// with `forbidden_missing_control_token` if no token is sent.
+pub(crate) fn read_control_token(home: &std::path::Path) -> Option<String> {
+    if let Ok(env) = std::env::var("AGENTSSO_CONTROL_TOKEN") {
+        let trimmed = env.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_owned());
+        }
+    }
+    let path = home.join("control.token");
+    let content = std::fs::read_to_string(&path).ok()?;
+    let trimmed = content.trim();
+    if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) }
+}
+
 /// Minimal HTTP/1.1 POST `{}` → read full response → extract JSON body.
 ///
 /// Uses raw TCP matching the pattern in `cli/status.rs`. Handles both
 /// `Content-Length`-delimited and connection-closed bodies. We control
 /// both endpoints (the request and the daemon) and the body is always
 /// `Content-Length` small JSON, so we don't implement chunked decoding.
-pub(crate) async fn http_post_empty_json(addr: SocketAddr, path: &str) -> Result<String> {
-    http_post_json(addr, path, "{}").await
+pub(crate) async fn http_post_empty_json(
+    addr: SocketAddr,
+    path: &str,
+    control_token: Option<&str>,
+) -> Result<String> {
+    http_post_json(addr, path, "{}", control_token).await
 }
 
 /// Minimal HTTP/1.1 POST with a caller-supplied JSON body. Used by
 /// `cli/agent.rs::register_agent` and `cli/agent.rs::remove_agent`
 /// (Story 4.4).
-pub(crate) async fn http_post_json(addr: SocketAddr, path: &str, body: &str) -> Result<String> {
-    tokio::time::timeout(HTTP_DEADLINE, http_post_json_inner(addr, path, body))
+pub(crate) async fn http_post_json(
+    addr: SocketAddr,
+    path: &str,
+    body: &str,
+    control_token: Option<&str>,
+) -> Result<String> {
+    tokio::time::timeout(HTTP_DEADLINE, http_post_json_inner(addr, path, body, control_token))
         .await
         .with_context(|| format!("HTTP POST {path} timed out after {HTTP_DEADLINE:?}"))?
 }
 
-async fn http_post_json_inner(addr: SocketAddr, path: &str, body: &str) -> Result<String> {
+async fn http_post_json_inner(
+    addr: SocketAddr,
+    path: &str,
+    body: &str,
+    control_token: Option<&str>,
+) -> Result<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
     let mut stream =
         TcpStream::connect(addr).await.with_context(|| format!("connect to {addr}"))?;
 
+    let auth_header =
+        control_token.map(|t| format!("X-Agentsso-Control: {t}\r\n")).unwrap_or_default();
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{auth_header}Connection: close\r\n\r\n{body}",
         body.len()
     );
     stream.write_all(request.as_bytes()).await.context("write HTTP request")?;
@@ -242,20 +285,31 @@ async fn http_post_json_inner(addr: SocketAddr, path: &str, body: &str) -> Resul
 ///
 /// Same contract as `http_post_empty_json` but for GETs. Used by
 /// `cli/resume.rs` (state probe) and `cli/setup.rs` (kill-state preflight).
-pub(crate) async fn http_get(addr: SocketAddr, path: &str) -> Result<String> {
-    tokio::time::timeout(HTTP_DEADLINE, http_get_inner(addr, path))
+pub(crate) async fn http_get(
+    addr: SocketAddr,
+    path: &str,
+    control_token: Option<&str>,
+) -> Result<String> {
+    tokio::time::timeout(HTTP_DEADLINE, http_get_inner(addr, path, control_token))
         .await
         .with_context(|| format!("HTTP GET {path} timed out after {HTTP_DEADLINE:?}"))?
 }
 
-async fn http_get_inner(addr: SocketAddr, path: &str) -> Result<String> {
+async fn http_get_inner(
+    addr: SocketAddr,
+    path: &str,
+    control_token: Option<&str>,
+) -> Result<String> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
     let mut stream =
         TcpStream::connect(addr).await.with_context(|| format!("connect to {addr}"))?;
 
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    let auth_header =
+        control_token.map(|t| format!("X-Agentsso-Control: {t}\r\n")).unwrap_or_default();
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{auth_header}Connection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).await.context("write HTTP request")?;
 
     let mut response = Vec::new();
@@ -270,20 +324,31 @@ async fn http_get_inner(addr: SocketAddr, path: &str) -> Result<String> {
 /// 5.5 / M4 review patch: `agentsso status --connections` needs this
 /// to surface the daemon's `forbidden_not_loopback` block instead of
 /// trying to deserialize the error body as a `ConnectionsResponse`.
-pub(crate) async fn http_get_with_status(addr: SocketAddr, path: &str) -> Result<(u16, String)> {
-    tokio::time::timeout(HTTP_DEADLINE, http_get_with_status_inner(addr, path))
+pub(crate) async fn http_get_with_status(
+    addr: SocketAddr,
+    path: &str,
+    control_token: Option<&str>,
+) -> Result<(u16, String)> {
+    tokio::time::timeout(HTTP_DEADLINE, http_get_with_status_inner(addr, path, control_token))
         .await
         .with_context(|| format!("HTTP GET {path} timed out after {HTTP_DEADLINE:?}"))?
 }
 
-async fn http_get_with_status_inner(addr: SocketAddr, path: &str) -> Result<(u16, String)> {
+async fn http_get_with_status_inner(
+    addr: SocketAddr,
+    path: &str,
+    control_token: Option<&str>,
+) -> Result<(u16, String)> {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpStream;
 
     let mut stream =
         TcpStream::connect(addr).await.with_context(|| format!("connect to {addr}"))?;
 
-    let request = format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\nConnection: close\r\n\r\n");
+    let auth_header =
+        control_token.map(|t| format!("X-Agentsso-Control: {t}\r\n")).unwrap_or_default();
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: {addr}\r\n{auth_header}Connection: close\r\n\r\n");
     stream.write_all(request.as_bytes()).await.context("write HTTP request")?;
 
     let mut response = Vec::new();

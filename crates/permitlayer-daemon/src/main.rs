@@ -109,7 +109,24 @@ async fn main() -> ExitCode {
                 // is backlogged. `eprint!` not `eprintln!` because
                 // the banner already ends in `\n`.
                 eprint!("{}", e.render_banner());
-                tracing::error!(error = %e, exit_code = e.exit_code(), "daemon startup failed");
+                // Walk the source chain so the OSStatus from a macOS
+                // keychain ACL denial (Plan A) reaches both the compact
+                // stdout layer (via `record_error` on the `&dyn Error`
+                // field) and the JSON file layer (via the pre-
+                // stringified `error_chain` field — JsonVisitor does
+                // not walk sources).
+                let chain: Vec<String> =
+                    std::iter::successors(Some(&e as &(dyn std::error::Error + 'static)), |err| {
+                        err.source()
+                    })
+                    .map(|err| err.to_string())
+                    .collect();
+                tracing::error!(
+                    error = &e as &(dyn std::error::Error + 'static),
+                    error_chain = ?chain,
+                    exit_code = e.exit_code(),
+                    "daemon startup failed",
+                );
                 ExitCode::from(e.exit_code())
             }
         },

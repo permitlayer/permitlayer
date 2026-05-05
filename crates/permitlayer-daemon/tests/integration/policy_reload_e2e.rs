@@ -8,7 +8,7 @@
 //!   daemon returns an error and the old set is preserved.
 //! - Assert `policy-reloaded` audit event was written on the success reload.
 
-use crate::common::{DaemonTestConfig, http_post, start_daemon, wait_for_health};
+use crate::common::{DaemonTestConfig, start_daemon, wait_for_health};
 
 const POLICY_A: &str = r#"
 [[policies]]
@@ -46,7 +46,14 @@ fn reload_lifecycle_add_and_error_and_audit() {
     crate::common::assert_daemon_pid_matches(&_daemon);
 
     // --- Reload 1: no changes, should report unchanged=1 ---
-    let (status, body) = http_post(port, "/v1/control/reload", None);
+    let _ctl = crate::common::read_test_control_token(home.path());
+    let (status, body) = crate::common::http_request_with_headers(
+        port,
+        "POST",
+        "/v1/control/reload",
+        None,
+        &[("X-Agentsso-Control", _ctl.as_str())],
+    );
     assert_eq!(status, 200, "reload should succeed, body: {body}");
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["status"], "ok");
@@ -57,7 +64,14 @@ fn reload_lifecycle_add_and_error_and_audit() {
 
     // --- Reload 2: add a second policy, should report added=1 ---
     std::fs::write(policies_dir.join("b.toml"), POLICY_B).unwrap();
-    let (status, body) = http_post(port, "/v1/control/reload", None);
+    let _ctl = crate::common::read_test_control_token(home.path());
+    let (status, body) = crate::common::http_request_with_headers(
+        port,
+        "POST",
+        "/v1/control/reload",
+        None,
+        &[("X-Agentsso-Control", _ctl.as_str())],
+    );
     assert_eq!(status, 200, "reload should succeed, body: {body}");
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["status"], "ok");
@@ -77,7 +91,14 @@ approval-mode = "auto"
 "#,
     )
     .unwrap();
-    let (status, body) = http_post(port, "/v1/control/reload", None);
+    let _ctl = crate::common::read_test_control_token(home.path());
+    let (status, body) = crate::common::http_request_with_headers(
+        port,
+        "POST",
+        "/v1/control/reload",
+        None,
+        &[("X-Agentsso-Control", _ctl.as_str())],
+    );
     assert_eq!(status, 400, "reload with bad policy should fail, body: {body}");
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["status"], "error");
@@ -85,7 +106,14 @@ approval-mode = "auto"
 
     // Remove the bad file and reload to confirm old set is intact.
     std::fs::remove_file(policies_dir.join("bad.toml")).unwrap();
-    let (status, body) = http_post(port, "/v1/control/reload", None);
+    let _ctl = crate::common::read_test_control_token(home.path());
+    let (status, body) = crate::common::http_request_with_headers(
+        port,
+        "POST",
+        "/v1/control/reload",
+        None,
+        &[("X-Agentsso-Control", _ctl.as_str())],
+    );
     assert_eq!(status, 200, "reload after removing bad file should succeed, body: {body}");
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["policies_loaded"], 2, "old set was preserved through failed reload");

@@ -17,7 +17,7 @@ pub enum KeyStoreError {
     /// Linux Secret Service daemon is not running, or the keyring feature
     /// for this OS was compiled out. Callers typically fall back to the
     /// passphrase adapter.
-    #[error("keychain backend '{backend}' is unavailable")]
+    #[error("keychain backend '{backend}' is unavailable: {source}")]
     BackendUnavailable {
         /// Which backend failed: "apple", "libsecret", "windows", etc.
         backend: &'static str,
@@ -71,4 +71,38 @@ pub enum KeyStoreError {
     /// or tampering.
     #[error("master key has wrong length: expected {expected_len} bytes, got {actual_len}")]
     MalformedMasterKey { expected_len: usize, actual_len: usize },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pin Plan A's load-bearing Display contract on every CI leg.
+    ///
+    /// `BackendUnavailable`'s `#[error("...: {source}")]` is what carries
+    /// the OSStatus from the routing layer in `keyring_shared::map_err`
+    /// to operator stderr via `log_fallback`'s `eprintln!("...: {e}")`.
+    /// The macOS-specific routing test in `keyring_shared.rs` already
+    /// asserts the same thing — but it's gated behind
+    /// `#[cfg(all(test, target_os = "macos"))]`, so a Linux contributor
+    /// who refactored the format string would not trip CI. This test
+    /// runs on every leg (Linux, Windows, macOS) and catches that
+    /// regression class before merge.
+    #[test]
+    fn backend_unavailable_display_surfaces_source() {
+        let sentinel = "PLAN_A_SENTINEL_OSSTATUS_-25308";
+        let err = KeyStoreError::BackendUnavailable {
+            backend: "test",
+            source: Box::new(std::io::Error::other(sentinel)),
+        };
+        let displayed = err.to_string();
+        assert!(
+            displayed.contains(sentinel),
+            "BackendUnavailable Display must surface its source — got {displayed:?}"
+        );
+        assert!(
+            displayed.contains("test"),
+            "BackendUnavailable Display must surface the backend name — got {displayed:?}"
+        );
+    }
 }

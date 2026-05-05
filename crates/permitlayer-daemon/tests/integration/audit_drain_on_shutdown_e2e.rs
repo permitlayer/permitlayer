@@ -83,7 +83,14 @@ fn audit_drain_on_shutdown_preserves_all_blocked_events() {
     // Activate the kill switch via the CLI over loopback. The control
     // endpoint is POST /v1/control/kill (non-idempotent; returns 200
     // on first activation, 409 on subsequent if already active).
-    let (status, body) = crate::common::http_post(port, "/v1/control/kill", None);
+    let ctl = crate::common::read_test_control_token(home.path());
+    let (status, body) = crate::common::http_request_with_headers(
+        port,
+        "POST",
+        "/v1/control/kill",
+        None,
+        &[("X-Agentsso-Control", ctl.as_str())],
+    );
     assert_eq!(status, 200, "kill activation failed: {body}");
 
     // Fire a burst of blocked requests. 50 is enough to exercise the

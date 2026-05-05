@@ -195,7 +195,7 @@ pub fn parse_v2_token(token: &str) -> Option<(&str, Vec<u8>)> {
 /// URL-safe base64 decode without padding (RFC 4648 §5).
 /// Mirrors the encoder used by `register_agent_handler`. Returns `None`
 /// on any non-alphabet byte or invalid trailing-character count.
-fn base64_url_no_pad_decode(s: &str) -> Option<Vec<u8>> {
+pub fn base64_url_no_pad_decode(s: &str) -> Option<Vec<u8>> {
     // Lookup table: index by ASCII byte → 6-bit value (or 0xFF for
     // "not in alphabet"). Hand-rolled to keep `parse_v2_token`
     // dependency-free.

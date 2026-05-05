@@ -389,7 +389,7 @@ fn auth_round_trip_against_running_daemon() {
     crate::common::assert_daemon_pid_matches(&daemon_v1);
 
     // Phase 2 — register an agent through the control plane.
-    let old_token = register_agent(port, "round-trip-agent", "gmail-read-only");
+    let old_token = register_agent(port, home.path(), "round-trip-agent", "gmail-read-only");
     assert!(
         old_token.starts_with("agt_v2_round-trip-agent_"),
         "registered token must use v2 shape with the agent name: {old_token}"
@@ -466,9 +466,16 @@ fn auth_round_trip_against_running_daemon() {
 /// helper-discipline fence (each integration file may have its own
 /// thin wrappers if they don't duplicate canonical logic).
 #[cfg(not(windows))]
-fn register_agent(port: u16, name: &str, policy: &str) -> String {
+fn register_agent(port: u16, home: &std::path::Path, name: &str, policy: &str) -> String {
     let body = format!(r#"{{"name":"{name}","policy_name":"{policy}"}}"#);
-    let (status, resp_body) = http_post_loopback(port, "/v1/control/agent/register", &body);
+    let ctl = crate::common::read_test_control_token(home);
+    let (status, resp_body) = http_request(
+        port,
+        "POST",
+        "/v1/control/agent/register",
+        &[("X-Agentsso-Control", ctl.as_str())],
+        Some(&body),
+    );
     assert_eq!(
         status, 200,
         "agent register should succeed for {name} → {policy}, got {status}: {resp_body}"
@@ -520,11 +527,6 @@ fn read_new_token_for_agent(home: &std::path::Path, agent_name: &str) -> String 
 #[cfg(not(windows))]
 fn http_get_loopback(port: u16, path: &str, headers: &[(&str, &str)]) -> (u16, String) {
     http_request(port, "GET", path, headers, None)
-}
-
-#[cfg(not(windows))]
-fn http_post_loopback(port: u16, path: &str, body: &str) -> (u16, String) {
-    http_request(port, "POST", path, &[], Some(body))
 }
 
 #[cfg(not(windows))]

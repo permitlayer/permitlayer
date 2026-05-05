@@ -81,23 +81,6 @@ fn run_cli(home: &std::path::Path, port: u16, args: &[&str]) -> (i32, String, St
     (code, stdout, stderr)
 }
 
-fn http_get(port: u16, path: &str) -> (u16, String) {
-    let mut stream = std::net::TcpStream::connect_timeout(
-        &format!("127.0.0.1:{port}").parse().unwrap(),
-        Duration::from_secs(2),
-    )
-    .expect("failed to connect");
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-    let req = format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n");
-    stream.write_all(req.as_bytes()).unwrap();
-    let mut buf = Vec::new();
-    let _ = stream.read_to_end(&mut buf);
-    let raw = String::from_utf8_lossy(&buf).to_string();
-    let status = raw.split_whitespace().nth(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
-    let body = raw.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
-    (status, body)
-}
-
 // ---------- AC #28 ----------
 
 #[test]
@@ -191,7 +174,14 @@ fn control_endpoint_returns_registry() {
         let _ = child.kill();
         panic!("daemon did not become healthy");
     }
-    let (status, body) = http_get(port, "/v1/control/connectors");
+    let ctl = crate::common::read_test_control_token(tmp.path());
+    let (status, body) = crate::common::http_request_with_headers(
+        port,
+        "GET",
+        "/v1/control/connectors",
+        None,
+        &[("X-Agentsso-Control", ctl.as_str())],
+    );
     let _ = child.kill();
     let _ = child.wait();
 

@@ -69,10 +69,22 @@ jobs:
         run: rustup show active-toolchain || rustup toolchain install
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
-      - name: Install cargo-nextest
+      # Try the fast path first (taiki-e/install-action pulls a
+      # prebuilt binary). On Windows runners the action's bash
+      # shim has been failing intermittently with
+      # "install-action: installation failed due to bash startup
+      # failure" — see actions/partner-runner-images#169. When the
+      # fast path fails we fall back to the slower-but-reliable
+      # `cargo install` route below.
+      - name: Install cargo-nextest (fast path)
+        id: nextest-fast
         uses: taiki-e/install-action@v2
+        continue-on-error: true
         with:
           tool: cargo-nextest
+      - name: Install cargo-nextest (fallback)
+        if: steps.nextest-fast.outcome != 'success'
+        run: cargo install --locked cargo-nextest
       # Linux-only: install libsecret build deps + start a secret-service
       # backend so LinuxKeyStore conformance tests exercise the real
       # libsecret path instead of skipping with BackendUnavailable.

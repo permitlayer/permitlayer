@@ -296,7 +296,12 @@ pub fn start_daemon(config: DaemonTestConfig) -> DaemonHandle {
         (config.port, None)
     };
 
-    DaemonHandle { child: Some(child), port: resolved_port, captured_stdout }
+    DaemonHandle {
+        child: Some(child),
+        port: resolved_port,
+        home: config.home.clone(),
+        captured_stdout,
+    }
 }
 
 /// Drop-safe handle to a daemon subprocess.
@@ -311,6 +316,10 @@ pub struct DaemonHandle {
     /// The port the daemon is bound to. Convenience field so tests
     /// can do `handle.port` instead of threading a separate variable.
     pub port: u16,
+    /// The daemon's home directory (`AGENTSSO_PATHS__HOME`). Used by
+    /// test helpers that need to read the daemon's `<home>/control.token`
+    /// (Plan B) or other home-resident state.
+    pub home: PathBuf,
     /// Captured stdout buffer when `start_daemon` used zero-port mode
     /// (Story 7.7). The marker reader has to take `child.stdout`, so
     /// `Child::wait_with_output` would otherwise see an empty stdout.
@@ -679,7 +688,17 @@ pub fn assert_daemon_pid_matches(handle: &DaemonHandle) {
     // Story 7.7 P19 — `/v1/control/whoami` is the loopback-gated
     // identity beacon. `/health` no longer exposes PID (it leaked
     // daemon identity to LAN peers when bound `0.0.0.0`).
-    let (status, body) = http_get(handle.port, "/v1/control/whoami");
+    //
+    // Plan B: /v1/control/* requires `X-Agentsso-Control` token. Read
+    // it from the daemon's home (where it was minted at startup).
+    let token = read_test_control_token(&handle.home);
+    let (status, body) = http_request_with_headers(
+        handle.port,
+        "GET",
+        "/v1/control/whoami",
+        None,
+        &[("X-Agentsso-Control", token.as_str())],
+    );
     assert_eq!(status, 200, "/v1/control/whoami should return 200, got {status}: {body}");
     let json: serde_json::Value = serde_json::from_str(&body)
         .unwrap_or_else(|e| panic!("/v1/control/whoami response not JSON: {e}\nbody: {body}"));
@@ -766,6 +785,19 @@ pub fn wait_for_health(port: u16) -> bool {
     false
 }
 
+/// Read the daemon's minted control token from `<home>/control.token`.
+/// Plan B requires every `/v1/control/*` request to carry the token in
+/// the `X-Agentsso-Control` header. Test helpers that drive control
+/// endpoints directly (rather than via the CLI) use this to look up
+/// the token. Returns the trimmed encoded form (`agt_ctl_*`).
+pub fn read_test_control_token(home: &std::path::Path) -> String {
+    let path = home.join("control.token");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("control.token not readable at {}: {e}", path.display()))
+        .trim()
+        .to_owned()
+}
+
 /// Issue an HTTP GET against the daemon and return (status_code, body).
 pub fn http_get(port: u16, path: &str) -> (u16, String) {
     http_request(port, "GET", path, None)
@@ -793,7 +825,7 @@ fn http_request(port: u16, method: &str, path: &str, body: Option<&str>) -> (u16
     http_request_with_headers(port, method, path, body, &[])
 }
 
-fn http_request_with_headers(
+pub fn http_request_with_headers(
     port: u16,
     method: &str,
     path: &str,
@@ -897,7 +929,12 @@ mod tests {
         let pid = child.id();
 
         {
-            let _handle = DaemonHandle { child: Some(child), port: 0, captured_stdout: None };
+            let _handle = DaemonHandle {
+                child: Some(child),
+                port: 0,
+                home: PathBuf::from("/tmp/dummy-handle-home"),
+                captured_stdout: None,
+            };
             // Confirm the process is alive via `kill -0 <pid>`.
             let alive = Command::new("kill").arg("-0").arg(pid.to_string()).status().unwrap();
             assert!(alive.success(), "sleep process should be alive before handle drop");

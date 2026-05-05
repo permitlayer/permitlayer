@@ -1330,6 +1330,12 @@ pub(crate) enum StartError {
     #[error("failed to acquire PID file: {0}")]
     PidFileAcquire(String),
 
+    /// Plan B (operator-token auth): could not read or mint the
+    /// `<home>/control.token` file at startup. Causes: filesystem
+    /// permissions, malformed existing file, mode-other-than-0o600.
+    #[error("failed to bootstrap control token: {0}")]
+    ControlTokenBootstrap(String),
+
     /// Story 7.6a AC #3: vault-level advisory lock is held by another
     /// process — typically `agentsso rotate-key` mid-flight, an
     /// `agentsso setup` in progress, or a stale daemon that survived
@@ -1463,6 +1469,7 @@ impl StartError {
             // Exit 3 — another process holds a coordination resource.
             Self::DaemonAlreadyRunning { .. }
             | Self::PidFileAcquire(_)
+            | Self::ControlTokenBootstrap(_)
             | Self::DaemonStartVaultBusy { .. } => 3,
             // Exit 4 — filesystem-level failure on a coordination
             // resource (Story 7.6a round-1 review patch).
@@ -1511,12 +1518,19 @@ impl StartError {
                  request would return 401 and the vault cannot decrypt credentials.\n\
                  \n\
                  common causes:\n\
+                 - on macOS: the login keychain refused access. After\n\
+                   `brew upgrade agentsso`, the new binary's codesign hash no\n\
+                   longer matches the previously-authorized ACL on the existing\n\
+                   master-key entry — the daemon should have fallen back to the\n\
+                   passphrase prompt, so seeing this banner means either fallback\n\
+                   is disabled or the failure was a non-ACL platform error\n\
+                   (e.g., locked keychain → unlock and retry).\n\
                  - on linux: the secret-service daemon is not running\n\
                    (install `libsecret` / `gnome-keyring-daemon` and start a session)\n\
                  - on fresh CI containers: no keyring backend available —\n\
                    install a software keyring, or use a dev build.\n\
                  \n\
-                 run `agentsso` with `RUST_LOG=debug` for the underlying error.\n"
+                 run with `AGENTSSO_LOG__LEVEL=debug` for the underlying error.\n"
                     .to_owned()
             }
             Self::MasterKeyCall { .. } => "error: failed to provision the vault master key.\n\
@@ -1525,13 +1539,18 @@ impl StartError {
                  request would return 401 and the vault cannot decrypt credentials.\n\
                  \n\
                  common causes:\n\
-                 - on macOS: the login keychain is locked — unlock it and retry\n\
+                 - on macOS: the login keychain is locked — unlock it and retry.\n\
+                   If you just ran `brew upgrade agentsso`, the new binary's\n\
+                   codesign hash invalidated the keychain ACL on the existing\n\
+                   master-key entry; the auto-fallback should have dropped to a\n\
+                   passphrase prompt — if you saw this banner instead, the\n\
+                   keychain failure was a non-ACL platform error.\n\
                  - on linux: the secret-service daemon is not running\n\
                    (install `libsecret` / `gnome-keyring-daemon` and start a session)\n\
                  - on fresh CI containers: no keyring backend available —\n\
                    install a software keyring, or use a dev build.\n\
                  \n\
-                 run `agentsso` with `RUST_LOG=debug` for the underlying error.\n"
+                 run with `AGENTSSO_LOG__LEVEL=debug` for the underlying error.\n"
                 .to_owned(),
             Self::HkdfExpand => "error: HKDF expansion of the agent token lookup subkey failed \
                  unexpectedly.\n\
@@ -1542,6 +1561,15 @@ impl StartError {
                 format!("error: daemon is already running (pid {pid})\n")
             }
             Self::PidFileAcquire(msg) => format!("error: failed to acquire PID file: {msg}\n"),
+            Self::ControlTokenBootstrap(msg) => format!(
+                "error: failed to bootstrap control token: {msg}\n\
+                 \n\
+                 the daemon could not read or mint ~/.agentsso/control.token. \
+                 common causes:\n\
+                 - the file exists but has the wrong mode (must be 0o600)\n\
+                 - the file exists but is malformed (delete it and the daemon will mint fresh)\n\
+                 - filesystem permissions on ~/.agentsso/ block writing\n",
+            ),
             Self::DaemonStartVaultBusy { holder_pid, holder_command } => {
                 let holder_text = match (holder_pid, holder_command.as_deref()) {
                     (Some(pid), Some(cmd)) => format!("pid {pid} ({cmd})"),
@@ -1983,6 +2011,18 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         }
     };
 
+    // Read or mint the operator-authentication token for /v1/control/*.
+    // Persists at <home>/control.token (mode 0o600). Survives across
+    // daemon restarts so ops automation doesn't break on every bounce.
+    let control_token =
+        match crate::lifecycle::control_token::ControlToken::read_or_mint(&config.paths.home) {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(error = ?e, "control token bootstrap failed — refusing to boot");
+                return Err(StartError::ControlTokenBootstrap(e.to_string()));
+            }
+        };
+
     // 3a. Acquire the vault-level advisory lock (Story 7.6a AC #3).
     //
     // Precedence: PidFile guards "the daemon is running"; VaultLock
@@ -2269,7 +2309,26 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     // decrypt any credential. Booting into a half-alive state serves
     // no one.
     let master_key = ensure_master_key_bootstrapped(&config).await.inspect_err(|e| {
-        tracing::error!(error = %e, "master key bootstrap failed — refusing to boot");
+        // The compact stdout layer walks the source chain via
+        // `Visit::record_error` when the value is recorded as
+        // `&dyn Error`. The `%e` shorthand routes through
+        // `record_debug` and drops the chain, so the boxed
+        // `security_framework::base::Error` carrying the OSStatus
+        // (post-Plan-A) would never reach the operator's terminal.
+        // The pre-stringified `error_chain` field is for the JSON
+        // file layer, whose `JsonVisitor` does NOT walk source
+        // errors.
+        let chain: Vec<String> =
+            std::iter::successors(Some(e as &(dyn std::error::Error + 'static)), |err| {
+                err.source()
+            })
+            .map(|err| err.to_string())
+            .collect();
+        tracing::error!(
+            error = e as &(dyn std::error::Error + 'static),
+            error_chain = ?chain,
+            "master key bootstrap failed — refusing to boot",
+        );
     })?;
 
     // Story 7.6a AC #12: walk the vault and compute the active
@@ -2639,6 +2698,7 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         Arc::clone(&cli_overrides),
         Arc::clone(&proxy_stub_branch_active),
         vault_dir_for_reload,
+        Arc::clone(&control_token),
     );
     // `agent_lookup_key` (the local binding) is moved into control::router
     // above — the middleware call earlier already `Arc::clone`d its

@@ -45,6 +45,7 @@ mod config_theme;
 mod connectors_list_e2e;
 mod connectors_new_e2e;
 mod connectors_test_e2e;
+mod control_token_e2e;
 mod credentials_refresh_daemon_conflict;
 mod credentials_status;
 mod daemon_lifecycle;

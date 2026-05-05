@@ -17,15 +17,14 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::cli::kill::{
-    error_block_daemon_not_running, error_block_daemon_unreachable, error_block_protocol_error,
-    http_get, http_post_empty_json, load_daemon_config_or_default_with_warn,
+    error_block_daemon_unreachable, error_block_protocol_error, http_get, http_post_empty_json,
+    load_daemon_config_or_default_with_warn,
 };
 use crate::design::kill_banner::{
     DeactivationSummaryView, ResumeBannerInputs, render_resume_banner,
 };
 use crate::design::terminal::{ColorSupport, terminal_width};
 use crate::design::theme::Theme;
-use crate::lifecycle::pid::PidFile;
 
 #[derive(clap::Args)]
 pub struct ResumeArgs {}
@@ -36,20 +35,18 @@ pub async fn run(_args: ResumeArgs) -> Result<()> {
     let config = load_daemon_config_or_default_with_warn("resume");
     let home = config.paths.home.clone();
 
-    // 1. Check daemon is running.
-    if PidFile::read(&home)?.is_none() || !PidFile::is_daemon_running(&home)? {
-        eprint!("{}", error_block_daemon_not_running("resume"));
-        // Clean up stale PID file (mirror cli/kill.rs behavior).
-        let _ = std::fs::remove_file(home.join("agentsso.pid"));
-        std::process::exit(3);
-    }
+    // No PID-file pre-check — Plan B's operator-token auth on
+    // `/v1/control/*` is the canonical gate. The HTTP path's
+    // `error_block_daemon_unreachable` handles the genuine "no daemon"
+    // case below.
 
     let bind_addr = config.http.bind_addr;
+    let token = crate::cli::kill::read_control_token(&home);
 
-    // 2. GET /v1/control/state to capture `activated_at` (for
+    // 1. GET /v1/control/state to capture `activated_at` (for
     //    `duration_killed` in the banner) AND short-circuit when the
     //    daemon is already running (cheaper idempotent path).
-    let state_body = match http_get(bind_addr, "/v1/control/state").await {
+    let state_body = match http_get(bind_addr, "/v1/control/state", token.as_deref()).await {
         Ok(b) => b,
         Err(e) => {
             tracing::debug!(error = %e, addr = %bind_addr, "state probe failed during resume");
@@ -77,14 +74,15 @@ pub async fn run(_args: ResumeArgs) -> Result<()> {
     // 3. POST /v1/control/resume (always — the daemon is the authority on
     //    idempotency). We rely on its returned `was_already_inactive` flag
     //    as the canonical answer rather than the pre-probe reading.
-    let resume_body = match http_post_empty_json(bind_addr, "/v1/control/resume").await {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::debug!(error = %e, addr = %bind_addr, "resume request failed");
-            eprint!("{}", error_block_daemon_unreachable("resume", bind_addr));
-            std::process::exit(3);
-        }
-    };
+    let resume_body =
+        match http_post_empty_json(bind_addr, "/v1/control/resume", token.as_deref()).await {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!(error = %e, addr = %bind_addr, "resume request failed");
+                eprint!("{}", error_block_daemon_unreachable("resume", bind_addr));
+                std::process::exit(3);
+            }
+        };
 
     let parsed: ResumeResponseView = match serde_json::from_str(&resume_body) {
         Ok(v) => v,

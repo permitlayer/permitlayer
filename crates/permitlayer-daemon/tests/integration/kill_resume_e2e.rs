@@ -218,19 +218,33 @@ fn get_health(port: u16) -> String {
     )
 }
 
-fn post_control(port: u16, path: &str) -> String {
+/// Read the daemon's minted control token. Plan B requires
+/// /v1/control/* requests to carry `X-Agentsso-Control: <token>`;
+/// integration tests that drive the endpoints directly (bypassing the
+/// CLI) must thread the token in via this helper.
+fn read_test_control_token(home: &std::path::Path) -> String {
+    let path = home.join("control.token");
+    std::fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("control.token not readable at {}: {e}", path.display()))
+        .trim()
+        .to_owned()
+}
+
+fn post_control(port: u16, path: &str, control_token: &str) -> String {
     let body = "{}";
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Agentsso-Control: {control_token}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     send_http_request(port, &request)
 }
 
-fn get_control(port: u16, path: &str) -> String {
+fn get_control(port: u16, path: &str, control_token: &str) -> String {
     send_http_request(
         port,
-        &format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),
+        &format!(
+            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Agentsso-Control: {control_token}\r\nConnection: close\r\n\r\n"
+        ),
     )
 }
 
@@ -364,16 +378,18 @@ fn resume_is_idempotent() {
 #[test]
 fn kill_when_no_daemon_exits_3() {
     let home = tempfile::TempDir::new().unwrap();
-    // No daemon spawned: the CLI exits 3 before ever opening a TCP
-    // connection. A literal placeholder port is fine.
+    // No daemon spawned: the CLI exits 3 with `daemon_unreachable`
+    // when the HTTP call to /v1/control/kill fails to connect.
+    // (Pre-Plan-B, this was a PID-file pre-check producing
+    // `daemon_not_running`. Plan B removed the PID gate; the HTTP
+    // call's error path is the canonical "no daemon" signal now.)
     let port: u16 = 1;
 
-    // No daemon running.
     let out = run_cli(home.path(), port, &["kill"]);
     assert_eq!(out.status, Some(3), "expected exit 3, got {:?}; stderr={}", out.status, out.stderr);
     assert!(
-        out.stderr.contains("daemon_not_running"),
-        "stderr missing daemon_not_running: {}",
+        out.stderr.contains("daemon_unreachable"),
+        "stderr missing daemon_unreachable: {}",
         out.stderr
     );
 }
@@ -386,8 +402,8 @@ fn resume_when_no_daemon_exits_3() {
     let out = run_cli(home.path(), port, &["resume"]);
     assert_eq!(out.status, Some(3), "expected exit 3, got {:?}; stderr={}", out.status, out.stderr);
     assert!(
-        out.stderr.contains("daemon_not_running"),
-        "stderr missing daemon_not_running: {}",
+        out.stderr.contains("daemon_unreachable"),
+        "stderr missing daemon_unreachable: {}",
         out.stderr
     );
 }
@@ -410,10 +426,11 @@ fn control_resume_bypasses_kill_middleware() {
     let (child, port) = start_daemon(home.path());
     let _guard = DaemonGuard::new(child);
     assert!(wait_for_health(port, Duration::from_secs(5)));
+    let token = read_test_control_token(home.path());
 
     // Kill via direct POST (not via CLI) so we isolate the test to the
     // control endpoint behavior.
-    let raw = post_control(port, "/v1/control/kill");
+    let raw = post_control(port, "/v1/control/kill", &token);
     assert_eq!(parse_status_code(&raw), 200, "control kill must be 200: {raw}");
 
     // /health is now blocked.
@@ -421,7 +438,7 @@ fn control_resume_bypasses_kill_middleware() {
     assert_eq!(parse_status_code(&raw), 403, "post-kill /health must be 403");
 
     // But /v1/control/resume must still reach the handler.
-    let raw = post_control(port, "/v1/control/resume");
+    let raw = post_control(port, "/v1/control/resume", &token);
     assert_eq!(
         parse_status_code(&raw),
         200,
@@ -448,8 +465,9 @@ fn main_endpoints_still_blocked_while_killed() {
     let (child, port) = start_daemon(home.path());
     let _guard = DaemonGuard::new(child);
     assert!(wait_for_health(port, Duration::from_secs(5)));
+    let token = read_test_control_token(home.path());
 
-    assert_eq!(parse_status_code(&post_control(port, "/v1/control/kill")), 200);
+    assert_eq!(parse_status_code(&post_control(port, "/v1/control/kill", &token)), 200);
 
     for path in ["/health", "/v1/health", "/mcp"] {
         let raw = send_http_request(
@@ -478,10 +496,11 @@ fn control_state_endpoint_reports_active_while_killed() {
     let (child, port) = start_daemon(home.path());
     let _guard = DaemonGuard::new(child);
     assert!(wait_for_health(port, Duration::from_secs(5)));
+    let token = read_test_control_token(home.path());
 
-    assert_eq!(parse_status_code(&post_control(port, "/v1/control/kill")), 200);
+    assert_eq!(parse_status_code(&post_control(port, "/v1/control/kill", &token)), 200);
 
-    let raw = get_control(port, "/v1/control/state");
+    let raw = get_control(port, "/v1/control/state", &token);
     assert_eq!(parse_status_code(&raw), 200);
     let body = parse_response_body(&raw);
     assert!(body.contains("\"active\":true"), "state must report active=true: {body}");
@@ -494,8 +513,9 @@ fn setup_blocked_when_killed() {
     let (child, port) = start_daemon(home.path());
     let _guard = DaemonGuard::new(child);
     assert!(wait_for_health(port, Duration::from_secs(5)));
+    let token = read_test_control_token(home.path());
 
-    assert_eq!(parse_status_code(&post_control(port, "/v1/control/kill")), 200);
+    assert_eq!(parse_status_code(&post_control(port, "/v1/control/kill", &token)), 200);
 
     // Run `agentsso setup gmail --non-interactive` — it should be blocked
     // by the kill-state probe before any OAuth flow starts.
@@ -527,8 +547,9 @@ fn control_state_endpoint_content_type_is_json() {
     let (child, port) = start_daemon(home.path());
     let _guard = DaemonGuard::new(child);
     assert!(wait_for_health(port, Duration::from_secs(5)));
+    let token = read_test_control_token(home.path());
 
-    let raw = get_control(port, "/v1/control/state");
+    let raw = get_control(port, "/v1/control/state", &token);
     assert_eq!(parse_status_code(&raw), 200);
     assert_eq!(
         parse_header(&raw, "content-type").as_deref(),

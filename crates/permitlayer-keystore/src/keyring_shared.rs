@@ -191,14 +191,103 @@ pub(crate) fn map_err(backend: &'static str, e: keyring::Error) -> KeyStoreError
             KeyStoreError::BackendUnavailable { backend, source }
         }
         keyring::Error::PlatformFailure(source) => {
+            #[cfg(target_os = "macos")]
+            if let Some(routed) = classify_macos_platform_failure(backend, source.as_ref()) {
+                return routed;
+            }
             KeyStoreError::PlatformError { backend, message: source.to_string() }
         }
         other => KeyStoreError::PlatformError { backend, message: other.to_string() },
     }
 }
 
+/// On macOS only: pattern-match the OSStatus inside a boxed
+/// `security_framework::base::Error` to recognize ACL-denial codes
+/// that should trigger the auto-fallback to passphrase mode rather
+/// than surfacing as opaque `PlatformError`.
+///
+/// `brew upgrade agentsso` invalidates the codesign-bound keychain ACL
+/// because the new binary's hash differs from the old one's; without
+/// this routing the daemon hard-fails on the keystore probe instead of
+/// dropping to the passphrase prompt that would let an interactive
+/// operator recover.
+#[cfg(target_os = "macos")]
+fn classify_macos_platform_failure(
+    backend: &'static str,
+    source: &(dyn std::error::Error + 'static),
+) -> Option<KeyStoreError> {
+    use security_framework::base::Error as SfError;
+    let sf_err = source.downcast_ref::<SfError>()?;
+    let code = sf_err.code();
+    // -25308 errSecInteractionNotAllowed: Security Agent has no GUI to
+    //   prompt; common after `brew upgrade` invalidates the
+    //   codesign-bound ACL on the existing master-key entry.
+    // -25293 errSecAuthFailed: explicit ACL denial.
+    matches!(code, -25308 | -25293).then(|| KeyStoreError::BackendUnavailable {
+        backend,
+        // io::Error::other is the workspace's existing idiom for boxing
+        // a String into `dyn Error + Send + Sync` (see telemetry/mod.rs).
+        source: Box::new(std::io::Error::other(format!("{sf_err} (OSStatus {code})"))),
+    })
+}
+
 /// Map a `tokio::task::JoinError` into our `KeyStoreError` surface.
 /// Used by every async wrapper that dispatches to `spawn_blocking`.
 pub(crate) fn join_err(backend: &'static str, e: tokio::task::JoinError) -> KeyStoreError {
     KeyStoreError::PlatformError { backend, message: format!("spawn_blocking join failed: {e}") }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+#[allow(clippy::panic)]
+mod macos_routing_tests {
+    use super::*;
+    use crate::error::KeyStoreError;
+    use keyring::Error::PlatformFailure;
+    use security_framework::base::Error as SfError;
+
+    #[test]
+    fn macos_acl_denial_codes_route_to_backend_unavailable() {
+        for code in [-25308_i32, -25293] {
+            let sf_err = SfError::from_code(code);
+            let keyring_err = PlatformFailure(Box::new(sf_err));
+            let routed = map_err("apple", keyring_err);
+            match &routed {
+                KeyStoreError::BackendUnavailable { backend, source } => {
+                    assert_eq!(*backend, "apple");
+                    let s = source.to_string();
+                    assert!(
+                        s.contains(&format!("OSStatus {code}")),
+                        "source string should embed OSStatus, got: {s}"
+                    );
+                }
+                other => {
+                    panic!("OSStatus {code} should route to BackendUnavailable, got {other:?}")
+                }
+            }
+            // Pin the load-bearing Display contract: the outer error's
+            // Display MUST surface the OSStatus, otherwise log_fallback's
+            // `{e}` formatting in lib.rs swallows the code before it
+            // reaches operator stderr.
+            let displayed = routed.to_string();
+            assert!(
+                displayed.contains(&format!("OSStatus {code}")),
+                "outer Display should embed OSStatus, got: {displayed}"
+            );
+        }
+    }
+
+    #[test]
+    fn macos_other_platform_codes_remain_platform_error() {
+        // -25299 errSecDuplicateItem — explicitly NOT an ACL denial.
+        // Plan A intentionally leaves these as opaque PlatformError so a
+        // misconfigured keychain doesn't silently drop the user into
+        // passphrase mode.
+        let sf_err = SfError::from_code(-25299);
+        let keyring_err = PlatformFailure(Box::new(sf_err));
+        let routed = map_err("apple", keyring_err);
+        assert!(
+            matches!(routed, KeyStoreError::PlatformError { .. }),
+            "non-ACL codes must still surface as PlatformError, got {routed:?}",
+        );
+    }
 }
