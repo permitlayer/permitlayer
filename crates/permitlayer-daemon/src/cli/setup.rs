@@ -184,11 +184,13 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
 
     // ── Story 7.6c: daemon-running pre-flight ──────────────────────
     //
-    // setup writes to the vault via `CredentialFsStore::put` which
-    // acquires the exclusive vault `flock` (Story 7.6a). The daemon
-    // holds the same lock for its entire runtime — without this guard,
-    // setup blocks indefinitely on `flock(2)` with no operator-visible
-    // message. Surfaced 2026-05-01 during onboarding when
+    // setup writes to the vault and mutates keystore state (master
+    // key bootstrap, agent registry, etc). Running it concurrent
+    // with a live daemon would race against the daemon's in-memory
+    // caches: the daemon would continue serving requests against
+    // stale credential/agent state until restart. Refusing here
+    // keeps the operator on the documented `stop → setup → start`
+    // sequence. Surfaced 2026-05-01 during onboarding when
     // `brew services start agentsso` was active.
     //
     // **Ordering note:** this pre-flight runs AFTER the kill-state
@@ -205,8 +207,8 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
     //
     // The `home` resolution + PID-file probe uses the same fail-closed
     // posture as rotate-key: if the probe itself errors, treat as
-    // "daemon running for safety" rather than letting setup proceed
-    // into a flock deadlock.
+    // "daemon running for safety" rather than letting setup race
+    // against the running daemon's in-memory state.
     let preflight_home = super::agentsso_home()?;
     let daemon_running = crate::lifecycle::pid::PidFile::is_daemon_running(&preflight_home)
         .unwrap_or_else(|e| {
@@ -223,8 +225,8 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
             render::error_block(
                 "setup_daemon_running",
                 &format!(
-                    "agentsso daemon is running{pid_hint}; setup writes to the vault \
-                     and would block on the daemon's exclusive lock."
+                    "agentsso daemon is running{pid_hint}; setup mutates vault and \
+                     keystore state and must not race against a live daemon."
                 ),
                 "agentsso stop && agentsso setup <service> --oauth-client <path>",
                 None,
