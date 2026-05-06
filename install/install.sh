@@ -221,40 +221,77 @@ download_release() {
     ARCHIVE_PATH="${TMPDIR_DL}/${ARTIFACT_NAME}"
     SIG_PATH="${TMPDIR_DL}/${ARTIFACT_NAME}.minisig"
 
+    SIG_LOG="${TMPDIR_DL}/curl-sig.log"
+    ARCHIVE_LOG="${TMPDIR_DL}/curl-archive.log"
+
     # Fetch the signature first so we can fail fast if it's missing in
     # non-interactive mode — avoids wasting a large tarball download when
     # the install is going to abort anyway. A dropped .minisig (MITM, cache
     # poisoning, partial release) MUST NOT silently bypass verification.
     #
-    # `--retry 15 --retry-delay 3 --retry-all-errors` covers the
-    # asset-CDN propagation window after a fresh release. The PR #12
-    # round used `--retry 5 --retry-delay 2` (10s budget); v0.3.0-rc.7
-    # smoke (run 25324891575) showed CDN propagation taking >40s on
-    # ubuntu-22.04 — 5 retries exhausted at T+10s while the minisig
-    # was still 404'ing on GitHub's edge. The macOS smoke job dodges
-    # this by depending on `homebrew-publish` (which adds ~30s of
-    # serialized delay before brew tap fetches anything), but the
-    # Linux smoke fetches release assets directly. Bumping the
-    # budget to 15 × 3s = 45s eliminates the race.
+    # GitHub's release-asset CDN (release-assets.githubusercontent.com)
+    # is eventually consistent across edges. After `gh release create`
+    # returns, different edges populate at different rates; a 404 from
+    # one edge doesn't mean the asset is missing, it means that edge
+    # hasn't been told about it yet.
+    #
+    # History: PR #12 (rc.6→rc.7) was the first bandaid (5×2s = 10s,
+    # then 15×3s = 45s). PR #23 (rc.10) added a workflow-level
+    # pre-wait that polls until 200; rc.11 proved this is insufficient
+    # because it samples a single edge. This iteration drops the
+    # pre-wait and trusts the install-script-level retry budget,
+    # bumped to 30 attempts × 5s with a 180-second hard ceiling via
+    # `--retry-max-time` (curl 7.52+). 3 minutes covers public reports
+    # of GitHub Releases propagation tails to >99th percentile.
     #
     # `--retry-all-errors` is required because curl's `--retry` only
     # retries on a hardcoded list of transient codes (408, 429, 5xx)
     # and network errors — NOT on the 404 that GitHub's edge returns
-    # during the propagation window.
+    # during the propagation window. Requires curl >= 7.71.0
+    # (June 2020). Targets: ubuntu-22.04 (curl 7.81.0), Apple silicon
+    # macOS default (Sonoma 8.4.0), Intel macOS recent (Big Sur
+    # 7.77.0). `--retry-max-time` requires curl >= 7.52.0 (Dec 2016)
+    # — same target coverage.
     #
-    # `--retry-all-errors` requires curl >= 7.71.0 (June 2020).
-    # Targets: ubuntu-22.04 (curl 7.81.0), Apple silicon macOS
-    # default (Sonoma 8.4.0), Intel macOS recent (Big Sur 7.77.0).
-    # All in scope.
-    curl -fsSL --connect-timeout 10 --max-time 30 \
-        --retry 15 --retry-delay 3 --retry-all-errors \
-        -o "$SIG_PATH" "$SIG_URL" 2>/dev/null || SIG_PATH=""
+    # We also redirect curl's stderr to a log file (instead of
+    # discarding it via `2>/dev/null`) and dump it to our stderr on
+    # failure. Without this, an operator hitting a real failure (TLS
+    # handshake, DNS, the CDN tail exceeding 180s) sees only the
+    # generic "no signature file available" — which is what made
+    # rc.10/rc.11 a guessing game. With the log dumped, the next
+    # failure is diagnosable in seconds.
+    if ! curl -fsSL --connect-timeout 10 --max-time 30 \
+            --retry 30 --retry-delay 5 --retry-all-errors \
+            --retry-max-time 180 \
+            -o "$SIG_PATH" "$SIG_URL" 2>"$SIG_LOG"; then
+        SIG_PATH=""
+    fi
     if [ -z "$SIG_PATH" ] && [ ! -t 0 ] && [ "$ALLOW_UNSIGNED" != "1" ]; then
+        if [ -f "$SIG_LOG" ] && [ -s "$SIG_LOG" ]; then
+            printf '%s\n' "--- curl stderr (sig fetch) ---" >&2
+            cat "$SIG_LOG" >&2
+            printf '%s\n' "--- end curl stderr ---" >&2
+        fi
         err "no signature file available for ${ARTIFACT_NAME} and non-interactive mode is in use. Re-run with \`--allow-unsigned\` to bypass (not recommended) or install interactively."
     fi
 
-    curl -fsSL --connect-timeout 10 --max-time 120 -o "$ARCHIVE_PATH" "$DOWNLOAD_URL" \
-        || err "failed to download ${DOWNLOAD_URL}"
+    # Same retry shape + diagnostic-output discipline for the archive.
+    # Previously this had NO retry flags at all (rc.11 got lucky — the
+    # .minisig races first and gates failure, but a future propagation
+    # tail that resolves the .minisig and not the .tar.xz would have
+    # surfaced as "failed to download" with no retry). Belt-and-
+    # suspenders.
+    if ! curl -fsSL --connect-timeout 10 --max-time 120 \
+            --retry 30 --retry-delay 5 --retry-all-errors \
+            --retry-max-time 180 \
+            -o "$ARCHIVE_PATH" "$DOWNLOAD_URL" 2>"$ARCHIVE_LOG"; then
+        if [ -f "$ARCHIVE_LOG" ] && [ -s "$ARCHIVE_LOG" ]; then
+            printf '%s\n' "--- curl stderr (archive fetch) ---" >&2
+            cat "$ARCHIVE_LOG" >&2
+            printf '%s\n' "--- end curl stderr ---" >&2
+        fi
+        err "failed to download ${DOWNLOAD_URL}"
+    fi
 
     # Calculate download size for display
     if [ -f "$ARCHIVE_PATH" ]; then

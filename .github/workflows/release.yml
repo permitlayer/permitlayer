@@ -982,43 +982,22 @@ jobs:
           echo "DBUS_SESSION_BUS_PID=$DBUS_SESSION_BUS_PID" >> "$GITHUB_ENV"
           printf '%s\n' "${KEYRING_PW}" | gnome-keyring-daemon --unlock --components=secrets &
           sleep 1
-      # rc.10 (run 25384973256) fallout: install.sh's internal 45s
-      # retry budget for the .minisig fetch is not always enough.
-      # GitHub's release-asset CDN replicates the .tar.xz and the
-      # .minisig independently, and the .minisig has been observed
-      # to lag past 45s — install.sh hard-fails non-interactive
-      # without it (intentional; the sig is a real trust gate).
+      # rc.10 added a "Wait for .minisig CDN propagation" step here to
+      # work around install.sh's then-45s retry budget exhausting under
+      # GitHub Releases CDN propagation tails. rc.11 proved that step
+      # was insufficient: it polled a single edge replica, succeeded at
+      # T+0s, then install.sh hit a different edge 1 second later and
+      # failed for ~45s. The pre-wait was solving the wrong problem
+      # (single-edge sample doesn't guarantee multi-edge consistency).
       #
-      # The macOS smoke job dodges this race by depending on
-      # `homebrew-publish` (~60s of serialized work before it
-      # touches release assets); the Windows smoke survives
-      # because install.ps1 treats the .minisig as best-effort.
-      # The Linux smoke is the only path that races `host`'s
-      # asset upload directly AND mandates the .minisig.
-      #
-      # Pre-poll the public .minisig URL until it returns 200,
-      # then let install.sh proceed. 5-minute deadline — far
-      # longer than any propagation we've measured; if it ever
-      # exceeds this, the delay itself is the bug worth
-      # investigating, not a flake to paper over. install.sh's
-      # own 45s budget is left as-is (different role: end-user
-      # `curl | sh` UX vs CI gate).
-      - name: Wait for .minisig CDN propagation
-        shell: bash
-        run: |
-          set -euo pipefail
-          SIG_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/${TAG}/permitlayer-daemon-x86_64-unknown-linux-gnu.tar.xz.minisig"
-          DEADLINE=$((SECONDS + 300))
-          while [ $SECONDS -lt $DEADLINE ]; do
-            if curl -fsSL --connect-timeout 5 --max-time 15 -o /dev/null "$SIG_URL"; then
-              echo "::notice::.minisig propagated after ${SECONDS}s"
-              exit 0
-            fi
-            echo "Sig not yet propagated (T+${SECONDS}s); sleeping 5s"
-            sleep 5
-          done
-          echo "::error::.minisig did not propagate after 300s — investigate the host job's upload, not this gate"
-          exit 1
+      # The fix lives in install.sh now: 30 retries × 5s with a 180s
+      # `--retry-max-time` ceiling, plus stderr capture+dump on
+      # failure so the next failure is diagnosable in seconds instead
+      # of a guessing game. The pre-wait is dropped from this job
+      # because install.sh's own retry budget covers what the pre-wait
+      # was trying to accomplish, more robustly. The mcp-inspector-
+      # conformance job (which also calls install.sh) is automatically
+      # covered by the same change.
       - name: Install via curl|sh
         run: |
           set -euo pipefail
