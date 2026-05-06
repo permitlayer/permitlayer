@@ -106,12 +106,6 @@ pub struct SetupArgs {
     /// Implied by `--non-interactive`.
     #[arg(long)]
     pub force: bool,
-    /// Print the authorization URL instead of launching a browser.
-    /// Use this when running over SSH, under `su` without GUI access,
-    /// or any context where `open::that()` cannot reach a usable
-    /// browser. The local callback server still binds to 127.0.0.1;
-    /// complete consent in any browser that can reach loopback on this
-    /// host.
     /// Skip browser launch and the loopback callback listener; print
     /// the auth URL and accept the redirect URL via stdin paste.
     /// Use this when SSH'd from a different machine (the redirect
@@ -264,6 +258,31 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
     let color_support = ColorSupport::detect();
     tracing::info!(home = %home.display(), service = %service, "starting OAuth setup");
 
+    // Reject `--headless` + `--non-interactive` early (rc.13 review #2):
+    // headless requires the operator to paste a URL via stdin, which
+    // is incompatible with --non-interactive. Without this rejection,
+    // setup would print the auth URL and then block in
+    // read_pasted_redirect_url for 300 seconds before timing out — a
+    // confusing footgun for CI scripts that pass both flags.
+    if args.headless && args.non_interactive {
+        eprint!(
+            "{}",
+            render::error_block(
+                "headless_requires_interactive",
+                "--headless requires an interactive terminal — it reads the pasted \
+                 redirect URL from stdin, which --non-interactive forbids",
+                &format!(
+                    "drop one of the flags:\n\n    \
+                     agentsso setup {service} --headless --oauth-client ./client_secret.json\n\n\
+                     or, for fully-scripted use, run with a real browser available and pass \
+                     --non-interactive without --headless",
+                ),
+                None,
+            )
+        );
+        std::process::exit(1);
+    }
+
     // Resolve OAuth client configuration.
     //
     // permitlayer has no shared CASA-certified client yet, so every user
@@ -271,13 +290,24 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
     // client ever ships, this is the spot that would construct it.
     //
     // rc.13 (interactive UX): if `--oauth-client` is absent AND we're
-    // attached to a TTY for stdin AND stdout (not just piped), prompt
-    // the operator for the file path interactively. The old
-    // hard-fail-with-error-block behavior survives for non-interactive
-    // contexts (CI, scripts) where the prompt would block forever.
+    // attached to a TTY for both stdin AND stdout (not piped or
+    // backgrounded), prompt the operator for the file path
+    // interactively. The old hard-fail-with-error-block behavior
+    // survives for non-interactive contexts (CI, scripts) where the
+    // prompt would block forever.
+    //
+    // `console::user_attended()` checks STDOUT only (verified against
+    // console-0.16.3/src/term.rs:583), not the bidirectional check
+    // its name suggests. We pair it with an explicit stdin TTY check
+    // (`std::io::IsTerminal`) so a piped invocation like
+    // `agentsso setup gmail < some-file` doesn't silently consume the
+    // file as the OAuth client path.
     let oauth_config = match &args.oauth_client {
         Some(path) => GoogleOAuthConfig::from_client_json(path)?,
-        None if console::user_attended() && !args.non_interactive => {
+        None if console::user_attended()
+            && std::io::IsTerminal::is_terminal(&std::io::stdin())
+            && !args.non_interactive =>
+        {
             // dialoguer + spawn_blocking, matching the existing pattern
             // at setup.rs:347-351 and :397-402 (Story P61 discipline).
             let teal_theme = build_teal_theme(&theme);
@@ -502,7 +532,7 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
         // thread on any non-happy-path exit (Story 1.8 defer closed).
         let guard = SpinnerGuard::new(spinner);
 
-        let authorize_result = client.authorize(scopes_owned.clone(), None, false).await;
+        let authorize_result = client.authorize(scopes_owned.clone(), None).await;
         // Drop the guard explicitly BEFORE any output so the spinner
         // line is cleared from the terminal before we print an error
         // block or success message.
@@ -525,7 +555,7 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
         }
     } else {
         tracing::info!("opening browser for Google OAuth consent...");
-        match client.authorize(scopes_owned.clone(), None, false).await {
+        match client.authorize(scopes_owned.clone(), None).await {
             Ok(r) => r,
             Err(e) => {
                 render_oauth_error(

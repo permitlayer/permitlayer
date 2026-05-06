@@ -75,14 +75,21 @@ pub(crate) fn parse_redirect_url(
 ) -> Result<String, OAuthError> {
     // Strip whitespace and bracketed-paste markers. Order:
     // 1. Trim outer whitespace (operator's stray newline).
-    // 2. Strip start marker if present (don't require it).
-    // 3. Strip end marker if present (don't require it).
+    // 2. Strip ALL leading start markers (some terminals double-bracket).
+    // 3. Strip ALL trailing end markers (same reason).
     // 4. Trim again (markers may have been adjacent to inner ws).
+    //
+    // The while-loops handle terminals that emit nested bracketed-paste
+    // sequences (rare but real: certain terminal multiplexer + emulator
+    // combinations forward the inner emitter's brackets verbatim,
+    // resulting in `\e[200~\e[200~URL\e[201~\e[201~`). A single
+    // `strip_prefix` would leave the inner `\e[200~` in the URL and
+    // `Url::parse` would fail with `PastedUrlMalformed`.
     let mut s = pasted.trim();
-    if let Some(rest) = s.strip_prefix(BRACKETED_PASTE_START) {
+    while let Some(rest) = s.strip_prefix(BRACKETED_PASTE_START) {
         s = rest;
     }
-    if let Some(rest) = s.strip_suffix(BRACKETED_PASTE_END) {
+    while let Some(rest) = s.strip_suffix(BRACKETED_PASTE_END) {
         s = rest;
     }
     let trimmed = s.trim();
@@ -270,6 +277,23 @@ mod tests {
         let core = make_url("auth-code-xyz", STATE);
         let pasted = format!("  \n{BRACKETED_PASTE_START}{core}{BRACKETED_PASTE_END}\n  ");
         let code = parse_redirect_url(&pasted, REDIRECT, STATE).expect("strips ws + brackets");
+        assert_eq!(code, "auth-code-xyz");
+    }
+
+    /// Some terminal multiplexer + emulator combinations forward the
+    /// inner emitter's bracketed-paste sequences verbatim, producing
+    /// `\e[200~\e[200~URL\e[201~\e[201~`. The strip code uses
+    /// while-loops to handle this; a single `strip_prefix`/`strip_suffix`
+    /// would leave the inner markers in the URL and `Url::parse` would
+    /// fail with `PastedUrlMalformed`.
+    #[test]
+    fn double_bracketed_paste_stripped() {
+        let core = make_url("auth-code-xyz", STATE);
+        let pasted = format!(
+            "{BRACKETED_PASTE_START}{BRACKETED_PASTE_START}{core}\
+             {BRACKETED_PASTE_END}{BRACKETED_PASTE_END}"
+        );
+        let code = parse_redirect_url(&pasted, REDIRECT, STATE).expect("strips both layers");
         assert_eq!(code, "auth-code-xyz");
     }
 

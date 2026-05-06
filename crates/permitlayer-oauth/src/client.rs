@@ -122,24 +122,27 @@ impl OAuthClient {
         Ok(Self { inner: builder, http_client })
     }
 
-    /// Run the full OAuth 2.1 authorization code flow with PKCE.
+    /// Run the full OAuth 2.1 authorization code flow with PKCE,
+    /// using a local callback server.
     ///
     /// 1. Generates PKCE challenge + verifier
     /// 2. Spawns ephemeral callback server
-    /// 3. Opens browser to consent screen (or prints URL if `no_browser`)
+    /// 3. Opens the operator's default browser to the consent screen;
+    ///    on `open::that()` failure (no GUI, headless context), falls
+    ///    back to printing the URL so a same-host browser can be
+    ///    pointed at it manually
     /// 4. Awaits callback with authorization code
     /// 5. Exchanges code for tokens
     /// 6. Returns tokens wrapped in credential types
     ///
-    /// When `no_browser` is true, the URL is printed to stdout and the
-    /// caller (or end-user) is responsible for opening it. When false,
-    /// `open::that()` is invoked; on IO failure the URL is printed to
-    /// stderr as a fallback so the user can complete the flow manually.
+    /// For SSH-from-another-machine (where the operator's local
+    /// browser cannot reach this host's loopback), use
+    /// [`Self::authorize_headless`] instead — it skips the listener
+    /// entirely and reads the redirect URL via stdin paste.
     pub async fn authorize(
         &self,
         scopes: Vec<String>,
         timeout: Option<Duration>,
-        no_browser: bool,
     ) -> Result<AuthorizeResult, OAuthError> {
         // Generate PKCE.
         let (pkce_challenge, pkce_verifier) = pkce::generate_pkce();
@@ -172,29 +175,25 @@ impl OAuthClient {
 
         let (auth_url, _csrf_token) = auth_request.url();
 
-        // Open browser — or print URL if --no-browser was requested.
-        // open::that() is blocking on some platforms, so we use
-        // spawn_blocking to avoid stalling the async executor.
+        // Open browser. open::that() is blocking on some platforms,
+        // so we use spawn_blocking to avoid stalling the async
+        // executor.
         let url_string = auth_url.to_string();
-        if no_browser {
-            print_manual_auth_url(&url_string);
-        } else {
-            let url_for_open = url_string.clone();
-            let open_result = tokio::task::spawn_blocking(move || open::that(&url_for_open)).await;
-            match open_result {
-                Ok(Ok(())) => {}
-                Ok(Err(e)) => {
-                    // Auto-fallback: if open::that() can't reach a usable
-                    // browser (no DISPLAY, headless SSH, `su` without GUI
-                    // context, etc.), print the URL so the user can
-                    // complete the flow manually instead of dead-ending.
-                    print_browser_fallback_message(&url_string, &e);
-                }
-                Err(e) => {
-                    return Err(OAuthError::BrowserOpenFailed {
-                        source: std::io::Error::other(e.to_string()),
-                    });
-                }
+        let url_for_open = url_string.clone();
+        let open_result = tokio::task::spawn_blocking(move || open::that(&url_for_open)).await;
+        match open_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                // Auto-fallback: if open::that() can't reach a usable
+                // browser (no DISPLAY, headless SSH, `su` without GUI
+                // context, etc.), print the URL so the user can
+                // complete the flow manually instead of dead-ending.
+                print_browser_fallback_message(&url_string, &e);
+            }
+            Err(e) => {
+                return Err(OAuthError::BrowserOpenFailed {
+                    source: std::io::Error::other(e.to_string()),
+                });
             }
         }
 
@@ -388,35 +387,10 @@ impl OAuthClient {
     }
 }
 
-/// Render the manual-paste consent message to the given writer.
-///
-/// Used when the auto-fallback at [`Self::authorize`] couldn't open a
-/// browser. The caller (the user) opens the URL in a browser on this
-/// host (where the loopback listener is running). For the
-/// SSH-from-another-machine case, see [`Self::authorize_headless`]
-/// instead — it uses a different prompt UX (operator pastes the
-/// redirect URL back instead of curling it from the same host).
-///
-/// Extracted as a writer-injected helper so unit tests can assert the
-/// rendered text without capturing global stdout. Production callers
-/// pipe through [`print_manual_auth_url`].
-pub(crate) fn render_manual_auth_url(w: &mut dyn std::io::Write, url: &str) -> std::io::Result<()> {
-    writeln!(w)?;
-    writeln!(w, "  Open this URL in any browser ON THIS MACHINE to grant consent:")?;
-    writeln!(w)?;
-    writeln!(w, "    {url}")?;
-    writeln!(w)?;
-    writeln!(w, "  After approving, the redirect lands on this host's loopback listener")?;
-    writeln!(w, "  automatically. If you're SSH'd from a different machine, cancel this")?;
-    writeln!(w, "  and re-run with --headless instead — that flow accepts the redirect URL")?;
-    writeln!(w, "  via stdin paste (no loopback listener needed).")?;
-    writeln!(w)?;
-    Ok(())
-}
-
 /// Render the auto-fallback "browser launch failed" message to the
-/// given writer. See [`render_manual_auth_url`] for the writer-injection
-/// rationale.
+/// given writer. Extracted as a writer-injected helper so unit tests
+/// can assert the rendered text without capturing global stdout.
+/// Production callers pipe through [`print_browser_fallback_message`].
 pub(crate) fn render_browser_fallback_message(
     w: &mut dyn std::io::Write,
     url: &str,
@@ -427,17 +401,11 @@ pub(crate) fn render_browser_fallback_message(
     writeln!(w)?;
     writeln!(w, "    {url}")?;
     writeln!(w)?;
+    writeln!(w, "  If you're SSH'd from a different machine, cancel this and")?;
+    writeln!(w, "  re-run with --headless instead — that flow accepts the redirect")?;
+    writeln!(w, "  URL via stdin paste (no loopback listener needed).")?;
+    writeln!(w)?;
     Ok(())
-}
-
-/// Print the manual-paste consent message to stdout. The callback
-/// server is already listening before this is called.
-fn print_manual_auth_url(url: &str) {
-    let mut stdout = std::io::stdout();
-    // Best-effort: a stdout write failure here is unrecoverable for the
-    // user-facing flow but shouldn't fail the OAuth call. The auth URL
-    // is also available in trace logs at INFO level.
-    let _ = render_manual_auth_url(&mut stdout, url);
 }
 
 /// Print the auto-fallback message to stderr when `open::that()` fails.
@@ -536,30 +504,121 @@ mod tests {
         assert_eq!(refresh.as_ref().unwrap().reveal(), b"1//test-refresh-token-placeholder");
     }
 
-    #[test]
-    fn render_manual_auth_url_includes_url_and_instructions() {
-        let mut buf = Vec::new();
-        render_manual_auth_url(&mut buf, "https://example.test/auth?foo=bar")
-            .expect("write into Vec cannot fail");
-        let out = String::from_utf8(buf).expect("ascii output");
-        assert!(out.contains("https://example.test/auth?foo=bar"), "URL must appear in output");
-        assert!(out.contains("Open this URL"), "primary instruction must appear");
-        assert!(
-            out.contains("ON THIS MACHINE") || out.contains("on this machine"),
-            "must direct user to a browser on the same host (rc.13: no more cross-host curl)"
+    /// rc.13 contract pin: `authorize_headless` reuses the SAME
+    /// `redirect_uri` between auth-URL construction and token exchange.
+    /// A regression that drifts those two values would cause Google to
+    /// reject the token exchange with `redirect_uri_mismatch`. We
+    /// verify by capturing the form body the mock token server sees
+    /// and asserting the `redirect_uri` field matches what was minted
+    /// at the start of the headless flow.
+    #[tokio::test]
+    async fn authorize_headless_round_trip_uses_consistent_redirect_uri() {
+        use std::sync::Mutex;
+
+        // Shared state: the token handler stashes the form body it
+        // receives so the test can assert on it.
+        #[derive(Default)]
+        struct Captured {
+            form: Option<String>,
+        }
+        let captured = std::sync::Arc::new(Mutex::new(Captured::default()));
+
+        let captured_for_handler = std::sync::Arc::clone(&captured);
+        let app = axum::Router::new().route(
+            "/token",
+            post(move |body: String| {
+                let captured = std::sync::Arc::clone(&captured_for_handler);
+                async move {
+                    captured.lock().expect("not poisoned").form = Some(body);
+                    Json(serde_json::json!({
+                        "access_token": "ya29.headless-roundtrip-token",
+                        "refresh_token": "1//headless-refresh",
+                        "token_type": "Bearer",
+                        "expires_in": 3600,
+                        "scope": "https://www.googleapis.com/auth/gmail.readonly",
+                    }))
+                }
+            }),
         );
-        assert!(
-            out.contains("--headless"),
-            "must point cross-machine SSH operators to the --headless flag"
+
+        let (base_url, listener) = spawn_mock_token_server().await;
+        let token_url = format!("{base_url}/token");
+        let auth_url_endpoint = format!("{base_url}/auth");
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("mock server");
+        });
+
+        let client = OAuthClient::new_with_endpoint_overrides(
+            "test-client-id".to_owned(),
+            Some("test-secret".to_owned()),
+            &auth_url_endpoint,
+            &token_url,
+        )
+        .expect("client");
+
+        // Capture the auth URL the closure receives so we can extract
+        // the redirect_uri the daemon minted, then synthesize a paste
+        // that matches.
+        let captured_auth_url = std::sync::Arc::new(Mutex::new(String::new()));
+        let captured_auth_url_for_renderer = std::sync::Arc::clone(&captured_auth_url);
+
+        let result = client
+            .authorize_headless(
+                vec!["https://www.googleapis.com/auth/gmail.readonly".to_owned()],
+                move |auth_url| {
+                    let captured_auth_url = std::sync::Arc::clone(&captured_auth_url_for_renderer);
+                    async move {
+                        // Parse the auth URL Google would receive,
+                        // extract redirect_uri + state, build a
+                        // matching paste.
+                        let parsed = url::Url::parse(&auth_url).expect("auth url parses");
+                        let redirect_uri = parsed
+                            .query_pairs()
+                            .find(|(k, _)| k == "redirect_uri")
+                            .map(|(_, v)| v.into_owned())
+                            .expect("redirect_uri in auth url");
+                        let state = parsed
+                            .query_pairs()
+                            .find(|(k, _)| k == "state")
+                            .map(|(_, v)| v.into_owned())
+                            .expect("state in auth url");
+                        *captured_auth_url.lock().expect("not poisoned") = auth_url.clone();
+                        Ok(format!("{redirect_uri}?code=test-headless-code&state={state}"))
+                    }
+                },
+            )
+            .await;
+
+        let result = result.expect("authorize_headless succeeds");
+        assert_eq!(
+            result.access_token.reveal(),
+            b"ya29.headless-roundtrip-token",
+            "access token plumbs through correctly",
         );
+
+        // The crucial pin: the token-exchange form body MUST contain
+        // the same redirect_uri that was in the auth URL.
+        let captured_auth_url = captured_auth_url.lock().expect("not poisoned").clone();
+        let auth_url_parsed = url::Url::parse(&captured_auth_url).expect("auth url");
+        let auth_redirect_uri = auth_url_parsed
+            .query_pairs()
+            .find(|(k, _)| k == "redirect_uri")
+            .map(|(_, v)| v.into_owned())
+            .expect("auth redirect_uri");
+
+        let form_body = captured.lock().expect("not poisoned").form.clone().expect("form captured");
+        // Form-encoded; redirect_uri appears as redirect_uri=...
+        // url-encoded. We just substring-search for the encoded form.
+        let encoded_redirect_uri =
+            url::form_urlencoded::byte_serialize(auth_redirect_uri.as_bytes()).collect::<String>();
         assert!(
-            !out.contains("curl"),
-            "rc.13: drop the misleading curl-from-this-host instruction"
+            form_body.contains(&format!("redirect_uri={encoded_redirect_uri}")),
+            "token-exchange form body must reuse the auth-URL redirect_uri (got body: {form_body})",
         );
     }
 
     #[test]
-    fn render_browser_fallback_includes_url_and_error() {
+    fn render_browser_fallback_includes_url_and_error_and_headless_pointer() {
         let err = std::io::Error::other("simulated open failure");
         let mut buf = Vec::new();
         render_browser_fallback_message(&mut buf, "https://example.test/auth", &err)
@@ -568,5 +627,13 @@ mod tests {
         assert!(out.contains("https://example.test/auth"), "URL must appear in fallback output");
         assert!(out.contains("Could not open browser"), "fallback header must appear");
         assert!(out.contains("simulated open failure"), "underlying error must appear");
+        assert!(
+            out.contains("--headless"),
+            "rc.13: cross-machine SSH operators should be pointed at --headless"
+        );
+        assert!(
+            !out.contains("curl"),
+            "rc.13: drop the misleading curl-from-this-host instruction"
+        );
     }
 }
