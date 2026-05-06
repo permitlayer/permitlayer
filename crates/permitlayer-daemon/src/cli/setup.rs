@@ -112,8 +112,16 @@ pub struct SetupArgs {
     /// browser. The local callback server still binds to 127.0.0.1;
     /// complete consent in any browser that can reach loopback on this
     /// host.
-    #[arg(long = "no-browser")]
-    pub no_browser: bool,
+    /// Skip browser launch and the loopback callback listener; print
+    /// the auth URL and accept the redirect URL via stdin paste.
+    /// Use this when SSH'd from a different machine (the redirect
+    /// will land on YOUR machine, not this host's loopback), or in
+    /// any context where no browser will hit this host's loopback.
+    ///
+    /// Renamed from `--no-browser` in rc.13 — operators with the old
+    /// flag in scripts get a clap "did you mean --headless?" error.
+    #[arg(long = "headless")]
+    pub headless: bool,
 }
 
 /// Run the `setup` subcommand.
@@ -261,8 +269,28 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
     // permitlayer has no shared CASA-certified client yet, so every user
     // must bring their own OAuth client via --oauth-client. If a shared
     // client ever ships, this is the spot that would construct it.
+    //
+    // rc.13 (interactive UX): if `--oauth-client` is absent AND we're
+    // attached to a TTY for stdin AND stdout (not just piped), prompt
+    // the operator for the file path interactively. The old
+    // hard-fail-with-error-block behavior survives for non-interactive
+    // contexts (CI, scripts) where the prompt would block forever.
     let oauth_config = match &args.oauth_client {
         Some(path) => GoogleOAuthConfig::from_client_json(path)?,
+        None if console::user_attended() && !args.non_interactive => {
+            // dialoguer + spawn_blocking, matching the existing pattern
+            // at setup.rs:347-351 and :397-402 (Story P61 discipline).
+            let teal_theme = build_teal_theme(&theme);
+            let theme_clone = std::sync::Arc::new(teal_theme);
+            let theme_for_input = theme_clone.clone();
+            let path_str: String = tokio::task::spawn_blocking(move || {
+                dialoguer::Input::with_theme(&*theme_for_input)
+                    .with_prompt("path to client_secret.json")
+                    .interact_text()
+            })
+            .await??;
+            GoogleOAuthConfig::from_client_json(std::path::Path::new(path_str.trim()))?
+        }
         None => {
             eprint!(
                 "{}",
@@ -435,18 +463,38 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
     let default_scopes = scopes::default_scopes_for_service(&service);
     let scopes_owned: Vec<String> = default_scopes.iter().map(|s| (*s).to_owned()).collect();
 
-    let result = if interactive {
+    let result = if args.headless {
+        // Headless flow: no callback listener, no browser launch.
+        // Print the URL, attempt OSC 52 clipboard copy, read the
+        // operator's pasted redirect URL, validate, exchange.
+        tracing::info!("running headless OAuth flow (no callback listener)");
+        let authorize_result = client
+            .authorize_headless(scopes_owned.clone(), |url| async move {
+                print_headless_consent_block(&url);
+                read_pasted_redirect_url().await
+            })
+            .await;
+        match authorize_result {
+            Ok(r) => r,
+            Err(e) => {
+                render_oauth_error(
+                    &e,
+                    &service,
+                    interactive,
+                    OAuthErrorSeverity::Fatal,
+                    "headless authorize failed",
+                );
+                std::process::exit(1);
+            }
+        }
+    } else if interactive {
         let spinner = indicatif::ProgressBar::new_spinner();
         spinner.set_style(
             indicatif::ProgressStyle::with_template("{spinner} {msg}")
                 .unwrap_or_else(|_| indicatif::ProgressStyle::default_spinner()),
         );
         spinner.enable_steady_tick(std::time::Duration::from_millis(120));
-        spinner.set_message(if args.no_browser {
-            "waiting for consent (open URL above)..."
-        } else {
-            "waiting for browser consent..."
-        });
+        spinner.set_message("waiting for browser consent...");
 
         // RAII: guarantee the spinner is cleared on normal return,
         // early return, or panic. Replaces the old manual
@@ -454,7 +502,7 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
         // thread on any non-happy-path exit (Story 1.8 defer closed).
         let guard = SpinnerGuard::new(spinner);
 
-        let authorize_result = client.authorize(scopes_owned.clone(), None, args.no_browser).await;
+        let authorize_result = client.authorize(scopes_owned.clone(), None, false).await;
         // Drop the guard explicitly BEFORE any output so the spinner
         // line is cleared from the terminal before we print an error
         // block or success message.
@@ -476,12 +524,8 @@ pub async fn run(args: SetupArgs) -> anyhow::Result<()> {
             }
         }
     } else {
-        if args.no_browser {
-            tracing::info!("printing OAuth consent URL (--no-browser)");
-        } else {
-            tracing::info!("opening browser for Google OAuth consent...");
-        }
-        match client.authorize(scopes_owned.clone(), None, args.no_browser).await {
+        tracing::info!("opening browser for Google OAuth consent...");
+        match client.authorize(scopes_owned.clone(), None, false).await {
             Ok(r) => r,
             Err(e) => {
                 render_oauth_error(
@@ -1028,6 +1072,182 @@ fn non_interactive_skip_reason(force: bool) -> &'static str {
 }
 
 // ─────────────────────────────────────────────────────────────────────
+// rc.13 — `--headless` flow: print URL, OSC 52 copy, paste redirect.
+// ─────────────────────────────────────────────────────────────────────
+
+/// How long the daemon waits for the operator to paste the redirect
+/// URL before giving up. Reuses `OAuthError::CallbackTimeout` for
+/// symmetry with the listener-based path's same failure mode.
+const HEADLESS_PASTE_TIMEOUT_SECS: u64 = 300;
+
+/// Print the headless consent block: the URL, an OSC 52 clipboard
+/// copy attempt, and instructions for the operator.
+///
+/// All output goes to stderr so a `2>` redirect can capture the
+/// operator-facing UX without entangling stdout (which `--json` modes
+/// elsewhere in the daemon use).
+fn print_headless_consent_block(url: &str) {
+    eprintln!();
+    eprintln!("  Open this URL in any browser to grant consent:");
+    eprintln!();
+    eprintln!("    {url}");
+    eprintln!();
+
+    emit_osc52_copy(url);
+
+    eprintln!("  (Attempted to copy the URL to your terminal's clipboard. If your");
+    eprintln!("   terminal supports OSC 52, paste it directly. Otherwise select");
+    eprintln!("   and copy the URL above manually.)");
+    eprintln!();
+    eprintln!("  After approving, your browser will redirect to a 127.0.0.1 URL");
+    eprintln!("  that won't load (this host isn't listening for it). That's expected.");
+    eprintln!("  Copy the full redirect URL from your browser's address bar and");
+    eprintln!("  paste it below.");
+    eprintln!();
+}
+
+/// Emit the OSC 52 escape sequence to ask the operator's terminal
+/// emulator to put `text` in their clipboard. Works the same way
+/// locally and over SSH — the escape sequence travels over the tty
+/// channel and is interpreted by whatever terminal emulator the
+/// operator's eyes are looking at.
+///
+/// On terminals that don't support OSC 52 (Terminal.app, plain
+/// xterm without `allowWindowOps`), the escape sequence is silently
+/// discarded. The URL is always printed above this call, so the
+/// operator can fall back to mouse-select.
+fn emit_osc52_copy(text: &str) {
+    let payload = encode_base64_standard(text.as_bytes());
+    // OSC 52: \e]52;c;<base64>\a
+    // - 52 = clipboard manipulation
+    // - c = clipboard (vs 'p' primary selection on X11)
+    // - \a = BEL terminator (broad compatibility)
+    eprint!("\x1b]52;c;{payload}\x07");
+    let _ = std::io::Write::flush(&mut std::io::stderr());
+}
+
+/// Inline base64 encoder for OSC 52 payloads. Avoids adding a `base64`
+/// crate dependency to permitlayer-daemon for what is one ~5-line
+/// function used in exactly one place. Standard alphabet
+/// (A–Z a–z 0–9 + /), `=` padding to multiple-of-4. Matches RFC 4648
+/// §4.
+fn encode_base64_standard(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        out.push(ALPHABET[(b0 >> 2) as usize] as char);
+        out.push(ALPHABET[(((b0 & 0b11) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() >= 2 {
+            out.push(ALPHABET[(((b1 & 0b1111) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() >= 3 {
+            out.push(ALPHABET[(b2 & 0b111111) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod base64_tests {
+    use super::encode_base64_standard;
+
+    /// RFC 4648 §10 test vectors.
+    #[test]
+    fn rfc4648_vectors() {
+        assert_eq!(encode_base64_standard(b""), "");
+        assert_eq!(encode_base64_standard(b"f"), "Zg==");
+        assert_eq!(encode_base64_standard(b"fo"), "Zm8=");
+        assert_eq!(encode_base64_standard(b"foo"), "Zm9v");
+        assert_eq!(encode_base64_standard(b"foob"), "Zm9vYg==");
+        assert_eq!(encode_base64_standard(b"fooba"), "Zm9vYmE=");
+        assert_eq!(encode_base64_standard(b"foobar"), "Zm9vYmFy");
+    }
+
+    /// Realistic OSC 52 payload — a typical Google OAuth URL is
+    /// ~400 bytes; encode without panic.
+    #[test]
+    fn handles_oauth_url_length() {
+        let url = "https://accounts.google.com/o/oauth2/v2/auth?response_type=code&\
+                   client_id=475660129608-7lk21pft9aqoro9lhadi4s2ie8p8b4s2.apps.googleusercontent.com&\
+                   state=xm-3XGDgIUQs0XGsikF6VA&\
+                   code_challenge=TKphIZYUhMF-lgWHtQBglyZVdAMraTNZSAs4sRR5iKk&\
+                   code_challenge_method=S256&\
+                   redirect_uri=http%3A%2F%2F127.0.0.1%3A63921%2Fcallback&\
+                   scope=https%3A%2F%2Fwww.googleapis.com%2Fauth%2Fgmail.readonly";
+        let encoded = encode_base64_standard(url.as_bytes());
+        assert!(encoded.is_ascii(), "base64 output must be ASCII");
+        // Round-trip via stdlib: every '=' pad char must be at the tail.
+        let pad_start = encoded.find('=').unwrap_or(encoded.len());
+        assert!(
+            encoded[pad_start..].chars().all(|c| c == '='),
+            "padding must be contiguous at end"
+        );
+        assert_eq!(encoded.len() % 4, 0, "base64 length must be multiple of 4");
+    }
+}
+
+/// Read the operator's pasted redirect URL from stdin. Bounded
+/// timeout (300s by default) so a closed-browser-tab session
+/// doesn't hang the daemon forever; empty input (Ctrl-D / immediate
+/// Enter) is treated as an explicit cancel and surfaces as
+/// `CallbackTimeout` so the operator sees a remediation message.
+///
+/// Sync stdin reads run inside `tokio::task::spawn_blocking` per the
+/// daemon's Story P61 discipline (rest of setup.rs follows this
+/// pattern at lines 347-351, 397-402).
+async fn read_pasted_redirect_url() -> Result<String, permitlayer_oauth::OAuthError> {
+    use std::io::{BufRead, Write};
+
+    eprint!("  Paste redirect URL (Ctrl-D to cancel): ");
+    let _ = std::io::stderr().flush();
+
+    let read_handle = tokio::task::spawn_blocking(|| -> std::io::Result<String> {
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line)?;
+        Ok(line)
+    });
+
+    let line = match tokio::time::timeout(
+        std::time::Duration::from_secs(HEADLESS_PASTE_TIMEOUT_SECS),
+        read_handle,
+    )
+    .await
+    {
+        Ok(Ok(Ok(s))) => s,
+        Ok(Ok(Err(e))) => {
+            return Err(permitlayer_oauth::OAuthError::CallbackServerFailed { source: e });
+        }
+        Ok(Err(join_err)) => {
+            return Err(permitlayer_oauth::OAuthError::CallbackServerFailed {
+                source: std::io::Error::other(format!("stdin task panicked: {join_err}")),
+            });
+        }
+        Err(_) => {
+            return Err(permitlayer_oauth::OAuthError::CallbackTimeout {
+                timeout_secs: HEADLESS_PASTE_TIMEOUT_SECS,
+            });
+        }
+    };
+
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        // Ctrl-D / immediate Enter — operator-explicit cancel.
+        return Err(permitlayer_oauth::OAuthError::CallbackTimeout {
+            timeout_secs: HEADLESS_PASTE_TIMEOUT_SECS,
+        });
+    }
+    Ok(trimmed.to_owned())
+}
+
+// ─────────────────────────────────────────────────────────────────────
 // Story 7.3 Task 3 — top-level `agentsso setup` orchestrator.
 //
 // Runs only when `agentsso setup` is invoked WITHOUT a service arg.
@@ -1139,7 +1359,7 @@ async fn run_orchestrator(args: SetupArgs) -> anyhow::Result<()> {
         oauth_client: args.oauth_client,
         non_interactive: false,
         force: args.force,
-        no_browser: args.no_browser,
+        headless: args.headless,
     };
     Box::pin(run(per_service_args)).await?;
 

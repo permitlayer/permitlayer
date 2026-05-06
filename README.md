@@ -106,18 +106,32 @@ keeps tokens scoped to your Google account, not a shared app.
 ### Setup over SSH or under `su`
 
 If `agentsso setup` cannot reach a usable browser (SSH session, `su user`
-without GUI access, headless server, etc.), pass `--no-browser` to
-print the authorization URL instead of launching a browser:
+without GUI access, headless server, etc.), pass `--headless` instead:
 
 ```sh
-agentsso setup gmail --oauth-client ./client_secret.json --no-browser
+agentsso setup gmail --oauth-client ./client_secret.json --headless
 ```
 
-Open the printed URL in any browser that can reach `127.0.0.1` on this
-host (the local callback server is loopback-bound). After consent, the
-redirect lands automatically. If your browser is on a different
-machine, copy the resulting redirect URL and `curl` it from the host
-running setup.
+In headless mode the daemon prints the authorization URL, attempts to
+copy it to your terminal's clipboard via OSC 52 (works in iTerm2,
+Kitty, Wezterm, VS Code's integrated terminal — silently no-ops in
+others, in which case mouse-select the URL above), and then waits for
+you to paste the redirect URL back.
+
+Workflow:
+
+1. Copy the printed authorization URL.
+2. Open it in any browser — local or on a different machine.
+3. Approve consent.
+4. Your browser will redirect to `http://127.0.0.1:<port>/callback?...`
+   and show a "connection refused" error. **That's expected** — this
+   host isn't listening, that's the whole point of `--headless`.
+5. Copy the full redirect URL from your browser's address bar.
+6. Paste it into the `agentsso setup` prompt and press Enter.
+
+The daemon validates the pasted URL against the redirect URI it
+issued (scheme, host, port, path, and CSRF state must all match)
+and exchanges the authorization code for tokens locally.
 
 On macOS, `su`-ing to a user that is not the foreground GUI user also
 requires unlocking that user's login keychain in the same shell:

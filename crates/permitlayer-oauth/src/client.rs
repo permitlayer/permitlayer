@@ -242,6 +242,111 @@ impl OAuthClient {
         Ok(AuthorizeResult { access_token, refresh_token, expires_in, scopes })
     }
 
+    /// Run the OAuth authorization flow in headless mode: print the
+    /// auth URL via the caller's `paste_url_renderer`, expect the
+    /// caller to return the operator's pasted redirect URL, validate
+    /// it, and exchange the code for tokens.
+    ///
+    /// This is the SSH-from-another-machine path: there is no usable
+    /// browser on this host AND no callback listener is spawned. The
+    /// operator opens the URL on their local machine, approves
+    /// consent, and pastes the resulting `http://127.0.0.1:<port>/...`
+    /// redirect URL back into the daemon's terminal.
+    ///
+    /// `paste_url_renderer` is owned by the caller (`cli/setup.rs`)
+    /// because it runs the operator-facing terminal interaction —
+    /// printing the URL, attempting an OSC 52 clipboard copy, reading
+    /// stdin with a bounded timeout. This crate doesn't bundle
+    /// terminal UX.
+    pub async fn authorize_headless<F, Fut>(
+        &self,
+        scopes: Vec<String>,
+        paste_url_renderer: F,
+    ) -> Result<AuthorizeResult, OAuthError>
+    where
+        F: FnOnce(String) -> Fut,
+        Fut: std::future::Future<Output = Result<String, OAuthError>>,
+    {
+        // Generate PKCE.
+        let (pkce_challenge, pkce_verifier) = pkce::generate_pkce();
+
+        // Generate CSRF state token.
+        let csrf_state = CsrfToken::new_random();
+        let csrf_state_secret = csrf_state.secret().clone();
+
+        // Reserve an ephemeral port (bind 127.0.0.1:0, capture, drop).
+        // The port becomes part of the redirect_uri Google will
+        // validate AND the URL the operator's browser shows after
+        // consent. We never actually listen on it.
+        let port = crate::headless::reserve_ephemeral_port().await?;
+        let redirect_uri_str = format!("http://127.0.0.1:{port}/callback");
+        let redirect_url = RedirectUrl::new(redirect_uri_str.clone()).map_err(|_| {
+            OAuthError::CallbackServerFailed {
+                source: std::io::Error::other("invalid redirect URL"),
+            }
+        })?;
+
+        // Build authorization URL.
+        let mut auth_request = self
+            .inner
+            .authorize_url(|| csrf_state)
+            .set_pkce_challenge(pkce_challenge)
+            .set_redirect_uri(std::borrow::Cow::Owned(redirect_url));
+
+        for scope in &scopes {
+            auth_request = auth_request.add_scope(Scope::new(scope.clone()));
+        }
+
+        let (auth_url, _csrf_token) = auth_request.url();
+        let auth_url_string = auth_url.to_string();
+
+        // Hand off to the caller's renderer. The caller is expected
+        // to print the URL, attempt OSC 52 clipboard copy, and read
+        // the operator's pasted redirect URL from stdin with a
+        // bounded timeout.
+        let pasted = paste_url_renderer(auth_url_string).await?;
+
+        // Validate the pasted URL: scheme/host/port/path match,
+        // strip bracketed-paste markers, extract code, constant-
+        // time-compare CSRF state.
+        let code =
+            crate::headless::parse_redirect_url(&pasted, &redirect_uri_str, &csrf_state_secret)?;
+
+        // Exchange code for tokens. Same shape as `authorize` —
+        // redirect_uri MUST match the one used at auth-URL
+        // construction time.
+        let redirect_url_for_exchange =
+            RedirectUrl::new(redirect_uri_str).map_err(|_| OAuthError::CallbackServerFailed {
+                source: std::io::Error::other("invalid redirect URL for exchange"),
+            })?;
+
+        let token_response = self
+            .inner
+            .exchange_code(AuthorizationCode::new(code))
+            .set_pkce_verifier(pkce_verifier)
+            .set_redirect_uri(std::borrow::Cow::Owned(redirect_url_for_exchange))
+            .request_async(&self.http_client)
+            .await
+            .map_err(|e| OAuthError::TokenExchangeFailed {
+                service: "google-oauth".to_owned(),
+                source: Box::new(e),
+            })?;
+
+        let access_token = OAuthToken::from_trusted_bytes(
+            token_response.access_token().secret().as_bytes().to_vec(),
+        );
+        let refresh_token = token_response
+            .refresh_token()
+            .map(|rt| OAuthRefreshToken::from_trusted_bytes(rt.secret().as_bytes().to_vec()));
+        let expires_in = token_response.expires_in();
+        let scopes = token_response
+            .scopes()
+            .map(|s| s.iter().map(|scope| scope.to_string()).collect())
+            .unwrap_or_default();
+
+        Ok(AuthorizeResult { access_token, refresh_token, expires_in, scopes })
+    }
+
     /// Get a reference to the inner `BasicClient`.
     ///
     /// Crate-private accessor used by the internal token-exchange test
@@ -285,22 +390,26 @@ impl OAuthClient {
 
 /// Render the manual-paste consent message to the given writer.
 ///
+/// Used when the auto-fallback at [`Self::authorize`] couldn't open a
+/// browser. The caller (the user) opens the URL in a browser on this
+/// host (where the loopback listener is running). For the
+/// SSH-from-another-machine case, see [`Self::authorize_headless`]
+/// instead — it uses a different prompt UX (operator pastes the
+/// redirect URL back instead of curling it from the same host).
+///
 /// Extracted as a writer-injected helper so unit tests can assert the
 /// rendered text without capturing global stdout. Production callers
 /// pipe through [`print_manual_auth_url`].
 pub(crate) fn render_manual_auth_url(w: &mut dyn std::io::Write, url: &str) -> std::io::Result<()> {
     writeln!(w)?;
-    writeln!(w, "  Open this URL in any browser to grant consent:")?;
+    writeln!(w, "  Open this URL in any browser ON THIS MACHINE to grant consent:")?;
     writeln!(w)?;
     writeln!(w, "    {url}")?;
     writeln!(w)?;
-    writeln!(w, "  After approving, you'll be redirected to a 127.0.0.1 page on this host.")?;
-    writeln!(w, "  If you completed consent in a browser on the SAME machine, the redirect")?;
-    writeln!(w, "  lands here automatically. If you used a DIFFERENT machine, copy the full")?;
-    writeln!(w, "  redirected URL (starting with http://127.0.0.1:...) and curl it from this")?;
-    writeln!(w, "  host:")?;
-    writeln!(w)?;
-    writeln!(w, "    curl '<paste-redirect-url-here>'")?;
+    writeln!(w, "  After approving, the redirect lands on this host's loopback listener")?;
+    writeln!(w, "  automatically. If you're SSH'd from a different machine, cancel this")?;
+    writeln!(w, "  and re-run with --headless instead — that flow accepts the redirect URL")?;
+    writeln!(w, "  via stdin paste (no loopback listener needed).")?;
     writeln!(w)?;
     Ok(())
 }
@@ -435,8 +544,18 @@ mod tests {
         let out = String::from_utf8(buf).expect("ascii output");
         assert!(out.contains("https://example.test/auth?foo=bar"), "URL must appear in output");
         assert!(out.contains("Open this URL"), "primary instruction must appear");
-        assert!(out.contains("127.0.0.1"), "loopback note must appear");
-        assert!(out.contains("curl"), "curl-fallback note must appear for cross-host case");
+        assert!(
+            out.contains("ON THIS MACHINE") || out.contains("on this machine"),
+            "must direct user to a browser on the same host (rc.13: no more cross-host curl)"
+        );
+        assert!(
+            out.contains("--headless"),
+            "must point cross-machine SSH operators to the --headless flag"
+        );
+        assert!(
+            !out.contains("curl"),
+            "rc.13: drop the misleading curl-from-this-host instruction"
+        );
     }
 
     #[test]
