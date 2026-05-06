@@ -39,6 +39,8 @@
 #![deny(unsafe_op_in_unsafe_fn)]
 
 pub mod error;
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+pub(crate) mod fallback;
 #[cfg(feature = "test-seam")]
 pub mod file_backed;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
@@ -269,13 +271,35 @@ pub fn default_keystore(config: &KeystoreConfig) -> Result<Box<dyn KeyStore>, Ke
     }
 }
 
+/// Wrap a successfully-constructed native keystore in the runtime
+/// `FallbackKeyStore` if `FallbackMode::Auto` is active. Otherwise
+/// return the native bare. The wrapper makes runtime
+/// `BackendUnavailable` from `master_key()` etc. engage lazy fallback
+/// — without it, the daemon hard-fails on probe-vs-runtime
+/// disagreement (rc.10/rc.11 onboarding hit this twice).
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn maybe_wrap_native(
+    home: &std::path::Path,
+    fallback: FallbackMode,
+    native: Box<dyn KeyStore>,
+) -> Result<Box<dyn KeyStore>, KeyStoreError> {
+    match fallback {
+        FallbackMode::Auto => Ok(Box::new(fallback::FallbackKeyStore::production(
+            home.to_path_buf(),
+            fallback,
+            native,
+        )?)),
+        FallbackMode::None | FallbackMode::Passphrase => Ok(native),
+    }
+}
+
 #[cfg(target_os = "macos")]
 fn native_or_fallback(
     home: &std::path::Path,
     fallback: FallbackMode,
 ) -> Result<Box<dyn KeyStore>, KeyStoreError> {
     match MacKeyStore::new() {
-        Ok(ks) => Ok(Box::new(ks)),
+        Ok(ks) => maybe_wrap_native(home, fallback, Box::new(ks)),
         Err(e) if fallback == FallbackMode::Auto && is_backend_unavailable(&e) => {
             log_fallback("apple", &e);
             Ok(Box::new(PassphraseKeyStore::from_prompt(home)?))
@@ -290,7 +314,7 @@ fn native_or_fallback(
     fallback: FallbackMode,
 ) -> Result<Box<dyn KeyStore>, KeyStoreError> {
     match LinuxKeyStore::new() {
-        Ok(ks) => Ok(Box::new(ks)),
+        Ok(ks) => maybe_wrap_native(home, fallback, Box::new(ks)),
         Err(e) if fallback == FallbackMode::Auto && is_backend_unavailable(&e) => {
             log_fallback("libsecret", &e);
             Ok(Box::new(PassphraseKeyStore::from_prompt(home)?))
@@ -305,7 +329,7 @@ fn native_or_fallback(
     fallback: FallbackMode,
 ) -> Result<Box<dyn KeyStore>, KeyStoreError> {
     match WindowsKeyStore::new() {
-        Ok(ks) => Ok(Box::new(ks)),
+        Ok(ks) => maybe_wrap_native(home, fallback, Box::new(ks)),
         Err(e) if fallback == FallbackMode::Auto && is_backend_unavailable(&e) => {
             log_fallback("windows", &e);
             Ok(Box::new(PassphraseKeyStore::from_prompt(home)?))
@@ -332,7 +356,7 @@ fn native_or_fallback(
 /// failures (`PlatformError`) surface to the caller so a misconfigured
 /// keychain doesn't silently drop users into passphrase mode.
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
-fn is_backend_unavailable(e: &KeyStoreError) -> bool {
+pub(crate) fn is_backend_unavailable(e: &KeyStoreError) -> bool {
     matches!(e, KeyStoreError::BackendUnavailable { .. })
 }
 
@@ -342,6 +366,17 @@ fn is_backend_unavailable(e: &KeyStoreError) -> bool {
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 fn log_fallback(backend: &'static str, e: &KeyStoreError) {
     eprintln!("keystore: native backend '{backend}' unavailable, falling back to passphrase: {e}");
+}
+
+/// Log the native backend's error before engaging RUNTIME fallback
+/// (the lazy `FallbackKeyStore` wrapper, post-rc.12). Distinct from
+/// `log_fallback` (construction-time) so operators reading logs can
+/// tell which decision point fired. Carries the full error chain via
+/// `{e}` — Plan A's `BackendUnavailable: {source}` Display still
+/// surfaces the OSStatus.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+pub(crate) fn log_fallback_runtime(e: &KeyStoreError) {
+    eprintln!("keystore: native backend unavailable at runtime, engaging passphrase fallback: {e}");
 }
 
 #[cfg(test)]

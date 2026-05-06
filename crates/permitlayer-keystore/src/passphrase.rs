@@ -114,8 +114,22 @@ impl PassphraseKeyStore {
         // until some future allocator reuse. `rpassword` returns a
         // plain `String` which does NOT zeroize on drop, so the
         // original string would otherwise linger after derivation.
+        //
+        // rc.12 contract: rpassword opens `/dev/tty` for read AND
+        // write. Under launchd / `brew services` / `ssh -T`, the
+        // open() fails with EIO, ENXIO, or ENOTTY (varies by OS and
+        // shell). Translate that specific failure shape into the
+        // structured `PassphrasePromptUnavailable` variant so the
+        // operator-facing banner can surface recovery guidance
+        // instead of just a generic "I/O error" string.
         let passphrase: Zeroizing<String> =
-            Zeroizing::new(rpassword::prompt_password("permitlayer passphrase: ")?);
+            match rpassword::prompt_password("permitlayer passphrase: ") {
+                Ok(s) => Zeroizing::new(s),
+                Err(io_err) if is_no_tty_error(&io_err) => {
+                    return Err(KeyStoreError::PassphrasePromptUnavailable);
+                }
+                Err(io_err) => return Err(io_err.into()),
+            };
         Self::from_passphrase_inner(home, passphrase.as_str())
     }
 
@@ -412,6 +426,32 @@ fn atomic_write_new(target: &Path, bytes: &[u8]) -> Result<(), KeyStoreError> {
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
     a.ct_eq(b).into()
+}
+
+/// Detect rpassword's failure shape when no controlling terminal is
+/// available. rpassword opens `/dev/tty` for both reading and writing;
+/// under launchd / `brew services start` / `ssh -T` the open fails
+/// with one of: ENXIO ("Device not configured"), EIO ("I/O error"),
+/// or ENOTTY ("Inappropriate ioctl for device"). The exact errno
+/// varies by OS and shell context; we match all three.
+///
+/// Note: `ErrorKind::Other` is the catch-all rpassword sometimes uses
+/// when the underlying syscall returns an OS error it doesn't map to
+/// a more specific kind. We additionally check `raw_os_error` so we
+/// don't over-translate genuine I/O errors that happen to be Other-
+/// kind.
+#[cfg(unix)]
+fn is_no_tty_error(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::ENXIO) | Some(libc::EIO) | Some(libc::ENOTTY))
+}
+
+#[cfg(not(unix))]
+fn is_no_tty_error(_e: &std::io::Error) -> bool {
+    // Windows: rpassword uses CONIN$/CONOUT$ instead of /dev/tty,
+    // and the no-console failure shape is different. Defer to the
+    // generic IO error path until we have a documented Windows
+    // failure to translate.
+    false
 }
 
 #[cfg(test)]

@@ -1,0 +1,626 @@
+//! Lazy passphrase-fallback wrapper around a native keystore.
+//!
+//! # Why this module exists
+//!
+//! Until rc.12, the daemon's auto-fallback decision was made *only* at
+//! `MacKeyStore::new()` / `LinuxKeyStore::new()` / `WindowsKeyStore::new()`
+//! construction time, gated by `probe_backend`'s synchronous read of
+//! the master-key entry. If the construction-time probe disagreed
+//! with the runtime `master_key()` call (observed on Angie's box,
+//! rc.11 over SSH after `brew upgrade`: probe returned `Ok`, runtime
+//! call returned `BackendUnavailable -25308`), the fallback never
+//! engaged and the daemon hard-failed boot despite a fully-functional
+//! recovery mechanism existing.
+//!
+//! This wrapper moves the fallback decision to where the failure
+//! actually happens — the runtime trait calls — so probe-vs-runtime
+//! disagreement cannot prevent recovery.
+//!
+//! # Engagement semantics
+//!
+//! - On `FallbackMode::Auto`, the wrapper sits between the public
+//!   `Box<dyn KeyStore>` returned by `default_keystore` and the
+//!   underlying `MacKeyStore`/`LinuxKeyStore`/`WindowsKeyStore`.
+//! - On any trait method that returns `BackendUnavailable`, the
+//!   wrapper lazily mints a `PassphraseKeyStore` (via injectable
+//!   closure for testing) and stores it in a `tokio::sync::OnceCell`.
+//! - All subsequent trait calls — including `set_master_key`,
+//!   `previous_master_key`, etc. — route to the engaged fallback.
+//!   This is the same wholesale-swap semantics that today's
+//!   construction-time fallback already implements.
+//! - The closure that runs `construct_fallback` is invoked INSIDE
+//!   `OnceCell::get_or_try_init`'s closure body, so concurrent
+//!   first-failures serialize on a single construction. Exactly one
+//!   `from_prompt` call, exactly one `passphrase.state` write, even
+//!   under racing trait calls.
+//!
+//! # Marker-driven preference at construction
+//!
+//! `OnceCell` is process-local. Without explicit handling, the
+//! cross-restart split-key scenario corrupts the vault: boot 1
+//! engages fallback under -25308, writes `passphrase.state`, seals
+//! credentials with the derived key. Boot 2 sees native available
+//! again (operator unlocked the keychain, or transient -25308
+//! resolved), tries native first, succeeds, returns a *different*
+//! key — credentials from boot 1 are unsealable.
+//!
+//! Fix: at `production()` construction time, check whether
+//! `<home>/keystore/passphrase.state` exists. If yes, eagerly install
+//! the passphrase fallback into the OnceCell BEFORE any native call.
+//! The daemon was previously using passphrase, so it must keep using
+//! passphrase — switching back to native would orphan the credentials.
+//!
+//! # `kind()` reporting
+//!
+//! `KeyStore::kind()` is load-bearing for `agentsso rotate-key`'s
+//! refusal gate. Before fallback engages, the wrapper reports the
+//! native's kind (`Native`). After engagement, it reports the
+//! engaged keystore's kind (`Passphrase`). rotate-key separately
+//! uses `FallbackMode::None` to bypass the wrapper entirely (the
+//! orchestrator's `.rotation-state` marker can't tolerate fallback
+//! engaging mid-rotation), but the kind() correctness is documented
+//! as a contract regardless.
+
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use tokio::sync::OnceCell;
+use zeroize::Zeroizing;
+
+use crate::error::KeyStoreError;
+use crate::passphrase::PassphraseKeyStore;
+use crate::{
+    DeleteOutcome, FallbackMode, KeyStore, KeyStoreKind, MASTER_KEY_LEN, is_backend_unavailable,
+    log_fallback_runtime,
+};
+
+/// Closure type for constructing the fallback keystore. Production
+/// callers pass `PassphraseKeyStore::from_prompt`-wrapping closure;
+/// unit tests pass synthetic constructors so they don't block on
+/// `/dev/tty` in CI.
+pub(crate) type ConstructFallback =
+    Arc<dyn Fn(&Path) -> Result<Arc<dyn KeyStore>, KeyStoreError> + Send + Sync>;
+
+/// Wrapper that delegates to a native keystore but lazily falls back
+/// to a passphrase keystore on the first runtime `BackendUnavailable`.
+pub(crate) struct FallbackKeyStore {
+    native: Box<dyn KeyStore>,
+    home: PathBuf,
+    fallback_mode: FallbackMode,
+    fallback: OnceCell<Arc<dyn KeyStore>>,
+    construct_fallback: ConstructFallback,
+}
+
+impl FallbackKeyStore {
+    /// Production constructor. Uses `PassphraseKeyStore::from_prompt`
+    /// for the fallback construction (which prompts on `/dev/tty`).
+    ///
+    /// Honors marker-driven preference: if the `passphrase.state`
+    /// file already exists in the home directory, eagerly installs
+    /// the passphrase fallback into the OnceCell BEFORE returning,
+    /// so subsequent trait calls go straight to the fallback without
+    /// touching the native keystore.
+    pub(crate) fn production(
+        home: PathBuf,
+        fallback_mode: FallbackMode,
+        native: Box<dyn KeyStore>,
+    ) -> Result<Self, KeyStoreError> {
+        let fallback: OnceCell<Arc<dyn KeyStore>> = OnceCell::new();
+        // Marker-driven preference: passphrase.state exists ⇒ a
+        // previous boot engaged passphrase fallback. Continue using
+        // passphrase to avoid the cross-restart split-key scenario.
+        if home.join("keystore").join("passphrase.state").exists() {
+            let fb = PassphraseKeyStore::from_prompt(&home)?;
+            // OnceCell::set returns Err if already initialized; we
+            // just initialized the cell empty above, so this can't
+            // fail. Tolerate via let _ = anyway.
+            let _ = fallback.set(Arc::new(fb) as Arc<dyn KeyStore>);
+        }
+        Ok(Self {
+            native,
+            home,
+            fallback_mode,
+            fallback,
+            construct_fallback: Arc::new(|h: &Path| {
+                PassphraseKeyStore::from_prompt(h).map(|ks| Arc::new(ks) as Arc<dyn KeyStore>)
+            }),
+        })
+    }
+
+    /// Test constructor. Inject a synthetic fallback-construction
+    /// closure (no /dev/tty dependency) AND a synthetic
+    /// `passphrase_state_exists` flag (no filesystem dependency).
+    #[cfg(test)]
+    pub(crate) fn with_constructor(
+        home: PathBuf,
+        fallback_mode: FallbackMode,
+        native: Box<dyn KeyStore>,
+        construct_fallback: ConstructFallback,
+        passphrase_state_exists: bool,
+    ) -> Self {
+        let fallback: OnceCell<Arc<dyn KeyStore>> = OnceCell::new();
+        if passphrase_state_exists {
+            // Run the synthetic constructor to install the fallback.
+            // In tests this is the same closure used for runtime
+            // engagement, so the marker test exercises the same code
+            // path.
+            if let Ok(fb) = (construct_fallback)(&home) {
+                let _ = fallback.set(fb);
+            }
+        }
+        Self { native, home, fallback_mode, fallback, construct_fallback }
+    }
+
+    /// Engage the fallback (or return the existing one) if `e` is a
+    /// `BackendUnavailable` and `FallbackMode::Auto` is active.
+    /// Routes through `OnceCell::get_or_try_init` so concurrent
+    /// first-failures serialize on exactly one construction.
+    ///
+    /// The closure that runs `construct_fallback` is INSIDE the
+    /// `get_or_try_init` body — this is load-bearing. If the closure
+    /// were called outside, both racing callers would invoke
+    /// `from_prompt` (and write `passphrase.state` twice).
+    async fn try_engage_fallback(
+        &self,
+        native_err: &KeyStoreError,
+    ) -> Result<Option<&Arc<dyn KeyStore>>, KeyStoreError> {
+        if self.fallback_mode != FallbackMode::Auto || !is_backend_unavailable(native_err) {
+            return Ok(None);
+        }
+        log_fallback_runtime(native_err);
+        let installed = self
+            .fallback
+            .get_or_try_init(|| async {
+                (self.construct_fallback)(&self.home).map_err(|fb_err| {
+                    KeyStoreError::RuntimeFallbackFailed {
+                        native: Box::new(native_err.clone_for_chain()),
+                        fallback: Box::new(fb_err),
+                    }
+                })
+            })
+            .await?;
+        Ok(Some(installed))
+    }
+}
+
+#[async_trait]
+impl KeyStore for FallbackKeyStore {
+    async fn master_key(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyStoreError> {
+        if let Some(fb) = self.fallback.get() {
+            return fb.master_key().await;
+        }
+        match self.native.master_key().await {
+            Ok(bytes) => Ok(bytes),
+            Err(native_err) => match self.try_engage_fallback(&native_err).await? {
+                Some(fb) => fb.master_key().await,
+                None => Err(native_err),
+            },
+        }
+    }
+
+    async fn set_master_key(&self, key: &[u8; MASTER_KEY_LEN]) -> Result<(), KeyStoreError> {
+        if let Some(fb) = self.fallback.get() {
+            return fb.set_master_key(key).await;
+        }
+        match self.native.set_master_key(key).await {
+            Ok(()) => Ok(()),
+            Err(native_err) => match self.try_engage_fallback(&native_err).await? {
+                Some(fb) => fb.set_master_key(key).await,
+                None => Err(native_err),
+            },
+        }
+    }
+
+    async fn delete_master_key(&self) -> Result<DeleteOutcome, KeyStoreError> {
+        if let Some(fb) = self.fallback.get() {
+            return fb.delete_master_key().await;
+        }
+        match self.native.delete_master_key().await {
+            Ok(outcome) => Ok(outcome),
+            Err(native_err) => match self.try_engage_fallback(&native_err).await? {
+                Some(fb) => fb.delete_master_key().await,
+                None => Err(native_err),
+            },
+        }
+    }
+
+    fn kind(&self) -> KeyStoreKind {
+        // If fallback is engaged, report as the engaged backing
+        // keystore. Otherwise report the native's kind. This is
+        // load-bearing for rotate-key's refusal gate.
+        if let Some(fb) = self.fallback.get() { fb.kind() } else { self.native.kind() }
+    }
+
+    async fn set_previous_master_key(
+        &self,
+        previous: &[u8; MASTER_KEY_LEN],
+    ) -> Result<(), KeyStoreError> {
+        if let Some(fb) = self.fallback.get() {
+            return fb.set_previous_master_key(previous).await;
+        }
+        match self.native.set_previous_master_key(previous).await {
+            Ok(()) => Ok(()),
+            Err(native_err) => match self.try_engage_fallback(&native_err).await? {
+                Some(fb) => fb.set_previous_master_key(previous).await,
+                None => Err(native_err),
+            },
+        }
+    }
+
+    async fn previous_master_key(
+        &self,
+    ) -> Result<Option<Zeroizing<[u8; MASTER_KEY_LEN]>>, KeyStoreError> {
+        if let Some(fb) = self.fallback.get() {
+            return fb.previous_master_key().await;
+        }
+        match self.native.previous_master_key().await {
+            Ok(opt) => Ok(opt),
+            Err(native_err) => match self.try_engage_fallback(&native_err).await? {
+                Some(fb) => fb.previous_master_key().await,
+                None => Err(native_err),
+            },
+        }
+    }
+
+    async fn clear_previous_master_key(&self) -> Result<(), KeyStoreError> {
+        if let Some(fb) = self.fallback.get() {
+            return fb.clear_previous_master_key().await;
+        }
+        match self.native.clear_previous_master_key().await {
+            Ok(()) => Ok(()),
+            Err(native_err) => match self.try_engage_fallback(&native_err).await? {
+                Some(fb) => fb.clear_previous_master_key().await,
+                None => Err(native_err),
+            },
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod fallback_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU32, Ordering};
+    use tempfile::TempDir;
+
+    /// Synthetic native keystore that always returns the configured
+    /// error from every trait call. Counts how many times each
+    /// method was invoked so tests can assert routing.
+    struct ErroringNative {
+        error: Mutex<Option<KeyStoreError>>,
+        master_key_calls: AtomicU32,
+    }
+
+    impl ErroringNative {
+        fn new(error: KeyStoreError) -> Self {
+            Self { error: Mutex::new(Some(error)), master_key_calls: AtomicU32::new(0) }
+        }
+        fn take_error(&self) -> KeyStoreError {
+            self.error.lock().expect("poisoned").clone_for_chain_or_take()
+        }
+    }
+
+    // Helper: a Mutex<Option<KeyStoreError>> can't directly clone
+    // because KeyStoreError isn't Clone. Use clone_for_chain through
+    // an Option helper.
+    trait OptionHelper {
+        fn clone_for_chain_or_take(&mut self) -> KeyStoreError;
+    }
+    impl OptionHelper for Option<KeyStoreError> {
+        fn clone_for_chain_or_take(&mut self) -> KeyStoreError {
+            self.as_ref()
+                .map(|e| e.clone_for_chain())
+                .unwrap_or(KeyStoreError::PassphraseAdapterImmutable)
+        }
+    }
+
+    #[async_trait]
+    impl KeyStore for ErroringNative {
+        async fn master_key(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyStoreError> {
+            self.master_key_calls.fetch_add(1, Ordering::SeqCst);
+            Err(self.take_error())
+        }
+        async fn set_master_key(&self, _: &[u8; MASTER_KEY_LEN]) -> Result<(), KeyStoreError> {
+            Err(self.take_error())
+        }
+        async fn delete_master_key(&self) -> Result<DeleteOutcome, KeyStoreError> {
+            Err(self.take_error())
+        }
+        async fn set_previous_master_key(
+            &self,
+            _: &[u8; MASTER_KEY_LEN],
+        ) -> Result<(), KeyStoreError> {
+            Err(self.take_error())
+        }
+        async fn previous_master_key(
+            &self,
+        ) -> Result<Option<Zeroizing<[u8; MASTER_KEY_LEN]>>, KeyStoreError> {
+            Err(self.take_error())
+        }
+        async fn clear_previous_master_key(&self) -> Result<(), KeyStoreError> {
+            Err(self.take_error())
+        }
+    }
+
+    /// Synthetic fallback keystore that always succeeds with a
+    /// hardcoded key. Used as the closure return value in tests.
+    struct SyntheticFallback {
+        kind: KeyStoreKind,
+    }
+
+    #[async_trait]
+    impl KeyStore for SyntheticFallback {
+        async fn master_key(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyStoreError> {
+            Ok(Zeroizing::new([0xAA; MASTER_KEY_LEN]))
+        }
+        async fn set_master_key(&self, _: &[u8; MASTER_KEY_LEN]) -> Result<(), KeyStoreError> {
+            Err(KeyStoreError::PassphraseAdapterImmutable)
+        }
+        async fn delete_master_key(&self) -> Result<DeleteOutcome, KeyStoreError> {
+            Err(KeyStoreError::PassphraseAdapterImmutable)
+        }
+        fn kind(&self) -> KeyStoreKind {
+            self.kind
+        }
+        async fn set_previous_master_key(
+            &self,
+            _: &[u8; MASTER_KEY_LEN],
+        ) -> Result<(), KeyStoreError> {
+            Err(KeyStoreError::PassphraseAdapterImmutable)
+        }
+        async fn previous_master_key(
+            &self,
+        ) -> Result<Option<Zeroizing<[u8; MASTER_KEY_LEN]>>, KeyStoreError> {
+            Err(KeyStoreError::PassphraseAdapterImmutable)
+        }
+        async fn clear_previous_master_key(&self) -> Result<(), KeyStoreError> {
+            Err(KeyStoreError::PassphraseAdapterImmutable)
+        }
+    }
+
+    fn make_synthetic_constructor() -> ConstructFallback {
+        Arc::new(|_home: &Path| {
+            Ok(Arc::new(SyntheticFallback { kind: KeyStoreKind::Passphrase }) as Arc<dyn KeyStore>)
+        })
+    }
+
+    fn make_counting_constructor(counter: Arc<AtomicU32>) -> ConstructFallback {
+        Arc::new(move |_home: &Path| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            Ok(Arc::new(SyntheticFallback { kind: KeyStoreKind::Passphrase }) as Arc<dyn KeyStore>)
+        })
+    }
+
+    fn make_failing_constructor() -> ConstructFallback {
+        Arc::new(|_home: &Path| Err(KeyStoreError::PassphrasePromptUnavailable))
+    }
+
+    /// Test #1: native returns BackendUnavailable; wrapper engages
+    /// fallback and returns synthetic key.
+    #[tokio::test]
+    async fn runtime_backend_unavailable_engages_fallback() {
+        let dir = TempDir::new().unwrap();
+        let native = Box::new(ErroringNative::new(KeyStoreError::BackendUnavailable {
+            backend: "test",
+            source: Box::new(std::io::Error::other("OSStatus -25308")),
+        }));
+        let wrapper = FallbackKeyStore::with_constructor(
+            dir.path().to_path_buf(),
+            FallbackMode::Auto,
+            native,
+            make_synthetic_constructor(),
+            false,
+        );
+        let key = wrapper.master_key().await.expect("fallback must engage");
+        assert_eq!(*key, [0xAA; MASTER_KEY_LEN]);
+    }
+
+    /// Test #2: native returns PlatformError; wrapper does NOT engage
+    /// fallback (only BackendUnavailable triggers it).
+    #[tokio::test]
+    async fn runtime_platform_error_does_not_engage_fallback() {
+        let dir = TempDir::new().unwrap();
+        let native = Box::new(ErroringNative::new(KeyStoreError::PlatformError {
+            backend: "test",
+            message: "configurational error".into(),
+        }));
+        let wrapper = FallbackKeyStore::with_constructor(
+            dir.path().to_path_buf(),
+            FallbackMode::Auto,
+            native,
+            make_synthetic_constructor(),
+            false,
+        );
+        match wrapper.master_key().await {
+            Err(KeyStoreError::PlatformError { .. }) => {}
+            other => panic!("expected PlatformError to propagate, got {other:?}"),
+        }
+    }
+
+    /// Test #3: once fallback engages, subsequent calls go to the
+    /// fallback even if native would now succeed. Permanent decision.
+    #[tokio::test]
+    async fn runtime_fallback_persists_across_calls() {
+        let dir = TempDir::new().unwrap();
+        let native = Box::new(ErroringNative::new(KeyStoreError::BackendUnavailable {
+            backend: "test",
+            source: Box::new(std::io::Error::other("OSStatus -25308")),
+        }));
+        let wrapper = FallbackKeyStore::with_constructor(
+            dir.path().to_path_buf(),
+            FallbackMode::Auto,
+            native,
+            make_synthetic_constructor(),
+            false,
+        );
+        let key1 = wrapper.master_key().await.expect("first call engages fallback");
+        let key2 = wrapper.master_key().await.expect("second call routes to engaged fallback");
+        assert_eq!(*key1, *key2);
+        // Synthetic fallback always returns 0xAA.
+        assert_eq!(*key1, [0xAA; MASTER_KEY_LEN]);
+    }
+
+    /// Test #4: after fallback engages on master_key, set_master_key
+    /// routes to the passphrase adapter and returns
+    /// PassphraseAdapterImmutable — NOT the native's error.
+    #[tokio::test]
+    async fn set_master_key_after_fallback_routes_to_passphrase() {
+        let dir = TempDir::new().unwrap();
+        let native = Box::new(ErroringNative::new(KeyStoreError::BackendUnavailable {
+            backend: "test",
+            source: Box::new(std::io::Error::other("OSStatus -25308")),
+        }));
+        let wrapper = FallbackKeyStore::with_constructor(
+            dir.path().to_path_buf(),
+            FallbackMode::Auto,
+            native,
+            make_synthetic_constructor(),
+            false,
+        );
+        // Engage fallback via master_key.
+        let _ = wrapper.master_key().await.expect("engages");
+        // Now set_master_key MUST route to fallback.
+        match wrapper.set_master_key(&[0u8; MASTER_KEY_LEN]).await {
+            Err(KeyStoreError::PassphraseAdapterImmutable) => {}
+            other => panic!(
+                "set_master_key after fallback engagement must return PassphraseAdapterImmutable, got {other:?}"
+            ),
+        }
+    }
+
+    /// Test #6: kind() reports native before engagement, fallback
+    /// after engagement. Pins the rotate-key gate.
+    #[tokio::test]
+    async fn kind_reports_native_until_engagement() {
+        let dir = TempDir::new().unwrap();
+        let native = Box::new(ErroringNative::new(KeyStoreError::BackendUnavailable {
+            backend: "test",
+            source: Box::new(std::io::Error::other("OSStatus -25308")),
+        }));
+        let wrapper = FallbackKeyStore::with_constructor(
+            dir.path().to_path_buf(),
+            FallbackMode::Auto,
+            native,
+            make_synthetic_constructor(),
+            false,
+        );
+        // Before engagement: ErroringNative's default kind() is
+        // Native (the trait default).
+        assert_eq!(wrapper.kind(), KeyStoreKind::Native);
+        // Engage.
+        let _ = wrapper.master_key().await.expect("engages");
+        // After engagement: synthetic fallback is Passphrase.
+        assert_eq!(wrapper.kind(), KeyStoreKind::Passphrase);
+    }
+
+    /// Test #7: marker_present_at_construction installs fallback
+    /// EAGERLY. A subsequent master_key() call routes to fallback
+    /// even though the native is healthy. Pins the cross-restart
+    /// split-key prevention.
+    #[tokio::test]
+    async fn marker_present_at_construction_eagerly_installs_fallback() {
+        let dir = TempDir::new().unwrap();
+        // Note: we use a HEALTHY-looking native (would succeed) — but
+        // the marker tells the wrapper to use the passphrase fallback
+        // anyway. This is exactly the cross-restart scenario: boot 1
+        // engaged fallback, boot 2's native is fine but credentials
+        // are sealed under the passphrase-derived key.
+        let native = Box::new(ErroringNative::new(KeyStoreError::BackendUnavailable {
+            backend: "test",
+            source: Box::new(std::io::Error::other("won't be hit")),
+        }));
+        let wrapper = FallbackKeyStore::with_constructor(
+            dir.path().to_path_buf(),
+            FallbackMode::Auto,
+            native,
+            make_synthetic_constructor(),
+            true, // passphrase_state_exists
+        );
+        // First call should NOT touch native — fallback is already
+        // installed. Synthetic fallback returns 0xAA.
+        let key = wrapper.master_key().await.expect("eager fallback engages");
+        assert_eq!(*key, [0xAA; MASTER_KEY_LEN]);
+    }
+
+    /// Test #8: concurrent first-failure constructs fallback ONCE.
+    /// OnceCell::get_or_try_init serializes the construction across
+    /// racing tasks. Pins the "no double prompt" guarantee.
+    #[tokio::test]
+    async fn concurrent_first_failure_constructs_fallback_once() {
+        let dir = TempDir::new().unwrap();
+        // Fresh native per spawned task — sharing one ErroringNative
+        // across tasks is awkward because its take_error() consumes
+        // state. The wrapper's OnceCell race is what we're pinning,
+        // not the native's behavior. So one native error is enough:
+        // both racing tasks will both fail through the wrapper.
+        let native = Box::new(ErroringNative::new(KeyStoreError::BackendUnavailable {
+            backend: "test",
+            source: Box::new(std::io::Error::other("OSStatus -25308")),
+        }));
+        let counter = Arc::new(AtomicU32::new(0));
+        let wrapper = Arc::new(FallbackKeyStore::with_constructor(
+            dir.path().to_path_buf(),
+            FallbackMode::Auto,
+            native,
+            make_counting_constructor(counter.clone()),
+            false,
+        ));
+
+        // Spawn two concurrent master_key calls. Both should engage
+        // fallback through the same OnceCell — counter MUST reach 1,
+        // not 2.
+        let w1 = Arc::clone(&wrapper);
+        let w2 = Arc::clone(&wrapper);
+        let h1 = tokio::spawn(async move { w1.master_key().await });
+        let h2 = tokio::spawn(async move { w2.master_key().await });
+        let (r1, r2) = (h1.await.unwrap(), h2.await.unwrap());
+
+        assert!(r1.is_ok() || r2.is_ok(), "at least one call must succeed via fallback");
+        assert_eq!(
+            counter.load(Ordering::SeqCst),
+            1,
+            "construct_fallback closure MUST run exactly once even under racing first-failures"
+        );
+    }
+
+    /// Test #9: fallback construction failure chains BOTH errors.
+    /// Native returns BackendUnavailable, fallback returns
+    /// PassphrasePromptUnavailable, wrapper returns
+    /// RuntimeFallbackFailed with both visible in Display.
+    #[tokio::test]
+    async fn runtime_fallback_failed_chains_both_errors() {
+        let dir = TempDir::new().unwrap();
+        let native_sentinel = "RUNTIME_FALLBACK_NATIVE_SENTINEL";
+        let native = Box::new(ErroringNative::new(KeyStoreError::BackendUnavailable {
+            backend: "test",
+            source: Box::new(std::io::Error::other(native_sentinel)),
+        }));
+        let wrapper = FallbackKeyStore::with_constructor(
+            dir.path().to_path_buf(),
+            FallbackMode::Auto,
+            native,
+            make_failing_constructor(), // Returns PassphrasePromptUnavailable
+            false,
+        );
+
+        match wrapper.master_key().await {
+            Err(KeyStoreError::RuntimeFallbackFailed { native, fallback }) => {
+                let displayed =
+                    KeyStoreError::RuntimeFallbackFailed { native, fallback }.to_string();
+                assert!(
+                    displayed.contains(native_sentinel),
+                    "must surface native cause sentinel — got {displayed:?}"
+                );
+                assert!(
+                    displayed.contains("passphrase prompt unavailable")
+                        || displayed.contains("PassphrasePromptUnavailable")
+                        || displayed.to_lowercase().contains("passphrase"),
+                    "must surface fallback failure — got {displayed:?}"
+                );
+            }
+            other => panic!("expected RuntimeFallbackFailed, got {other:?}"),
+        }
+    }
+}

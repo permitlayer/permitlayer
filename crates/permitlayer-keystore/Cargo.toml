@@ -34,6 +34,13 @@ subtle.workspace = true
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
 
+# Unix-only: errno constants used by `passphrase::is_no_tty_error` to
+# detect rpassword's no-controlling-terminal failure shape (ENXIO /
+# EIO / ENOTTY) and translate it into the structured
+# `KeyStoreError::PassphrasePromptUnavailable` variant.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "time", "test-util"] }
 walkdir.workspace = true

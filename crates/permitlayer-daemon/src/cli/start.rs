@@ -1540,11 +1540,15 @@ impl StartError {
                  \n\
                  common causes:\n\
                  - on macOS: the login keychain is locked — unlock it and retry.\n\
-                   If you just ran `brew upgrade agentsso`, the new binary's\n\
-                   codesign hash invalidated the keychain ACL on the existing\n\
-                   master-key entry; the auto-fallback should have dropped to a\n\
-                   passphrase prompt — if you saw this banner instead, the\n\
-                   keychain failure was a non-ACL platform error.\n\
+                   After `brew upgrade agentsso`, the new binary's codesign hash\n\
+                   invalidates the keychain ACL on the existing master-key entry;\n\
+                   on a TTY-attached session (interactive terminal, SSH with TTY)\n\
+                   the daemon should have dropped to a passphrase prompt. If you\n\
+                   see this banner instead, you are likely running under launchd\n\
+                   (`brew services start agentsso`), `ssh -T`, or another\n\
+                   non-interactive context where the prompt cannot be displayed.\n\
+                   See README \"Recovery after `brew upgrade agentsso`\" for\n\
+                   recovery steps.\n\
                  - on linux: the secret-service daemon is not running\n\
                    (install `libsecret` / `gnome-keyring-daemon` and start a session)\n\
                  - on fresh CI containers: no keyring backend available —\n\

@@ -2240,6 +2240,7 @@ dependencies = [
  "async-trait",
  "hmac",
  "keyring",
+ "libc",
  "rand 0.8.5",
  "rpassword",
  "security-framework 3.7.0",
