@@ -1450,6 +1450,35 @@ pub(crate) enum StartError {
     },
 }
 
+/// Append a structured-cause tail to a keystore-error banner ONLY for
+/// `KeyStoreError` variants we author whose `Display` carries
+/// operator-actionable recovery guidance. Hermetic-banner discipline:
+/// we explicitly whitelist variants rather than rendering arbitrary
+/// `KeyStoreError::Display` (which could leak filesystem paths or
+/// keyring crate internals into operator stderr).
+///
+/// Currently whitelisted:
+/// - `PassphrasePromptUnavailable`: tells the operator they're under
+///   launchd / non-TTY and gives the recovery path.
+/// - `RuntimeFallbackFailed`: chains the native cause AND the fallback
+///   failure so operators can see "we tried -25308 → tried passphrase
+///   prompt → no TTY" in one line.
+fn append_structured_keystore_tail(
+    banner: &mut String,
+    source: &permitlayer_keystore::KeyStoreError,
+) {
+    use permitlayer_keystore::KeyStoreError as E;
+    match source {
+        E::PassphrasePromptUnavailable | E::RuntimeFallbackFailed { .. } => {
+            banner.push('\n');
+            banner.push_str("structured cause: ");
+            banner.push_str(&source.to_string());
+            banner.push('\n');
+        }
+        _ => {}
+    }
+}
+
 impl StartError {
     /// Map each variant to its operator-facing exit code. See the
     /// `StartError` doc comment for the exit code semantics.
@@ -1511,8 +1540,8 @@ impl StartError {
             // subscriber via `tracing::error!` in `main()` — operators
             // who need the raw cause can grep the log, while the
             // banner stays hermetic.
-            Self::KeystoreConstruction { .. } => {
-                "error: failed to construct the platform keystore adapter.\n\
+            Self::KeystoreConstruction { source } => {
+                let mut banner = "error: failed to construct the platform keystore adapter.\n\
                  \n\
                  the daemon cannot boot without a keystore — every authenticated\n\
                  request would return 401 and the vault cannot decrypt credentials.\n\
@@ -1531,9 +1560,12 @@ impl StartError {
                    install a software keyring, or use a dev build.\n\
                  \n\
                  run with `AGENTSSO_LOG__LEVEL=debug` for the underlying error.\n"
-                    .to_owned()
+                    .to_owned();
+                append_structured_keystore_tail(&mut banner, source);
+                banner
             }
-            Self::MasterKeyCall { .. } => "error: failed to provision the vault master key.\n\
+            Self::MasterKeyCall { source } => {
+                let mut banner = "error: failed to provision the vault master key.\n\
                  \n\
                  the daemon cannot boot without a master key — every authenticated\n\
                  request would return 401 and the vault cannot decrypt credentials.\n\
@@ -1555,7 +1587,10 @@ impl StartError {
                    install a software keyring, or use a dev build.\n\
                  \n\
                  run with `AGENTSSO_LOG__LEVEL=debug` for the underlying error.\n"
-                .to_owned(),
+                    .to_owned();
+                append_structured_keystore_tail(&mut banner, source);
+                banner
+            }
             Self::HkdfExpand => "error: HKDF expansion of the agent token lookup subkey failed \
                  unexpectedly.\n\
                  This is a cryptographic library error and should not happen in normal operation.\n\

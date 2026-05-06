@@ -293,11 +293,41 @@ fn maybe_wrap_native(
     }
 }
 
+/// Marker-driven preference: if `<home>/keystore/passphrase.state`
+/// exists, a previous boot engaged passphrase fallback. We MUST keep
+/// using passphrase regardless of whether native is now available —
+/// switching back to native would mint a different key and orphan
+/// every credential sealed under the passphrase-derived key. This
+/// check fires BEFORE constructing the native adapter, so a hung or
+/// surprising native probe cannot bypass marker preference.
+///
+/// Returns `Some(boxed_passphrase_keystore)` when the marker exists
+/// and we should short-circuit native entirely. Returns `None` when
+/// the marker is absent and the caller should proceed with the
+/// normal native-or-fallback flow.
+#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+fn marker_short_circuit(
+    home: &std::path::Path,
+    fallback: FallbackMode,
+) -> Result<Option<Box<dyn KeyStore>>, KeyStoreError> {
+    if fallback != FallbackMode::Auto {
+        return Ok(None);
+    }
+    if !home.join("keystore").join("passphrase.state").exists() {
+        return Ok(None);
+    }
+    let fb = PassphraseKeyStore::from_prompt(home)?;
+    Ok(Some(Box::new(fb)))
+}
+
 #[cfg(target_os = "macos")]
 fn native_or_fallback(
     home: &std::path::Path,
     fallback: FallbackMode,
 ) -> Result<Box<dyn KeyStore>, KeyStoreError> {
+    if let Some(passphrase) = marker_short_circuit(home, fallback)? {
+        return Ok(passphrase);
+    }
     match MacKeyStore::new() {
         Ok(ks) => maybe_wrap_native(home, fallback, Box::new(ks)),
         Err(e) if fallback == FallbackMode::Auto && is_backend_unavailable(&e) => {
@@ -313,6 +343,9 @@ fn native_or_fallback(
     home: &std::path::Path,
     fallback: FallbackMode,
 ) -> Result<Box<dyn KeyStore>, KeyStoreError> {
+    if let Some(passphrase) = marker_short_circuit(home, fallback)? {
+        return Ok(passphrase);
+    }
     match LinuxKeyStore::new() {
         Ok(ks) => maybe_wrap_native(home, fallback, Box::new(ks)),
         Err(e) if fallback == FallbackMode::Auto && is_backend_unavailable(&e) => {
@@ -328,6 +361,9 @@ fn native_or_fallback(
     home: &std::path::Path,
     fallback: FallbackMode,
 ) -> Result<Box<dyn KeyStore>, KeyStoreError> {
+    if let Some(passphrase) = marker_short_circuit(home, fallback)? {
+        return Ok(passphrase);
+    }
     match WindowsKeyStore::new() {
         Ok(ks) => maybe_wrap_native(home, fallback, Box::new(ks)),
         Err(e) if fallback == FallbackMode::Auto && is_backend_unavailable(&e) => {

@@ -96,27 +96,19 @@ impl FallbackKeyStore {
     /// Production constructor. Uses `PassphraseKeyStore::from_prompt`
     /// for the fallback construction (which prompts on `/dev/tty`).
     ///
-    /// Honors marker-driven preference: if the `passphrase.state`
-    /// file already exists in the home directory, eagerly installs
-    /// the passphrase fallback into the OnceCell BEFORE returning,
-    /// so subsequent trait calls go straight to the fallback without
-    /// touching the native keystore.
+    /// Note: marker-driven preference (the "passphrase.state exists ⇒
+    /// stay in passphrase mode" rule) is enforced by
+    /// `lib.rs::marker_short_circuit` BEFORE we get here. By the time
+    /// `production()` is called, the marker is known to be absent —
+    /// otherwise the caller would have returned a bare
+    /// `PassphraseKeyStore` and never constructed the wrapper. So
+    /// we don't need to re-check the marker here.
     pub(crate) fn production(
         home: PathBuf,
         fallback_mode: FallbackMode,
         native: Box<dyn KeyStore>,
     ) -> Result<Self, KeyStoreError> {
         let fallback: OnceCell<Arc<dyn KeyStore>> = OnceCell::new();
-        // Marker-driven preference: passphrase.state exists ⇒ a
-        // previous boot engaged passphrase fallback. Continue using
-        // passphrase to avoid the cross-restart split-key scenario.
-        if home.join("keystore").join("passphrase.state").exists() {
-            let fb = PassphraseKeyStore::from_prompt(&home)?;
-            // OnceCell::set returns Err if already initialized; we
-            // just initialized the cell empty above, so this can't
-            // fail. Tolerate via let _ = anyway.
-            let _ = fallback.set(Arc::new(fb) as Arc<dyn KeyStore>);
-        }
         Ok(Self {
             native,
             home,
@@ -302,9 +294,14 @@ mod fallback_tests {
         }
     }
 
-    // Helper: a Mutex<Option<KeyStoreError>> can't directly clone
-    // because KeyStoreError isn't Clone. Use clone_for_chain through
-    // an Option helper.
+    // Helper: KeyStoreError doesn't implement Clone (Box<dyn Error>
+    // sources aren't Clone-safe), so we use the `clone_for_chain`
+    // helper which preserves error semantics with lossy substitution
+    // for the few non-Clone variants. Each call to this method
+    // returns a CLONE of the stored error — the original is left in
+    // place, so subsequent trait calls on the same `ErroringNative`
+    // also see the configured error. (The misleading `take` in the
+    // method name is a holdover; it's never actually `take()`.)
     trait OptionHelper {
         fn clone_for_chain_or_take(&mut self) -> KeyStoreError;
     }
@@ -547,14 +544,16 @@ mod fallback_tests {
     /// Test #8: concurrent first-failure constructs fallback ONCE.
     /// OnceCell::get_or_try_init serializes the construction across
     /// racing tasks. Pins the "no double prompt" guarantee.
-    #[tokio::test]
+    ///
+    /// Uses `flavor = "multi_thread"` so spawned tasks actually run on
+    /// distinct worker threads (the default `current_thread` flavor
+    /// would serialize them on the test thread, making the race
+    /// untestable). 16 tasks + a `Barrier` synchronize their start so
+    /// they all hit `try_engage_fallback` together.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_first_failure_constructs_fallback_once() {
+        const N: usize = 16;
         let dir = TempDir::new().unwrap();
-        // Fresh native per spawned task — sharing one ErroringNative
-        // across tasks is awkward because its take_error() consumes
-        // state. The wrapper's OnceCell race is what we're pinning,
-        // not the native's behavior. So one native error is enough:
-        // both racing tasks will both fail through the wrapper.
         let native = Box::new(ErroringNative::new(KeyStoreError::BackendUnavailable {
             backend: "test",
             source: Box::new(std::io::Error::other("OSStatus -25308")),
@@ -568,16 +567,27 @@ mod fallback_tests {
             false,
         ));
 
-        // Spawn two concurrent master_key calls. Both should engage
-        // fallback through the same OnceCell — counter MUST reach 1,
-        // not 2.
-        let w1 = Arc::clone(&wrapper);
-        let w2 = Arc::clone(&wrapper);
-        let h1 = tokio::spawn(async move { w1.master_key().await });
-        let h2 = tokio::spawn(async move { w2.master_key().await });
-        let (r1, r2) = (h1.await.unwrap(), h2.await.unwrap());
-
-        assert!(r1.is_ok() || r2.is_ok(), "at least one call must succeed via fallback");
+        let barrier = Arc::new(tokio::sync::Barrier::new(N));
+        let mut handles = Vec::with_capacity(N);
+        for _ in 0..N {
+            let w = Arc::clone(&wrapper);
+            let b = Arc::clone(&barrier);
+            handles.push(tokio::spawn(async move {
+                // All N tasks wait at the barrier, then ALL release
+                // simultaneously. Maximizes the chance that multiple
+                // tasks reach try_engage_fallback before any of them
+                // installs the OnceCell.
+                b.wait().await;
+                w.master_key().await
+            }));
+        }
+        let mut at_least_one_ok = false;
+        for h in handles {
+            if h.await.unwrap().is_ok() {
+                at_least_one_ok = true;
+            }
+        }
+        assert!(at_least_one_ok, "at least one call must succeed via fallback");
         assert_eq!(
             counter.load(Ordering::SeqCst),
             1,

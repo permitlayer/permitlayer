@@ -430,16 +430,29 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 
 /// Detect rpassword's failure shape when no controlling terminal is
 /// available. rpassword opens `/dev/tty` for both reading and writing;
-/// under launchd / `brew services start` / `ssh -T` the open fails
-/// with one of: ENXIO ("Device not configured"), EIO ("I/O error"),
-/// or ENOTTY ("Inappropriate ioctl for device"). The exact errno
-/// varies by OS and shell context; we match all three.
+/// the open fails with different errno values depending on how the
+/// process was launched and what state /dev/tty is in:
 ///
-/// Note: `ErrorKind::Other` is the catch-all rpassword sometimes uses
-/// when the underlying syscall returns an OS error it doesn't map to
-/// a more specific kind. We additionally check `raw_os_error` so we
-/// don't over-translate genuine I/O errors that happen to be Other-
-/// kind.
+/// - **ENXIO** ("Device not configured"): `/dev/tty` is present in
+///   the filesystem but the process has no controlling terminal —
+///   the canonical launchd / `brew services start` failure. Most
+///   common.
+/// - **ENOTTY** ("Inappropriate ioctl for device"): the file
+///   descriptor opened from `/dev/tty` doesn't accept the termios
+///   ioctls rpassword issues to disable echo. Seen under `ssh -T`
+///   on some platforms.
+/// - **EIO** ("I/O error"): the controlling terminal exists but its
+///   session has been disconnected or backgrounded. rpassword's read
+///   syscall returns EIO when reading from a terminal that has been
+///   stolen by another session leader. False-positive risk: a
+///   genuine hardware I/O error on a real serial line would also
+///   return EIO. Mitigation: an EIO from a real, working tty would
+///   leave the user's terminal session in a state they could see
+///   visually; the operator-recovery message
+///   (`PassphrasePromptUnavailable` Display) directs them to either
+///   run from a working terminal OR set `[keystore].fallback =
+///   "none"`. Either path leads to a fix; the false-positive is
+///   strictly a labeling issue, not a correctness one.
 #[cfg(unix)]
 fn is_no_tty_error(e: &std::io::Error) -> bool {
     matches!(e.raw_os_error(), Some(libc::ENXIO) | Some(libc::EIO) | Some(libc::ENOTTY))
