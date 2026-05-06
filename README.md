@@ -133,34 +133,51 @@ interaction is not allowed`.
 
 `brew upgrade agentsso` reinstalls the binary with a different codesign
 hash, which invalidates the macOS Keychain ACL on the existing
-master-key entry. Symptom: the next interactive `agentsso start &` logs
+master-key entry. Symptom: the next `agentsso start &` logs
 `keychain backend 'apple' is unavailable: User interaction is not allowed.
-(OSStatus -25308)` and falls back to the passphrase prompt. The
-fallback derives a fresh master key, so existing sealed credentials
-will not unseal.
+(OSStatus -25308)`.
 
-Two recovery paths:
+Behavior on rc.12 and later, by context:
+
+- **Interactive terminal (or SSH with TTY)**: the daemon drops to a
+  passphrase prompt automatically. Type any passphrase you'll
+  remember; the daemon mints a fresh master key under that
+  passphrase and stores `~/.agentsso/keystore/passphrase.state` to
+  remember the choice across restarts. **The fallback's derived key
+  cannot unseal credentials sealed under the previous native key**,
+  so existing connectors are stale until you re-run `setup`.
+- **launchd / `brew services start agentsso` / `ssh -T`**: no
+  controlling terminal. The daemon fails fast with a structured
+  `PassphrasePromptUnavailable` error. The recovery path is one of
+  the manual steps below, run from an interactive shell.
+
+Two recovery paths after fallback fires (or for the headless case):
 
 1. **(Preferred)** Re-run `agentsso setup gmail --oauth-client ...`
    under the new master key. Any other configured connectors must be
-   re-set-up too.
-2. **(Faster, but loses unrelated state)** Wipe the keychain entry and
-   the vault, then let the daemon mint a fresh master key on next boot:
+   re-set-up too. The vault is preserved; only the OAuth seal
+   regenerates.
+2. **(Faster, but loses unrelated state)** Wipe the keychain entry,
+   the passphrase fallback state, and the vault, then let the daemon
+   mint a fresh master key on next boot:
 
    ```sh
+   agentsso stop 2>/dev/null
    security delete-generic-password -s io.permitlayer.master-key -a master
-   rm -rf ~/.agentsso/vault
+   rm -rf ~/.agentsso/vault ~/.agentsso/keystore/passphrase.state
    agentsso start &
    ```
 
 For diagnostic detail, run with `AGENTSSO_LOG__LEVEL=debug` (the daemon
 does not honor `RUST_LOG`).
 
-> **Known gap:** `brew services start agentsso` cannot recover this
-> way — there is no controlling TTY for the passphrase prompt. Tracked
-> for v0.4 as headless / launchd-managed Keychain ACL recovery (vault
-> rekey on detected ACL break OR keychain partition-list authorization
-> on install OR a `--passphrase-from-env` flag).
+> **Known gap (still tracked for v0.4):** headless launchd recovery
+> remains unsolved. `brew services start agentsso` cannot prompt for
+> a passphrase, so it still requires manual `security` /
+> `agentsso setup` recovery from an interactive shell. Real fix
+> options under consideration: `--passphrase-from-env`, vault rekey
+> on detected ACL break, or keychain partition-list authorization on
+> install.
 
 ### Running the daemon and the agent under different OS users
 

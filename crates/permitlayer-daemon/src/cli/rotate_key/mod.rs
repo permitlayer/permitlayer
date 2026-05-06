@@ -294,7 +294,22 @@ pub async fn run(args: RotateKeyArgs) -> Result<()> {
     #[cfg(not(feature = "test-seam"))]
     let test_file_keystore: Option<Box<dyn permitlayer_keystore::KeyStore>> = None;
 
-    let keystore_config = KeystoreConfig { fallback: FallbackMode::Auto, home: home.clone() };
+    // rc.12: rotate-key uses FallbackMode::None instead of Auto. The
+    // Auto path now wraps the native keystore in a lazy
+    // `FallbackKeyStore` that engages passphrase fallback on a runtime
+    // `BackendUnavailable`. For rotate-key that's actively dangerous —
+    // a fallback engaging mid-rotation (e.g., during
+    // `set_previous_master_key` after the orchestrator has already
+    // written `.rotation-state`) would route to a passphrase keystore
+    // that returns `PassphraseAdapterImmutable`, leaving the marker
+    // on disk in a phase the operator has to clean up by hand.
+    //
+    // rotate-key is interactive and SHOULD fail loudly if the native
+    // keychain isn't accessible. None gives us that: native errors
+    // propagate to the operator banner directly. The
+    // `kind() == Passphrase` gate below still applies for users who
+    // explicitly configured `[keystore].fallback = "passphrase"`.
+    let keystore_config = KeystoreConfig { fallback: FallbackMode::None, home: home.clone() };
     let keystore = if let Some(test_ks) = test_file_keystore {
         test_ks
     } else {

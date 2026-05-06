@@ -71,6 +71,81 @@ pub enum KeyStoreError {
     /// or tampering.
     #[error("master key has wrong length: expected {expected_len} bytes, got {actual_len}")]
     MalformedMasterKey { expected_len: usize, actual_len: usize },
+
+    /// The daemon needed to prompt for a passphrase (because the native
+    /// keychain is unavailable and `FallbackMode::Auto` is engaged) but
+    /// no controlling terminal is available. Surfaces under launchd /
+    /// `brew services start` / `ssh -T` — anywhere `/dev/tty` cannot
+    /// be opened.
+    ///
+    /// Carries operator-actionable recovery guidance in its `Display`
+    /// so the daemon's error banner doesn't need to special-case this
+    /// variant.
+    #[error(
+        "passphrase prompt unavailable: no controlling terminal (run from a terminal, OR set `[keystore].fallback = \"none\"` and recover the keychain ACL manually, OR use `agentsso setup` to remint the master key)"
+    )]
+    PassphrasePromptUnavailable,
+
+    /// The native keystore failed at runtime AND the lazy passphrase
+    /// fallback also failed to construct. Carries both errors so the
+    /// operator sees the underlying native cause AND the fallback
+    /// failure in a single Display chain — instead of just the
+    /// fallback error opaquely hiding the OSStatus that triggered the
+    /// fallback in the first place.
+    ///
+    /// Common shape: native is `BackendUnavailable(-25308)`, fallback
+    /// is `PassphrasePromptUnavailable` (because the daemon is running
+    /// under launchd).
+    #[error("native keystore unavailable ({native}) and passphrase fallback failed ({fallback})")]
+    RuntimeFallbackFailed {
+        #[source]
+        native: Box<KeyStoreError>,
+        fallback: Box<KeyStoreError>,
+    },
+}
+
+impl KeyStoreError {
+    /// Best-effort clone of self for error chaining. Used when an error
+    /// must appear inside another error variant (e.g.,
+    /// `RuntimeFallbackFailed`'s `native` field). The underlying types
+    /// in some variants do not implement `Clone` (e.g.,
+    /// `Box<dyn Error>` on `BackendUnavailable`'s source), so we
+    /// stringify them rather than try to deep-clone.
+    pub(crate) fn clone_for_chain(&self) -> Self {
+        match self {
+            Self::BackendUnavailable { backend, source } => {
+                // The boxed source isn't Clone; preserve its message
+                // by re-wrapping as a synthetic io::Error so the
+                // OSStatus text is retained for operator visibility.
+                Self::BackendUnavailable {
+                    backend,
+                    source: Box::new(std::io::Error::other(source.to_string())),
+                }
+            }
+            Self::PassphraseMismatch => Self::PassphraseMismatch,
+            Self::EmptyPassphrase => Self::EmptyPassphrase,
+            // argon2::Error doesn't implement Clone; preserve via Display.
+            Self::Argon2Failed(e) => {
+                Self::PlatformError { backend: "argon2", message: e.to_string() }
+            }
+            Self::Argon2ParamsFailed(e) => {
+                Self::PlatformError { backend: "argon2", message: e.to_string() }
+            }
+            Self::IoError(e) => Self::PlatformError { backend: "io", message: e.to_string() },
+            Self::PlatformError { backend, message } => {
+                Self::PlatformError { backend, message: message.clone() }
+            }
+            Self::PassphraseAdapterImmutable => Self::PassphraseAdapterImmutable,
+            Self::MalformedMasterKey { expected_len, actual_len } => {
+                Self::MalformedMasterKey { expected_len: *expected_len, actual_len: *actual_len }
+            }
+            Self::PassphrasePromptUnavailable => Self::PassphrasePromptUnavailable,
+            Self::RuntimeFallbackFailed { native, fallback } => Self::RuntimeFallbackFailed {
+                native: Box::new(native.clone_for_chain()),
+                fallback: Box::new(fallback.clone_for_chain()),
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -103,6 +178,36 @@ mod tests {
         assert!(
             displayed.contains("test"),
             "BackendUnavailable Display must surface the backend name — got {displayed:?}"
+        );
+    }
+
+    /// rc.12 contract: `RuntimeFallbackFailed` must surface BOTH the
+    /// native cause AND the fallback failure in its Display. Without
+    /// this, an operator under launchd would see only the fallback's
+    /// `PassphrasePromptUnavailable` error and lose the OSStatus that
+    /// caused the fallback to engage in the first place.
+    #[test]
+    fn runtime_fallback_failed_chains_both_messages() {
+        let native_sentinel = "OSSTATUS_-25308_NATIVE_SENTINEL";
+        let fallback_sentinel = "FALLBACK_PROMPT_SENTINEL";
+        let err = KeyStoreError::RuntimeFallbackFailed {
+            native: Box::new(KeyStoreError::BackendUnavailable {
+                backend: "apple",
+                source: Box::new(std::io::Error::other(native_sentinel)),
+            }),
+            fallback: Box::new(KeyStoreError::PlatformError {
+                backend: "passphrase",
+                message: fallback_sentinel.into(),
+            }),
+        };
+        let displayed = err.to_string();
+        assert!(
+            displayed.contains(native_sentinel),
+            "must surface native cause in Display — got {displayed:?}"
+        );
+        assert!(
+            displayed.contains(fallback_sentinel),
+            "must surface fallback failure in Display — got {displayed:?}"
         );
     }
 }

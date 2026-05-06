@@ -114,8 +114,22 @@ impl PassphraseKeyStore {
         // until some future allocator reuse. `rpassword` returns a
         // plain `String` which does NOT zeroize on drop, so the
         // original string would otherwise linger after derivation.
+        //
+        // rc.12 contract: rpassword opens `/dev/tty` for read AND
+        // write. Under launchd / `brew services` / `ssh -T`, the
+        // open() fails with EIO, ENXIO, or ENOTTY (varies by OS and
+        // shell). Translate that specific failure shape into the
+        // structured `PassphrasePromptUnavailable` variant so the
+        // operator-facing banner can surface recovery guidance
+        // instead of just a generic "I/O error" string.
         let passphrase: Zeroizing<String> =
-            Zeroizing::new(rpassword::prompt_password("permitlayer passphrase: ")?);
+            match rpassword::prompt_password("permitlayer passphrase: ") {
+                Ok(s) => Zeroizing::new(s),
+                Err(io_err) if is_no_tty_error(&io_err) => {
+                    return Err(KeyStoreError::PassphrasePromptUnavailable);
+                }
+                Err(io_err) => return Err(io_err.into()),
+            };
         Self::from_passphrase_inner(home, passphrase.as_str())
     }
 
@@ -412,6 +426,45 @@ fn atomic_write_new(target: &Path, bytes: &[u8]) -> Result<(), KeyStoreError> {
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
     a.ct_eq(b).into()
+}
+
+/// Detect rpassword's failure shape when no controlling terminal is
+/// available. rpassword opens `/dev/tty` for both reading and writing;
+/// the open fails with different errno values depending on how the
+/// process was launched and what state /dev/tty is in:
+///
+/// - **ENXIO** ("Device not configured"): `/dev/tty` is present in
+///   the filesystem but the process has no controlling terminal —
+///   the canonical launchd / `brew services start` failure. Most
+///   common.
+/// - **ENOTTY** ("Inappropriate ioctl for device"): the file
+///   descriptor opened from `/dev/tty` doesn't accept the termios
+///   ioctls rpassword issues to disable echo. Seen under `ssh -T`
+///   on some platforms.
+/// - **EIO** ("I/O error"): the controlling terminal exists but its
+///   session has been disconnected or backgrounded. rpassword's read
+///   syscall returns EIO when reading from a terminal that has been
+///   stolen by another session leader. False-positive risk: a
+///   genuine hardware I/O error on a real serial line would also
+///   return EIO. Mitigation: an EIO from a real, working tty would
+///   leave the user's terminal session in a state they could see
+///   visually; the operator-recovery message
+///   (`PassphrasePromptUnavailable` Display) directs them to either
+///   run from a working terminal OR set `[keystore].fallback =
+///   "none"`. Either path leads to a fix; the false-positive is
+///   strictly a labeling issue, not a correctness one.
+#[cfg(unix)]
+fn is_no_tty_error(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::ENXIO) | Some(libc::EIO) | Some(libc::ENOTTY))
+}
+
+#[cfg(not(unix))]
+fn is_no_tty_error(_e: &std::io::Error) -> bool {
+    // Windows: rpassword uses CONIN$/CONOUT$ instead of /dev/tty,
+    // and the no-console failure shape is different. Defer to the
+    // generic IO error path until we have a documented Windows
+    // failure to translate.
+    false
 }
 
 #[cfg(test)]
