@@ -722,3 +722,50 @@ fn test_plugin_runtime_init_failure_bubbles_as_start_error() {
         "expected banner containing 'connector plugin runtime', got: {stderr}"
     );
 }
+
+/// Regression: the daemon must NOT hold the vault advisory lock past
+/// boot pre-flight. Holding it for the daemon's lifetime deadlocked
+/// every per-write `CredentialFsStore::put` on the request path
+/// (token refresh in particular) because `flock(2)` on macOS is
+/// per-fd, so a second open+flock from the same process blocks on
+/// the first. Diagnosed 2026-05-06 via `sample` of a hung daemon
+/// process showing 6 tokio worker threads wedged in
+/// `permitlayer_core::vault::lock::VaultLock::acquire → flock`.
+///
+/// On Unix the assertion is straight: a separate process can
+/// `try_acquire` the lock once the daemon is past boot. On Windows
+/// `LockFileEx` is mandatory and would also fail under the bug, so
+/// the assertion holds cross-platform — but the symptom that
+/// motivated this test is specifically the macOS deadlock. Either
+/// way, the architectural rule the test pins is: "the daemon does
+/// not hold the vault lock past pre-flight."
+#[test]
+fn vault_lock_is_released_after_boot_preflight() {
+    let home = tempfile::TempDir::new().unwrap();
+    let (mut child, port) = start_daemon(home.path());
+    assert!(wait_for_health(port, Duration::from_secs(30)), "daemon did not become healthy");
+
+    // From the test process, try to acquire the vault lock. If the
+    // daemon is correctly releasing it after pre-flight, this
+    // succeeds immediately. If a future refactor reintroduces a
+    // daemon-lifetime hold, this fails with `Busy`.
+    let result = permitlayer_core::VaultLock::try_acquire(home.path());
+
+    // Capture the assertion outcome BEFORE cleanup so the daemon is
+    // always shut down even if the assertion would panic.
+    let acquired_ok = result.is_ok();
+    let err_display = match &result {
+        Ok(_) => String::new(),
+        Err(e) => format!("{e:?}"),
+    };
+    drop(result); // release the test-side lock if we got it.
+
+    send_sigterm(&mut child);
+    let _ = child.wait();
+
+    assert!(
+        acquired_ok,
+        "vault lock was held by the running daemon — boot pre-flight \
+         lock leaked into the serve loop. Error: {err_display}"
+    );
+}

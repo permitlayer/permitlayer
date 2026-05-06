@@ -2176,6 +2176,29 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         }
     }
 
+    // Release the boot-time vault lock now that rotation-state pre-
+    // flight has passed. Holding it for the daemon's lifetime
+    // deadlocks every subsequent `CredentialFsStore::put` — token
+    // refresh writes hot on the request path — because flock on
+    // macOS is per-fd, so a second open+flock from the same process
+    // blocks on the first. The lock module's "Deadlock-prevention
+    // rule" (see `permitlayer_core::vault::lock` module docs)
+    // forbids holding a VaultLock while making any call that may
+    // itself acquire one.
+    //
+    // The boot lock served only as a pre-flight check against a
+    // crashed-mid-flight `agentsso rotate-key` — the marker file +
+    // min/max key_id checks above. Once those pass, it has no
+    // further job. Cross-process exclusion against a concurrent
+    // `agentsso rotate-key` while the daemon is running is provided
+    // by `PidFile::is_daemon_running` (rotate_key/mod.rs) — rotate-
+    // key refuses to start while the daemon's PID file exists, so
+    // we never reach a per-write `acquire` race against it. After
+    // this drop, per-write callers acquire+release the lock inside
+    // their own scope to serialize against any out-of-tree concurrent
+    // writer (operator hand-edits, future tooling).
+    drop(_vault_lock);
+
     // 4. Initialize tracing subscriber (stdout + daily-rotating file
     // appender). The returned `WorkerGuard`s MUST live until process
     // exit — dropping them flushes buffered log lines through the
@@ -2183,10 +2206,12 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     // as `_guards` keeps the vector alive across the serve loop; the
     // final drop runs during stack unwind at `main()` return.
     //
-    // Runs AFTER PidFile + VaultLock acquisition (Story 7.4 P19/P23 +
-    // 7.6a review patch): a refused-to-start attempt must not create
-    // `logs/`. The `pid_file` and `_vault_lock` bindings are local —
-    // their `Drop`s run cleanly on the early-return paths above.
+    // Runs AFTER PidFile acquisition (Story 7.4 P19/P23): a refused-
+    // to-start attempt must not create `logs/`. The `pid_file`
+    // binding is local — its `Drop` runs cleanly on the early-return
+    // paths above. (`_vault_lock` was released above; it serves only
+    // as a boot-time rotation-state pre-flight, NOT a daemon-lifetime
+    // guard.)
     let log_dir = log_cfg.path.clone().unwrap_or_else(|| config.paths.home.join("logs"));
     let _guards =
         telemetry::init_tracing(&config.log.level, Some(&log_dir), log_cfg.retention_days)

@@ -365,17 +365,18 @@ async fn refresh_credentials(args: RefreshArgs) -> anyhow::Result<()> {
 
     // ── Story 7.6c: daemon-running pre-flight ──────────────────────
     //
-    // `credentials refresh` writes to the vault via
-    // `CredentialFsStore::put` (refresh_flow.rs:495,531) which
-    // acquires the exclusive vault `flock` (Story 7.6a). The daemon
-    // holds the same lock for its entire runtime — without this guard
-    // refresh would block indefinitely on `flock(2)`.
+    // `credentials refresh` rewrites the on-disk vault entry. Running
+    // it concurrent with a live daemon would race against the
+    // daemon's in-memory token cache: the daemon would continue
+    // serving requests with the pre-refresh token until restart,
+    // and the dual-writer pattern can produce torn-state windows
+    // for downstream readers. Refusing here keeps the operator on
+    // the documented `stop → refresh → start` sequence.
     //
     // Replaces the old soft `eprintln!` warning ("do not run while
-    // daemon is active") with a structured refusal that actually
-    // prevents the deadlock instead of just hoping the operator
-    // notices the warning. Mirrors `cli::setup::run`'s pre-flight and
-    // `cli::rotate_key::run` Pre-flight 2 verbatim.
+    // daemon is active") with a structured refusal. Mirrors
+    // `cli::setup::run`'s pre-flight and `cli::rotate_key::run`
+    // Pre-flight 2 verbatim.
     //
     // Pre-flight runs BEFORE the audit-store carve-out below so a
     // refused-to-run refresh does not emit audit events for an action
@@ -396,8 +397,8 @@ async fn refresh_credentials(args: RefreshArgs) -> anyhow::Result<()> {
             render::error_block(
                 "credentials_refresh_daemon_running",
                 &format!(
-                    "agentsso daemon is running{pid_hint}; credentials refresh writes to \
-                     the vault and would block on the daemon's exclusive lock."
+                    "agentsso daemon is running{pid_hint}; credentials refresh rewrites \
+                     the vault entry and must not race against a live daemon's token cache."
                 ),
                 "agentsso stop && agentsso credentials refresh <service>",
                 None,

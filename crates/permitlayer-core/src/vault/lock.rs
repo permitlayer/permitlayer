@@ -5,9 +5,19 @@
 //! `~/.agentsso/vault/`, not inside it — Windows `LockFileEx` is
 //! mandatory and would block the v1 → v2 migration's
 //! `rename(vault/, vault.bak/)` step). It serializes every writer of
-//! the vault — the long-running daemon, every CLI subcommand that
-//! mutates credentials (`agentsso setup`, `agentsso rotate-key`), and
-//! the `cli::update::migrations` schema-upgrade path.
+//! the vault — every CLI subcommand that mutates credentials
+//! (`agentsso setup`, `agentsso rotate-key`), the
+//! `cli::update::migrations` schema-upgrade path, and per-credential
+//! writes inside the running daemon (each `CredentialFsStore::put`
+//! acquires + releases its own scope).
+//!
+//! The daemon does NOT hold a process-singleton lock for its lifetime
+//! — that would deadlock against its own per-write `acquire` (flock on
+//! macOS is per-fd, so a second open in the same process blocks on the
+//! first). Cross-process exclusion against a concurrent `agentsso
+//! rotate-key` while the daemon is alive is provided by
+//! `PidFile::is_daemon_running` — rotate-key refuses to start while
+//! the daemon's PID file exists.
 //!
 //! # Why an advisory lock and not a mutex
 //!
