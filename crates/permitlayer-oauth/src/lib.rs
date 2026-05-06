@@ -11,6 +11,7 @@ pub mod callback;
 pub mod client;
 pub mod error;
 pub mod google;
+pub(crate) mod headless;
 pub mod metadata;
 pub mod pkce;
 pub mod refresh;

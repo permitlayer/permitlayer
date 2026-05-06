@@ -137,6 +137,42 @@ pub enum OAuthError {
         #[source]
         source: Option<Box<dyn std::error::Error + Send + Sync>>,
     },
+
+    // --- rc.13 headless-paste flow variants ---
+    /// The redirect URL the operator pasted could not be parsed as a URL,
+    /// even after stripping bracketed-paste markers (\e[200~ ... \e[201~).
+    #[error("could not parse the pasted redirect URL — make sure you copied the full address")]
+    PastedUrlMalformed,
+
+    /// The pasted URL parsed but did not match the redirect URI we issued
+    /// to Google (scheme/host/port/path mismatch). Most commonly: operator
+    /// pasted from the wrong browser tab, or pasted a URL from a previous
+    /// session.
+    #[error("pasted redirect URL doesn't match the expected callback (got {got})")]
+    PastedUrlMismatch {
+        /// The scheme://host:port/path of what we got, for operator
+        /// diagnosis.
+        got: String,
+    },
+
+    /// The pasted URL was missing the `code=` query parameter. Likely a
+    /// truncated paste or a URL from before consent was granted.
+    #[error("pasted redirect URL has no `code` parameter — make sure consent was approved")]
+    PastedUrlMissingCode,
+
+    /// The pasted URL was missing the `state=` query parameter. The
+    /// state parameter is how we defend against CSRF; without it we
+    /// cannot trust the pasted URL.
+    #[error("pasted redirect URL has no `state` parameter — paste was likely truncated")]
+    PastedUrlMissingState,
+
+    /// The pasted URL's `state` parameter did not match the one we issued.
+    /// Either the paste was from a stale prior session OR an attacker
+    /// substituted a different consent flow's URL.
+    #[error(
+        "pasted redirect URL has the wrong `state` parameter — possible stale paste or CSRF attempt"
+    )]
+    PastedUrlStateMismatch,
 }
 
 impl OAuthError {
@@ -186,6 +222,21 @@ impl OAuthError {
             Self::VerificationFailed { .. } => {
                 "Credentials are stored. Re-run setup or check the service status at https://www.google.com/appsstatus."
             }
+            Self::PastedUrlMalformed => {
+                "Copy the entire URL from your browser's address bar (starting with http://127.0.0.1:) and paste it again."
+            }
+            Self::PastedUrlMismatch { .. } => {
+                "Make sure you pasted the redirect URL (starts with http://127.0.0.1:), not the original consent URL or a different page."
+            }
+            Self::PastedUrlMissingCode => {
+                "The pasted URL didn't include an authorization code — approve the consent screen and try the redirect URL again."
+            }
+            Self::PastedUrlMissingState => {
+                "Paste the full redirect URL including the `state` query parameter — it's part of the URL after `?state=...`."
+            }
+            Self::PastedUrlStateMismatch => {
+                "The pasted URL is from a different setup session. Run `agentsso setup gmail --headless` again to start a fresh flow."
+            }
         }
     }
 
@@ -207,6 +258,11 @@ impl OAuthError {
             Self::ClientJsonReadFailed { .. } => "client_json_read_failed",
             Self::ClientJsonInvalid { .. } => "client_json_invalid",
             Self::VerificationFailed { .. } => "verification_failed",
+            Self::PastedUrlMalformed => "pasted_url_malformed",
+            Self::PastedUrlMismatch { .. } => "pasted_url_mismatch",
+            Self::PastedUrlMissingCode => "pasted_url_missing_code",
+            Self::PastedUrlMissingState => "pasted_url_missing_state",
+            Self::PastedUrlStateMismatch => "pasted_url_state_mismatch",
         }
     }
 }

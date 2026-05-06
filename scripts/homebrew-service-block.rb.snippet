@@ -2,7 +2,16 @@
     <<~EOS
       permitlayer is installed. To get started:
 
-          agentsso setup gmail
+          1. Create a Desktop OAuth client at
+             https://console.cloud.google.com/apis/credentials and
+             download the JSON ("client_secret_XXXX.json").
+          2. Run setup, pointing at that JSON:
+
+                 agentsso setup gmail --oauth-client ./client_secret.json
+
+             For SSH-from-another-machine, add --headless. The bare
+             `agentsso setup gmail` will interactively prompt for the
+             file path if you forget the flag.
 
       To run the daemon as a Homebrew-managed background service:
 
