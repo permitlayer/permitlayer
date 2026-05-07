@@ -56,6 +56,12 @@ trybuild.workspace = true
 insta = { workspace = true, features = ["json"] }
 criterion.workspace = true
 
+# Story 7.11 review-round-1 D11: euid check for atomicity tests
+# (no-unsafe wrapper around `geteuid()`). Unix-only — the
+# atomicity tests are `#[cfg(unix)]`-gated.
+[target.'cfg(unix)'.dev-dependencies]
+nix = { workspace = true }
+
 [features]
 # Exposes fault-injection seams for integration tests. Gated behind a
 # feature (not just `#[cfg(test)]`) because integration tests live in

@@ -5,6 +5,17 @@
 
 #![forbid(unsafe_code)]
 
+// Story 7.11 review-round-2 Q3: workspace-wide test-seam discipline.
+// The daemon's `test-seam` feature transitively enables
+// `permitlayer-keystore/test-seam`. See `permitlayer-core::lib.rs`
+// for the full rationale.
+#[cfg(all(feature = "test-seam", not(debug_assertions)))]
+compile_error!(
+    "the `test-seam` feature must NOT be enabled in release builds. \
+     If you need to run integration tests against this crate, build \
+     with `cargo test --features test-seam` (debug profile) instead."
+);
+
 mod approval;
 mod cli;
 mod config;

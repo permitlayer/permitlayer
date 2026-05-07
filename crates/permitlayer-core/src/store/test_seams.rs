@@ -67,4 +67,15 @@ impl AgentIdentityStore for MockAgentStore {
         // than this mock.
         Ok(false)
     }
+
+    async fn update_policy(
+        &self,
+        _name: &str,
+        _new_policy_name: String,
+    ) -> Result<bool, StoreError> {
+        // Mock returns `Ok(false)` ("no such agent") because `get`
+        // always returns `None`. Tests that exercise rebind mutation
+        // (Story 7.11) should use the real `AgentIdentityFsStore`.
+        Ok(false)
+    }
 }

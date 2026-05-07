@@ -35,6 +35,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod agent_rebind_e2e;
 mod agent_registry_e2e;
 mod approval_prompt_e2e;
 mod audit_drain_on_shutdown_e2e;

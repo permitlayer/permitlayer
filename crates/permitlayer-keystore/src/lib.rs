@@ -38,6 +38,18 @@
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
+// Story 7.11 review-round-2 Q3: workspace-wide test-seam discipline.
+// The `test-seam` feature exposes `FileBackedKeyStore` and
+// `PassphraseKeyStore::from_passphrase` for integration tests; it
+// must NOT be enabled in release builds. See
+// `permitlayer-core::lib.rs` for the full rationale.
+#[cfg(all(feature = "test-seam", not(debug_assertions)))]
+compile_error!(
+    "the `test-seam` feature must NOT be enabled in release builds. \
+     If you need to run integration tests against this crate, build \
+     with `cargo test --features test-seam` (debug profile) instead."
+);
+
 pub mod error;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub(crate) mod fallback;

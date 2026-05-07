@@ -2143,6 +2143,7 @@ dependencies = [
  "hmac",
  "insta",
  "libc",
+ "nix",
  "permitlayer-credential",
  "rand 0.8.5",
  "regex",

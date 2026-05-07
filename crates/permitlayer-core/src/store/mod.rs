@@ -156,4 +156,31 @@ pub trait AgentIdentityStore: Send + Sync {
         new_lookup_key_hex: String,
         new_token_hash: String,
     ) -> Result<bool, StoreError>;
+
+    /// Atomically rewrite ONLY the `policy_name` field of an existing
+    /// agent. Used by `agentsso agent rebind` (Story 7.11) to extend
+    /// or change an agent's policy binding WITHOUT rotating its bearer
+    /// token. The agent's identity (`name`, `token_hash`, `lookup_key_hex`,
+    /// `created_at`, `last_seen_at`) is preserved verbatim.
+    ///
+    /// Implementations MUST:
+    /// - validate `name` via `agent::validate_agent_name` and surface
+    ///   [`StoreError::InvalidAgentName`] on failure
+    /// - mirror `put`'s atomic-write discipline (tempfile → fsync →
+    ///   rename → fsync parent dir; mode `0o600` on Unix in `0o700`
+    ///   parent dir)
+    /// - return `Ok(false)` if no agent with that name exists
+    /// - return `Ok(true)` on a successful rewrite
+    /// - NOT validate `new_policy_name` against any policy registry —
+    ///   the store layer is policy-agnostic. Policy existence MUST be
+    ///   verified by the caller (the daemon control-plane handler)
+    ///   BEFORE invoking this method.
+    ///
+    /// **Why a dedicated 1-field method:** rebind must NEVER mutate
+    /// the token-bearing fields (`token_hash`, `lookup_key_hex`). A
+    /// typed method makes that invariant a compiler-checked property
+    /// (see `update_lookup_key_and_token` for the symmetric posture).
+    /// See `architecture.md` §"Authentication & Security" → "Bearer
+    /// token immutability across policy rebind".
+    async fn update_policy(&self, name: &str, new_policy_name: String) -> Result<bool, StoreError>;
 }
