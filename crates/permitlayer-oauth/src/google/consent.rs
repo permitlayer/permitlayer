@@ -12,6 +12,48 @@ use crate::error::OAuthError;
 /// maliciously huge file via a TOCTOU'd symlink in a shared tmp dir.
 const MAX_CLIENT_JSON_BYTES: u64 = 65_536;
 
+/// Validate a Google Cloud project ID against the canonical grammar
+/// (Story 7.12 review P3). Per Google's documentation:
+/// <https://cloud.google.com/resource-manager/docs/creating-managing-projects#identifying_projects>
+///
+/// > Project IDs must be 6-30 characters, start with a lowercase letter,
+/// > and contain only lowercase letters, digits, and hyphens. Project
+/// > IDs must not end with a hyphen.
+///
+/// Returns `Some(owned)` if the value matches; `None` otherwise. The
+/// caller treats `None` identically to absent — the verify path's
+/// remediation URL omits `?project=<id>` and the `--project` flag.
+///
+/// This validation is the privacy/safety boundary between the
+/// untrusted on-disk `client_secret.json` and the operator-facing
+/// URLs/CLI commands that the verify path constructs from the
+/// project ID.
+fn validate_gcp_project_id(raw: &str) -> Option<String> {
+    let bytes = raw.as_bytes();
+    if bytes.len() < 6 || bytes.len() > 30 {
+        return None;
+    }
+    if !bytes[0].is_ascii_lowercase() {
+        return None;
+    }
+    // Must not end with a hyphen.
+    if bytes[bytes.len() - 1] == b'-' {
+        return None;
+    }
+    if !bytes.iter().all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || *b == b'-') {
+        return None;
+    }
+    // R2-P7 round-2 review: reject consecutive hyphens. Google's
+    // grammar `^[a-z][-a-z0-9]{4,28}[a-z0-9]$` does not explicitly
+    // disallow consecutive hyphens, but in practice GCP rejects
+    // project IDs like `a----z` at creation time. Failing here means
+    // the URL/CLI never points at a non-existent project — better UX.
+    if raw.contains("--") {
+        return None;
+    }
+    Some(raw.to_owned())
+}
+
 /// A Google OAuth client configuration, loaded from a user-provided
 /// Google Cloud Console OAuth client JSON file ("bring-your-own").
 ///
@@ -27,6 +69,12 @@ pub struct GoogleOAuthConfig {
     client_id: String,
     /// The client secret (optional — PKCE-capable clients may omit it).
     client_secret: Option<String>,
+    /// The Google Cloud project ID from the JSON file. Optional because
+    /// older or hand-edited client JSON may omit it; Google Cloud Console
+    /// exports always include it for both `installed` and `web` types.
+    /// Surfaced to the verify path so 403 actionable-remediation URLs
+    /// (Story 7.12) can pre-fill `?project=<id>`.
+    project_id: Option<String>,
     /// Path to the original JSON file (for provenance display).
     source_path: PathBuf,
 }
@@ -42,6 +90,16 @@ impl GoogleOAuthConfig {
     #[must_use]
     pub fn client_secret(&self) -> Option<&str> {
         self.client_secret.as_deref()
+    }
+
+    /// Return the Google Cloud project ID parsed from the OAuth client
+    /// JSON, if present. Used by the post-OAuth verify path (Story 7.12)
+    /// to pre-fill the `?project=<id>` query parameter on the
+    /// console-enablement remediation URL when a 403 surfaces a
+    /// `SERVICE_DISABLED` / `BILLING_DISABLED` reason.
+    #[must_use]
+    pub fn project_id(&self) -> Option<&str> {
+        self.project_id.as_deref()
     }
 
     /// Return a provenance tag for credential metadata display.
@@ -120,7 +178,19 @@ impl GoogleOAuthConfig {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_owned());
 
-        Ok(Self { client_id, client_secret, source_path: path.to_owned() })
+        // Story 7.12: parse `project_id` for the verify path's actionable
+        // remediation URL. Mirrors `client_secret`'s shape, plus shape
+        // validation against Google's GCP project-ID grammar
+        // (`^[a-z][-a-z0-9]{4,28}[a-z0-9]$`) per Story 7.12 review P3 —
+        // the value flows raw into URL+gcloud rendering, so a corrupted
+        // or hand-edited `client_secret.json` with whitespace, control
+        // chars, or injected query parameters must not survive parse.
+        // Any value that fails validation is treated identically to
+        // absent (the renderer omits `?project=…` and `--project`).
+        let project_id =
+            client_obj.get("project_id").and_then(|v| v.as_str()).and_then(validate_gcp_project_id);
+
+        Ok(Self { client_id, client_secret, project_id, source_path: path.to_owned() })
     }
 }
 
@@ -148,7 +218,213 @@ mod tests {
         let config = GoogleOAuthConfig::from_client_json(&path).unwrap();
         assert_eq!(config.client_id(), "123.apps.googleusercontent.com");
         assert_eq!(config.client_secret(), Some("GOCSPX-test-secret"));
+        assert_eq!(config.project_id(), Some("my-project"));
         assert_eq!(config.provenance_tag(), format!("byo:{}", path.display()));
+    }
+
+    #[test]
+    fn parse_installed_without_project_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "installed": {
+                    "client_id": "123.apps.googleusercontent.com",
+                    "client_secret": "GOCSPX-test-secret"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = GoogleOAuthConfig::from_client_json(&path).unwrap();
+        assert!(config.project_id().is_none());
+    }
+
+    /// P3 round-1 review: `project_id` is shape-validated against
+    /// Google's GCP grammar. Values containing whitespace, control
+    /// chars, or query-string metacharacters are silently dropped to
+    /// `None` (treated identically to absent — URL omits the param).
+    #[test]
+    fn rejects_project_id_with_query_string_injection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "installed": {
+                    "client_id": "x.apps.googleusercontent.com",
+                    "project_id": "my-project&inject=evil"
+                }
+            }"#,
+        )
+        .unwrap();
+        let config = GoogleOAuthConfig::from_client_json(&path).unwrap();
+        assert!(config.project_id().is_none(), "P3: project_id with `&` must be rejected");
+    }
+
+    #[test]
+    fn rejects_project_id_with_whitespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "installed": {
+                    "client_id": "x.apps.googleusercontent.com",
+                    "project_id": "my project"
+                }
+            }"#,
+        )
+        .unwrap();
+        let config = GoogleOAuthConfig::from_client_json(&path).unwrap();
+        assert!(config.project_id().is_none(), "P3: project_id with whitespace must be rejected");
+    }
+
+    #[test]
+    fn rejects_project_id_with_uppercase() {
+        // GCP project IDs are lowercase by spec.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "installed": {
+                    "client_id": "x.apps.googleusercontent.com",
+                    "project_id": "MyProject"
+                }
+            }"#,
+        )
+        .unwrap();
+        let config = GoogleOAuthConfig::from_client_json(&path).unwrap();
+        assert!(config.project_id().is_none(), "P3: project_id must be lowercase");
+    }
+
+    #[test]
+    fn rejects_project_id_too_short_or_too_long() {
+        // Per Google: 6-30 characters.
+        let dir = tempfile::tempdir().unwrap();
+        for (label, short_id) in
+            [("too short", "abc"), ("too long", "a".repeat(40).as_str())].iter()
+        {
+            let path = dir.path().join(format!("client_{label}.json"));
+            std::fs::write(
+                &path,
+                format!(
+                    r#"{{"installed":{{"client_id":"x.apps.googleusercontent.com","project_id":"{short_id}"}}}}"#
+                ),
+            )
+            .unwrap();
+            let config = GoogleOAuthConfig::from_client_json(&path).unwrap();
+            assert!(config.project_id().is_none(), "P3: project_id length-bounded ({label})");
+        }
+    }
+
+    /// R2-P7 round-2 review: consecutive hyphens are rejected (Google's
+    /// project-creation API rejects them in practice; failing at parse
+    /// time means the URL/CLI never points at a non-existent project).
+    #[test]
+    fn rejects_project_id_with_consecutive_hyphens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "installed": {
+                    "client_id": "x.apps.googleusercontent.com",
+                    "project_id": "abc--xyz"
+                }
+            }"#,
+        )
+        .unwrap();
+        let config = GoogleOAuthConfig::from_client_json(&path).unwrap();
+        assert!(
+            config.project_id().is_none(),
+            "R2-P7: project_id with consecutive hyphens must be rejected"
+        );
+    }
+
+    /// R3-P16 round-3 review: multiple single hyphens in project ID
+    /// (the canonical Google form) is accepted. Coverage gap flagged
+    /// by Edge Case Hunter #24.
+    #[test]
+    fn accepts_project_id_with_multiple_single_hyphens() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "installed": {
+                    "client_id": "x.apps.googleusercontent.com",
+                    "project_id": "my-app-prod"
+                }
+            }"#,
+        )
+        .unwrap();
+        let config = GoogleOAuthConfig::from_client_json(&path).unwrap();
+        assert_eq!(
+            config.project_id(),
+            Some("my-app-prod"),
+            "R3-P16: multiple single hyphens (canonical Google form) must be accepted"
+        );
+    }
+
+    #[test]
+    fn rejects_project_id_ending_with_hyphen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "installed": {
+                    "client_id": "x.apps.googleusercontent.com",
+                    "project_id": "my-project-"
+                }
+            }"#,
+        )
+        .unwrap();
+        let config = GoogleOAuthConfig::from_client_json(&path).unwrap();
+        assert!(config.project_id().is_none(), "P3: project_id ending with `-` must be rejected");
+    }
+
+    #[test]
+    fn parse_installed_with_empty_project_id_treated_as_none() {
+        // Empty-string `project_id` is parsed as None (mirrors client_secret).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "installed": {
+                    "client_id": "123.apps.googleusercontent.com",
+                    "project_id": ""
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = GoogleOAuthConfig::from_client_json(&path).unwrap();
+        assert!(config.project_id().is_none());
+    }
+
+    #[test]
+    fn parse_web_app_json_with_project_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("client.json");
+        std::fs::write(
+            &path,
+            r#"{
+                "web": {
+                    "client_id": "456.apps.googleusercontent.com",
+                    "client_secret": "GOCSPX-web-secret",
+                    "project_id": "web-project-id"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = GoogleOAuthConfig::from_client_json(&path).unwrap();
+        assert_eq!(config.project_id(), Some("web-project-id"));
     }
 
     #[test]

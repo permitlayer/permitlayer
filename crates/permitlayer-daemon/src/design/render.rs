@@ -65,7 +65,25 @@ pub fn styled_outcome(outcome: Outcome, theme: &Theme, support: ColorSupport) ->
 ///      ~/.agentsso/policies/default.toml:14 · expected "allow" | "deny" | "prompt"
 ///      run:  agentsso policy validate default
 /// ```
+///
+/// **Story 7.12 review P10:** when `remediation` carries embedded
+/// newlines (e.g., the verify-403 actionable hints that print a console
+/// URL on one line and a `gcloud` command on the next), each
+/// continuation line is indented to align with the content column of
+/// the first line (`     run:  `, 11 spaces) so the visual frame
+/// remains intact.
 pub fn error_block(code: &str, message: &str, remediation: &str, location: Option<&str>) -> String {
+    // R2-P18 round-2 review: strip ASCII control chars (except `\n`)
+    // from `message` and `remediation`. The `message` arg routinely
+    // carries `e.to_string()` over arbitrary upstream `reason` strings
+    // (HTTP status text, network error messages, parse error details);
+    // a hostile or malformed upstream `\r` would cause terminals to
+    // overwrite the displayed line, hiding the actual error.
+    let message = sanitize_control_chars(message);
+    let remediation = sanitize_control_chars(remediation);
+    let message = message.as_str();
+    let remediation = remediation.as_str();
+
     let mut buf = String::with_capacity(256);
     writeln!(buf, "  \u{26A0}  {code}").ok();
     if let Some(loc) = location {
@@ -73,8 +91,119 @@ pub fn error_block(code: &str, message: &str, remediation: &str, location: Optio
     } else {
         writeln!(buf, "     {message}").ok();
     }
-    writeln!(buf, "     run:  {remediation}").ok();
+    let indent = "           "; // 11 spaces — matches "     run:  " content column.
+    let mut lines = remediation.lines();
+    if let Some(first) = lines.next() {
+        writeln!(buf, "     run:  {first}").ok();
+        for cont in lines {
+            // R3-P22 round-3 review: producers can convey hierarchy
+            // with up to 4 leading spaces, which we preserve relative
+            // to the canonical content column. >4 leading spaces
+            // collapse to the canonical column to prevent runaway
+            // indentation. Pre-fix (R1-P10) trimmed all leading
+            // whitespace and re-anchored at column 11, which flattened
+            // intentional sub-indent hierarchy (R2-P12 footer was
+            // visually misleading as a result; R3-P2 reshaped it to
+            // flat text, R3-P22 makes the renderer competent for
+            // future producers that DO want hierarchy).
+            const MAX_PRESERVED_INDENT: usize = 4;
+            let leading = cont.bytes().take_while(|&b| b == b' ').count();
+            let preserved = leading.min(MAX_PRESERVED_INDENT);
+            let payload = &cont[leading..];
+            if payload.is_empty() {
+                writeln!(buf).ok();
+            } else {
+                let extra: String = " ".repeat(preserved);
+                writeln!(buf, "{indent}{extra}{payload}").ok();
+            }
+        }
+    } else {
+        // R2-P2 round-2 review: empty remediation must still produce a
+        // `run:` line so the visual frame is intact. Pre-round-1
+        // behavior was `writeln!(buf, "     run:  ")` unconditionally;
+        // the round-1 iterator-based rewrite silently dropped this for
+        // empty input. Restore the always-emit invariant.
+        //
+        // R3-P25 round-3 review: drop the trailing space after the
+        // colon when remediation is empty. Pre-fix produced
+        // `"     run:  \n"` (two trailing spaces before newline);
+        // some terminals render trailing whitespace differently. Now
+        // produces `"     run:\n"` for empty input.
+        writeln!(buf, "     run:").ok();
+    }
     buf
+}
+
+/// Strip terminal-injection-capable characters from operator-facing text
+/// (R2-P18 + R3-P6 + R3-P7 — Story 7.12 review). The `error_block`
+/// `message` and `remediation` arguments routinely flow from upstream-
+/// supplied error strings (e.g., `OAuthError::VerificationFailed.reason`
+/// carries HTTP status text or parse-error descriptions); a hostile or
+/// malformed upstream `\r`, `\x1b[2J`, or other control sequence would
+/// let an attacker overwrite or hide displayed text in the operator's
+/// terminal.
+///
+/// Newlines (`\n`, U+000A) are preserved because the round-1 P10
+/// multi-line remediation rendering needs them as continuation-line
+/// breaks. All other characters in the following classes are dropped:
+///
+/// 1. **C0 control chars** (U+0000–U+001F except U+000A) and DEL
+///    (U+007F) — overwrite-current-line via `\r`, ANSI escapes via
+///    `\x1b`, BEL via `\x07`.
+/// 2. **C1 control chars** (U+0080–U+009F) — interpreted as control
+///    sequences by 8-bit-CSI terminals (R3-P6).
+/// 3. **Unicode "Trojan Source" / BIDI override chars** — U+0085 (NEL),
+///    U+2028 (LINE SEPARATOR), U+2029 (PARAGRAPH SEPARATOR), U+200E
+///    (LTR MARK), U+200F (RTL MARK), U+202A–U+202E (LTR/RTL EMBEDDING +
+///    OVERRIDE), U+2066–U+2069 (BIDI ISOLATES). RTLO + isolates are the
+///    canonical visual-spoofing attack class (R3-P7).
+///
+/// The slow path runs `chars()` over the full input; performance is
+/// negligible because all real callers pass <1 KiB strings (operator-
+/// facing error text). Pre-fix R2-P18 had a byte-level fast path that
+/// incorrectly accepted UTF-8 continuation bytes >= 0x20; we now always
+/// run the codepoint-aware filter so multi-byte sequences are inspected
+/// as Unicode scalar values, not as bytes.
+fn sanitize_control_chars(s: &str) -> String {
+    s.chars().filter(|&c| !is_terminal_unsafe_char(c)).collect()
+}
+
+/// Helper: returns `true` for characters that the terminal sanitizer
+/// drops. Centralized so test coverage and the docstring stay aligned.
+fn is_terminal_unsafe_char(c: char) -> bool {
+    if c == '\n' {
+        return false; // explicit allow — multi-line remediation
+    }
+    let cp = c as u32;
+    // C0 controls except already-allowed `\n`.
+    if cp < 0x20 {
+        return true;
+    }
+    // DEL.
+    if c == '\x7f' {
+        return true;
+    }
+    // C1 control range U+0080-U+009F (R3-P6).
+    if (0x80..=0x9f).contains(&cp) {
+        return true;
+    }
+    // Unicode Trojan Source / BIDI override class (R3-P7).
+    matches!(
+        c,
+        '\u{2028}' // LINE SEPARATOR
+            | '\u{2029}' // PARAGRAPH SEPARATOR
+            | '\u{200e}' // LEFT-TO-RIGHT MARK
+            | '\u{200f}' // RIGHT-TO-LEFT MARK
+            | '\u{202a}' // LRE
+            | '\u{202b}' // RLE
+            | '\u{202c}' // POP DIRECTIONAL FORMATTING
+            | '\u{202d}' // LRO
+            | '\u{202e}' // RLO — the classic Trojan Source vector
+            | '\u{2066}' // LRI
+            | '\u{2067}' // RLI
+            | '\u{2068}' // FSI
+            | '\u{2069}' // PDI
+    )
 }
 
 /// Render an empty-state message with the Scute glyph.
@@ -560,6 +689,210 @@ mod tests {
         assert!(result.contains("auth_failed"));
         assert!(result.contains("token expired"));
         assert!(!result.contains("\u{00B7}"));
+    }
+
+    /// Story 7.12 review P10: multi-line `remediation` (e.g. the
+    /// verify-403 actionable hint with a console URL on one line and
+    /// a `gcloud` command on the next) renders with each continuation
+    /// line indented to the canonical content column (11 spaces) so
+    /// the visual frame remains intact.
+    #[test]
+    fn error_block_indents_multi_line_remediation() {
+        let remediation = "Enable Calendar API in Google Cloud Console:\n    https://console.cloud.google.com/apis/library/calendar.googleapis.com?project=p\n  Or via gcloud:\n    gcloud services enable calendar.googleapis.com --project p";
+        let result = error_block("verification_failed", "calendar · 403", remediation, None);
+        // First remediation line is on the `run:` line.
+        assert!(
+            result.contains("run:  Enable Calendar API in Google Cloud Console:"),
+            "first line on run-prefix: {result}"
+        );
+        // R3-P22 round-3 review: continuation lines preserve up to 4
+        // leading spaces of producer indent on top of the canonical
+        // 11-space anchor. The 4-space-indented URL renders at column
+        // 15 (11 + 4); the 2-space-indented "Or via gcloud:" heading
+        // renders at column 13 (11 + 2).
+        assert!(
+            result.contains("\n               https://console.cloud.google.com/apis/library/"),
+            "URL line at col 15 (canonical 11 + 4 producer indent): {result}"
+        );
+        assert!(
+            result.contains("\n             Or via gcloud:"),
+            "gcloud heading at col 13 (canonical 11 + 2 producer indent): {result}"
+        );
+        assert!(
+            result.contains(
+                "\n               gcloud services enable calendar.googleapis.com --project p"
+            ),
+            "gcloud command at col 15 (canonical 11 + 4 producer indent): {result}"
+        );
+    }
+
+    /// R2-P2 round-2 review: empty `remediation` must still produce a
+    /// `run:` line so the visual frame is intact. Pre-fix the round-1
+    /// iterator-based rewrite silently dropped the line on empty input.
+    /// R3-P25 round-3 review: the `run:` line for empty input has no
+    /// trailing whitespace.
+    #[test]
+    fn error_block_with_empty_remediation_still_emits_run_line() {
+        let result = error_block("auth_failed", "token expired", "", None);
+        assert!(result.contains("auth_failed"));
+        assert!(result.contains("token expired"));
+        assert!(
+            result.contains("\n     run:\n"),
+            "R2-P2 + R3-P25: empty remediation must emit `run:` with no trailing whitespace: {result:?}"
+        );
+    }
+
+    /// R2-P18 round-2 review: control characters in `message` and
+    /// `remediation` are stripped to prevent terminal injection
+    /// (overwrite-current-line via `\r`, clear-screen via ANSI, etc.).
+    /// Newlines in `remediation` are preserved (continuation-line
+    /// support); newlines in `message` would be malformed but are
+    /// also dropped by the sanitizer for consistency.
+    #[test]
+    fn error_block_strips_carriage_return_from_message() {
+        // \r mid-message would cause terminals to overwrite the line.
+        let hostile = "real error\rATTACKER OVERWROTE THIS";
+        let result = error_block("verification_failed", hostile, "agentsso setup gmail", None);
+        assert!(!result.contains('\r'), "must strip \\r from message: {result:?}");
+        assert!(result.contains("real error"));
+        // The "ATTACKER OVERWROTE THIS" text is concatenated since the \r is gone,
+        // but importantly the operator can SEE it rather than be deceived.
+        assert!(result.contains("ATTACKER OVERWROTE THIS"));
+    }
+
+    #[test]
+    fn error_block_strips_ansi_escape_from_message() {
+        // \x1b[2J = ANSI clear screen.
+        let hostile = "innocuous\x1b[2J\x1b[Hattacker text";
+        let result = error_block("verification_failed", hostile, "fix it", None);
+        assert!(!result.contains('\x1b'), "must strip ESC byte: {result:?}");
+        assert!(result.contains("innocuous"));
+        assert!(result.contains("attacker text"));
+    }
+
+    #[test]
+    fn error_block_strips_control_chars_from_remediation() {
+        let hostile_remediation = "run agentsso setup\x07\x08gmail"; // BEL + BS
+        let result = error_block("auth_failed", "token expired", hostile_remediation, None);
+        assert!(!result.contains('\x07'));
+        assert!(!result.contains('\x08'));
+        assert!(result.contains("run agentsso setupgmail"));
+    }
+
+    #[test]
+    fn error_block_preserves_newlines_in_remediation() {
+        // Newlines are the one control char preserved in remediation
+        // (multi-line remediation is the round-1 P10 feature).
+        let multi_line = "line one\nline two";
+        let result = error_block("code", "msg", multi_line, None);
+        assert!(result.contains("line one"));
+        assert!(result.contains("line two"));
+    }
+
+    /// R3-P22 round-3 review: continuation lines preserve up to 4
+    /// leading spaces of producer-supplied indent, anchored against
+    /// the canonical column 11. Producers can convey hierarchy with
+    /// `\n  ` (2-space sub-indent) or `\n    ` (4-space sub-indent).
+    /// Pre-fix R1-P10 trimmed all leading whitespace and re-anchored,
+    /// flattening hierarchy.
+    #[test]
+    fn error_block_preserves_continuation_line_indent_up_to_four_spaces() {
+        let remediation = "step 1: enable\n  sub-step a\n    sub-sub-step b\n          deep (collapses to canonical)";
+        let result = error_block("code", "msg", remediation, None);
+        // First line at canonical column 11.
+        assert!(
+            result.contains("     run:  step 1: enable"),
+            "first line at canonical column: {result}"
+        );
+        // 2-space sub-indent preserved → column 13.
+        assert!(result.contains("\n             sub-step a"), "2-space indent preserved: {result}");
+        // 4-space sub-indent preserved → column 15.
+        assert!(
+            result.contains("\n               sub-sub-step b"),
+            "4-space indent preserved: {result}"
+        );
+        // 10 leading spaces collapse to MAX_PRESERVED_INDENT (4) →
+        // column 15.
+        assert!(
+            result.contains("\n               deep (collapses to canonical)"),
+            ">4 leading spaces collapse to canonical+max: {result}"
+        );
+    }
+
+    /// R3-P25 round-3 review: empty remediation produces `run:` with
+    /// NO trailing whitespace before the newline.
+    #[test]
+    fn error_block_empty_remediation_run_line_has_no_trailing_whitespace() {
+        let result = error_block("code", "msg", "", None);
+        // Find the `run:` line and assert no trailing space before `\n`.
+        let run_line = result.lines().find(|l| l.contains("run:")).expect("must contain run: line");
+        assert_eq!(
+            run_line, "     run:",
+            "empty remediation: `run:` line must have no trailing whitespace, got {run_line:?}"
+        );
+    }
+
+    /// R3-P6 round-3 review: C1 control codes (U+0080–U+009F) are
+    /// stripped. Some terminals interpret U+009B as the 8-bit CSI;
+    /// pre-fix R2-P18 byte-level filter accepted these.
+    #[test]
+    fn error_block_strips_c1_control_codes() {
+        // U+009B is CSI (control sequence introducer) in 8-bit mode.
+        let hostile = "innocuous\u{009b}2J injected";
+        let result = error_block("code", hostile, "fix", None);
+        assert!(!result.contains('\u{009b}'), "must strip U+009B CSI: {result:?}");
+        assert!(result.contains("innocuous"));
+        assert!(result.contains("injected"));
+    }
+
+    #[test]
+    fn error_block_strips_c1_nel() {
+        // U+0085 (NEL) is treated as a line break by some terminals.
+        let hostile = "before\u{0085}after";
+        let result = error_block("code", hostile, "fix", None);
+        assert!(!result.contains('\u{0085}'), "must strip U+0085 NEL: {result:?}");
+    }
+
+    /// R3-P7 round-3 review: Unicode "Trojan Source" RTLO/BIDI override
+    /// chars are stripped. U+202E is the canonical visual-spoofing
+    /// vector that swaps subsequent character order on supporting
+    /// terminals.
+    #[test]
+    fn error_block_strips_rtlo_bidi_override() {
+        let hostile = "before\u{202e}after\u{202c}end";
+        let result = error_block("code", hostile, "fix", None);
+        assert!(!result.contains('\u{202e}'), "must strip U+202E RLO: {result:?}");
+        assert!(!result.contains('\u{202c}'), "must strip U+202C PDF: {result:?}");
+    }
+
+    #[test]
+    fn error_block_strips_line_separator() {
+        let hostile = "before\u{2028}after";
+        let result = error_block("code", hostile, "fix", None);
+        assert!(!result.contains('\u{2028}'), "must strip U+2028 LINE SEPARATOR: {result:?}");
+    }
+
+    #[test]
+    fn error_block_strips_paragraph_separator_in_remediation() {
+        // Paragraph separator (U+2029) — analog of LINE SEPARATOR that
+        // some renderers treat as a line break and others as a chunk
+        // boundary. Drop unconditionally.
+        let hostile_remediation = "step 1\u{2029}step 2";
+        let result = error_block("code", "msg", hostile_remediation, None);
+        assert!(!result.contains('\u{2029}'), "must strip U+2029 PARA SEP: {result:?}");
+    }
+
+    /// R3-P6/P7: multibyte UTF-8 in the input must survive (the new
+    /// codepoint-aware filter should not break valid Unicode).
+    #[test]
+    fn error_block_preserves_multibyte_utf8() {
+        // Japanese + emoji + combining accent: all valid Unicode that
+        // is NOT in the unsafe class.
+        let safe = "こんにちは 🎉 café";
+        let result = error_block("code", safe, "fix", None);
+        assert!(result.contains("こんにちは"));
+        assert!(result.contains("🎉"));
+        assert!(result.contains("café"));
     }
 
     #[test]
