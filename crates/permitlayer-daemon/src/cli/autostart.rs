@@ -94,12 +94,12 @@ fn run_enable() -> Result<()> {
 
 /// Shared rendering for an `autostart::enable()` outcome.
 ///
-/// **P12 (code review):** the setup-wizard orchestrator
-/// (`cli::setup::run_orchestrator`) used to print autostart errors via
-/// raw `eprintln!`, which produced inconsistent UX vs the
-/// `agentsso autostart enable` CLI surface (which renders
-/// `error_block`s with structured codes). Both call sites now go
-/// through this helper for identical error rendering.
+/// **P12 (code review):** the setup-wizard orchestrator (legacy
+/// `cli::setup::run_orchestrator`, removed in Story 7.13) used to
+/// print autostart errors via raw `eprintln!`, which produced
+/// inconsistent UX vs the `agentsso autostart enable` CLI surface
+/// (which renders `error_block`s with structured codes). Both call
+/// sites now go through this helper for identical error rendering.
 ///
 /// All `Ok` variants emit the same `next: agentsso autostart status`
 /// hint (P23 fix — previously only `Registered` did), so the operator

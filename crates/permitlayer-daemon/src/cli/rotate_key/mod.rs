@@ -170,7 +170,7 @@ pub struct RotateKeyArgs {
     pub yes: bool,
 
     /// Treat the call as non-interactive: implies `--yes` is required.
-    /// Mirrors `cli::uninstall`'s and `cli::setup`'s posture.
+    /// Mirrors `cli::uninstall`'s and `cli::connect`'s posture.
     #[arg(long)]
     pub non_interactive: bool,
 }

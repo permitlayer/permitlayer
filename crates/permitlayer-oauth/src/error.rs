@@ -5,6 +5,93 @@
 //! types (`OAuthToken`, `OAuthRefreshToken`) are non-`Debug` by design;
 //! this enum keeps `#[derive(Debug)]` because it holds only metadata.
 
+use std::borrow::Cow;
+
+/// Parsed form of the canonical Google API `errdetails[].reason` taxonomy
+/// surfaced on a 403 from the post-OAuth verification probe.
+///
+/// Only the canonical-protocol fields named by Google's `errdetails`
+/// taxonomy (`reason`, `metadata.service`, `metadata.scope`) flow into
+/// these variants. The raw response body NEVER appears here — the
+/// privacy contract from Story 2.7 Decision 2B is preserved by the
+/// closed whitelist in `permitlayer_oauth::google::verify::parse_verify_403_reason`.
+///
+/// New variants should be added when a new canonical reason needs
+/// operator-actionable remediation. Reasons that fall outside the
+/// allowlist (e.g. `QUOTA_EXCEEDED`, `IP_ADDRESS_DENIED`) leave the
+/// enclosing `OAuthError::VerificationFailed.reason` set to `None` so
+/// the existing generic remediation message remains in effect.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum VerifyReason {
+    /// `details[].reason == "SERVICE_DISABLED"` — the named API is not
+    /// enabled in the operator's GCP project. The remediation URL points
+    /// at the API library page; `gcloud services enable …` is the
+    /// CLI-equivalent.
+    ServiceDisabled {
+        /// Canonical service name (e.g. `"calendar.googleapis.com"`)
+        /// from `details[].metadata.service`.
+        service: String,
+        /// Operator's GCP project ID (from `client_secret.json`'s
+        /// `project_id` field) if known. None ⇒ remediation URL omits
+        /// the `?project=…` query parameter.
+        project: Option<String>,
+        /// **R2-P12 round-2 review:** when Google bundles
+        /// `BILLING_DISABLED` alongside `SERVICE_DISABLED` in the same
+        /// `details[]` (common for new GCP projects), the parser sets
+        /// this flag and the renderer appends a billing-also-disabled
+        /// footer to the remediation. Without this flag the operator
+        /// would enable the API, retry, and hit a second 403 because
+        /// billing wasn't fixed first.
+        also_billing_disabled: bool,
+    },
+    /// `details[].reason == "BILLING_DISABLED"` — billing is not enabled
+    /// for the operator's GCP project. The remediation URL points at the
+    /// billing console.
+    BillingDisabled {
+        /// Operator's GCP project ID, if known.
+        project: Option<String>,
+    },
+    /// `details[].reason == "ACCESS_TOKEN_SCOPE_INSUFFICIENT"` — the
+    /// granted access token doesn't carry the scopes required by the
+    /// API endpoint we tried to call. Operator must re-run the consent
+    /// flow with the missing scopes selected.
+    ScopeInsufficient {
+        /// Scopes named in `details[].metadata.scope` (split on
+        /// whitespace and commas, trimmed, empty entries dropped).
+        ///
+        /// **R3-P21 round-3 review — semantic contract:**
+        /// `Some(ScopeInsufficient { missing_scopes: vec![] })` is a
+        /// valid "we know there's a scope problem but Google didn't
+        /// tell us which" state, distinct from `None` which means
+        /// "parser found no recognized reason in `details[]`." Future
+        /// code that branches on `verify_reason.is_some()` to decide
+        /// whether to emit a "structured remediation available"
+        /// signal should be aware that an empty-scopes case still
+        /// counts as "structured" — the operator-facing message
+        /// includes a re-consent hint with no scope list.
+        missing_scopes: Vec<String>,
+        /// **R3-P1 round-3 review:** when Google bundles
+        /// `SERVICE_DISABLED` alongside `ACCESS_TOKEN_SCOPE_INSUFFICIENT`
+        /// (real for brand-new GCP projects with missing scopes), the
+        /// parser captures the canonical service identifier here so the
+        /// renderer can surface the API-enablement step alongside the
+        /// re-consent step. Operator avoids hitting a second 403 after
+        /// re-consenting with full scopes.
+        also_service_disabled: Option<String>,
+        /// **R3-P1 round-3 review:** when Google bundles
+        /// `BILLING_DISABLED` in the same `details[]`, the renderer
+        /// surfaces the billing-console URL alongside the re-consent
+        /// step.
+        also_billing_disabled: bool,
+    },
+    /// Recognized 403 shape but the specific reason is not in our
+    /// allowlist. Reserved for future expansion; today's parser never
+    /// constructs this variant (it returns `None` for unknown reasons
+    /// so the generic remediation kicks in via the outer `Option`).
+    Other,
+}
+
 /// Errors returned by OAuth client operations.
 ///
 /// # Credential safety
@@ -132,6 +219,15 @@ pub enum OAuthError {
         reason: String,
         /// HTTP status code if applicable.
         status_code: Option<u16>,
+        /// Story 7.12: typed parse of the response body's
+        /// `errdetails[].reason` taxonomy on a 403, when present.
+        ///
+        /// **Privacy invariant (extends Story 2.7 Decision 2B):** only
+        /// canonical-protocol fields cross from the response body into
+        /// these variants. The raw body string never appears here. See
+        /// `permitlayer_oauth::google::verify::parse_verify_403_reason`
+        /// for the field whitelist.
+        verify_reason: Option<VerifyReason>,
         /// Underlying error for chain inspection (e.g., reqwest::Error).
         /// Consistent with TokenExchangeFailed and RefreshFailed which both carry `#[source]`.
         #[source]
@@ -175,8 +271,46 @@ pub enum OAuthError {
     PastedUrlStateMismatch,
 }
 
+/// Friendly short-name for a known Google API service identifier.
+/// Returns `None` for unknown services so the renderer can fall back to
+/// the raw identifier (`<service>.googleapis.com`). Adding a new entry
+/// here is a one-line change.
+///
+/// **R2-P9 round-2 review:** the prior round-1 P11(b) `to_ascii_lowercase`
+/// allocation was provably dead behind `validate_service_identifier`'s
+/// strict-lowercase byte-class check. The parser's gate is the actual
+/// contract; this lookup matches `service` directly. If a future caller
+/// bypasses the parser (e.g., a CLI subcommand pretty-printing stored
+/// reasons), they're responsible for normalizing case before lookup.
+/// **R3-P9 round-3 review:** single source of truth for the verify-failed
+/// generic remediation text. Referenced by both `OAuthError::remediation`
+/// (the static-string fallback) and `render_verify_remediation`'s
+/// defensive `VerifyReason::Other` arm so future text updates land in
+/// one place. Pre-fix R2-P6 had the text duplicated in both arms; if
+/// `remediation` was updated and the `Other` arm forgotten, debug builds
+/// would panic loudly but release builds would silently serve stale
+/// text.
+pub(crate) const VERIFY_FAILED_GENERIC_REMEDIATION: &str = "Credentials are stored. Re-run setup or check the service status at https://www.google.com/appsstatus.";
+
+fn google_api_friendly_name(service: &str) -> Option<&'static str> {
+    match service {
+        "calendar.googleapis.com" => Some("Calendar API"),
+        "drive.googleapis.com" => Some("Drive API"),
+        "gmail.googleapis.com" => Some("Gmail API"),
+        "sheets.googleapis.com" => Some("Sheets API"),
+        "docs.googleapis.com" => Some("Docs API"),
+        _ => None,
+    }
+}
+
 impl OAuthError {
     /// Return a user-facing remediation hint for this error.
+    ///
+    /// Returns a `&'static str` for backwards compatibility. Variants
+    /// whose remediation needs runtime data (URLs, project IDs, scope
+    /// lists) MUST be rendered via [`Self::remediation_owned`] —
+    /// `remediation` returns the static fallback for those variants so
+    /// existing static-string callers degrade gracefully.
     #[must_use]
     pub fn remediation(&self) -> &'static str {
         match self {
@@ -219,9 +353,7 @@ impl OAuthError {
             Self::ClientJsonInvalid { .. } => {
                 "The file must be a Google Cloud Console OAuth client JSON (installed or web type)."
             }
-            Self::VerificationFailed { .. } => {
-                "Credentials are stored. Re-run setup or check the service status at https://www.google.com/appsstatus."
-            }
+            Self::VerificationFailed { .. } => VERIFY_FAILED_GENERIC_REMEDIATION,
             Self::PastedUrlMalformed => {
                 "Copy the entire URL from your browser's address bar (starting with http://127.0.0.1:) and paste it again."
             }
@@ -263,6 +395,145 @@ impl OAuthError {
             Self::PastedUrlMissingCode => "pasted_url_missing_code",
             Self::PastedUrlMissingState => "pasted_url_missing_state",
             Self::PastedUrlStateMismatch => "pasted_url_state_mismatch",
+        }
+    }
+
+    /// Return a user-facing remediation hint that may include
+    /// runtime-computed data (URLs, project IDs, scope names).
+    ///
+    /// Companion to [`Self::remediation`]: variants whose text is
+    /// purely static return `Cow::Borrowed(self.remediation())`;
+    /// variants that need runtime data return `Cow::Owned(...)`.
+    /// Story 7.12 added the dynamic dispatch arms for
+    /// `VerificationFailed { verify_reason: Some(...), .. }` so that
+    /// post-OAuth 403 errors render an actionable URL + `gcloud`
+    /// command. New `OAuthError` variants in the future should add a
+    /// match arm here only if their text needs runtime data; otherwise
+    /// the default branch handles them.
+    ///
+    /// **P8 round-1 review:** `VerifyReason::Other` falls through to
+    /// the static [`Self::remediation`] text via `Cow::Borrowed`
+    /// rather than allocating a fresh `String`. This keeps the static
+    /// fallback text in a single place — if `remediation`'s text is
+    /// updated, `Other` follows automatically.
+    #[must_use]
+    pub fn remediation_owned(&self) -> Cow<'static, str> {
+        if let Self::VerificationFailed { verify_reason: Some(vr), .. } = self {
+            // P8: Other shares the static text with `verify_reason: None`
+            // and other static variants — borrow rather than allocate.
+            if matches!(vr, VerifyReason::Other) {
+                return Cow::Borrowed(self.remediation());
+            }
+            return Cow::Owned(render_verify_remediation(vr));
+        }
+        Cow::Borrowed(self.remediation())
+    }
+}
+
+/// Render a [`VerifyReason`] into operator-facing remediation text.
+///
+/// Pure string interpolation — no I/O, no panics, allocation bounded
+/// (worst-case ~500 bytes). Output is rendered into terminal UIs
+/// (`error_block`) and structured `tracing` events.
+///
+/// **P8 round-1 review:** the `Other` variant is intentionally NOT
+/// handled here — [`OAuthError::remediation_owned`] short-circuits
+/// `Other` to `Cow::Borrowed(self.remediation())` so the static
+/// fallback text lives in exactly one place. The match below is
+/// therefore exhaustive over the remaining variants of the
+/// `#[non_exhaustive]` enum (caught by the unreachable!() guard).
+fn render_verify_remediation(vr: &VerifyReason) -> String {
+    match vr {
+        VerifyReason::ServiceDisabled { service, project, also_billing_disabled } => {
+            let friendly = google_api_friendly_name(service).unwrap_or(service);
+            let console_url = match project {
+                Some(p) => {
+                    format!("https://console.cloud.google.com/apis/library/{service}?project={p}")
+                }
+                None => format!("https://console.cloud.google.com/apis/library/{service}"),
+            };
+            let gcloud = match project {
+                Some(p) => format!("gcloud services enable {service} --project {p}"),
+                None => format!("gcloud services enable {service}"),
+            };
+            let mut out = format!(
+                "Enable {friendly} in Google Cloud Console:\n    {console_url}\n  Or via gcloud:\n    {gcloud}"
+            );
+            // R2-P12 + R3-P2 round-3 review: when Google bundles billing
+            // AND service-disabled (common for new GCP projects), surface
+            // both fixes. The footer text is flat so it reads correctly
+            // after `error_block`'s continuation-line indent (R3-P2:
+            // pre-fix used 2-space and 4-space sub-indents to convey
+            // "do this first" hierarchy, which `error_block` flattens).
+            if *also_billing_disabled {
+                let billing_url = match project {
+                    Some(p) => format!("https://console.cloud.google.com/billing?project={p}"),
+                    None => "https://console.cloud.google.com/billing".to_owned(),
+                };
+                out.push_str(&format!(
+                    "\nFirst enable billing for this project (the API enablement above will fail without billing):\n{billing_url}"
+                ));
+            }
+            out
+        }
+        VerifyReason::BillingDisabled { project } => {
+            let url = match project {
+                Some(p) => format!("https://console.cloud.google.com/billing?project={p}"),
+                None => "https://console.cloud.google.com/billing".to_owned(),
+            };
+            format!("Enable billing for this Google Cloud project:\n    {url}")
+        }
+        VerifyReason::ScopeInsufficient {
+            missing_scopes,
+            also_service_disabled,
+            also_billing_disabled,
+        } => {
+            // R3-P10 round-3 review: pluralize correctly when only one
+            // scope is missing.
+            let mut out = if missing_scopes.is_empty() {
+                "Re-run setup with the missing scopes (none reported in the error metadata — \
+                 try the consent flow again with all required scopes)."
+                    .to_owned()
+            } else {
+                let noun = if missing_scopes.len() == 1 { "scope" } else { "scopes" };
+                let list = missing_scopes.join(", ");
+                format!("Re-run setup with the missing {noun}: {list}")
+            };
+            // R3-P1 round-3 review: when Google bundles SERVICE and/or
+            // BILLING alongside SCOPE_INSUFFICIENT (real for brand-new
+            // GCP projects), surface them as ordered "do this AFTER
+            // re-consenting" steps so the operator avoids a 2nd or 3rd
+            // 403 after fixing the scopes.
+            if let Some(service) = also_service_disabled {
+                let friendly = google_api_friendly_name(service).unwrap_or(service);
+                out.push_str(&format!(
+                    "\n  Then enable {friendly} in Google Cloud Console:\n    https://console.cloud.google.com/apis/library/{service}"
+                ));
+            }
+            if *also_billing_disabled {
+                out.push_str(
+                    "\n  Then enable billing for this Google Cloud project:\n    https://console.cloud.google.com/billing"
+                );
+            }
+            out
+        }
+        // R2-P6 round-2 review: `Other` is short-circuited in
+        // `remediation_owned` to `Cow::Borrowed(self.remediation())`
+        // and should not reach this function. The pre-fix `unreachable!`
+        // would panic in production if a future caller bypassed the
+        // short-circuit. We now `debug_assert!` for the dev-time
+        // signal and return the same static fallback text the
+        // short-circuit would have produced — fail-open in release,
+        // loud in debug. Behavior is identical to going through the
+        // short-circuit.
+        VerifyReason::Other => {
+            debug_assert!(
+                false,
+                "VerifyReason::Other should be handled by OAuthError::remediation_owned's short-circuit"
+            );
+            // R3-P9: reference the same constant `OAuthError::remediation`
+            // serves so a future text update lands in exactly one place.
+            VERIFY_FAILED_GENERIC_REMEDIATION.to_owned()
         }
     }
 }

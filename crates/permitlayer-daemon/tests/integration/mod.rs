@@ -35,6 +35,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod agent_rebind_e2e;
 mod agent_registry_e2e;
 mod approval_prompt_e2e;
 mod audit_drain_on_shutdown_e2e;
@@ -42,6 +43,7 @@ mod audit_export_e2e;
 mod audit_follow;
 mod audit_query_e2e;
 mod config_theme;
+mod connect_e2e;
 mod connectors_list_e2e;
 mod connectors_new_e2e;
 mod connectors_test_e2e;
@@ -62,7 +64,6 @@ mod policy_reload_e2e;
 mod rotate_key_crash_resume_e2e;
 mod rotate_key_e2e;
 mod scrub_explain_warnings;
-mod setup_daemon_conflict;
 mod status_connections_e2e;
 mod uninstall_e2e;
 mod update_e2e;

@@ -5,6 +5,17 @@
 
 #![forbid(unsafe_code)]
 
+// Story 7.11 review-round-2 Q3: workspace-wide test-seam discipline.
+// The daemon's `test-seam` feature transitively enables
+// `permitlayer-keystore/test-seam`. See `permitlayer-core::lib.rs`
+// for the full rationale.
+#[cfg(all(feature = "test-seam", not(debug_assertions)))]
+compile_error!(
+    "the `test-seam` feature must NOT be enabled in release builds. \
+     If you need to run integration tests against this crate, build \
+     with `cargo test --features test-seam` (debug profile) instead."
+);
+
 mod approval;
 mod cli;
 mod config;
@@ -34,8 +45,10 @@ enum Commands {
     Status(cli::status::StatusArgs),
     /// Reload configuration (sends SIGHUP)
     Reload,
-    /// Set up OAuth for an upstream service (e.g., gmail)
-    Setup(cli::setup::SetupArgs),
+    /// Connect a Google service to an agent end-to-end (Story 7.13).
+    /// Composes vault-seal + verify + policy-merge + agent-rebind +
+    /// OpenClaw-snippet emission. Idempotent on re-runs.
+    Connect(cli::connect::ConnectArgs),
     /// Manage stored credentials
     Credentials(cli::credentials::CredentialsArgs),
     /// Manage user-facing configuration
@@ -98,6 +111,28 @@ enum Commands {
 /// `ExitCode::FAILURE` (1) on error, matching the pre-1.15 behavior.
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Story 7.13 AC #7 — legacy `agentsso setup` interceptor.
+    //
+    // The `setup` subcommand was removed in favor of the
+    // orchestration-aware `agentsso connect <service>` verb. Operators
+    // (or scripts) still typing `agentsso setup` get a structured
+    // remediation block instead of clap's terse "unrecognized
+    // subcommand" error. Runs BEFORE clap parsing so it short-circuits
+    // even when later args would themselves fail clap.
+    if std::env::args().nth(1).as_deref() == Some("setup") {
+        eprint!(
+            "{}",
+            crate::design::render::error_block(
+                "setup.removed",
+                "`agentsso setup` was removed; use `agentsso connect <service> --agent <name>`",
+                "agentsso connect <service> --agent <name> --oauth-client <path>\n\n  \
+                 supported services: gmail, calendar, drive",
+                None,
+            )
+        );
+        return ExitCode::from(2);
+    }
+
     let cli = Cli::parse();
     match cli.command {
         Some(Commands::Start(args)) => match cli::start::run(args).await {
@@ -133,7 +168,7 @@ async fn main() -> ExitCode {
         Some(Commands::Stop) => anyhow_to_exit_code(cli::stop::run()),
         Some(Commands::Status(args)) => anyhow_to_exit_code(cli::status::run(args).await),
         Some(Commands::Reload) => anyhow_to_exit_code(cli::reload::run().await),
-        Some(Commands::Setup(args)) => setup_to_exit_code(cli::setup::run(args).await),
+        Some(Commands::Connect(args)) => connect_to_exit_code(cli::connect::run(args).await),
         // `credentials_refresh_to_exit_code` is shape-compatible with
         // `list`/`status` outcomes (the typed-marker downcast is a
         // no-op for those variants). Only `refresh` ever produces
@@ -298,22 +333,37 @@ fn rotate_key_to_exit_code(result: anyhow::Result<()>) -> ExitCode {
     }
 }
 
-/// `agentsso setup`-specific dispatch (Story 7.6c). Single typed
-/// marker (`SetupExitCode3`) covering the daemon-running pre-flight
+/// `agentsso connect`-specific dispatch (Story 7.13, replaces
+/// `setup_to_exit_code` from Story 7.6c). Single typed marker
+/// (`ConnectExitCode3`) covering the daemon-running pre-flight
 /// refusal. Mirrors [`rotate_key_to_exit_code`] above.
 ///
 /// **Architecture note:** with this PR there are now four
 /// `*_to_exit_code` dispatchers with the same shape (uninstall +
-/// update + rotate-key + setup + credentials_refresh). The
+/// update + rotate-key + connect + credentials_refresh). The
 /// `cli::common::exit_code::dispatch_with_markers` extraction
 /// tracked in deferred-work.md becomes correspondingly more
 /// attractive — see Story 7.6c's deferred-work entry.
-fn setup_to_exit_code(result: anyhow::Result<()>) -> ExitCode {
+fn connect_to_exit_code(result: anyhow::Result<()>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
-            let exit_three = e.downcast_ref::<cli::setup::SetupExitCode3>().is_some();
-            let resolved_code = if exit_three { 3 } else { 1 };
+            // Story 7.13: connect has two typed exit-code markers
+            // (operator-correctable input → 2; resource conflict → 3).
+            // The chain walk handles anyhow's ContextError wrapping;
+            // see the comment on `uninstall_to_exit_code` for the
+            // rationale.
+            let exit_two = e.downcast_ref::<cli::connect::ConnectExitCode2>().is_some()
+                || e.chain().any(|s| s.is::<cli::connect::ConnectExitCode2>());
+            let exit_three = e.downcast_ref::<cli::connect::ConnectExitCode3>().is_some()
+                || e.chain().any(|s| s.is::<cli::connect::ConnectExitCode3>());
+            let resolved_code = if exit_three {
+                3
+            } else if exit_two {
+                2
+            } else {
+                1
+            };
             if e.downcast_ref::<cli::SilentCliError>().is_some()
                 || e.chain().any(|s| s.is::<cli::SilentCliError>())
             {

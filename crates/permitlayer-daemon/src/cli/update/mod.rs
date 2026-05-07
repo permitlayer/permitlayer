@@ -65,7 +65,8 @@ impl std::fmt::Display for UpdateExitCode3 {
 impl std::error::Error for UpdateExitCode3 {}
 
 /// Exit-code 4 marker — auth / network / signature / disk-space
-/// failure. Same semantics as `cli::setup`'s auth-error code.
+/// failure. Same semantics class as `permitlayer_oauth::error::OAuthError`'s
+/// auth-failure variants surfaced from `cli::connect`.
 #[derive(Debug)]
 pub(crate) struct UpdateExitCode4;
 

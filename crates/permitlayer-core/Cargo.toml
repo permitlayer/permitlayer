@@ -32,6 +32,9 @@ regex.workspace = true
 static_assertions.workspace = true
 arc-swap.workspace = true
 toml.workspace = true
+# Story 7.13: policy::edit uses tempfile-rename for atomic policy file
+# updates. Promoted from dev-dep to runtime dep here.
+tempfile.workspace = true
 # Argon2id for at-rest agent token hashing (Story 4.4).
 argon2.workspace = true
 # HMAC-SHA-256 for the runtime token-lookup index (Story 4.4 dual-index design).
@@ -50,11 +53,16 @@ libc = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
-tempfile.workspace = true
 walkdir.workspace = true
 trybuild.workspace = true
 insta = { workspace = true, features = ["json"] }
 criterion.workspace = true
+
+# Story 7.11 review-round-1 D11: euid check for atomicity tests
+# (no-unsafe wrapper around `geteuid()`). Unix-only — the
+# atomicity tests are `#[cfg(unix)]`-gated.
+[target.'cfg(unix)'.dev-dependencies]
+nix = { workspace = true }
 
 [features]
 # Exposes fault-injection seams for integration tests. Gated behind a

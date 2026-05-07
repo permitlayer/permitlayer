@@ -16,14 +16,20 @@
 //!   string discriminants — TOML users write `approval-mode = "auto"`,
 //!   not `ApprovalMode::Auto`.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Top-level deserialization target for a single `*.toml` file.
 ///
 /// A file MUST contain at least one `[[policies]]` entry; the empty
 /// case surfaces as [`super::PolicyCompileError::EmptyPoliciesArray`]
 /// during compile, not a parser rejection here.
-#[derive(Debug, Deserialize)]
+///
+/// Story 7.13 round-1 P2: implements `Serialize` so [`super::edit::add_scopes_to_policy`]
+/// can round-trip the file through the typed schema (rather than
+/// hand-building a `toml::Value` table that silently drops fields not
+/// enumerated in the serializer). Adding a new field on `TomlPolicy`
+/// or `TomlRule` automatically round-trips through edit.rs from now on.
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TomlPolicyFile {
     /// Array of `[[policies]]` table entries.
@@ -31,7 +37,7 @@ pub struct TomlPolicyFile {
 }
 
 /// One `[[policies]]` entry.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TomlPolicy {
     /// Stable identifier used to bind agents to this policy
@@ -60,7 +66,12 @@ pub struct TomlPolicy {
 
     /// Per-rule overrides. Rules are evaluated in declaration order;
     /// the first rule whose scopes AND resources match wins.
-    #[serde(default)]
+    ///
+    /// `skip_serializing_if`: an empty rules vec is omitted on round-trip
+    /// (TOML's `rules = []` is awkward and the file parses identically
+    /// without it). On deserialize the `default` keeps backwards-compat
+    /// with files that omit the field entirely.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<TomlRule>,
 
     /// Positive-framed flag (AR28): when true, all rules whose
@@ -73,6 +84,12 @@ pub struct TomlPolicy {
     /// the evaluator — Story 4.5 (approval prompts) owns the
     /// runtime behavior. The flag is schema-validated here so the
     /// field is not an "unknown key" trigger.
+    ///
+    /// Story 7.13 round-1 P16: this field is **always serialized**
+    /// (no `skip_serializing_if`). An operator who explicitly wrote
+    /// `auto-approve-reads = false` keeps that declaration verbatim
+    /// after a connect-flow edit, instead of having it silently
+    /// erased to default.
     #[serde(rename = "auto-approve-reads", default)]
     pub auto_approve_reads: bool,
 }
@@ -81,7 +98,7 @@ pub struct TomlPolicy {
 ///
 /// These values appear verbatim in user-written TOML:
 /// `approval-mode = "auto"` / `"prompt"` / `"deny"`.
-#[derive(Debug, Deserialize, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum TomlApprovalMode {
     /// Request is allowed without prompting the operator.
@@ -93,7 +110,7 @@ pub enum TomlApprovalMode {
 }
 
 /// One `[[policies.rules]]` entry.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TomlRule {
     /// Stable string identifier. Appears in HTTP 403 response bodies
@@ -103,11 +120,11 @@ pub struct TomlRule {
 
     /// If present, overrides the policy-level scope allowlist for
     /// matching purposes. Absent means "inherit the policy's scopes".
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scopes: Option<Vec<String>>,
 
     /// If present, overrides the policy-level resource allowlist.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub resources: Option<Vec<String>>,
 
     /// What happens when this rule matches. Narrower than policy-level
@@ -119,7 +136,7 @@ pub struct TomlRule {
 /// Rule-level actions. Superset of `TomlApprovalMode` so rules can
 /// express explicit `allow` (which the policy-level field cannot —
 /// a policy's default is either auto, prompt, or deny, not allow).
-#[derive(Debug, Deserialize, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Deserialize, Serialize, Clone, Copy, Eq, PartialEq)]
 #[serde(rename_all = "kebab-case")]
 pub enum TomlRuleAction {
     /// Explicitly allow requests matching this rule (used to carve

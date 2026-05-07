@@ -2218,6 +2218,26 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
             .map_err(|source| StartError::TelemetryInit { source })?;
     tracing::info!("daemon starting");
 
+    // Story 7.11 review-round-3 #4: runtime smoke alarm if this
+    // binary was compiled with `test-seam` features enabled. The
+    // compile_error! gate in each crate root blocks `--release
+    // --features test-seam`, but a debug build with the feature
+    // still compiles. This warning fires on every boot so an
+    // operator who accidentally deployed a debug+test-seam binary
+    // sees a loud diagnostic in their startup logs. The seam itself
+    // is also gated on `debug_assertions` so a release binary
+    // cannot reach the injection branches even if the feature were
+    // somehow enabled — but this warning catches the lighter case
+    // where someone did `cargo build --features test-seam` and
+    // shipped the resulting debug binary.
+    #[cfg(feature = "test-seam")]
+    tracing::warn!(
+        "this binary was compiled with the `test-seam` feature enabled. \
+         Test-seam binaries expose fault-injection helpers (e.g. RenameFailGuard) \
+         and MUST NOT be deployed to production. If you see this warning on a \
+         production daemon, rebuild without `--features test-seam` and redeploy."
+    );
+
     // **M2 review patch (continued):** post-init re-emit of the
     // clamp warning. `validated()` did the work pre-init; this
     // surfaces the diagnostic to the operator now that the

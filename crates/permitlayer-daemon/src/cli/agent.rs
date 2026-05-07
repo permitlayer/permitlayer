@@ -49,6 +49,12 @@ pub enum AgentCommand {
     /// in-flight requests using the old snapshot finish, new requests
     /// return 401.
     Remove(RemoveArgs),
+    /// Update an agent's policy binding without rotating its bearer
+    /// token (Story 7.11). Use this to extend an agent's scopes —
+    /// e.g., switch a Gmail-only agent to a policy that also covers
+    /// Calendar — without re-pasting a new token into your MCP-client
+    /// config.
+    Rebind(RebindArgs),
 }
 
 #[derive(Args)]
@@ -67,11 +73,22 @@ pub struct RemoveArgs {
     pub name: String,
 }
 
+#[derive(Args)]
+pub struct RebindArgs {
+    /// Name of the agent to rebind.
+    pub name: String,
+    /// Policy to rebind the agent to. Must already exist in
+    /// `~/.agentsso/policies/`.
+    #[arg(long)]
+    pub policy: String,
+}
+
 pub async fn run(args: AgentArgs) -> Result<()> {
     match args.command {
         AgentCommand::Register(a) => register_agent(a).await,
         AgentCommand::List => list_agents().await,
         AgentCommand::Remove(a) => remove_agent(a).await,
+        AgentCommand::Rebind(a) => rebind_agent(a).await,
     }
 }
 
@@ -128,7 +145,12 @@ async fn register_agent(args: RegisterArgs) -> Result<()> {
             std::process::exit(3);
         }
     };
-    if parsed["status"] == "error" {
+    // Story 7.11 review-round-1 D3: explicit `Some("ok")` positive
+    // check. Pre-7.11 the register/list/remove handlers fell through
+    // to success on missing/unknown status; D3 lifts the rebind-path
+    // discipline to all CLI handlers.
+    let status = parsed["status"].as_str();
+    if status == Some("error") {
         let code = parsed["code"].as_str().unwrap_or("agent.unknown_error").to_owned();
         let message = parsed["message"].as_str().unwrap_or("(no message provided)").to_owned();
         let suggested = match code.as_str() {
@@ -142,7 +164,17 @@ async fn register_agent(args: RegisterArgs) -> Result<()> {
             _ => "see message above".to_owned(),
         };
         eprint!("{}", error_block(&code, &message, &suggested, None));
-        std::process::exit(if code == "agent.duplicate_name" { 2 } else { 3 });
+        // Story 7.11 review-round-2 Q2: route through the shared
+        // `agent_control_exit_code` helper so register/list/remove/
+        // rebind agree on exit codes for the same error code.
+        std::process::exit(agent_control_exit_code(&code));
+    } else if status != Some("ok") {
+        tracing::debug!(
+            body = %response,
+            "unexpected agent register response: status was neither 'ok' nor 'error'"
+        );
+        eprint!("{}", error_block_protocol_error());
+        std::process::exit(3);
     }
 
     let name = parsed["name"].as_str().unwrap_or(&args.name).to_owned();
@@ -211,7 +243,14 @@ async fn list_agents() -> Result<()> {
     // (with `status: "error"`) when the backing store is degraded —
     // without this guard the operator would see "no agents registered"
     // and chase a red herring.
-    if parsed["status"] == "error" {
+    //
+    // Story 7.11 review-round-1 D3: explicit Some("ok") discipline.
+    // NB: list responses can ALSO take the Plan B
+    // `{"error":{"code":"forbidden_*"}}` shape (auth errors), handled
+    // immediately below — so the unknown-status branch only fires
+    // when neither shape matches.
+    let status = parsed["status"].as_str();
+    if status == Some("error") {
         let code = parsed["code"].as_str().unwrap_or("agent.unknown_error").to_owned();
         let message = parsed["message"].as_str().unwrap_or("(no message provided)").to_owned();
         let suggested = match code.as_str() {
@@ -222,7 +261,8 @@ async fn list_agents() -> Result<()> {
             _ => "see message above".to_owned(),
         };
         eprint!("{}", error_block(&code, &message, &suggested, None));
-        std::process::exit(3);
+        // Story 7.11 review-round-2 Q2: shared exit-code helper.
+        std::process::exit(agent_control_exit_code(&code));
     }
     // Plan B: control-plane auth errors come back with a different
     // top-level shape: `{"error":{"code":"forbidden_*", "message":...}}`.
@@ -241,6 +281,18 @@ async fn list_agents() -> Result<()> {
             _ => "see message above".to_owned(),
         };
         eprint!("{}", error_block(&code, &message, &suggested, None));
+        std::process::exit(3);
+    }
+
+    // Story 7.11 review-round-1 D3: now that BOTH error shapes are
+    // ruled out, require explicit `status: "ok"` before reading
+    // `agents`. Anything else is a protocol error.
+    if status != Some("ok") {
+        tracing::debug!(
+            body = %response,
+            "unexpected agent list response: status was neither 'ok' nor 'error'"
+        );
+        eprint!("{}", error_block_protocol_error());
         std::process::exit(3);
     }
 
@@ -333,10 +385,20 @@ async fn remove_agent(args: RemoveArgs) -> Result<()> {
         }
     };
 
-    if parsed["status"] == "error" {
+    // Story 7.11 review-round-1 D3: explicit Some("ok") discipline.
+    let status = parsed["status"].as_str();
+    if status == Some("error") {
         let code = parsed["code"].as_str().unwrap_or("agent.unknown_error").to_owned();
         let message = parsed["message"].as_str().unwrap_or("(no message provided)").to_owned();
         eprint!("{}", error_block(&code, &message, "see message above", None));
+        // Story 7.11 review-round-2 Q2: shared exit-code helper.
+        std::process::exit(agent_control_exit_code(&code));
+    } else if status != Some("ok") {
+        tracing::debug!(
+            body = %response,
+            "unexpected agent remove response: status was neither 'ok' nor 'error'"
+        );
+        eprint!("{}", error_block_protocol_error());
         std::process::exit(3);
     }
 
@@ -348,6 +410,171 @@ async fn remove_agent(args: RemoveArgs) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Rebind an agent to a new policy without rotating its bearer token
+/// (Story 7.11). The bearer-token-immutable-across-rebind invariant
+/// is the load-bearing property — operators can extend an agent's
+/// scopes via the policy file + `agent rebind` without touching
+/// downstream MCP-client configs.
+async fn rebind_agent(args: RebindArgs) -> Result<()> {
+    let config = load_daemon_config_or_default_with_warn("agent rebind");
+    let home = config.paths.home.clone();
+
+    // Same Plan B operator-token discipline as `agent register` /
+    // `agent remove`. Daemon must be running (HTTP call); the
+    // `error_block_daemon_unreachable` path renders the right error
+    // message if the daemon is down.
+    let body = serde_json::json!({
+        "name": args.name,
+        "policy_name": args.policy,
+    })
+    .to_string();
+    let bind_addr = config.http.bind_addr;
+    let token = crate::cli::kill::read_control_token(&home);
+    let response = match http_post_json(
+        bind_addr,
+        "/v1/control/agent/rebind",
+        &body,
+        token.as_deref(),
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::debug!(error = %e, addr = %bind_addr, "agent rebind request failed");
+            eprint!("{}", error_block_daemon_unreachable("agent rebind", bind_addr));
+            std::process::exit(3);
+        }
+    };
+
+    let parsed: serde_json::Value = match serde_json::from_str(&response) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(error = %e, body = %response, "unexpected agent rebind response");
+            eprint!("{}", error_block_protocol_error());
+            std::process::exit(3);
+        }
+    };
+
+    // Story 7.11 review-round-1 P4: explicit positive `status == "ok"`
+    // check. Pre-existing register/remove handlers fall through to
+    // success on missing/unknown status — the rebind path tightens
+    // this. Everything that's NOT an explicit "ok" or "error" gets
+    // routed to `error_block_protocol_error` rather than silently
+    // printing a phony success.
+    let status = parsed["status"].as_str();
+    if status == Some("error") {
+        let code = parsed["code"].as_str().unwrap_or("agent.unknown_error").to_owned();
+        let message = parsed["message"].as_str().unwrap_or("(no message provided)").to_owned();
+        let suggested = match code.as_str() {
+            "agent.unknown_policy" => {
+                "edit ~/.agentsso/policies/ then `agentsso reload`".to_owned()
+            }
+            "agent.not_found" => format!(
+                "register the agent first: agentsso agent register {} --policy={}",
+                args.name, args.policy
+            ),
+            "agent.rate_limited" => "wait briefly and retry".to_owned(),
+            "agent.registry_reload_failed" => {
+                "the agent file was rewritten on disk but the in-memory registry is stale; \
+                 run `agentsso reload` to recover"
+                    .to_owned()
+            }
+            _ => "see message above".to_owned(),
+        };
+        eprint!("{}", error_block(&code, &message, &suggested, None));
+        // Story 7.11 review-round-2 Q2: route through the shared
+        // `agent_control_exit_code` helper. The earlier round-1 P3
+        // hand-rolled this same mapping inline; round-2 promoted it
+        // to a shared helper so register/list/remove/rebind agree.
+        std::process::exit(agent_control_exit_code(&code));
+    } else if status != Some("ok") {
+        // Unknown status (missing, null, or anything other than
+        // "ok"/"error"). The daemon should never produce this shape,
+        // but if it does (network corruption, future schema drift,
+        // proxy interposition), fall back to a protocol error rather
+        // than printing a phony success block.
+        tracing::debug!(
+            body = %response,
+            "unexpected agent rebind response: status was neither 'ok' nor 'error'"
+        );
+        eprint!("{}", error_block_protocol_error());
+        std::process::exit(3);
+    }
+
+    // status == Some("ok") — render success.
+    let agent = match parsed.get("agent") {
+        Some(a) if a.is_object() => a,
+        _ => {
+            // Server returned `status: ok` but no `agent` payload.
+            // Defense in depth — same bucket as protocol error.
+            tracing::debug!(
+                body = %response,
+                "agent rebind ok-response missing 'agent' field"
+            );
+            eprint!("{}", error_block_protocol_error());
+            std::process::exit(3);
+        }
+    };
+    let name = agent["name"].as_str().unwrap_or(&args.name);
+    let policy_name = agent["policy_name"].as_str().unwrap_or(&args.policy);
+
+    // The reassurance-line is operator-facing and required by the
+    // story spec (Task 3.3) — it makes the bearer-token-immutable
+    // invariant visible at the moment it matters most.
+    println!();
+    println!("✓ agent '{name}' rebound → policy '{policy_name}'");
+    println!("  (bearer token unchanged — your MCP-client config does NOT need to be updated)");
+    println!();
+
+    Ok(())
+}
+
+/// Story 7.11 review-round-2 Q2: centralized exit-code mapping for
+/// `agentsso agent` subcommands (register / list / remove / rebind).
+///
+/// The contract:
+/// - **2** = operator-correctable precondition. The command's target
+///   state is wrong (agent missing, policy unknown, name invalid,
+///   name already taken). The operator must fix their input and
+///   retry. Scripts can map exit 2 → "review the command, don't
+///   blindly retry."
+/// - **3** = daemon/system error. Transient (rate-limited) or
+///   systemic (persist failed, registry reload failed, daemon
+///   unreachable). Scripts can map exit 3 → "wait briefly and retry,
+///   or escalate if persistent."
+///
+/// This helper is intentionally scoped to `agent` subcommands.
+/// Other CLI surfaces (`start`, `update`, `rotate-key`) have their
+/// own exit-code conventions and MUST NOT be routed through this.
+/// Story 7.13 (`agentsso connect`) introduces OAuth/browser/provider
+/// failure classes that need their own bucket and likewise must not
+/// be shoehorned into this taxonomy.
+///
+/// Codified in response to Story 7.11 round-2 review where
+/// `register` and `rebind` were found disagreeing on the exit code
+/// for `agent.unknown_policy` (3 vs 2). Single source of truth here.
+pub(crate) fn agent_control_exit_code(code: &str) -> i32 {
+    match code {
+        // Operator-correctable preconditions.
+        // Story 7.11 review-round-3 #3: `agent.bad_request` (emitted
+        // for malformed JSON / oversized body / unparseable input)
+        // belongs in the "fix your input and retry" bucket, NOT
+        // "retry later". Scripts mapping exit 3 → retry-with-backoff
+        // would loop forever on a malformed payload.
+        "agent.not_found"
+        | "agent.unknown_policy"
+        | "agent.invalid_name"
+        | "agent.duplicate_name"
+        | "agent.bad_request" => 2,
+        // Daemon/system errors (rate_limited, persist_failed,
+        // registry_reload_failed, lookup_failed, store_unavailable,
+        // internal, unknown). Default 3 keeps unknown future codes
+        // in the "retry later" bucket; revisit if a new code
+        // surfaces that's clearly operator-correctable.
+        _ => 3,
+    }
 }
 
 #[cfg(test)]
@@ -395,5 +622,85 @@ mod tests {
             }
             _ => panic!("expected Remove variant"),
         }
+    }
+
+    #[test]
+    fn clap_parses_rebind_with_policy_flag() {
+        let parsed = CliWrapper::parse_from([
+            "agent",
+            "rebind",
+            "email-triage",
+            "--policy=email-and-calendar",
+        ]);
+        match parsed.cmd {
+            AgentCommand::Rebind(r) => {
+                assert_eq!(r.name, "email-triage");
+                assert_eq!(r.policy, "email-and-calendar");
+            }
+            _ => panic!("expected Rebind variant"),
+        }
+    }
+
+    #[test]
+    fn clap_rebind_requires_policy_flag() {
+        // `agent rebind <name>` without --policy must fail to parse.
+        let result = CliWrapper::try_parse_from(["agent", "rebind", "email-triage"]);
+        assert!(result.is_err(), "rebind without --policy must fail clap parse");
+    }
+
+    // Story 7.11 review-round-2 Q2: exit-code helper unit tests.
+    // Pins the contract so register/list/remove/rebind agree.
+
+    #[test]
+    fn agent_control_exit_code_preconditions_map_to_2() {
+        for code in &[
+            "agent.not_found",
+            "agent.unknown_policy",
+            "agent.invalid_name",
+            "agent.duplicate_name",
+        ] {
+            assert_eq!(
+                agent_control_exit_code(code),
+                2,
+                "{code} must map to exit code 2 (operator-correctable precondition)"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_control_exit_code_bad_request_is_precondition() {
+        // Story 7.11 review-round-3 #3: `agent.bad_request` (malformed
+        // JSON / oversized body) is operator-correctable input,
+        // belongs in exit 2.
+        assert_eq!(agent_control_exit_code("agent.bad_request"), 2);
+    }
+
+    #[test]
+    fn agent_control_exit_code_system_errors_map_to_3() {
+        for code in &[
+            "agent.rate_limited",
+            "agent.persist_failed",
+            "agent.registry_reload_failed",
+            "agent.lookup_failed",
+            "agent.store_unavailable",
+            "agent.internal",
+            "agent.unknown_error",
+        ] {
+            assert_eq!(
+                agent_control_exit_code(code),
+                3,
+                "{code} must map to exit code 3 (transient or systemic)"
+            );
+        }
+    }
+
+    #[test]
+    fn agent_control_exit_code_unknown_future_codes_default_to_3() {
+        // Future error codes that haven't been classified yet land
+        // in the "retry later" bucket. This is intentional — we'd
+        // rather scripts retry than treat an unknown code as
+        // "fix your input."
+        assert_eq!(agent_control_exit_code("agent.future_unknown"), 3);
+        assert_eq!(agent_control_exit_code(""), 3);
     }
 }

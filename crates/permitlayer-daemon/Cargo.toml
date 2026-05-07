@@ -158,6 +158,9 @@ mockito = { workspace = true }
 # (production-side dep at workspace level); zero impact on release
 # builds since this is dev-deps only.
 minisign = "0.9"
+# Story 7.11 round-1 review-extra (used by agent_rebind_e2e to read
+# the on-disk agent TOML for byte-compare assertions).
+toml = { workspace = true }
 
 [lints]
 workspace = true
