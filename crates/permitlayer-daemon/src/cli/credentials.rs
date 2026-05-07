@@ -45,7 +45,7 @@ mod cli_exit {
 // ── Story 7.6c: typed exit-code marker for the daemon-running
 // pre-flight on `credentials refresh` ──────────────────────────────
 //
-// Same shape as `SetupExitCode3` in `cli::setup` and
+// Same shape as `ConnectExitCode3` in `cli::connect` and
 // `RotateKeyExitCode3` in `cli::rotate_key`. Mirrors the typed-marker
 // pattern so `main.rs::credentials_refresh_to_exit_code` can downcast
 // the chain. Note this marker uses exit code 3 (resource conflict) —
@@ -375,8 +375,8 @@ async fn refresh_credentials(args: RefreshArgs) -> anyhow::Result<()> {
     //
     // Replaces the old soft `eprintln!` warning ("do not run while
     // daemon is active") with a structured refusal. Mirrors
-    // `cli::setup::run`'s pre-flight and `cli::rotate_key::run`
-    // Pre-flight 2 verbatim.
+    // `cli::connect::run`'s Step 2 daemon-running gate and
+    // `cli::rotate_key::run` Pre-flight 2 verbatim.
     //
     // Pre-flight runs BEFORE the audit-store carve-out below so a
     // refused-to-run refresh does not emit audit events for an action

@@ -36,8 +36,9 @@
 //! guard for the lifetime of the daemon process or trailing log lines
 //! are silently lost. [`init_tracing`] returns a `Vec<WorkerGuard>`
 //! that `cli::start::run` binds until process exit. Passing
-//! `log_dir = None` (e.g., from `cli::setup::run`) produces an empty
-//! `Vec` — stdout is synchronous, no worker thread to flush.
+//! `log_dir = None` (e.g., from `cli::connect::run` or any one-shot
+//! CLI command) produces an empty `Vec` — stdout is synchronous, no
+//! worker thread to flush.
 
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};

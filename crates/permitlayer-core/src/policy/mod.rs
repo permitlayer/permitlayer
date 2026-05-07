@@ -29,6 +29,7 @@
 //! 403 response bodies. Unknown branches never return `Allow`.
 
 pub mod compile;
+pub mod edit;
 pub mod error;
 pub mod eval;
 pub mod schema;

@@ -508,7 +508,10 @@ fn control_state_endpoint_reports_active_while_killed() {
 }
 
 #[test]
-fn setup_blocked_when_killed() {
+fn connect_blocked_when_killed() {
+    // Story 7.13: setup → connect rename. The kill-state probe is
+    // ported verbatim into cli/connect.rs and fires the same
+    // `daemon_killed` block + `agentsso resume` remediation.
     let home = tempfile::TempDir::new().unwrap();
     let (child, port) = start_daemon(home.path());
     let _guard = DaemonGuard::new(child);
@@ -517,24 +520,27 @@ fn setup_blocked_when_killed() {
 
     assert_eq!(parse_status_code(&post_control(port, "/v1/control/kill", &token)), 200);
 
-    // Run `agentsso setup gmail --non-interactive` — it should be blocked
-    // by the kill-state probe before any OAuth flow starts.
-    let out = run_cli(home.path(), port, &["setup", "gmail", "--non-interactive"]);
+    // Run `agentsso connect gmail --agent me --non-interactive` — it
+    // should be blocked by the kill-state probe before any OAuth flow
+    // starts. The agent name is irrelevant to the probe (which runs
+    // first); the test just needs the args to clap-parse.
+    let out =
+        run_cli(home.path(), port, &["connect", "gmail", "--agent", "me", "--non-interactive"]);
     assert_eq!(
         out.status,
         Some(2),
-        "expected setup to exit 2 when daemon killed, got {:?}; stderr={}",
+        "expected connect to exit 2 when daemon killed, got {:?}; stderr={}",
         out.status,
         out.stderr
     );
     assert!(
         out.stderr.contains("daemon_killed"),
-        "setup stderr missing daemon_killed: {}",
+        "connect stderr missing daemon_killed: {}",
         out.stderr
     );
     assert!(
         out.stderr.contains("agentsso resume"),
-        "setup stderr missing resume hint: {}",
+        "connect stderr missing resume hint: {}",
         out.stderr
     );
 }

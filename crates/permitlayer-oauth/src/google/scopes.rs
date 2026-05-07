@@ -91,6 +91,32 @@ pub fn default_scopes_for_service(service: &str) -> Vec<&'static str> {
     }
 }
 
+/// Story 7.13: convert a granted OAuth scope URI to its policy-file
+/// short name.
+///
+/// Policy TOML files store short names (e.g., `"gmail.readonly"`),
+/// not full URIs. This helper maps a granted scope URI like
+/// `"https://www.googleapis.com/auth/gmail.readonly"` to the policy-
+/// shape short name. Returns `None` for URIs we don't know about
+/// (the caller — `agentsso connect`'s policy-merge step — must skip
+/// those rather than write an unparseable scope into a policy file).
+#[must_use]
+pub fn uri_to_short_name(scope_uri: &str) -> Option<&'static str> {
+    scope_info(scope_uri).map(|info| info.short_name)
+}
+
+/// Story 7.13: return the policy-file short names for a service's
+/// default scopes.
+///
+/// Used by `agentsso connect` for its "is the credential already
+/// sealed AND covers all the requested scopes?" idempotency check
+/// in Step 2 (skip OAuth + seal phase). The returned `Vec<&str>`
+/// preserves declaration order from `default_scopes_for_service`.
+#[must_use]
+pub fn requested_short_names_for_service(service: &str) -> Vec<&'static str> {
+    default_scopes_for_service(service).into_iter().filter_map(uri_to_short_name).collect()
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -158,5 +184,29 @@ mod tests {
     fn default_scope_infos_for_unknown_service() {
         let infos = default_scope_infos_for_service("unknown");
         assert!(infos.is_empty());
+    }
+
+    #[test]
+    fn uri_to_short_name_round_trips_for_known_scopes() {
+        assert_eq!(uri_to_short_name(GMAIL_READONLY), Some("gmail.readonly"));
+        assert_eq!(uri_to_short_name(CALENDAR_EVENTS), Some("calendar.events"));
+        assert_eq!(uri_to_short_name(DRIVE_FILE), Some("drive.file"));
+    }
+
+    #[test]
+    fn uri_to_short_name_returns_none_for_unknown() {
+        assert_eq!(uri_to_short_name("https://example.com/some.unknown.scope"), None);
+    }
+
+    #[test]
+    fn requested_short_names_for_calendar() {
+        let names = requested_short_names_for_service("calendar");
+        assert_eq!(names, vec!["calendar.readonly", "calendar.events"]);
+    }
+
+    #[test]
+    fn requested_short_names_for_unknown_is_empty() {
+        let names = requested_short_names_for_service("unknown");
+        assert!(names.is_empty());
     }
 }

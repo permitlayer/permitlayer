@@ -137,7 +137,7 @@ pub struct UninstallArgs {
     pub yes: bool,
 
     /// Treat the call as non-interactive: implies `--yes` is
-    /// required. Mirrors `cli::setup`'s `--non-interactive` flag.
+    /// required. Mirrors `cli::connect`'s `--non-interactive` flag.
     #[arg(long)]
     pub non_interactive: bool,
 }
@@ -196,8 +196,8 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
     }
 
     // Set up tracing for this one-shot CLI command (matches the
-    // `cli::setup::run` pattern at setup.rs:121). Only after the
-    // brew-services pre-flight refusal — see P19 above.
+    // `cli::connect::run` pattern). Only after the brew-services
+    // pre-flight refusal — see P19 above.
     let _guards =
         crate::telemetry::init_tracing("info", None, 30).context("tracing init failed")?;
 
