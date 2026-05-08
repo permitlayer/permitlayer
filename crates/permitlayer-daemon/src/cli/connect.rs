@@ -157,6 +157,34 @@ pub(crate) fn silent_err_for_code(code: &str, internal_msg: &'static str) -> any
 
 const SUPPORTED_SERVICES: &[&str] = &["gmail", "calendar", "drive"];
 
+/// Resolve device-flow endpoints. Production: Google's hardcoded URLs.
+///
+/// Story 7.17 Task 3.8: under `#[cfg(debug_assertions)]` builds (i.e.
+/// `cargo test`, dev-builds), honor `AGENTSSO_DEVICE_FLOW_DEVICE_CODE_URL`
+/// and `AGENTSSO_DEVICE_FLOW_TOKEN_URL` so integration tests can point
+/// the polling loop at a mockito server. Release builds compile this
+/// branch out — operators cannot accidentally hijack the OAuth flow
+/// via env vars.
+fn device_flow_endpoints() -> permitlayer_oauth::google::device_flow::DeviceFlowEndpoints {
+    #[cfg(debug_assertions)]
+    {
+        let device_code_override = std::env::var("AGENTSSO_DEVICE_FLOW_DEVICE_CODE_URL").ok();
+        let token_override = std::env::var("AGENTSSO_DEVICE_FLOW_TOKEN_URL").ok();
+        if device_code_override.is_some() || token_override.is_some() {
+            let mut endpoints =
+                permitlayer_oauth::google::device_flow::DeviceFlowEndpoints::google();
+            if let Some(u) = device_code_override {
+                endpoints.device_code = u;
+            }
+            if let Some(u) = token_override {
+                endpoints.token = u;
+            }
+            return endpoints;
+        }
+    }
+    permitlayer_oauth::google::device_flow::DeviceFlowEndpoints::google()
+}
+
 /// Story 3.2 AC #7: refuse to run `agentsso connect` when a running
 /// daemon's kill switch is active.
 ///
@@ -286,6 +314,30 @@ pub struct ConnectArgs {
     /// paste flow needs a controlling terminal).
     #[arg(long, conflicts_with = "non_interactive")]
     pub headless: bool,
+
+    /// Use Google OAuth 2.0 device flow (RFC 8628) for truly headless
+    /// boxes with no browser. Story 7.17 Task 3.
+    ///
+    /// Operator opens the printed URL on any device with a browser
+    /// (laptop, phone, kiosk) and types the printed user code.
+    /// Polling completes without operator interaction at the target
+    /// machine — no SSH-tunneled paste, no `xdg-open` required.
+    ///
+    /// Requires an OAuth client of type **TV and Limited Input
+    /// Device** (separate Google client type from the **Desktop app**
+    /// type that scenarios #1 and #2 use). See `docs/user-guide/install.md`.
+    ///
+    /// Compatible with `--non-interactive` (the canonical scripted-
+    /// headless invocation). Mutually exclusive only with `--headless`
+    /// (the paste-redirect flow takes a different code path).
+    #[arg(long, conflicts_with = "headless")]
+    pub device_flow: bool,
+
+    /// Timeout for device-flow polling in seconds. Default 120s.
+    /// Hard ceiling at Google's `expires_in` (typically 1800s).
+    /// Story 7.17 Task 3.
+    #[arg(long, default_value = "120", requires = "device_flow")]
+    pub device_flow_timeout: u64,
 
     /// Overwrite an existing sealed credential without prompting.
     /// Implied by `--non-interactive`.
@@ -591,8 +643,9 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
             }
             println!();
 
-            // Phase 2: confirm browser open (skipped in headless mode).
-            if !args.headless {
+            // Phase 2: confirm browser open (skipped in headless mode
+            // and in device-flow mode — neither opens a local browser).
+            if !args.headless && !args.device_flow {
                 let theme_clone = teal_theme.clone();
                 let confirm = tokio::task::spawn_blocking(move || {
                     dialoguer::Confirm::with_theme(&*theme_clone)
@@ -623,7 +676,61 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
         let default_scopes = scopes::default_scopes_for_service(&service);
         let scopes_owned: Vec<String> = default_scopes.iter().map(|s| (*s).to_owned()).collect();
 
-        let result = if args.headless {
+        let result = if args.device_flow {
+            // Story 7.17 Task 3: Google OAuth 2.0 device flow.
+            // Operator opens the printed URL on any device with a
+            // browser; this code path never touches the local browser
+            // or stdin (paste-redirect lives in the `--headless` arm).
+            // Compatible with `--non-interactive` — the splice deliberately
+            // lives BEFORE the `interactive` branch.
+            tracing::info!(
+                timeout_secs = args.device_flow_timeout,
+                "running OAuth 2.0 device flow (RFC 8628)"
+            );
+            // Build a dedicated HTTP client for the device-flow polling
+            // loop. Mirrors the `build_verify_client` shape from
+            // `permitlayer_oauth::google::verify` (Story 7.12 R3-P26).
+            let device_http = match reqwest::Client::builder()
+                .user_agent("agentsso/0.1")
+                .timeout(std::time::Duration::from_secs(30))
+                .read_timeout(std::time::Duration::from_secs(10))
+                .build()
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    tracing::error!(error = %e, "failed to build device-flow http client");
+                    return Err(silent_err_for_code(
+                        "connect.oauth_failed",
+                        "device-flow http client build failed",
+                    ));
+                }
+            };
+            let scope_refs: Vec<&str> = scopes_owned.iter().map(String::as_str).collect();
+            let endpoints = device_flow_endpoints();
+            let device_result = permitlayer_oauth::google::device_flow::run_device_flow(
+                &device_http,
+                endpoints,
+                oauth_config.client_id(),
+                &scope_refs,
+                Some(std::time::Duration::from_secs(args.device_flow_timeout)),
+                &permitlayer_oauth::google::device_flow::SystemClock,
+                &permitlayer_oauth::google::device_flow::TokioSleeper,
+            )
+            .await;
+            match device_result {
+                Ok(r) => r.into(),
+                Err(e) => {
+                    render_oauth_error(
+                        &e,
+                        &service,
+                        interactive,
+                        OAuthErrorSeverity::Fatal,
+                        "device-flow authorize failed",
+                    );
+                    return Err(silent_err_for_code("connect.oauth_failed", "oauth failed"));
+                }
+            }
+        } else if args.headless {
             tracing::info!("running headless OAuth flow (no callback listener)");
             let r = client
                 .authorize_headless(scopes_owned.clone(), |url| async move {

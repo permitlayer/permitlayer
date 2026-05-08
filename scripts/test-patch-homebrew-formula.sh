@@ -116,10 +116,27 @@ if ! diff -q "$ACTUAL" "$REPATCHED" >/dev/null; then
     echo "info: patch is not idempotent (expected for Story 7.1 wiring)" >&2
 fi
 
-# Structural sanity: patched output must contain both new blocks.
-for marker in 'def caveats' 'service do' 'run \[opt_bin/"agentsso", "start"\]'; do
+# Structural sanity: patched output must contain the caveats block AND
+# Story 7.16 invariants. Story 7.16 dropped the `service do` block (the
+# `brew services start agentsso` path was structurally broken over SSH
+# on modern macOS — gui-domain bootstrap returns exit 125 — so we
+# recommend `agentsso autostart enable` instead, which targets the
+# user-domain via launchctl directly per Story 7.3 + 7.16).
+#
+# Positive markers (must be present):
+for marker in 'def caveats' 'agentsso connect' 'agentsso autostart enable'; do
     if ! grep -q "$marker" "$ACTUAL"; then
         echo "FAIL: patched output missing expected marker: $marker" >&2
+        exit 1
+    fi
+done
+
+# Negative markers (must NOT be present — Story 7.16 invariants):
+for negative in '^[[:space:]]+service do$' 'brew services start agentsso' '\bagentsso setup\b'; do
+    if grep -Eq "$negative" "$ACTUAL"; then
+        echo "FAIL: patched output contains banned marker (Story 7.16 regression): $negative" >&2
+        echo "      The brew formula no longer ships a service-do block (SSH-broken)" >&2
+        echo "      and no longer references the deleted 'agentsso setup' verb." >&2
         exit 1
     fi
 done

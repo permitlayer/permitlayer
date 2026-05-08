@@ -214,6 +214,39 @@ pub(crate) fn render_enable_outcome(outcome: Result<EnableOutcome, AutostartErro
             );
             Err(silent_cli_error("filesystem failure during enable"))
         }
+        // Story 7.16 Task 2: brew-services migration error variants.
+        Err(AutostartError::BrewMigrationRefused { ref message }) => {
+            eprint!(
+                "{}",
+                render::error_block(
+                    "autostart_brew_migration_refused",
+                    message,
+                    "Inspect the existing ~/Library/LaunchAgents/homebrew.mxcl.agentsso.plist; \
+                     if it's a hand-rolled custom plist, move it aside (e.g., \
+                     `mv ~/Library/LaunchAgents/homebrew.mxcl.agentsso.plist ~/Desktop/`) \
+                     and re-run `agentsso autostart enable`",
+                    None,
+                )
+            );
+            Err(silent_cli_error("brew migration refused"))
+        }
+        Err(AutostartError::BrewMigrationFailed { ref source }) => {
+            let message = format!("brew-services migration filesystem error: {source}");
+            eprint!(
+                "{}",
+                render::error_block(
+                    "autostart_brew_migration_failed",
+                    &message,
+                    "check that ~/Library/LaunchAgents is writable and that the existing \
+                     homebrew.mxcl.agentsso.plist is not held open by another process; \
+                     after fixing the filesystem condition, re-run `agentsso autostart enable` — \
+                     the migration is idempotent and will retry safely (launchd will reload the \
+                     brew plist at next login if the retry is delayed)",
+                    None,
+                )
+            );
+            Err(silent_cli_error("brew migration failed"))
+        }
     }
 }
 

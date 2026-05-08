@@ -29,18 +29,19 @@ normal OAuth client. The tokens never touch the agent.
 ```sh
 brew tap permitlayer/tap
 brew install permitlayer/tap/agentsso
-agentsso setup gmail
+agentsso connect gmail --oauth-client ./client_secret.json --agent <name>
 ```
 
-To run the daemon under a Homebrew-managed `launchd` service:
+Start the daemon and enable login-autostart (SSH-friendly per Story
+7.16 — works over SSH on macOS 13+ without a GUI session):
 
 ```sh
-brew services start agentsso
+agentsso start            # foreground for this session
+agentsso autostart enable # persistent across reboots
 ```
 
 See [docs/user-guide/install.md](docs/user-guide/install.md) for the
-full Homebrew lifecycle (`brew upgrade`, `brew uninstall`, how it
-coexists with `agentsso autostart enable`).
+full lifecycle (`brew upgrade`, `brew uninstall`, autostart details).
 
 ### macOS / Linux — curl | sh
 
@@ -78,15 +79,17 @@ keeps tokens scoped to your Google account, not a shared app.
      Credentials** → **OAuth client ID** → **Application type: Desktop app**.
    - Download the JSON file (Google calls it `client_secret_*.json`).
 
-2. **Authorize Gmail** (or `calendar`, `drive`):
+2. **Connect Gmail** (or `calendar`, `drive`):
 
    ```sh
-   agentsso setup gmail --oauth-client ./client_secret_XXXX.json
+   agentsso connect gmail --oauth-client ./client_secret_XXXX.json --agent <name>
    ```
 
    A browser window opens for Google consent. Tokens get sealed into the
    OS keychain (Keychain on macOS; Secret Service on Linux; Credential
-   Manager on Windows).
+   Manager on Windows). The `--agent <name>` flag is required (Story 7.13
+   verb rename); `connect` composes credential sealing + policy update +
+   agent rebind in one idempotent command.
 
 3. **Start the daemon**:
 
@@ -103,14 +106,34 @@ keeps tokens scoped to your Google account, not a shared app.
    agentsso audit --follow
    ```
 
-### Setup over SSH or under `su`
+### Connect over SSH or under `su`
 
-If `agentsso setup` cannot reach a usable browser (SSH session, `su user`
+If `agentsso connect` cannot reach a usable browser (SSH session, `su user`
 without GUI access, headless server, etc.), pass `--headless` instead:
 
 ```sh
-agentsso setup gmail --oauth-client ./client_secret.json --headless
+agentsso connect gmail --oauth-client ./client_secret.json --agent <name> --headless
 ```
+
+For truly headless boxes (no browser available at all on the target
+machine, e.g. CI runners, cloud-init provisioning, fully-headless
+servers), use `--device-flow` instead. The daemon prints a URL + code,
+you complete consent on any device with a browser (laptop, phone), and
+polling completes without operator interaction at the target machine:
+
+```sh
+# Scripted-install scenario (CI, Ansible, cloud-init):
+# OAuth client must be type "TV and Limited Input Device" (NOT "Desktop app").
+# See docs/user-guide/install.md → "Device-flow OAuth client setup".
+agentsso connect gmail --oauth-client ./client_secret_device.json --agent ci-bot \
+  --device-flow --device-flow-timeout 300 --non-interactive
+AGENTSSO_BEARER_TOKEN=$(agentsso agent register ci-bot --policy default --json | jq -r .bearer_token)
+agentsso autostart enable
+```
+
+`--device-flow` is mutually exclusive with `--headless` (the paste-
+redirect flow takes a different code path). It is compatible with
+`--non-interactive` — that's the canonical scripted-headless invocation.
 
 In headless mode the daemon prints the authorization URL, attempts to
 copy it to your terminal's clipboard via OSC 52 (works in iTerm2,
@@ -127,7 +150,7 @@ Workflow:
    and show a "connection refused" error. **That's expected** — this
    host isn't listening, that's the whole point of `--headless`.
 5. Copy the full redirect URL from your browser's address bar.
-6. Paste it into the `agentsso setup` prompt and press Enter.
+6. Paste it into the `agentsso connect` prompt and press Enter.
 
 The daemon validates the pasted URL against the redirect URI it
 issued (scheme, host, port, path, and CSRF state must all match)
@@ -159,17 +182,18 @@ Behavior on rc.12 and later, by context:
   passphrase and stores `~/.agentsso/keystore/passphrase.state` to
   remember the choice across restarts. **The fallback's derived key
   cannot unseal credentials sealed under the previous native key**,
-  so existing connectors are stale until you re-run `setup`.
-- **launchd / `brew services start agentsso` / `ssh -T`**: no
+  so existing connectors are stale until you re-run `connect`.
+- **launchd-managed contexts (legacy `brew services start agentsso`,
+  Story 7.16's `agentsso autostart enable`) / `ssh -T`**: no
   controlling terminal. The daemon fails fast with a structured
   `PassphrasePromptUnavailable` error. The recovery path is one of
   the manual steps below, run from an interactive shell.
 
 Two recovery paths after fallback fires (or for the headless case):
 
-1. **(Preferred)** Re-run `agentsso setup gmail --oauth-client ...`
+1. **(Preferred)** Re-run `agentsso connect gmail --oauth-client ... --agent <name>`
    under the new master key. Any other configured connectors must be
-   re-set-up too. The vault is preserved; only the OAuth seal
+   re-connected too. The vault is preserved; only the OAuth seal
    regenerates.
 2. **(Faster, but loses unrelated state)** Wipe the keychain entry,
    the passphrase fallback state, and the vault, then let the daemon
@@ -186,12 +210,13 @@ For diagnostic detail, run with `AGENTSSO_LOG__LEVEL=debug` (the daemon
 does not honor `RUST_LOG`).
 
 > **Known gap (still tracked for v0.4):** headless launchd recovery
-> remains unsolved. `brew services start agentsso` cannot prompt for
-> a passphrase, so it still requires manual `security` /
-> `agentsso setup` recovery from an interactive shell. Real fix
-> options under consideration: `--passphrase-from-env`, vault rekey
-> on detected ACL break, or keychain partition-list authorization on
-> install.
+> remains unsolved. Both legacy `brew services start agentsso` (now
+> dropped per Story 7.16) and `agentsso autostart enable` cannot prompt
+> for a passphrase from a non-interactive launchd context, so they
+> still require manual `security` / `agentsso connect` recovery from an
+> interactive shell. Real fix options under consideration:
+> `--passphrase-from-env`, vault rekey on detected ACL break, or keychain
+> partition-list authorization on install.
 
 ### Running the daemon and the agent under different OS users
 

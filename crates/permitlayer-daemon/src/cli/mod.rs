@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 pub mod agent;
+pub mod atomic_write;
 pub mod audit;
 pub mod audit_anomaly;
 pub mod audit_export;

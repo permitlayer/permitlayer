@@ -36,6 +36,7 @@
 mod common;
 
 mod agent_rebind_e2e;
+mod agent_register_scripted;
 mod agent_registry_e2e;
 mod approval_prompt_e2e;
 mod audit_drain_on_shutdown_e2e;
@@ -51,6 +52,7 @@ mod control_token_e2e;
 mod credentials_refresh_daemon_conflict;
 mod credentials_status;
 mod daemon_lifecycle;
+mod device_flow_e2e;
 mod envelope_v1_to_v2_e2e;
 mod kill_resume_e2e;
 mod kill_switch_e2e;

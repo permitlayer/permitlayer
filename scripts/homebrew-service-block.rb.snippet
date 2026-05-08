@@ -5,45 +5,24 @@
           1. Create a Desktop OAuth client at
              https://console.cloud.google.com/apis/credentials and
              download the JSON ("client_secret_XXXX.json").
-          2. Run setup, pointing at that JSON:
+          2. Connect a service, pointing at that JSON:
 
-                 agentsso setup gmail --oauth-client ./client_secret.json
+                 agentsso connect gmail --oauth-client ./client_secret.json --agent <name>
 
              For SSH-from-another-machine, add --headless. The bare
-             `agentsso setup gmail` will interactively prompt for the
+             `agentsso connect gmail` will interactively prompt for the
              file path if you forget the flag.
 
-      To run the daemon as a Homebrew-managed background service:
-
-          brew services start agentsso
-
-      If `agentsso` is already running (you started it manually with
-      `agentsso start`), stop it first with `agentsso stop` — `brew
-      services start` cannot take over a port already bound by another
-      process. Always verify the result with `brew services list`.
-
-      Or start it yourself:
+      Start the daemon yourself:
 
           agentsso start
 
-      Enable login-autostart instead (separate from brew services):
+      Enable login-autostart so the daemon comes up automatically at
+      login (Story 7.16: SSH-friendly — no GUI session required, works
+      over SSH on macOS 13+):
 
           agentsso autostart enable
 
       Docs: https://github.com/permitlayer/permitlayer
     EOS
-  end
-
-  service do
-    run [opt_bin/"agentsso", "start"]
-    # Restart only on real crashes (signal-killed: SIGSEGV, SIGABRT,
-    # OOM-kill, etc.). Don't respawn on deliberate non-zero exits like
-    # `agentsso start`'s exit-3 when it detects an already-running
-    # daemon — that's a configuration conflict, not a crash, and
-    # respawn-looping it just produces noisy launchd `error 78` rows
-    # in `brew services list` without resolving the conflict.
-    keep_alive crashed: true
-    log_path var/"log/agentsso.log"
-    error_log_path var/"log/agentsso.log"
-    working_dir HOMEBREW_PREFIX
   end

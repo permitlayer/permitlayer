@@ -169,50 +169,14 @@ fn redact_bearer(body: &str) -> String {
 /// 0o644 (not 0o600) because the admin/user split means the end user
 /// running OpenClaw is a different UID from the admin running this
 /// command (see module-level docs).
+///
+/// Story 7.17 Task 1.4 factored the underlying mechanism into
+/// [`crate::cli::atomic_write::write_atomic_with_mode`] so
+/// `agent register --token-out` (mode 0o600) shares the same
+/// tempfile-then-rename plus parent-must-exist plus refuse-existing-symlink
+/// contract.
 fn write_snippet_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
-    let parent = path.parent().ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("snippet path has no parent dir: {}", path.display()),
-        )
-    })?;
-    if !parent.exists() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            format!("parent dir does not exist: {}", parent.display()),
-        ));
-    }
-
-    // Story 7.13 round-1 P7: refuse to overwrite a symlink. `tempfile::persist`'s
-    // `rename(2)` would replace the symlink with a regular file (the link target
-    // file remains untouched), silently breaking admin workflows that symlink
-    // shared snippet paths to git-tracked locations. If the path doesn't exist
-    // yet we proceed normally; only existing-symlink is rejected.
-    if let Ok(md) = std::fs::symlink_metadata(path)
-        && md.file_type().is_symlink()
-    {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("--mcp-config-out path is a symlink (refusing to follow): {}", path.display()),
-        ));
-    }
-
-    let mut tmp = tempfile::NamedTempFile::new_in(parent)?;
-    tmp.write_all(bytes)?;
-    tmp.as_file().sync_all()?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o644);
-        std::fs::set_permissions(tmp.path(), perms)?;
-    }
-
-    tmp.persist(path).map_err(|e| e.error)?;
-    if let Ok(dir) = std::fs::File::open(parent) {
-        let _ = dir.sync_all();
-    }
-    Ok(())
+    crate::cli::atomic_write::write_atomic_with_mode(path, bytes, 0o644)
 }
 
 #[cfg(test)]

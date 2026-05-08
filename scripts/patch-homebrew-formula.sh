@@ -1,25 +1,33 @@
 #!/bin/sh
-# patch-homebrew-formula.sh — inject a class-doc comment, a `caveats`
-# block, and a `service do` block into a dist-generated Homebrew formula.
+# patch-homebrew-formula.sh — inject a class-doc comment and a `caveats`
+# block into a dist-generated Homebrew formula.
 #
 # dist (cargo-dist 0.31) generates a Homebrew formula from a fixed Jinja
 # template (cargo-dist/templates/installer/homebrew.rb.j2) that does NOT
-# emit a class-doc comment, `caveats`, or `service do`. Story 7.1 requires
-# all three:
+# emit a class-doc comment or `caveats`. Story 7.1 originally required
+# three injections (class-doc, caveats, `service do`); Story 7.16
+# removed `service do`:
 #
 #   - class-doc comment — required by rubocop's `Style/Documentation`
 #     cop that `brew style --fix` enforces but cannot autocorrect.
 #   - `caveats` — users need post-install instructions pointing at
-#     `agentsso setup gmail` as the next step.
-#   - `service do` — `brew services start agentsso` needs this block
-#     to register a launchd plist at `homebrew.mxcl.agentsso`.
+#     `agentsso connect <service>` (Story 7.13 verb rename) and
+#     `agentsso autostart enable` (Story 7.16 SSH-friendly persistence).
+#   - ~~`service do`~~ DROPPED in Story 7.16. The `brew services start
+#     agentsso` path is structurally broken over SSH on modern macOS:
+#     `launchctl enable gui/$UID/homebrew.mxcl.agentsso` returns exit
+#     125 ("Domain does not support specified action") because the
+#     gui-domain doesn't exist for SSH-only sessions. Recommend
+#     `agentsso autostart enable` instead — it targets the per-user
+#     `user/$UID` launchd domain (Apple's headless-friendly target),
+#     which works over SSH on macOS 13+.
 #
 # This script performs two injections in a single awk pass:
 #
 #   1. Prepend a one-line `# ... formula.` comment immediately above
 #      the `class Agentsso < Formula` line (anchor: `^class Agentsso`).
 #
-#   2. Insert the service + caveats snippet (from
+#   2. Insert the caveats snippet (from
 #      scripts/homebrew-service-block.rb.snippet) immediately before the
 #      first flush-left `^end$` (the one that closes the class body).
 #      dist's template indents every inner-method `end` with two spaces,

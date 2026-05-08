@@ -8,7 +8,7 @@ Windows (x86_64). Linux lands in Story 7.7.
 ```sh
 brew tap permitlayer/tap
 brew install permitlayer/tap/agentsso
-agentsso setup gmail
+agentsso connect gmail --oauth-client ./client_secret.json --agent <name>
 ```
 
 `brew install` downloads the architecture-matched tarball from
@@ -18,30 +18,35 @@ formula), and installs `agentsso` at:
 - **Apple Silicon:** `/opt/homebrew/bin/agentsso`
 - **Intel:** `/usr/local/bin/agentsso`
 
-### Running as a Homebrew-managed service
-
-Homebrew can register the daemon as a `launchd` user-service:
+### Starting the daemon (manual or autostart)
 
 ```sh
-brew services start agentsso
+agentsso start            # foreground for this session
+# OR
+agentsso autostart enable # persistent across reboots (Story 7.16: SSH-friendly)
 ```
 
-This generates `~/Library/LaunchAgents/homebrew.mxcl.agentsso.plist`
-and starts the daemon. The service restarts only on real crashes
-(`keep_alive crashed: true` — signal-killed exits like SIGSEGV,
-SIGABRT, OOM-kill) and survives logout/login. Deliberate non-zero
-exits — e.g. `agentsso start`'s exit-3 when another instance is
-already bound to the port — are NOT respawned, so a configuration
-conflict with a manually-started daemon shows up as a single
-`error 78` row in `brew services list` rather than a respawn loop.
+`agentsso autostart enable` writes a per-user LaunchAgent at
+`~/Library/LaunchAgents/dev.agentsso.daemon.plist` and bootstraps it
+into launchd's `user/$UID` domain. **Works over SSH on macOS 13+** —
+unlike the legacy `gui/$UID` domain, `user/$UID` is bootstrapped by
+any session (gui or ssh) and persists across logout. Story 7.16
+re-targeted from `gui/$UID` after the rc.15 install on Angie's box
+hit `launchctl exit 125: Domain does not support specified action`
+on the second command over SSH.
 
-Check status with `brew services list` or `agentsso status`.
+Check status with `agentsso autostart status` or `agentsso status`.
 
-To stop:
-
-```sh
-brew services stop agentsso
-```
+> **Story 7.16 changed the recommended path.** rc.15 and earlier
+> formulas shipped a `service do` block that registered a
+> `homebrew.mxcl.agentsso` plist via `brew services start agentsso`.
+> That path is structurally broken over SSH on modern macOS (Homebrew
+> internally targets the `gui/$UID` launchd domain, which doesn't
+> exist for SSH-only sessions). The rc.16 formula no longer ships
+> the `service do` block. If you're upgrading from rc.≤15 with brew-
+> services active, the next `agentsso autostart enable` automatically
+> migrates the brew-managed plist to a `*.bak.<timestamp>` backup
+> and registers our user-domain plist instead.
 
 ### Upgrading
 
@@ -49,27 +54,23 @@ brew services stop agentsso
 brew upgrade agentsso
 ```
 
-If the service is running, `brew` stops it, installs the new
-binary, and you can restart with `brew services start agentsso`.
+`brew upgrade` swaps the binary in place. If you previously had
+brew-services managing the daemon (rc.≤15 install path), the
+brew-services plist still exists at
+`~/Library/LaunchAgents/homebrew.mxcl.agentsso.plist`; the next
+`agentsso autostart enable` will migrate it (back up + remove)
+and bootstrap our user-domain plist.
 
 ### Uninstalling
 
-For a Homebrew install, `brew uninstall agentsso` is the canonical
-path — it removes the binary, the brew receipt, and tears down the
-brew-services plist if the service is running. `agentsso uninstall`
-deliberately **refuses** when it detects `brew services` is managing
-the daemon (it would otherwise leave Homebrew's plist respawning a
-missing binary at every login).
-
 ```sh
-brew services stop agentsso   # if the service is running
 brew uninstall agentsso
 brew untap permitlayer/tap    # optional
 ```
 
-`brew uninstall` does NOT touch `~/.agentsso/` (vault, credentials,
-audit log) or your OS keychain entry. To wipe those after `brew
-uninstall`, run:
+`brew uninstall` removes the binary and the brew receipt. It does
+NOT touch `~/.agentsso/` (vault, credentials, audit log) or your
+OS keychain entry. To wipe those after `brew uninstall`, run:
 
 ```sh
 agentsso uninstall --keep-binary --yes
@@ -260,78 +261,76 @@ directly will see a SmartScreen warning; click **More info** →
 **Run anyway**, or use the `install.ps1` flow which verifies via
 sha256 + minisign.
 
-## Autostart — two mechanisms, pick one
+## Autostart — `agentsso autostart enable`
 
-permitlayer offers two distinct autostart paths on macOS. They are
-**mutually exclusive** — if you enable both, two daemons will try
-to bind port 3820 and one will crash-loop.
+permitlayer ships a single autostart path: `agentsso autostart enable`,
+which writes a per-user LaunchAgent and bootstraps it into launchd's
+`user/$UID` domain (Story 7.16 fix; Apple's headless-friendly target
+that works over SSH on macOS 13+).
 
 | Path | Label | Enabled by | Managed by |
 |------|-------|-----------|-----------|
-| Homebrew service | `homebrew.mxcl.agentsso` | `brew services start agentsso` | `brew services ...` |
-| Standalone autostart | `dev.agentsso.daemon` | `agentsso autostart enable` | `agentsso autostart ...` |
+| permitlayer autostart | `dev.agentsso.daemon` | `agentsso autostart enable` | `agentsso autostart ...` |
 
-`brew services` is the right choice if you already use Homebrew
-for lifecycle management of other services. The standalone path
-(shipping in Story 7.3) works regardless of whether Homebrew is
-installed.
+> **Story 7.16 dropped the legacy `brew services` path.** Earlier docs
+> described two autostart mechanisms (the Homebrew-managed
+> `homebrew.mxcl.agentsso` plist, and our own
+> `dev.agentsso.daemon` plist). The Homebrew path was structurally
+> broken over SSH on macOS 13+ — Homebrew internally calls
+> `launchctl enable gui/$UID/homebrew.mxcl.agentsso`, but the
+> `gui/$UID` domain doesn't exist for SSH-only sessions, so the
+> command returns exit 125 ("Domain does not support specified
+> action"). `agentsso autostart enable` (Story 7.16) targets
+> `user/$UID` instead, which is bootstrapped by any session.
+> Existing rc.≤15 users with brew-services active are migrated
+> automatically on first `agentsso autostart enable` (the brew plist
+> is renamed to `*.bak.<timestamp>` rather than deleted).
 
-If you switch mechanisms, disable the old one first:
+### Migrating from rc.≤15 brew-services autostart
 
-```sh
-# Switching from brew services → standalone:
-brew services stop agentsso
-agentsso autostart enable
+If you originally installed permitlayer at rc.≤15 and ran
+`brew services start agentsso`, your `~/Library/LaunchAgents/`
+contains a `homebrew.mxcl.agentsso.plist`. After `brew upgrade
+agentsso` to rc.16+, your next `agentsso autostart enable` will:
 
-# Switching from standalone → brew services:
-agentsso autostart disable
-brew services start agentsso
-```
+1. Detect the brew plist (validates `<Label>` + `<ProgramArguments>[0]`
+   reference our binary; refuses if hand-rolled).
+2. Run `brew services stop agentsso` (best-effort).
+3. Run `launchctl bootout gui/$UID/homebrew.mxcl.agentsso` (tolerating
+   exit 125 for the SSH case).
+4. Rename the plist to `*.bak.<RFC3339-timestamp>` (NOT delete —
+   recoverable if mis-detected).
+5. Bootstrap the new `dev.agentsso.daemon` plist into `user/$UID`.
 
-### Third collision case: manual `agentsso start` + `brew services start`
+You'll see one informational stderr line: `migrated from
+brew-services autostart to user-domain LaunchAgent (brew plist
+backed up to <path>)`.
 
-There's also a third way to collide that the table above doesn't cover:
-running the daemon **manually in a terminal** (`agentsso start`) and then
-trying to take it over with `brew services`.
+> **Important:** the migration runs on `agentsso autostart enable`,
+> not on `brew upgrade` or `agentsso connect`. If you upgrade from
+> rc.≤15 and run `agentsso connect <service>` (or any other command)
+> as your first post-upgrade action, the brew plist remains in place
+> and Homebrew may re-launch a stale binary at next login. Run
+> `agentsso autostart enable` (or `agentsso autostart status` first
+> to inspect the conflict) before relying on autostart after an
+> rc.≤15 → rc.16 upgrade.
 
-**Symptom:** `brew services start agentsso` reports "Successfully started"
-but `brew services list` shows the agentsso row in `error` state with exit
-code 78. Nothing seems to work; `agentsso status` shows the daemon is
-running but you can't manage it via brew.
+### Conflict case: manual `agentsso start` + `agentsso autostart enable`
 
-**Why it happens:** The manual `agentsso` already has port 3820 bound. When
-launchd tries to start a second instance via `brew services`, the daemon
-detects the conflict via its PID-file check and exits with code 3 — a
-deliberate "won't start, can't take over" signal. v0.2.1+ formulas
-respect this and don't respawn-loop, but the launchd job still records
-the error.
+If you've manually run `agentsso start` in a terminal and then enable
+autostart, the autostart-enrolled daemon detects the conflict via its
+PID-file check and exits with code 3 (a deliberate "won't start,
+can't take over" signal). The autostart plist won't respawn-loop;
+the launchd job records a single error and stops.
 
 **Recovery:**
 
 ```sh
-# Verify nothing is hung:
-agentsso status                           # may show running
-
-# Stop the manual instance:
-agentsso stop                             # graceful SIGTERM, blocks <10s
-
-# Now brew services can take over cleanly:
-brew services start agentsso
-
-# Always verify after a start:
-brew services list | grep agentsso        # expect: started (not error)
+agentsso status               # confirm the manual instance is running
+agentsso stop                 # graceful SIGTERM, blocks <10s
+agentsso autostart enable     # re-enroll cleanly
+launchctl print user/$(id -u)/dev.agentsso.daemon | head -10
 ```
-
-**Diagnostic when in doubt:** the daemon's startup error message lands in
-`/opt/homebrew/var/log/agentsso.log` (Apple Silicon) or
-`/usr/local/var/log/agentsso.log` (Intel). `tail -n 20 <path>` after a
-failed `brew services start` shows exactly which conflict was detected.
-
-The general rule: **`brew services list | grep agentsso` is the
-authoritative status check.** `brew services start`'s "Successfully
-started" message means launchd accepted the request, not that the
-daemon is actually running under brew's management. Verify after every
-start.
 
 ## Autostart on Linux
 
@@ -380,11 +379,94 @@ In all three cases:
   not respawn-loop the daemon (lesson from Story 7.1's v0.2.1 hotfix).
 - `agentsso autostart status` is the authoritative cross-platform check.
 
-The setup wizard (`agentsso setup` with no service argument) walks you
-through both connecting a Google service AND deciding about autostart.
-Per-service flows (`agentsso setup gmail|calendar|drive`) skip the
-autostart prompt — they're for users scripting OAuth setup who don't
-want a follow-up question.
+`agentsso connect <service>` (Story 7.13 verb; replaces the prior
+`agentsso setup`) is the canonical onboarding command. It composes
+credential sealing + policy update + agent rebind in one idempotent
+command. Pass `--device-flow` (Story 7.17) for truly headless boxes
+where no browser is reachable on the target.
+
+## Device-flow OAuth client setup (scripted install — Story 7.17)
+
+The default `--oauth-client ./client_secret.json` flow uses an OAuth
+client of type **Desktop app**. The `--device-flow` path requires a
+*different* OAuth client type — Google's **TV and Limited Input
+Device** type — because the device-flow grant is registered server-
+side per client. Reusing a Desktop-app client with `--device-flow`
+causes Google to return `invalid_grant` mid-polling, which permitlayer
+surfaces as `device_flow_protocol`.
+
+You only need this if you're scripting `agentsso connect` on a box
+without a browser (CI runners, cloud-init provisioning,
+fully-headless servers). Scenarios #1 (interactive) and #2
+(SSH + `--headless`) keep using the existing Desktop-app client.
+
+### Create the device-flow OAuth client
+
+1. Open [Google Cloud Console → APIs & Services → Credentials](https://console.cloud.google.com/apis/credentials).
+2. Click **Create Credentials → OAuth client ID**.
+3. **Application type:** select **TV and Limited Input Device** (NOT
+   "Desktop app" — that's the type the existing client uses).
+4. Give the client a name like `permitlayer-device-flow`.
+5. Click **Create**, then **Download JSON**. Save the file as
+   `client_secret_device.json` (the name is convention; only the path
+   matters to the CLI).
+
+The downloaded JSON has the same `{"installed": {...}}` wrapper as
+the Desktop-app client; the JSON shape does not by itself distinguish
+device-flow from loopback clients. The distinction is server-side
+metadata Google associates with the client ID.
+
+### Run the scripted-install scenario
+
+```sh
+agentsso connect gmail \
+  --oauth-client ./client_secret_device.json \
+  --agent ci-bot \
+  --device-flow \
+  --device-flow-timeout 300 \
+  --non-interactive
+
+AGENTSSO_BEARER_TOKEN=$(agentsso agent register ci-bot --policy default --json | jq -r .bearer_token)
+
+agentsso autostart enable
+```
+
+What each flag does:
+
+- `--device-flow` — switches the OAuth dispatch from loopback /
+  paste-redirect to RFC 8628 device flow. Mutually exclusive with
+  `--headless`.
+- `--device-flow-timeout 300` — bound the operator's local wait at
+  300 seconds. Hard ceiling at Google's `expires_in` (typically
+  1800s). Without this flag the default is 120s.
+- `--non-interactive` — skip all prompts. Compatible with
+  `--device-flow` (the canonical scripted-headless invocation).
+- `agent register --json` — emit the bearer-token response as compact
+  single-line JSON to stdout for safe `jq -r` capture (no human-
+  formatted text to parse with `awk`).
+- `--token-out <path>` — alternative to `--json` when you want only
+  the token bytes written to a 0o600 file (no stdout pollution at
+  all).
+
+> **Tip:** put `client_secret_device.json` in your CI's secrets store
+> rather than checking it in. The JSON contains the client secret;
+> exposure lets a third party impersonate your OAuth application
+> (though not your users — they still have to consent).
+
+### What happens at run time
+
+1. The CLI POSTs to Google's `/device/code` endpoint and prints a
+   verification URL + short user code on stdout.
+2. The operator opens the URL on any device with a browser (laptop,
+   phone, kiosk), enters the user code, and approves consent.
+3. Meanwhile the target box is polling `/token` once every 5
+   seconds (RFC 8628). When Google records consent, `/token`
+   returns 200 with `access_token`, and `agentsso connect` continues
+   into Phase 4 (seal + store) exactly like the loopback flow.
+
+If the operator never approves, the polling loop terminates at
+`--device-flow-timeout` with a structured `device_flow_timeout` error
+on stderr and exit code 3.
 
 ## Uninstall — clean removal
 
@@ -456,7 +538,8 @@ brew uninstall agentsso                  # cleans the binary + brew receipt
 ```
 
 If `brew services` is currently managing the daemon at uninstall
-time, `agentsso uninstall` refuses up front (exit code 3) with a
+time (legacy rc.≤15 install path; see Story 7.16 callout above),
+`agentsso uninstall` refuses up front (exit code 3) with a
 remediation pointing you at:
 
 ```sh
@@ -465,14 +548,17 @@ agentsso uninstall
 ```
 
 This avoids leaving Homebrew's plist respawning the daemon at every
-login until you `brew uninstall agentsso`.
+login until you `brew uninstall agentsso`. (rc.16+ users won't hit
+this — the new formula doesn't ship a `service do` block, so brew
+never registers a launchd plist. The migration on first
+`agentsso autostart enable` cleans up any leftover.)
 
 ### Re-install after uninstall
 
 ```sh
 agentsso uninstall --yes
 curl -fsSL https://raw.githubusercontent.com/permitlayer/permitlayer/main/install/install.sh | sh
-agentsso setup gmail --oauth-client ./client_secret.json
+agentsso connect gmail --oauth-client ./client_secret.json --agent <name>
 ```
 
 A clean uninstall guarantees the next install mints a fresh master
@@ -660,7 +746,14 @@ returning a package owner, `--apply` refuses with the
 (MVP only ships curl|sh + brew + PowerShell installers; this is
 a forward-compat guard.)
 
-### Brew-services running
+### Brew-services running (legacy — Story 7.16 supersedes)
+
+> **Story 7.16:** rc.16+ formulas no longer ship a `service do` block,
+> so a fresh install will never reach this state. Users upgrading
+> from rc.≤15 with `brew services start agentsso` previously active
+> will still see this until they run `agentsso autostart enable`
+> (which migrates the brew plist to a `*.bak.<timestamp>` backup;
+> see "Migrating from rc.≤15 brew-services autostart" above).
 
 If `brew services list` shows agentsso as `started` or
 `scheduled`, `--apply` refuses with exit code 3:
@@ -671,6 +764,9 @@ error: agentsso is being managed by `brew services`. Running
        with Homebrew's plist.
 
   remediation: brew services stop agentsso && agentsso update --apply
+       OR (rc.16+):
+               agentsso autostart enable   # migrates the brew plist
+               agentsso update --apply
 ```
 
 Same refusal pattern as `agentsso uninstall` — a different
