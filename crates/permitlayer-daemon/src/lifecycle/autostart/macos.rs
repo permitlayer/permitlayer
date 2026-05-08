@@ -2,22 +2,47 @@
 //!
 //! Writes a per-user plist at
 //! `~/Library/LaunchAgents/dev.agentsso.daemon.plist` and loads it via
-//! the **modern** `launchctl bootstrap gui/$UID <plist>` API. The
+//! the **modern** `launchctl bootstrap user/$UID <plist>` API. The
 //! widely-cited `launchctl load -w <plist>` form is deprecated on
 //! macOS 13+ and emits a warning; we don't use it.
 //!
-//! # Conflict guardrail
+//! # Why `user/$UID` and not `gui/$UID` (Story 7.15)
+//!
+//! Story 7.3 originally targeted `gui/$UID`. That domain only exists
+//! when the user has an active GUI login session, so the bootstrap
+//! call returns `125: Domain does not support specified action` over
+//! SSH or in any context where the user has not logged in via the
+//! console. Story 7.15 re-targets to `user/$UID`, the per-user domain
+//! Apple introduced specifically for headless / SSH scenarios — it is
+//! bootstrapped by the first session of any kind (gui or ssh) and
+//! persists across logout. Same plist, same per-user keychain access,
+//! same threat model — only the launchctl bootstrap target changes.
+//!
+//! # Brew-services migration (Story 7.16)
 //!
 //! Homebrew's `brew services start agentsso` writes its own plist at
 //! `~/Library/LaunchAgents/homebrew.mxcl.agentsso.plist` and starts the
 //! daemon under launchd. If both autostart paths are enabled
 //! simultaneously, the second daemon to start fails its 127.0.0.1:3820
 //! TCP bind and either flap-loops (per Story 7.1's v0.2.1 hotfix
-//! lesson) or sits in error 78. [`enable`] probes
-//! `brew services list --json` first and refuses with
-//! [`AutostartError::BrewServicesActive`] when brew-services owns the
-//! daemon. See module docs of `super` and Story 7.1 Dev Notes
-//! "Cross-reference with Story 7.3 autostart".
+//! lesson) or sits in error 78.
+//!
+//! **Pre-rc.16 behavior:** [`enable`] probed `brew services list --json`
+//! first and refused with [`AutostartError::BrewServicesActive`] when
+//! brew-services owned the daemon. The operator had to manually run
+//! `brew services stop agentsso` before re-running.
+//!
+//! **rc.16 behavior (Story 7.16):** [`enable`] now MIGRATES the
+//! brew-managed state to our user-domain LaunchAgent automatically. Two
+//! independent detection signals back the migration decision: (a) brew
+//! status probe, (b) plist-on-disk inspection. If the plist on disk
+//! doesn't match the canonical brew-managed shape (label +
+//! `<ProgramArguments>[0]` referencing the agentsso binary), enable
+//! refuses with [`AutostartError::BrewMigrationRefused`] rather than
+//! auto-removing a hand-rolled config. The original
+//! `AutostartError::BrewServicesActive` variant is preserved on the enum
+//! for backward compatibility but is no longer produced by this module.
+//! See [`decide_brew_migration`] for the decision matrix.
 //!
 //! # KeepAlive posture
 //!
@@ -126,16 +151,31 @@ fn xml_escape(s: &str) -> String {
 
 /// macOS [`super::enable`] implementation.
 pub(crate) fn enable(exec: &impl Engine, home: &Path) -> Result<EnableOutcome, AutostartError> {
-    // Conflict guardrail: refuse if `brew services` is running the daemon.
-    if brew_services_active(exec)? {
-        return Err(AutostartError::BrewServicesActive);
+    // Story 7.16 Task 2: brew-services migration. Replaces the previous
+    // refuse-on-conflict path with a migrate-or-refuse-with-validation
+    // decision. Two independent detection signals: (a) brew status probe,
+    // (b) plist-on-disk inspection. The plist signal is load-bearing
+    // because over SSH `brew services list` itself can be unreliable
+    // (gui-domain probes that 125-fail mid-query); the plist file is the
+    // authoritative artifact regardless of what brew's status reports.
+    let brew_active = brew_services_active(exec)?;
+    let plist_inspection = inspect_brew_plist_path(home)?;
+    let daemon = current_daemon_path()?;
+    match decide_brew_migration(brew_active, plist_inspection.as_ref(), &daemon) {
+        BrewMigrationDecision::Skip => {}
+        BrewMigrationDecision::Refuse { reason } => {
+            return Err(AutostartError::BrewMigrationRefused { message: reason });
+        }
+        BrewMigrationDecision::Migrate { reason: _ } => {
+            execute_brew_migration(exec, plist_inspection.as_ref())?;
+        }
     }
 
     let plist = plist_path(home);
-    let daemon = current_daemon_path()?;
     // P36: reject non-UTF-8 paths up front rather than `to_string_lossy`
     // corrupting the rendered plist with U+FFFD silently. The plist
     // format is UTF-8; we can't represent invalid bytes faithfully.
+    // (`daemon` resolved earlier for the brew-migration decision; reuse.)
     super::require_utf8_path(&daemon)?;
     super::require_utf8_path(home)?;
     let log_path = home.join(".agentsso").join("logs").join("autostart.log");
@@ -159,7 +199,7 @@ pub(crate) fn enable(exec: &impl Engine, home: &Path) -> Result<EnableOutcome, A
     // returns exit 17 ("Service already loaded") on macOS 13+; treat as
     // success — the plist file may have been refreshed.
     let user = current_user_id()?;
-    let target = format!("gui/{user}");
+    let target = format!("user/{user}");
     let plist_str = plist.to_string_lossy();
     let plist_arg: &str = &plist_str;
     let args = ["bootstrap", target.as_str(), plist_arg];
@@ -171,11 +211,18 @@ pub(crate) fn enable(exec: &impl Engine, home: &Path) -> Result<EnableOutcome, A
         // daemon will NOT start at login until we clear that flag. The
         // previous code conflated 119 with "already loaded" and silently
         // reported success — direct AC #1 violation. Now: detect 119,
-        // run `launchctl enable gui/$UID/<label>` to clear the flag,
+        // run `launchctl enable user/$UID/<label>` to clear the flag,
         // then recover. Bootstrap is not re-run because the agent is
         // already known to launchd; clearing the disable is enough.
         if out.status.code() == Some(119) {
-            let enable_target = format!("gui/{user}/{LAUNCHD_LABEL}");
+            // Bootstrap is not re-run because the agent is already known to
+            // launchd; clearing the disable flag is enough. Invariant: this
+            // assumes the existing registration's plist path matches the
+            // path we just rendered — which holds because LAUNCHD_LABEL is
+            // a workspace constant (`dev.agentsso.daemon`) stable across
+            // all RC versions. If a future story renames the label, this
+            // recovery path needs to re-bootstrap.
+            let enable_target = format!("user/{user}/{LAUNCHD_LABEL}");
             let enable_args = ["enable", enable_target.as_str()];
             let enable_out = exec.run("launchctl", &enable_args)?;
             if !enable_out.status.success() {
@@ -201,6 +248,13 @@ pub(crate) fn enable(exec: &impl Engine, home: &Path) -> Result<EnableOutcome, A
 /// every login via brew. We log a warning to stderr in that case so the
 /// operator isn't surprised; we don't block the disable (their explicit
 /// intent is to remove our autostart, not brew's).
+///
+/// Migration-unwind invariant: `disable` does NOT restore a prior
+/// brew-services migration's `*.bak.<RFC3339>` file. Migration is
+/// one-way by design — the backup exists so the operator can manually
+/// roll back if needed (`mv ~/Library/LaunchAgents/homebrew.mxcl.agentsso.plist.bak.* \
+/// ~/Library/LaunchAgents/homebrew.mxcl.agentsso.plist && brew services start agentsso`),
+/// not so `disable` silently un-does the upgrade.
 pub(crate) fn disable(exec: &impl Engine, home: &Path) -> Result<DisableOutcome, AutostartError> {
     let plist = plist_path(home);
     if !plist.exists() {
@@ -208,7 +262,7 @@ pub(crate) fn disable(exec: &impl Engine, home: &Path) -> Result<DisableOutcome,
     }
 
     let user = current_user_id()?;
-    let target = format!("gui/{user}/{LAUNCHD_LABEL}");
+    let target = format!("user/{user}/{LAUNCHD_LABEL}");
     let args = ["bootout", target.as_str()];
     let out = exec.run("launchctl", &args)?;
     if !out.status.success() && !already_unloaded(&out) {
@@ -235,7 +289,7 @@ pub(crate) fn disable(exec: &impl Engine, home: &Path) -> Result<DisableOutcome,
 ///
 /// **P35 (code review round 3):** verifies BOTH that the plist file
 /// exists AND that launchd has actually loaded the agent (via
-/// `launchctl print gui/$UID/<label>`). The previous version only
+/// `launchctl print user/$UID/<label>`). The previous version only
 /// checked file existence — a leftover plist from a failed bootstrap
 /// would falsely report `Enabled` even though the daemon would never
 /// auto-start.
@@ -263,7 +317,9 @@ pub(crate) fn status(exec: &impl Engine, home: &Path) -> Result<AutostartStatus,
             detail: format!(
                 "both {LAUNCHD_LABEL} plist and `brew services` agentsso entry are active; \
                  they will both try to bind 127.0.0.1:3820 and one will fail. \
-                 Run `brew services stop agentsso` OR `agentsso autostart disable`."
+                 Run `brew services stop agentsso` OR `agentsso autostart disable`. \
+                 (If you just ran `agentsso autostart enable` to migrate off brew-services, \
+                 give brew ~30s for its status cache to refresh and re-check.)"
             ),
         });
     }
@@ -273,7 +329,7 @@ pub(crate) fn status(exec: &impl Engine, home: &Path) -> Result<AutostartStatus,
     }
 
     // P35: probe launchd to confirm the agent is ACTUALLY loaded.
-    // `launchctl print gui/$UID/<label>` returns 0 when the agent is
+    // `launchctl print user/$UID/<label>` returns 0 when the agent is
     // loaded; non-zero (typically 113 "Could not find specified
     // service") when it isn't. If launchd doesn't know about us, the
     // file is orphaned and we report Disabled — operator can re-run
@@ -297,7 +353,7 @@ pub(crate) fn status(exec: &impl Engine, home: &Path) -> Result<AutostartStatus,
             return Ok(AutostartStatus::Disabled);
         }
     };
-    let target = format!("gui/{user}/{LAUNCHD_LABEL}");
+    let target = format!("user/{user}/{LAUNCHD_LABEL}");
     let probe_args = ["print", target.as_str()];
     let loaded = match exec.run("launchctl", &probe_args) {
         Ok(out) => out.status.success(),
@@ -390,6 +446,346 @@ pub(crate) fn parse_brew_services_active(stdout: &[u8]) -> bool {
     })
 }
 
+// ─── Story 7.16 Task 2: brew-services migration ────────────────────────
+//
+// `agentsso autostart enable` previously refused (returning
+// `AutostartError::BrewServicesActive`) when brew-services was managing
+// the daemon. Story 7.16 changes this to a migrate-or-refuse decision so
+// existing rc.≤15 users can upgrade in place without manual cleanup.
+//
+// Two independent detection signals back the decision:
+// 1. `brew_services_active` — parses `brew services list --json`
+// 2. `inspect_brew_plist_path` — direct plist inspection
+//
+// The plist signal is load-bearing because over SSH the brew status
+// probe itself can be unreliable (gui-domain probes that 125-fail in
+// SSH context). The plist file at
+// `~/Library/LaunchAgents/homebrew.mxcl.agentsso.plist` is the
+// authoritative artifact regardless of what brew's status reports.
+
+/// Result of inspecting the brew-managed plist on disk.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BrewPlistInspection {
+    /// Absolute path to the plist file.
+    pub file_path: PathBuf,
+    /// Value of the `<Label>` key (expected: `homebrew.mxcl.agentsso`).
+    pub label: String,
+    /// First entry of `<ProgramArguments>` (expected: a path that
+    /// matches the `agentsso` binary we'd write the new plist for).
+    pub program_args_first: PathBuf,
+}
+
+/// Decision returned by [`decide_brew_migration`]. The caller branches
+/// on this to either skip (no migration needed), execute the migration
+/// (clean state for a fresh user-domain bootstrap), or refuse with an
+/// actionable error (the plist on disk doesn't match what we expect, so
+/// auto-removing it would be an operator footgun).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BrewMigrationDecision {
+    /// No brew-services state detected; proceed straight to user-domain bootstrap.
+    Skip,
+    /// Brew-managed state detected and validated; execute the migration.
+    Migrate { reason: BrewMigrationReason },
+    /// Brew-managed state detected but its shape is unexpected (hand-rolled
+    /// plist with same label, or program-args pointing at a different binary).
+    /// Refuse rather than auto-clean — operator must investigate manually.
+    Refuse { reason: String },
+}
+
+/// Which signal(s) triggered a migration. Informational; included in the
+/// stderr log line so an operator can correlate with their box's prior state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum BrewMigrationReason {
+    /// `brew services list --json` reported agentsso as `started`/`scheduled`,
+    /// but no plist on disk (pathological — brew claims active without an artifact).
+    BrewServicesActive,
+    /// Plist on disk validates as a brew-managed agentsso plist; brew's
+    /// status either says inactive or couldn't be probed.
+    PlistOnDisk,
+    /// Both signals positive — the canonical case for an rc.≤15 → rc.16 upgrade.
+    Both,
+}
+
+/// Inspect `~/Library/LaunchAgents/homebrew.mxcl.agentsso.plist`. Returns
+/// `Ok(None)` when the file doesn't exist (the common case for first-time
+/// installs); `Ok(Some(inspection))` when a plist is present and its
+/// `<Label>` + `<ProgramArguments>[0]` could be extracted.
+///
+/// Uses narrow string-scan parsing (NOT a `plist` crate dep — verified
+/// 2026-05-07 that no such dep is in the workspace, and adding one for a
+/// single use is bad ROI). Mirrors the simplicity of [`parse_program_path`]
+/// above. Returns `Ok(None)` if the plist exists but key extraction fails
+/// — the file is malformed enough that we can't make a confident decision,
+/// and the safest action is to skip migration (operator's hand-rolled
+/// config stays untouched).
+pub(crate) fn inspect_brew_plist_path(
+    home: &Path,
+) -> std::io::Result<Option<BrewPlistInspection>> {
+    // Per-user `brew services` writes to `~/Library/LaunchAgents/`.
+    // System-wide `sudo brew services` writes to `/Library/LaunchAgents/`
+    // — that path is intentionally NOT inspected here: rc.16's onboarding
+    // flow assumes per-user installs (single-operator threat model;
+    // `current_user_id` already refuses to ship a root LaunchAgent),
+    // and a system-wide brew install is administered by a different
+    // user account that wouldn't be running `agentsso autostart enable`
+    // from their own session in the first place.
+    let path = home.join("Library/LaunchAgents/homebrew.mxcl.agentsso.plist");
+    let bytes = match std::fs::read(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    let xml = match std::str::from_utf8(&bytes) {
+        Ok(s) => s,
+        Err(_) => return Ok(None), // malformed; skip migration safely
+    };
+
+    // Extract <Label>VALUE</Label> following <key>Label</key>.
+    let label = match extract_plist_string_after_key(xml, "Label") {
+        Some(s) => s,
+        None => return Ok(None),
+    };
+
+    // Extract first <string> inside <ProgramArguments> array. Reuse
+    // `parse_program_path`'s pattern (line 415) for symmetry.
+    let program_args_first = match extract_plist_program_args_first(xml) {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+
+    Ok(Some(BrewPlistInspection { file_path: path, label, program_args_first }))
+}
+
+/// Find `<key>NAME</key>\s*<string>VALUE</string>` and return VALUE
+/// (XML-unescaped). Returns `None` on parse failure.
+///
+/// The next non-whitespace token after the key MUST be `<string>` — a
+/// boolean (`<true/>`/`<false/>`), an array, a dict, or another key
+/// rejects the match. Without this guard the function would skip past
+/// non-string values to find a later `<string>` belonging to a
+/// different key (review finding 2026-05-07).
+fn extract_plist_string_after_key(xml: &str, key: &str) -> Option<String> {
+    let key_marker = format!("<key>{key}</key>");
+    let key_idx = xml.find(&key_marker)?;
+    let after_key = &xml[key_idx + key_marker.len()..];
+    let trimmed = after_key.trim_start();
+    if !trimmed.starts_with("<string>") {
+        return None;
+    }
+    let s_open = "<string>".len();
+    let s_close = trimmed[s_open..].find("</string>")? + s_open;
+    let raw = &trimmed[s_open..s_close];
+    let decoded = super::xml_unescape(raw);
+    if decoded.is_empty() {
+        return None;
+    }
+    Some(decoded)
+}
+
+/// Find `<key>ProgramArguments</key>\s*<array>\s*<string>FIRST</string>...`
+/// and return FIRST as a `PathBuf`. Returns `None` on parse failure.
+/// Mirrors [`parse_program_path`] (line 415) but operates on the
+/// brew-managed plist (which may have a different overall shape).
+fn extract_plist_program_args_first(xml: &str) -> Option<PathBuf> {
+    let key_idx = xml.find("<key>ProgramArguments</key>")?;
+    let array_start = xml[key_idx..].find("<array>")? + key_idx;
+    let array_end = xml[array_start..].find("</array>")? + array_start;
+    let arr_body = &xml[array_start..array_end];
+    let s_open = arr_body.find("<string>")? + "<string>".len();
+    let s_close = arr_body[s_open..].find("</string>")? + s_open;
+    let raw = &arr_body[s_open..s_close];
+    let decoded = super::xml_unescape(raw);
+    if decoded.is_empty() {
+        return None;
+    }
+    Some(PathBuf::from(decoded))
+}
+
+/// Path equality that tolerates the macOS Homebrew Cellar↔opt-bin
+/// symlink layout. The brew plist embeds the stable `opt_bin` path
+/// (e.g., `/opt/homebrew/bin/agentsso` → symlink to
+/// `/opt/homebrew/Cellar/agentsso/<ver>/bin/agentsso`), but
+/// [`current_daemon_path`] resolves through `current_exe()` which
+/// returns the canonicalized Cellar path on macOS. A naive `==`
+/// comparison would refuse legitimate migrations on every brew
+/// upgrade. We try `canonicalize` on both sides; if either fails to
+/// resolve (e.g., binary already removed mid-upgrade), fall back to
+/// byte-exact equality so a real path drift still triggers `Refuse`.
+fn same_binary(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(ca), Ok(cb)) => ca == cb,
+        _ => false,
+    }
+}
+
+/// Pure decision logic. Caller passes in the two signals and the path to
+/// the agentsso binary the new plist will reference; this returns a
+/// [`BrewMigrationDecision`] to dispatch on.
+///
+/// The decision matrix:
+///
+/// | brew_active | plist_inspection | Decision |
+/// |-------------|------------------|----------|
+/// | false       | None             | `Skip` (no brew-managed state) |
+/// | false       | matches binary   | `Migrate { PlistOnDisk }` (leftover plist) |
+/// | false       | mismatched binary | `Refuse` (hand-rolled or stale) |
+/// | true        | None             | `Migrate { BrewServicesActive }` (brew claims active, no plist — pathological but recoverable) |
+/// | true        | matches binary   | `Migrate { Both }` (canonical rc.≤15 upgrade case) |
+/// | true        | mismatched binary | `Refuse` (confused state) |
+///
+/// "Matches binary" means `<Label> == "homebrew.mxcl.agentsso"` AND
+/// `<ProgramArguments>[0]` is the same path as `expected_binary`. Both
+/// must validate; either failing → `Refuse`.
+pub(crate) fn decide_brew_migration(
+    brew_active: bool,
+    plist_inspection: Option<&BrewPlistInspection>,
+    expected_binary: &Path,
+) -> BrewMigrationDecision {
+    match (brew_active, plist_inspection) {
+        (false, None) => BrewMigrationDecision::Skip,
+        (true, None) => {
+            BrewMigrationDecision::Migrate { reason: BrewMigrationReason::BrewServicesActive }
+        }
+        (brew_state, Some(insp)) => {
+            // Validate the plist's shape regardless of brew_active.
+            if insp.label != "homebrew.mxcl.agentsso" {
+                return BrewMigrationDecision::Refuse {
+                    reason: format!(
+                        "{} <Label> is '{}', expected 'homebrew.mxcl.agentsso'. \
+                         This looks like a hand-rolled plist; refusing to migrate. \
+                         Move it aside manually and re-run.",
+                        insp.file_path.display(),
+                        insp.label
+                    ),
+                };
+            }
+            if !same_binary(&insp.program_args_first, expected_binary) {
+                return BrewMigrationDecision::Refuse {
+                    reason: format!(
+                        "{} <ProgramArguments>[0] is '{}', expected '{}'. \
+                         This looks like a stale or hand-rolled plist; refusing to migrate. \
+                         Move it aside manually and re-run.",
+                        insp.file_path.display(),
+                        insp.program_args_first.display(),
+                        expected_binary.display()
+                    ),
+                };
+            }
+            // Both validations pass.
+            BrewMigrationDecision::Migrate {
+                reason: if brew_state {
+                    BrewMigrationReason::Both
+                } else {
+                    BrewMigrationReason::PlistOnDisk
+                },
+            }
+        }
+    }
+}
+
+/// Execute the migration: stop brew-services (best-effort), bootout the
+/// gui-domain LaunchAgent (tolerating exit 125 in SSH contexts where the
+/// gui domain itself doesn't exist), and rename the plist to a timestamped
+/// backup file.
+///
+/// Idempotency: this helper is only called when [`decide_brew_migration`]
+/// returns `Migrate`, which requires a brew signal (status-active OR
+/// inspectable plist on disk). After a successful run, the original plist
+/// has been renamed to a backup path so a subsequent
+/// [`inspect_brew_plist_path`] call returns `None`; combined with brew's
+/// status going inactive after `services stop`, the next `enable`
+/// invocation takes the `Skip` branch in `decide_brew_migration` and
+/// this helper is not invoked at all. (If an operator manually restores
+/// a fresh brew plist between runs, a NEW timestamped backup is created
+/// on the second run — backup paths use nanosecond-precision RFC3339
+/// stamps via `chrono::SecondsFormat::AutoSi`, so collisions are not
+/// realistic.)
+pub(crate) fn execute_brew_migration(
+    exec: &impl Engine,
+    plist_inspection: Option<&BrewPlistInspection>,
+) -> Result<(), AutostartError> {
+    // Step 1: brew services stop agentsso (best-effort). Tolerate
+    // non-zero exit; brew may not be on PATH at all (rare; e.g.,
+    // operator manually installed a brew plist without homebrew),
+    // and even if it is, "service is already stopped" is a non-error
+    // outcome we don't want to fail on.
+    let _ = exec.run("brew", &["services", "stop", "agentsso"]);
+
+    // Step 2: launchctl bootout gui/$UID/homebrew.mxcl.agentsso.
+    // Tolerate 113 (not loaded), 3 (ESRCH — older form), 36
+    // (operation in progress — bootout is async). Exit 125 is
+    // tolerated ONLY when stderr identifies the gui-domain-absent
+    // case ("Domain does not support specified action") — narrowing
+    // the tolerance prevents masking a real permission-denied 125
+    // (which would surface as a different stderr message).
+    //
+    // Concurrency invariant: a still-pending bootout on
+    // `gui/$UID/homebrew.mxcl.agentsso` (label `homebrew.mxcl.agentsso`)
+    // cannot race the subsequent bootstrap into
+    // `user/$UID/dev.agentsso.daemon` — different label, different
+    // domain — so exit 36 is safe to tolerate without ordering.
+    let user = current_user_id()?;
+    let target = format!("gui/{user}/homebrew.mxcl.agentsso");
+    let bootout_args = ["bootout", target.as_str()];
+    if let Ok(out) = exec.run("launchctl", &bootout_args)
+        && !out.status.success()
+    {
+        let code = out.status.code();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let tolerated = match code {
+            Some(113) | Some(3) | Some(36) => true,
+            Some(125) => stderr.contains("Domain does not support specified action"),
+            _ => false,
+        };
+        if !tolerated {
+            return Err(service_manager_failed("launchctl", &bootout_args, &out));
+        }
+    }
+
+    // Step 3: rename the plist to a timestamped backup, IF a plist
+    // was inspected. (When `BrewMigrationReason::BrewServicesActive`
+    // fires without a plist, there's nothing to back up — brew claimed
+    // active but the artifact is missing.)
+    if let Some(insp) = plist_inspection {
+        let backup_path = backup_path_for(&insp.file_path);
+        std::fs::rename(&insp.file_path, &backup_path)
+            .map_err(|source| AutostartError::BrewMigrationFailed { source })?;
+        tracing::info!(
+            backup_path = %backup_path.display(),
+            "migrated from brew-services autostart to user-domain LaunchAgent (brew plist backed up)"
+        );
+    } else {
+        tracing::info!(
+            "migrated from brew-services autostart to user-domain LaunchAgent (no brew plist found on disk; brew status alone reported active)"
+        );
+    }
+
+    Ok(())
+}
+
+/// Compute the backup path for a brew-managed plist:
+/// `<original>.bak.<RFC3339-timestamp>`.
+///
+/// Uses `chrono::Utc::now().to_rfc3339()` (chrono is already in
+/// workspace deps per `Cargo.toml:153`). The RFC 3339 format includes
+/// colons (`2026-05-07T20:15:30Z`) — these are valid filename
+/// characters on macOS and Linux but NOT on Windows; this code path
+/// is `#[cfg(target_os = "macos")]` only so that's not a concern.
+fn backup_path_for(original: &Path) -> PathBuf {
+    let ts = chrono::Utc::now().to_rfc3339();
+    let mut backup = original.to_path_buf();
+    let name = original
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "homebrew.mxcl.agentsso.plist".to_owned());
+    backup.set_file_name(format!("{name}.bak.{ts}"));
+    backup
+}
+
+
 /// Pull the absolute daemon path out of a rendered plist by finding
 /// the first `<string>` inside `<key>ProgramArguments</key><array>...</array>`.
 ///
@@ -452,15 +848,15 @@ fn already_unloaded(out: &Output) -> bool {
     matches!(out.status.code(), Some(113) | Some(3) | Some(36))
 }
 
-/// Resolve the macOS user uid for the `gui/$UID` launchctl target.
+/// Resolve the macOS user uid for the `user/$UID` launchctl target.
 ///
 /// **P2 (code review):** when the user runs `sudo agentsso autostart enable`,
-/// `getuid()` returns 0 and the launchctl target becomes `gui/0` (root has
-/// no gui session) AND the plist gets written into root's
-/// `~/Library/LaunchAgents/`, so the daemon never auto-starts at the real
-/// user's login. We:
+/// `getuid()` returns 0 and the launchctl target would become `user/0`
+/// (root's per-user domain — exists, but not what the operator intends)
+/// AND the plist gets written into root's `~/Library/LaunchAgents/`, so
+/// the daemon never auto-starts at the real user's login. We:
 /// 1. If running as root, prefer the `SUDO_UID` env var (set by sudo) so the
-///    plist + launchctl target target the real user's gui session.
+///    plist + launchctl target target the real user's per-user domain.
 /// 2. If `SUDO_UID` is missing while running as root (e.g., user logged in
 ///    as root directly), refuse with a clean `Io` error rather than ship
 ///    a guaranteed-broken plist.
@@ -470,9 +866,17 @@ fn current_user_id() -> std::io::Result<u32> {
         return Ok(uid);
     }
     // Running as root — recover the real uid from sudo's environment.
+    // Validate that the parsed uid corresponds to a real user; a stale
+    // SUDO_UID pointing at a deleted account would otherwise produce a
+    // bootstrap target like `user/<bogus>` that fails launchctl with
+    // exit 125 (the same failure mode this story exists to prevent).
     if let Ok(sudo_uid) = std::env::var("SUDO_UID")
         && let Ok(parsed) = sudo_uid.parse::<u32>()
         && parsed != 0
+        && matches!(
+            nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(parsed)),
+            Ok(Some(_))
+        )
     {
         return Ok(parsed);
     }
@@ -580,17 +984,62 @@ mod tests {
     }
 
     #[test]
-    fn enable_refuses_when_brew_services_active() {
+    fn enable_migrates_when_brew_services_active_with_no_plist_on_disk() {
+        // Story 7.16 Task 2: previously this test asserted refusal
+        // (`Err(AutostartError::BrewServicesActive)`). New behavior:
+        // brew claims active but no plist on disk → Migrate
+        // (BrewMigrationReason::BrewServicesActive); execute migration
+        // (brew-stop + launchctl bootout, both best-effort), then
+        // proceed with the user-domain bootstrap. The old refusal
+        // path is no longer produced by `enable()`.
         let tmp = tempfile::TempDir::new().unwrap();
         let mock = MockExec::default();
-        // First call: `brew services list --json` returns the active entry.
+        // brew services list --json (returns active)
         mock.push_reply(MockExec::ok(r#"[{"name":"agentsso","status":"started"}]"#));
-        let result = enable(&mock, tmp.path());
-        assert!(matches!(result, Err(AutostartError::BrewServicesActive)));
-        // We must NOT have called launchctl.
+        // Migration step 1: brew services stop agentsso (best-effort; mock OK)
+        mock.push_reply(MockExec::ok(""));
+        // Migration step 2: launchctl bootout gui/<uid>/homebrew.mxcl.agentsso
+        // — over SSH this returns exit 125; mock that to verify tolerance.
+        mock.push_reply(MockExec::fail(125, "Domain does not support specified action"));
+        // Bootstrap proceeds normally.
+        mock.push_reply(MockExec::ok(""));
+
+        let outcome = enable(&mock, tmp.path()).unwrap();
+        match &outcome {
+            EnableOutcome::Registered { mechanism, artifact_path } => {
+                assert_eq!(*mechanism, MECHANISM);
+                assert!(artifact_path.exists());
+            }
+            other => panic!("expected Registered after migration, got {other:?}"),
+        }
+
+        // Assert call sequence: brew-list + brew-stop + launchctl-bootout + launchctl-bootstrap.
         let calls = mock.calls.borrow();
-        assert_eq!(calls.len(), 1);
+        assert_eq!(calls.len(), 4, "expected 4 calls (brew list, brew stop, launchctl bootout, launchctl bootstrap), got {calls:?}");
         assert_eq!(calls[0].0, "brew");
+        assert_eq!(calls[0].1[0], "services");
+        assert_eq!(calls[0].1[1], "list");
+        assert_eq!(calls[1].0, "brew");
+        assert_eq!(calls[1].1[0], "services");
+        assert_eq!(calls[1].1[1], "stop");
+        assert_eq!(calls[2].0, "launchctl");
+        assert_eq!(calls[2].1[0], "bootout");
+        // Story 7.16: bootout target is gui/<uid>/homebrew.mxcl.agentsso
+        // (the brew-managed plist's domain — gui, NOT user) because we're
+        // un-bootstrapping brew's prior registration.
+        assert!(
+            calls[2].1[1].starts_with("gui/"),
+            "bootout target should be gui/<uid>/homebrew.mxcl.agentsso, got {:?}",
+            calls[2].1[1]
+        );
+        assert_eq!(calls[3].0, "launchctl");
+        assert_eq!(calls[3].1[0], "bootstrap");
+        // Story 7.16 AC #2: bootstrap target is user/<uid>.
+        assert!(
+            calls[3].1[1].starts_with("user/"),
+            "bootstrap target should be user/<uid>, got {:?}",
+            calls[3].1[1]
+        );
     }
 
     #[test]
@@ -615,6 +1064,19 @@ mod tests {
         assert_eq!(calls[0].0, "brew");
         assert_eq!(calls[1].0, "launchctl");
         assert_eq!(calls[1].1[0], "bootstrap");
+        // Story 7.15 AC #2: launchctl target MUST be user/<uid>, never
+        // gui/<uid>. The gui/ domain only exists for active GUI login
+        // sessions and returns exit 125 over SSH.
+        assert!(
+            calls[1].1[1].starts_with("user/"),
+            "bootstrap target should be user/<uid>, got {:?}",
+            calls[1].1[1]
+        );
+        assert!(
+            !calls[1].1[1].starts_with("gui/"),
+            "bootstrap target must NOT use gui/ domain (Story 7.15 regression guard); got {:?}",
+            calls[1].1[1]
+        );
     }
 
     #[test]
@@ -691,6 +1153,21 @@ mod tests {
         let outcome = disable(&mock, tmp.path()).unwrap();
         assert!(matches!(outcome, DisableOutcome::Removed { .. }));
         assert!(!plist.exists());
+
+        // Story 7.15 AC #2: bootout target must be user/<uid>/<label>.
+        let calls = mock.calls.borrow();
+        let bootout_call = calls.iter().find(|c| c.0 == "launchctl" && c.1[0] == "bootout");
+        let bootout_call = bootout_call.expect("expected a launchctl bootout call");
+        assert!(
+            bootout_call.1[1].starts_with("user/"),
+            "bootout target should be user/<uid>/<label>, got {:?}",
+            bootout_call.1[1]
+        );
+        assert!(
+            !bootout_call.1[1].starts_with("gui/"),
+            "bootout target must NOT use gui/ domain (Story 7.15); got {:?}",
+            bootout_call.1[1]
+        );
     }
 
     #[test]
@@ -780,6 +1257,442 @@ mod tests {
         mock.push_reply(MockExec::ok("[]"));
         let st = status(&mock, tmp.path()).unwrap();
         assert_eq!(st, AutostartStatus::Disabled);
+
+        // Story 7.15 AC #2: end-to-end check — every launchctl call in
+        // this round-trip used user/<uid> domain, NEVER gui/<uid>.
+        // This is the regression-guard that catches a flip back to
+        // gui/ at any of the three call sites (bootstrap, print,
+        // bootout) or any future addition.
+        let calls = mock.calls.borrow();
+        for (cmd, args) in calls.iter() {
+            if cmd != "launchctl" {
+                continue;
+            }
+            // launchctl args: [verb, target, ...]. target is at index 1.
+            if let Some(target) = args.get(1) {
+                assert!(
+                    !target.starts_with("gui/"),
+                    "launchctl call used gui/ domain (Story 7.15 regression): {cmd} {args:?}"
+                );
+                if target.contains('/') {
+                    // Skip non-domain args (e.g., file paths). Real
+                    // launchctl targets always start with the domain.
+                    let starts_with_domain = target.starts_with("user/")
+                        || target.starts_with("system/")
+                        || target.starts_with("/"); // file path arg
+                    assert!(
+                        starts_with_domain,
+                        "launchctl target should be user/<uid>... (Story 7.15); got {:?}",
+                        target
+                    );
+                }
+            }
+        }
+    }
+
+    /// Story 7.15 AC #2: explicit regression guard — assert no `gui/`
+    /// domain reference exists in the production code path's launchctl
+    /// invocations. This is a separate test from the round-trip's
+    /// in-line assertion so a single test name maps to the regression
+    /// concern (easier to find when triaging a future failure).
+    #[test]
+    fn enable_targets_user_domain_at_all_call_sites() {
+        // Exercise enable → status (probe) → disable, then check
+        // every recorded launchctl call's target arg.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mock = MockExec::default();
+
+        // enable
+        mock.push_reply(MockExec::ok("[]")); // brew probe
+        mock.push_reply(MockExec::ok("")); // launchctl bootstrap
+        enable(&mock, tmp.path()).unwrap();
+
+        // status (probes launchctl print)
+        mock.push_reply(MockExec::ok("[]")); // brew probe
+        mock.push_reply(MockExec::ok("")); // launchctl print
+        status(&mock, tmp.path()).unwrap();
+
+        // disable
+        mock.push_reply(MockExec::ok("")); // launchctl bootout
+        mock.push_reply(MockExec::ok("[]")); // brew probe
+        disable(&mock, tmp.path()).unwrap();
+
+        // Walk every launchctl call's target. The target arg is
+        // args[1] for bootstrap/bootout/print (verb at args[0],
+        // target at args[1]).
+        let calls = mock.calls.borrow();
+        let launchctl_calls: Vec<_> = calls.iter().filter(|c| c.0 == "launchctl").collect();
+        assert_eq!(
+            launchctl_calls.len(),
+            3,
+            "expected 3 launchctl calls (bootstrap, print, bootout); got {launchctl_calls:?}"
+        );
+        for (_, args) in &launchctl_calls {
+            let target = &args[1];
+            assert!(
+                target.starts_with("user/"),
+                "launchctl target must start with user/ (Story 7.15); got {target:?}"
+            );
+            assert!(
+                !target.contains("gui/"),
+                "launchctl target contains gui/ — Story 7.15 regression: {target:?}"
+            );
+        }
+    }
+
+    /// Story 7.15 AC #2: regression guard against the 119-recovery
+    /// path. When bootstrap returns exit 119 (Service is disabled),
+    /// the recovery `launchctl enable` call MUST also target user/.
+    #[test]
+    fn enable_119_recovery_uses_user_domain_target() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let mock = MockExec::default();
+
+        mock.push_reply(MockExec::ok("[]")); // brew probe
+        mock.push_reply(MockExec::fail(119, "Service is disabled")); // bootstrap
+        mock.push_reply(MockExec::ok("")); // launchctl enable (recovery)
+
+        let outcome = enable(&mock, tmp.path()).unwrap();
+        assert!(matches!(outcome, EnableOutcome::Registered { .. }));
+
+        let calls = mock.calls.borrow();
+        let enable_recovery = calls.iter().find(|c| c.0 == "launchctl" && c.1[0] == "enable");
+        let enable_recovery = enable_recovery.expect("expected launchctl enable recovery call");
+        let target = &enable_recovery.1[1];
+        assert!(
+            target.starts_with("user/"),
+            "119-recovery enable target should start with user/ (Story 7.15); got {target:?}"
+        );
+        assert!(
+            !target.starts_with("gui/"),
+            "119-recovery enable target must NOT use gui/ (Story 7.15); got {target:?}"
+        );
+    }
+
+    // ─── Story 7.16 Task 2 brew-migration tests ────────────────────────
+
+    /// Helper: write a brew-shaped plist into a tempdir's
+    /// `Library/LaunchAgents/` for use as a Story 7.16 migration fixture.
+    /// `program_args_first` is what the plist's `<ProgramArguments>[0]`
+    /// will reference; pass `current_daemon_path()` to simulate a
+    /// canonical brew-managed plist that validates, or any other path to
+    /// simulate a hand-rolled plist that should be refused.
+    fn write_brew_plist_fixture(home: &Path, label: &str, program_args_first: &Path) -> PathBuf {
+        let plist_path = home.join("Library/LaunchAgents/homebrew.mxcl.agentsso.plist");
+        std::fs::create_dir_all(plist_path.parent().unwrap()).unwrap();
+        let xml = format!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{}</string>
+    <string>start</string>
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>
+"#,
+            label,
+            program_args_first.display()
+        );
+        std::fs::write(&plist_path, xml).unwrap();
+        plist_path
+    }
+
+    /// Story 7.16 AC #4: pure decision-matrix coverage. No exec calls.
+    /// Exercises `decide_brew_migration` against the 6 cases from the
+    /// docstring's matrix.
+    #[test]
+    fn decide_brew_migration_decision_matrix() {
+        let expected = Path::new("/usr/local/bin/agentsso");
+        let valid = BrewPlistInspection {
+            file_path: PathBuf::from("/Users/x/Library/LaunchAgents/homebrew.mxcl.agentsso.plist"),
+            label: "homebrew.mxcl.agentsso".to_owned(),
+            program_args_first: expected.to_path_buf(),
+        };
+        let bad_label = BrewPlistInspection { label: "homebrew.mxcl.evil".to_owned(), ..valid.clone() };
+        let bad_args = BrewPlistInspection {
+            program_args_first: PathBuf::from("/usr/bin/false"),
+            ..valid.clone()
+        };
+
+        // Row 1: brew_active=false, no plist → Skip.
+        assert_eq!(decide_brew_migration(false, None, expected), BrewMigrationDecision::Skip);
+
+        // Row 2: brew_active=false, valid plist → Migrate{PlistOnDisk}.
+        assert_eq!(
+            decide_brew_migration(false, Some(&valid), expected),
+            BrewMigrationDecision::Migrate { reason: BrewMigrationReason::PlistOnDisk }
+        );
+
+        // Row 3: brew_active=false, bad-label plist → Refuse.
+        assert!(matches!(
+            decide_brew_migration(false, Some(&bad_label), expected),
+            BrewMigrationDecision::Refuse { .. }
+        ));
+
+        // Row 4: brew_active=true, no plist → Migrate{BrewServicesActive}.
+        assert_eq!(
+            decide_brew_migration(true, None, expected),
+            BrewMigrationDecision::Migrate { reason: BrewMigrationReason::BrewServicesActive }
+        );
+
+        // Row 5: brew_active=true, valid plist → Migrate{Both}.
+        assert_eq!(
+            decide_brew_migration(true, Some(&valid), expected),
+            BrewMigrationDecision::Migrate { reason: BrewMigrationReason::Both }
+        );
+
+        // Row 6: brew_active=true, bad-args plist → Refuse.
+        assert!(matches!(
+            decide_brew_migration(true, Some(&bad_args), expected),
+            BrewMigrationDecision::Refuse { .. }
+        ));
+    }
+
+    /// Story 7.16 Task 2: full enable() with a valid brew-managed plist
+    /// on disk and brew status reporting active. Asserts the migration
+    /// path executes (brew-stop → bootout → plist-rename-to-backup) and
+    /// then the user-domain bootstrap succeeds. The plist file should
+    /// no longer exist at its primary path; a `*.bak.<timestamp>` file
+    /// should exist alongside it.
+    #[test]
+    fn migration_backs_up_plist_before_user_domain_bootstrap() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Fixture: brew plist on disk with the canonical label + a
+        // program-args path matching current_daemon_path(). This
+        // makes decide_brew_migration return Migrate{Both} (when
+        // combined with the active brew status below).
+        let daemon = current_daemon_path().unwrap();
+        let original_plist = write_brew_plist_fixture(
+            tmp.path(),
+            "homebrew.mxcl.agentsso",
+            &daemon,
+        );
+
+        let mock = MockExec::default();
+        // brew services list --json (returns active)
+        mock.push_reply(MockExec::ok(r#"[{"name":"agentsso","status":"started"}]"#));
+        // Migration: brew services stop
+        mock.push_reply(MockExec::ok(""));
+        // Migration: launchctl bootout (mock OK to simulate console-with-gui-domain box)
+        mock.push_reply(MockExec::ok(""));
+        // User-domain bootstrap
+        mock.push_reply(MockExec::ok(""));
+
+        let outcome = enable(&mock, tmp.path()).unwrap();
+        assert!(matches!(outcome, EnableOutcome::Registered { .. }));
+
+        // Original plist file should NO LONGER exist at its primary path.
+        assert!(
+            !original_plist.exists(),
+            "original brew plist should have been renamed to backup"
+        );
+        // A backup file MUST exist in the same directory matching `*.bak.*`.
+        let backup_dir = original_plist.parent().unwrap();
+        let backup_count = std::fs::read_dir(backup_dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .contains("homebrew.mxcl.agentsso.plist.bak.")
+            })
+            .count();
+        assert_eq!(backup_count, 1, "expected exactly one backup file in {}", backup_dir.display());
+    }
+
+    /// Story 7.16 Task 2: brew status is unreliable (over SSH) and
+    /// returns false despite a valid plist on disk. The plist signal
+    /// alone should drive the migration. Mirrors the SSH-context case
+    /// where `brew services list` itself fails or returns stale data.
+    #[test]
+    fn migration_uses_plist_path_when_brew_status_unreliable() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let daemon = current_daemon_path().unwrap();
+        let original_plist = write_brew_plist_fixture(
+            tmp.path(),
+            "homebrew.mxcl.agentsso",
+            &daemon,
+        );
+
+        let mock = MockExec::default();
+        // brew services list returns empty (status probe failed/empty)
+        mock.push_reply(MockExec::ok("[]"));
+        // Even without brew_active, the plist on disk drives Migrate{PlistOnDisk}.
+        // Migration: brew stop (best-effort)
+        mock.push_reply(MockExec::ok(""));
+        // Migration: launchctl bootout
+        mock.push_reply(MockExec::ok(""));
+        // User-domain bootstrap
+        mock.push_reply(MockExec::ok(""));
+
+        let outcome = enable(&mock, tmp.path()).unwrap();
+        assert!(matches!(outcome, EnableOutcome::Registered { .. }));
+        assert!(!original_plist.exists(), "plist should have been backed up");
+    }
+
+    /// Story 7.16 Task 2: launchctl bootout returns exit 125 (gui domain
+    /// unavailable in SSH context). Migration must tolerate this and
+    /// proceed with the plist rename + user-domain bootstrap. This is
+    /// the canonical SSH-on-Angie's-box failure mode that the original
+    /// rc.15 surfaced (just on a different launchctl invocation).
+    #[test]
+    fn migration_tolerates_bootout_exit_125() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let daemon = current_daemon_path().unwrap();
+        let original_plist = write_brew_plist_fixture(
+            tmp.path(),
+            "homebrew.mxcl.agentsso",
+            &daemon,
+        );
+
+        let mock = MockExec::default();
+        mock.push_reply(MockExec::ok(r#"[{"name":"agentsso","status":"started"}]"#));
+        mock.push_reply(MockExec::ok("")); // brew stop
+        // launchctl bootout returns exit 125 — gui domain not bootstrapped
+        // (this is exactly the failure mode rc.15 hit on Angie's box for the
+        // bootstrap call; here we hit it on the migration's bootout).
+        mock.push_reply(MockExec::fail(125, "Domain does not support specified action"));
+        mock.push_reply(MockExec::ok("")); // user-domain bootstrap
+
+        let outcome = enable(&mock, tmp.path()).unwrap();
+        assert!(matches!(outcome, EnableOutcome::Registered { .. }));
+        assert!(!original_plist.exists(), "plist should still be backed up despite bootout 125");
+    }
+
+    /// Story 7.16 review-finding regression: bootout exit-125 is
+    /// tolerated ONLY when stderr identifies the gui-domain-absent
+    /// case. A 125 with a different message (e.g., a permission
+    /// failure that happens to share the code) must surface as
+    /// `service_manager_failed`, not be silently swallowed.
+    #[test]
+    fn migration_does_not_tolerate_unrelated_125_failures() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let daemon = current_daemon_path().unwrap();
+        write_brew_plist_fixture(tmp.path(), "homebrew.mxcl.agentsso", &daemon);
+
+        let mock = MockExec::default();
+        mock.push_reply(MockExec::ok(r#"[{"name":"agentsso","status":"started"}]"#));
+        mock.push_reply(MockExec::ok("")); // brew stop
+        // 125 with stderr that does NOT match the gui-domain-absent
+        // signature — must surface as an error rather than be tolerated.
+        mock.push_reply(MockExec::fail(125, "Operation not permitted"));
+
+        let result = enable(&mock, tmp.path());
+        assert!(
+            matches!(result, Err(AutostartError::ServiceManagerFailed { .. })),
+            "expected ServiceManagerFailed for 125 with non-gui-domain stderr, got {result:?}"
+        );
+    }
+
+    /// Story 7.16 review-finding regression: real brew plists embed
+    /// the stable `opt_bin` symlink path (e.g.,
+    /// `/opt/homebrew/bin/agentsso`), while [`current_daemon_path`]
+    /// resolves through `current_exe()` and returns the canonicalized
+    /// Cellar target. A naive `==` would refuse legitimate migrations
+    /// on every brew upgrade. [`same_binary`] canonicalizes both
+    /// sides; this test pins that behavior by setting up an actual
+    /// symlink and pointing the brew plist at it.
+    #[test]
+    fn migration_accepts_symlinked_program_args_path() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // Real binary (stand in for the Cellar-resolved daemon path).
+        let real_bin = tmp.path().join("Cellar/agentsso/0.3.0/bin/agentsso");
+        std::fs::create_dir_all(real_bin.parent().unwrap()).unwrap();
+        std::fs::write(&real_bin, b"#!/bin/sh\nexit 0\n").unwrap();
+        // Symlink mimicking brew's opt_bin layout.
+        let opt_bin_dir = tmp.path().join("opt/homebrew/bin");
+        std::fs::create_dir_all(&opt_bin_dir).unwrap();
+        let symlink_path = opt_bin_dir.join("agentsso");
+        std::os::unix::fs::symlink(&real_bin, &symlink_path).unwrap();
+
+        // Brew plist embeds the symlink path. `expected_binary`
+        // (what current_daemon_path would return) is the real Cellar
+        // target — distinct PathBuf, but canonicalize-equal.
+        let inspection = BrewPlistInspection {
+            file_path: tmp.path().join("Library/LaunchAgents/homebrew.mxcl.agentsso.plist"),
+            label: "homebrew.mxcl.agentsso".to_owned(),
+            program_args_first: symlink_path.clone(),
+        };
+
+        // Sanity-check the test setup: byte-exact comparison would refuse.
+        assert_ne!(symlink_path, real_bin, "test fixture invalid: paths happen to be byte-equal");
+
+        // Decision should be Migrate, not Refuse.
+        let decision = decide_brew_migration(true, Some(&inspection), &real_bin);
+        assert!(
+            matches!(decision, BrewMigrationDecision::Migrate { .. }),
+            "expected Migrate for canonicalize-equal paths, got {decision:?}"
+        );
+    }
+
+    /// Story 7.16 Task 2: plist on disk has the brew label but its
+    /// `<ProgramArguments>[0]` does NOT match our daemon binary —
+    /// likely a stale or hand-rolled config. Migration must REFUSE
+    /// with `BrewMigrationRefused` and leave the plist file untouched
+    /// so the operator can investigate.
+    #[test]
+    fn migration_refuses_when_plist_program_args_unrecognized() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let original_plist = write_brew_plist_fixture(
+            tmp.path(),
+            "homebrew.mxcl.agentsso",
+            // NOT the current_daemon_path() — simulates a hand-rolled
+            // plist pointing at a different binary.
+            Path::new("/usr/bin/false"),
+        );
+        let plist_bytes_before = std::fs::read(&original_plist).unwrap();
+
+        let mock = MockExec::default();
+        // brew probe (doesn't matter — refusal happens regardless)
+        mock.push_reply(MockExec::ok("[]"));
+
+        let result = enable(&mock, tmp.path());
+        assert!(matches!(result, Err(AutostartError::BrewMigrationRefused { .. })));
+
+        // CRITICAL: plist file must be UNTOUCHED. Hand-rolled config preserved.
+        assert!(original_plist.exists(), "refused migration must NOT touch the plist file");
+        let plist_bytes_after = std::fs::read(&original_plist).unwrap();
+        assert_eq!(plist_bytes_after, plist_bytes_before, "plist contents must be byte-identical");
+
+        // No launchctl calls should have been made.
+        let calls = mock.calls.borrow();
+        let launchctl_calls: Vec<_> = calls.iter().filter(|c| c.0 == "launchctl").collect();
+        assert!(
+            launchctl_calls.is_empty(),
+            "refused migration must NOT call launchctl, got {launchctl_calls:?}"
+        );
+    }
+
+    /// Story 7.16 Task 2: plist on disk has a different `<Label>` value
+    /// (e.g., operator copied the homebrew namespace for a different
+    /// service). Same refusal semantics as the bad-args case.
+    #[test]
+    fn migration_refuses_when_plist_label_mismatched() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let daemon = current_daemon_path().unwrap();
+        let original_plist = write_brew_plist_fixture(
+            tmp.path(),
+            // NOT "homebrew.mxcl.agentsso" — defensive against a copy-paste.
+            "homebrew.mxcl.somethingelse",
+            &daemon,
+        );
+        let plist_bytes_before = std::fs::read(&original_plist).unwrap();
+
+        let mock = MockExec::default();
+        mock.push_reply(MockExec::ok("[]"));
+
+        let result = enable(&mock, tmp.path());
+        assert!(matches!(result, Err(AutostartError::BrewMigrationRefused { .. })));
+
+        // Plist preserved.
+        assert!(original_plist.exists());
+        assert_eq!(std::fs::read(&original_plist).unwrap(), plist_bytes_before);
     }
 
     #[test]

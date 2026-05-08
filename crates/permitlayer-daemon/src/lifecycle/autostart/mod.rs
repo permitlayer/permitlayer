@@ -87,6 +87,28 @@ pub enum AutostartError {
     /// `disable`, `status` paths so the CLI can render a clean error.
     #[error("autostart is not supported on this platform ({platform})")]
     UnsupportedPlatform { platform: &'static str },
+
+    /// macOS-only (Story 7.16 Task 2): `agentsso autostart enable`
+    /// detected a `homebrew.mxcl.agentsso` plist on disk but its
+    /// `<Label>` or `<ProgramArguments>[0]` does NOT match what
+    /// Homebrew would have written for our brew formula. Likely
+    /// causes: operator hand-rolled a custom plist with the same
+    /// label, or installed a different agentsso binary out-of-band.
+    /// Refuse to migrate rather than silently delete the operator's
+    /// custom config.
+    #[error("brew-services migration refused: {message}")]
+    BrewMigrationRefused { message: String },
+
+    /// macOS-only (Story 7.16 Task 2): the brew-services migration
+    /// detected a plist to migrate but the `bootout` + plist-rename
+    /// dance hit an unrecoverable error (filesystem permissions,
+    /// disk full, etc.). Distinct from `Io` so the CLI can render a
+    /// migration-specific remediation block.
+    #[error("brew-services migration failed: {source}")]
+    BrewMigrationFailed {
+        #[source]
+        source: std::io::Error,
+    },
 }
 
 /// Output of [`status`] — what [`enable`] / [`disable`] would see if
