@@ -258,8 +258,26 @@ fn start_acl_break_dispatch_reaches_auto_rekey_stub_when_dr_matches() {
     // `AutoRekeyFailed` on first run. The negative assertion below
     // covers EITHER outcome — both prove dispatch reached the
     // codesign-verification step.
-    let test_proc_dr = capture_self_designated_requirement()
-        .expect("test process must have a capturable codesign DR");
+    // On some macOS hosted runners (observed on macos-15-intel) the
+    // cargo-test process has no `kSecCodeInfoDesignatedRequirement` in
+    // its signing info dictionary — `capture_self_designated_requirement`
+    // returns `Other { code: 0, message: "signing information dictionary
+    // missing kSecCodeInfoDesignatedRequirement" }`. Without a
+    // capturable DR we can't seed an anchor that would even potentially
+    // match the daemon's binary, so this test's specific dispatch
+    // assertion (DR-match path → rekey stub) is unreachable. Skip
+    // gracefully on those hosts; macos-14 runners + dev hardware
+    // produce a capturable DR and exercise the dispatch end-to-end.
+    let test_proc_dr = match capture_self_designated_requirement() {
+        Ok(dr) => dr,
+        Err(e) => {
+            eprintln!(
+                "skipping: test process has no capturable codesign DR \
+                 (typical on hosted CI runners): {e}"
+            );
+            return;
+        }
+    };
     write_trust_anchor(home.path(), &test_proc_dr).expect("write trust anchor to test home");
 
     let handle = start_daemon(DaemonTestConfig {

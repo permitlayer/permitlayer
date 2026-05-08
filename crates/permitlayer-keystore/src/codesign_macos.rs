@@ -229,8 +229,10 @@ mod trust_anchor {
             // That's fine for a parse-validation read.
             CodesignError::RequirementMismatch { .. } => Ok(()),
             CodesignError::Unsigned => Ok(()),
+            #[cfg(target_os = "macos")]
             CodesignError::SecFrameworkCall { .. } => Ok(()),
             // These are the actual "file is garbage" cases.
+            #[cfg(target_os = "macos")]
             CodesignError::RequirementParseFailed { .. } => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "trust anchor file content is not a valid SecRequirement string",
@@ -406,6 +408,12 @@ mod error {
         /// `<home>/keystore/codesign-trust-anchor.req` could not be
         /// parsed by `SecRequirementCreateWithString`. The file is
         /// corrupted or hand-edited.
+        ///
+        /// Cross-platform note: `security_framework::base::Error` is
+        /// macOS-only, so this variant is gated to macOS. On
+        /// non-macOS platforms the parse path is unreachable —
+        /// `verify_self_against` returns `PlatformUnsupported` first.
+        #[cfg(target_os = "macos")]
         #[error(
             "stored codesign requirement string is malformed (could not parse as a SecRequirement)"
         )]
@@ -415,6 +423,10 @@ mod error {
         },
 
         /// Some other Security framework call failed unexpectedly.
+        ///
+        /// Cross-platform note: macOS-only; non-macOS call sites return
+        /// `PlatformUnsupported` first.
+        #[cfg(target_os = "macos")]
         #[error("Apple Security framework call failed: {source}")]
         SecFrameworkCall {
             #[source]
