@@ -52,7 +52,14 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: "-Dwarnings"
+  # NOTE: this workflow intentionally does NOT set `RUSTFLAGS="-Dwarnings"`.
+  # `ci.yml`'s `Lint (fmt + clippy)` job is the canonical zero-warning gate;
+  # it runs on debug builds where the relevant lints fire. This workflow's
+  # smoke build runs in release where some test-only `#[cfg(test)]` helpers
+  # show up as dead code (e.g. `CannedPromptReader::new`/`with_sleep` in
+  # `approval.rs`, `AppState::plugin_runtime` in `start.rs`). Treating those
+  # as errors here would block scripted-install regression testing on noise
+  # that the lint gate already covers correctly.
 
 jobs:
   smoke:
