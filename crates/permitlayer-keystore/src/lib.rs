@@ -50,6 +50,7 @@ compile_error!(
      with `cargo test --features test-seam` (debug profile) instead."
 );
 
+pub mod codesign_macos;
 pub mod error;
 #[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 pub(crate) mod fallback;
@@ -69,6 +70,7 @@ use std::path::PathBuf;
 
 use zeroize::Zeroizing;
 
+pub use codesign_macos::{capture_self_designated_requirement, verify_self_against, CodesignError};
 pub use error::KeyStoreError;
 #[cfg(feature = "test-seam")]
 pub use file_backed::FileBackedKeyStore;
