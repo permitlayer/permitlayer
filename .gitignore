@@ -69,3 +69,8 @@ credentials.json
 
 # Local forensic backup of release.yml during v0.2.0 first-release shakedown
 /.github/workflows/release.yml.old.bak
+
+# ============================================================================
+# Personal collaboration preferences (Austin)
+# ============================================================================
+/CLAUDE.md
