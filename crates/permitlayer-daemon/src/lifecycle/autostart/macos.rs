@@ -53,6 +53,53 @@
 //! the same lesson here — the rendered plist sets `<key>KeepAlive</key>
 //! <dict><key>SuccessfulExit</key><false/></dict>` so launchd respawns
 //! ONLY on crashes, not clean shutdowns.
+//!
+//! # LimitLoadToSessionType (Story 7.21)
+//!
+//! Without this key, launchd defaults a LaunchAgent's allowed session
+//! type to `Aqua` (per the launchd-dev archive thread on errno 134:
+//! <https://launchd-dev.macosforge.narkive.com/7s3ELd8z/cause-of-service-cannot-load-in-requested-session>).
+//! `launchctl bootstrap user/$UID` from an SSH session — which is the
+//! `Background` session type — refuses to load an `Aqua`-typed agent
+//! and surfaces errno 134 ("Service cannot load in requested session"),
+//! reported to userspace as errno 5 ("Bootstrap failed: Input/output error").
+//!
+//! Story 7.16 fixed the *domain* (`gui/$UID` → `user/$UID`) but did NOT
+//! set the session-type filter, so the rc.16 plist still hit errno 134
+//! on Angie's macOS 15.7.5 box (verified 2026-05-08, SSH-only).
+//!
+//! Our chosen value is `[Background, Aqua]`:
+//!
+//! - `Background` covers SSH-only sessions and is the load-bearing fix.
+//! - `Aqua` preserves rc.16 GUI-desktop behavior (a normal Terminal.app
+//!   session inside a logged-in macOS desktop).
+//! - `LoginWindow` is deliberately EXCLUDED: the daemon depends on the
+//!   per-user login keychain to unseal the master key, and the login
+//!   keychain isn't unlocked until the user has signed in. Combined
+//!   with `KeepAlive.SuccessfulExit=false`, loading at LoginWindow
+//!   would put the daemon into a respawn loop against a locked
+//!   keychain *before* the user has any way to interact with it. See
+//!   README:151,171-205 for the keychain-ACL recovery story.
+//!
+//! Mirrors Apple's `com.apple.cfprefsd.xpc.agent.plist` (uses
+//! `Background`) for the SSH path and Apple's general-purpose user-agent
+//! pattern for the GUI path. NOT mirroring `com.apple.ctkd` (which
+//! includes `LoginWindow`) — ctkd is a CryptoTokenKit XPC agent that
+//! must run pre-login by design (the OS may need to talk to a smart
+//! card before login itself), which is not our threat model.
+//!
+//! # rc.16 → rc.17 upgrade: bootout before bootstrap
+//!
+//! launchd reads a LaunchAgent plist at *bootstrap* time and caches the
+//! parsed properties. Rewriting the plist file alone does NOT push
+//! changes through to the live registration. So when `enable()` detects
+//! plist content drift (the existing P31 plist-content-comparison at
+//! line 235-240 below) and rewrites the file, it MUST also issue a
+//! `launchctl bootout user/$UID/<label>` before the bootstrap call so
+//! the new content is actually loaded. Without this, the rc.16 → rc.17
+//! upgrade leaves a stale launchd registration with the rc.16-default
+//! `Aqua` filter; the on-disk file would be correct but SSH-only
+//! bootstrap would continue to fail until the next reboot.
 
 use std::path::{Path, PathBuf};
 use std::process::Output;
@@ -84,7 +131,16 @@ pub(crate) fn plist_path(home: &Path) -> PathBuf {
 /// Hand-rendered (no `plist` crate dep) per Story 7.3 Dev Notes — the
 /// content is static beyond the binary path + log path, the format has
 /// been stable since macOS 10.6, and the snapshot test pins the
-/// load-bearing fields (`KeepAlive.SuccessfulExit=false`, `RunAtLoad=true`).
+/// load-bearing fields (`KeepAlive.SuccessfulExit=false`, `RunAtLoad=true`,
+/// `LimitLoadToSessionType=[Background, Aqua]` — Story 7.21).
+///
+/// # LimitLoadToSessionType
+///
+/// See module-level docs. The exact value `[Background, Aqua]` is
+/// asserted by an independent test
+/// (`render_plist_session_type_value_is_background_aqua_only`) in
+/// addition to the byte-for-byte `insta` snapshot — both must agree, and
+/// changing the value requires updating both tests in lockstep.
 ///
 /// # Escaping
 ///
@@ -116,6 +172,11 @@ pub(crate) fn render_plist(daemon_path: &Path, log_path: &Path, working_dir: &Pa
         <key>SuccessfulExit</key>
         <false/>
     </dict>
+    <key>LimitLoadToSessionType</key>
+    <array>
+        <string>Background</string>
+        <string>Aqua</string>
+    </array>
     <key>StandardOutPath</key>
     <string>{log}</string>
     <key>StandardErrorPath</key>
@@ -202,6 +263,40 @@ pub(crate) fn enable(exec: &impl Engine, home: &Path) -> Result<EnableOutcome, A
     let target = format!("user/{user}");
     let plist_str = plist.to_string_lossy();
     let plist_arg: &str = &plist_str;
+
+    // Story 7.21: when the on-disk plist content changed, the LIVE
+    // launchd registration may still hold the previous content (launchd
+    // reads the plist at bootstrap time and caches the parsed
+    // properties). Force a bootout BEFORE the bootstrap so the new
+    // content is actually picked up.
+    //
+    // Canonical case: rc.16 → rc.17 upgrade. rc.16 left a launchd
+    // registration with the default `LimitLoadToSessionType=Aqua`.
+    // rc.17's render adds the explicit `[Background, Aqua]` value.
+    // Without this bootout, an operator who runs `agentsso autostart
+    // enable` after `brew upgrade` would see the file refreshed (P31
+    // detection above) and `bootstrap` return "already loaded" (exit
+    // 17, treated as success), but the live registration would still
+    // be the rc.16-default `Aqua` — so SSH-only bootstrap would
+    // continue to fail with errno 134 until the next reboot.
+    //
+    // bootout returning errno 3 (`Boot-out failed: 3: No such process`)
+    // means the agent wasn't actually loaded; that's fine — there's
+    // nothing to refresh, and the subsequent bootstrap will register
+    // from scratch. Any non-3, non-success exit is a real launchctl
+    // failure and short-circuits with a structured error.
+    //
+    // Skip bootout when `unchanged == true` — re-running enable on a
+    // truly-idempotent path shouldn't churn launchd state.
+    if !unchanged {
+        let bootout_target = format!("user/{user}/{LAUNCHD_LABEL}");
+        let bootout_args = ["bootout", bootout_target.as_str()];
+        let bootout_out = exec.run("launchctl", &bootout_args)?;
+        if !bootout_out.status.success() && !already_unloaded(&bootout_out) {
+            return Err(service_manager_failed("launchctl", &bootout_args, &bootout_out));
+        }
+    }
+
     let args = ["bootstrap", target.as_str(), plist_arg];
     let out = exec.run("launchctl", &args)?;
     if !out.status.success() && !already_loaded(&out) {
@@ -896,6 +991,41 @@ mod tests {
         insta::assert_snapshot!("autostart_macos_plist", xml);
     }
 
+    /// Story 7.21: independently asserts the exact `LimitLoadToSessionType`
+    /// value. `insta::assert_snapshot!` accepts whatever the renderer
+    /// emits — if a future change accidentally uses `cargo insta accept`
+    /// on a wrong value (e.g., dropping `Background`, adding `LoginWindow`),
+    /// the snapshot test alone wouldn't catch it. This test independently
+    /// pins what we *want* the renderer to emit.
+    #[test]
+    fn render_plist_session_type_value_is_background_aqua_only() {
+        let xml = render_plist(
+            Path::new("/usr/local/bin/agentsso"),
+            Path::new("/tmp/log"),
+            Path::new("/tmp"),
+        );
+        // The exact substring is whitespace-sensitive to match the
+        // 4-space indent the renderer uses; if the renderer's
+        // indentation ever changes, both this test and the snapshot
+        // need updating in lockstep.
+        let expected = "    <key>LimitLoadToSessionType</key>\n    <array>\n        <string>Background</string>\n        <string>Aqua</string>\n    </array>\n";
+        assert!(
+            xml.contains(expected),
+            "rendered plist must contain LimitLoadToSessionType=[Background, Aqua] exactly. \
+             Got XML:\n{xml}"
+        );
+        // Defense in depth: ensure no `LoginWindow` snuck in. If a
+        // future story decides LoginWindow is OK after all, that
+        // story's plan needs to update this test AND the docstring
+        // in `macos.rs` explaining why the keychain-pre-login hazard
+        // is no longer load-bearing.
+        assert!(
+            !xml.contains("<string>LoginWindow</string>"),
+            "LimitLoadToSessionType must NOT include LoginWindow — see render_plist docstring \
+             for the keychain-pre-login + KeepAlive respawn-loop hazard rationale. XML:\n{xml}"
+        );
+    }
+
     #[test]
     fn plist_escapes_xml_special_chars() {
         let xml = render_plist(
@@ -995,6 +1125,12 @@ mod tests {
         // Migration step 2: launchctl bootout gui/<uid>/homebrew.mxcl.agentsso
         // — over SSH this returns exit 125; mock that to verify tolerance.
         mock.push_reply(MockExec::fail(125, "Domain does not support specified action"));
+        // Story 7.21: bootout-before-bootstrap on plist content drift
+        // (the on-disk plist is being newly written, so it differs from
+        // any pre-existing content — the unchanged-detection in enable()
+        // returns false and the bootout fires). errno 3 is the
+        // expected idempotent case (no prior registration to bootout).
+        mock.push_reply(MockExec::fail(3, "Boot-out failed: 3: No such process"));
         // Bootstrap proceeds normally.
         mock.push_reply(MockExec::ok(""));
 
@@ -1007,12 +1143,15 @@ mod tests {
             other => panic!("expected Registered after migration, got {other:?}"),
         }
 
-        // Assert call sequence: brew-list + brew-stop + launchctl-bootout + launchctl-bootstrap.
+        // Assert call sequence: brew-list + brew-stop + launchctl-bootout
+        // (gui/<uid>/homebrew.mxcl.agentsso, the brew-managed plist) +
+        // launchctl-bootout (user/<uid>/<our-label>, Story 7.21
+        // bootout-before-bootstrap on content drift) + launchctl-bootstrap.
         let calls = mock.calls.borrow();
         assert_eq!(
             calls.len(),
-            4,
-            "expected 4 calls (brew list, brew stop, launchctl bootout, launchctl bootstrap), got {calls:?}"
+            5,
+            "expected 5 calls (brew list, brew stop, brew-managed bootout, our-label bootout, our bootstrap), got {calls:?}"
         );
         assert_eq!(calls[0].0, "brew");
         assert_eq!(calls[0].1[0], "services");
@@ -1027,16 +1166,30 @@ mod tests {
         // un-bootstrapping brew's prior registration.
         assert!(
             calls[2].1[1].starts_with("gui/"),
-            "bootout target should be gui/<uid>/homebrew.mxcl.agentsso, got {:?}",
+            "brew-managed bootout target should be gui/<uid>/homebrew.mxcl.agentsso, got {:?}",
             calls[2].1[1]
         );
+        // Story 7.21: bootout our user-domain registration before
+        // bootstrap, so the new plist content is loaded fresh.
         assert_eq!(calls[3].0, "launchctl");
-        assert_eq!(calls[3].1[0], "bootstrap");
-        // Story 7.16 AC #2: bootstrap target is user/<uid>.
+        assert_eq!(calls[3].1[0], "bootout");
         assert!(
             calls[3].1[1].starts_with("user/"),
-            "bootstrap target should be user/<uid>, got {:?}",
+            "our-label bootout target should be user/<uid>/<our-label>, got {:?}",
             calls[3].1[1]
+        );
+        assert!(
+            calls[3].1[1].ends_with(LAUNCHD_LABEL),
+            "our-label bootout target should end with the agentsso label, got {:?}",
+            calls[3].1[1]
+        );
+        assert_eq!(calls[4].0, "launchctl");
+        assert_eq!(calls[4].1[0], "bootstrap");
+        // Story 7.16 AC #2: bootstrap target is user/<uid>.
+        assert!(
+            calls[4].1[1].starts_with("user/"),
+            "bootstrap target should be user/<uid>, got {:?}",
+            calls[4].1[1]
         );
     }
 
@@ -1045,6 +1198,10 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let mock = MockExec::default();
         mock.push_reply(MockExec::ok("[]")); // brew services list: empty
+        // Story 7.21: bootout-before-bootstrap fires because no plist
+        // exists on disk → unchanged=false → bootout. errno 3 ("No
+        // such process") is the expected idempotent outcome here.
+        mock.push_reply(MockExec::fail(3, "Boot-out failed: 3: No such process"));
         mock.push_reply(MockExec::ok("")); // launchctl bootstrap: ok
 
         let outcome = enable(&mock, tmp.path()).unwrap();
@@ -1056,24 +1213,26 @@ mod tests {
             other => panic!("expected Registered, got {other:?}"),
         }
 
-        // Calls in order: brew, launchctl bootstrap.
+        // Calls in order: brew, launchctl bootout (Story 7.21), launchctl bootstrap.
         let calls = mock.calls.borrow();
-        assert_eq!(calls.len(), 2);
+        assert_eq!(calls.len(), 3);
         assert_eq!(calls[0].0, "brew");
         assert_eq!(calls[1].0, "launchctl");
-        assert_eq!(calls[1].1[0], "bootstrap");
+        assert_eq!(calls[1].1[0], "bootout");
+        assert_eq!(calls[2].0, "launchctl");
+        assert_eq!(calls[2].1[0], "bootstrap");
         // Story 7.15 AC #2: launchctl target MUST be user/<uid>, never
         // gui/<uid>. The gui/ domain only exists for active GUI login
         // sessions and returns exit 125 over SSH.
         assert!(
-            calls[1].1[1].starts_with("user/"),
+            calls[2].1[1].starts_with("user/"),
             "bootstrap target should be user/<uid>, got {:?}",
-            calls[1].1[1]
+            calls[2].1[1]
         );
         assert!(
-            !calls[1].1[1].starts_with("gui/"),
+            !calls[2].1[1].starts_with("gui/"),
             "bootstrap target must NOT use gui/ domain (Story 7.15 regression guard); got {:?}",
-            calls[1].1[1]
+            calls[2].1[1]
         );
     }
 
@@ -1090,6 +1249,9 @@ mod tests {
 
         let mock = MockExec::default();
         mock.push_reply(MockExec::ok("[]")); // brew
+        // Story 7.21: bootout-before-bootstrap fires because the
+        // pre-existing plist content differs from the renderer output.
+        mock.push_reply(MockExec::ok("")); // launchctl bootout (the stale registration cleared)
         mock.push_reply(MockExec::ok("")); // launchctl bootstrap
 
         let outcome = enable(&mock, tmp.path()).unwrap();
@@ -1098,6 +1260,101 @@ mod tests {
         let xml = std::fs::read_to_string(&plist).unwrap();
         assert!(xml.contains("<key>Label</key>"));
         assert!(!xml.contains("stale plist"));
+    }
+
+    #[test]
+    fn enable_boots_out_stale_registration_on_plist_content_change() {
+        // Story 7.21 Task 1.6: when the on-disk plist content changes
+        // (rc.16 → rc.17 upgrade is the canonical case), enable() must
+        // `launchctl bootout user/<uid>/<label>` BEFORE `launchctl
+        // bootstrap`. Otherwise the live launchd registration keeps the
+        // rc.16-default Aqua filter even though the on-disk file now has
+        // [Background, Aqua] — the on-disk plist would be correct but
+        // SSH-only bootstrap would still fail with errno 134 until next
+        // reboot.
+        //
+        // Repro setup: pre-write a stale plist (anything different from
+        // the current renderer output triggers the content-drift path).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let plist = plist_path(tmp.path());
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        std::fs::write(&plist, "<?xml stale rc.16 plist ?>").unwrap();
+
+        let mock = MockExec::default();
+        // brew services list: empty (skip migration path).
+        mock.push_reply(MockExec::ok("[]"));
+        // Story 7.21: bootout returning errno 3 (`Boot-out failed: 3:
+        // No such process`) is the expected idempotent case — we don't
+        // know whether the agent was loaded, so we always try, and
+        // tolerate the not-loaded outcome. Mock that here.
+        mock.push_reply(MockExec::fail(3, "Boot-out failed: 3: No such process"));
+        // launchctl bootstrap proceeds.
+        mock.push_reply(MockExec::ok(""));
+
+        enable(&mock, tmp.path()).unwrap();
+
+        let calls = mock.calls.borrow();
+        // Expect 3 calls: brew list, launchctl bootout, launchctl bootstrap.
+        assert_eq!(
+            calls.len(),
+            3,
+            "expected 3 calls (brew list, launchctl bootout, launchctl bootstrap), got {calls:?}"
+        );
+        assert_eq!(calls[0].0, "brew");
+        // Story 7.21: bootout MUST come before bootstrap on content drift.
+        assert_eq!(calls[1].0, "launchctl");
+        assert_eq!(calls[1].1[0], "bootout");
+        assert!(
+            calls[1].1[1].starts_with("user/"),
+            "bootout target should be user/<uid>/<label>, got {:?}",
+            calls[1].1[1]
+        );
+        assert!(
+            calls[1].1[1].ends_with(LAUNCHD_LABEL),
+            "bootout target should end with the agentsso label, got {:?}",
+            calls[1].1[1]
+        );
+        assert_eq!(calls[2].0, "launchctl");
+        assert_eq!(calls[2].1[0], "bootstrap");
+    }
+
+    #[test]
+    fn enable_skips_bootout_when_plist_content_unchanged() {
+        // Story 7.21: when the on-disk plist content is byte-for-byte
+        // identical to what we'd write, enable() returns
+        // AlreadyEnabled and MUST NOT churn launchd state with a
+        // bootout. (See `enable_truly_idempotent_when_content_unchanged`
+        // for the broader idempotence invariant; this test pins the
+        // bootout-skip subset.)
+        let tmp = tempfile::TempDir::new().unwrap();
+        let plist = plist_path(tmp.path());
+        std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
+        let daemon = current_daemon_path().unwrap();
+        let log_path = tmp.path().join(".agentsso").join("logs").join("autostart.log");
+        let xml = render_plist(&daemon, &log_path, tmp.path());
+        std::fs::write(&plist, &xml).unwrap();
+
+        let mock = MockExec::default();
+        mock.push_reply(MockExec::ok("[]")); // brew
+        mock.push_reply(MockExec::ok("")); // launchctl bootstrap
+
+        enable(&mock, tmp.path()).unwrap();
+
+        let calls = mock.calls.borrow();
+        // Expect exactly 2 calls: brew list + launchctl bootstrap. NO bootout.
+        assert_eq!(calls.len(), 2, "expected 2 calls (brew list, bootstrap), got {calls:?}");
+        assert_eq!(calls[0].0, "brew");
+        assert_eq!(calls[1].0, "launchctl");
+        assert_eq!(calls[1].1[0], "bootstrap");
+        // The middle slot should NOT be a bootout.
+        for call in calls.iter() {
+            if call.0 == "launchctl" {
+                assert_ne!(
+                    call.1[0], "bootout",
+                    "Story 7.21: enable() must NOT bootout when plist content is unchanged"
+                );
+            }
+        }
     }
 
     #[test]
@@ -1233,8 +1490,9 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let mock = MockExec::default();
 
-        // enable: brew probe (empty) + launchctl bootstrap.
+        // enable: brew probe (empty) + Story 7.21 bootout-before-bootstrap + launchctl bootstrap.
         mock.push_reply(MockExec::ok("[]"));
+        mock.push_reply(MockExec::fail(3, "Boot-out failed: 3: No such process"));
         mock.push_reply(MockExec::ok(""));
         let outcome = enable(&mock, tmp.path()).unwrap();
         assert!(matches!(outcome, EnableOutcome::Registered { .. }));
@@ -1302,6 +1560,8 @@ mod tests {
 
         // enable
         mock.push_reply(MockExec::ok("[]")); // brew probe
+        // Story 7.21: bootout-before-bootstrap on content drift.
+        mock.push_reply(MockExec::fail(3, "Boot-out failed: 3: No such process"));
         mock.push_reply(MockExec::ok("")); // launchctl bootstrap
         enable(&mock, tmp.path()).unwrap();
 
@@ -1320,10 +1580,12 @@ mod tests {
         // target at args[1]).
         let calls = mock.calls.borrow();
         let launchctl_calls: Vec<_> = calls.iter().filter(|c| c.0 == "launchctl").collect();
+        // Story 7.21: 4 launchctl calls now — Story-7.21 bootout pre-bootstrap +
+        // bootstrap + status' print + disable's bootout.
         assert_eq!(
             launchctl_calls.len(),
-            3,
-            "expected 3 launchctl calls (bootstrap, print, bootout); got {launchctl_calls:?}"
+            4,
+            "expected 4 launchctl calls (Story 7.21 bootout, bootstrap, print, bootout); got {launchctl_calls:?}"
         );
         for (_, args) in &launchctl_calls {
             let target = &args[1];
@@ -1347,6 +1609,8 @@ mod tests {
         let mock = MockExec::default();
 
         mock.push_reply(MockExec::ok("[]")); // brew probe
+        // Story 7.21: bootout-before-bootstrap fires on content drift.
+        mock.push_reply(MockExec::fail(3, "Boot-out failed: 3: No such process"));
         mock.push_reply(MockExec::fail(119, "Service is disabled")); // bootstrap
         mock.push_reply(MockExec::ok("")); // launchctl enable (recovery)
 
@@ -1477,6 +1741,9 @@ mod tests {
         mock.push_reply(MockExec::ok(""));
         // Migration: launchctl bootout (mock OK to simulate console-with-gui-domain box)
         mock.push_reply(MockExec::ok(""));
+        // Story 7.21: bootout-before-bootstrap on content drift (our
+        // user-domain plist is being newly written, so unchanged=false).
+        mock.push_reply(MockExec::fail(3, "Boot-out failed: 3: No such process"));
         // User-domain bootstrap
         mock.push_reply(MockExec::ok(""));
 
@@ -1514,8 +1781,10 @@ mod tests {
         // Even without brew_active, the plist on disk drives Migrate{PlistOnDisk}.
         // Migration: brew stop (best-effort)
         mock.push_reply(MockExec::ok(""));
-        // Migration: launchctl bootout
+        // Migration: launchctl bootout (brew-managed gui-domain plist)
         mock.push_reply(MockExec::ok(""));
+        // Story 7.21: bootout-before-bootstrap on content drift (our user-domain plist).
+        mock.push_reply(MockExec::fail(3, "Boot-out failed: 3: No such process"));
         // User-domain bootstrap
         mock.push_reply(MockExec::ok(""));
 
@@ -1543,6 +1812,8 @@ mod tests {
         // (this is exactly the failure mode rc.15 hit on Angie's box for the
         // bootstrap call; here we hit it on the migration's bootout).
         mock.push_reply(MockExec::fail(125, "Domain does not support specified action"));
+        // Story 7.21: bootout-before-bootstrap on content drift.
+        mock.push_reply(MockExec::fail(3, "Boot-out failed: 3: No such process"));
         mock.push_reply(MockExec::ok("")); // user-domain bootstrap
 
         let outcome = enable(&mock, tmp.path()).unwrap();

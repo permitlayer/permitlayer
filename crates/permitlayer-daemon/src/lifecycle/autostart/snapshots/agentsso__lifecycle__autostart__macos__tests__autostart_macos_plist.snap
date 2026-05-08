@@ -20,6 +20,11 @@ expression: xml
         <key>SuccessfulExit</key>
         <false/>
     </dict>
+    <key>LimitLoadToSessionType</key>
+    <array>
+        <string>Background</string>
+        <string>Aqua</string>
+    </array>
     <key>StandardOutPath</key>
     <string>/Users/maya/.agentsso/logs/autostart.log</string>
     <key>StandardErrorPath</key>
