@@ -70,7 +70,10 @@ use std::path::PathBuf;
 
 use zeroize::Zeroizing;
 
-pub use codesign_macos::{capture_self_designated_requirement, verify_self_against, CodesignError};
+pub use codesign_macos::{
+    CodesignError, capture_self_designated_requirement, read_trust_anchor, trust_anchor_path,
+    verify_self_against, write_trust_anchor, write_trust_anchor_force,
+};
 pub use error::KeyStoreError;
 #[cfg(feature = "test-seam")]
 pub use file_backed::FileBackedKeyStore;
@@ -243,6 +246,51 @@ pub struct KeystoreConfig {
     /// Home directory for keystore on-disk state (salt + verifier).
     /// Typically `~/.agentsso`.
     pub home: PathBuf,
+    /// Story 7.22: controls whether a runtime
+    /// `BackendUnavailable -25308` (macOS keychain ACL invalidated
+    /// by a binary swap) surfaces as the
+    /// [`KeyStoreError::AclBreakNeedsRekey`] sentinel — which the
+    /// daemon's boot path catches and dispatches to the
+    /// codesign-verified auto-rekey flow — or falls through to the
+    /// existing passphrase-prompt fallback unchanged.
+    ///
+    /// Defaults to [`AclBreakRecoveryMode::Disabled`] so non-boot CLI
+    /// subcommands inherit existing behavior; only
+    /// `start.rs::ensure_master_key_bootstrapped` opts into
+    /// [`AclBreakRecoveryMode::Auto`].
+    pub acl_break_recovery: AclBreakRecoveryMode,
+}
+
+/// Story 7.22: opt-in switch on the lazy-fallback wrapper that
+/// controls whether the macOS keychain-ACL break (OSStatus -25308 on
+/// `master_key()`) surfaces as the
+/// [`KeyStoreError::AclBreakNeedsRekey`] sentinel for the daemon's
+/// boot path to handle.
+///
+/// **Boot-scoped on purpose** (Codex Finding 3): only the daemon's
+/// boot path ([`start.rs::ensure_master_key_bootstrapped`]) opts into
+/// `Auto`. Every non-boot CLI subcommand
+/// (`connect`, `credentials`, `rotate-key`, `uninstall`,
+/// `keystore-clear-previous`) MUST construct `KeystoreConfig` with
+/// `Disabled` so it inherits the existing passphrase-prompt
+/// fallback unchanged. An operator running e.g. `agentsso credentials
+/// refresh` from a TTY with a broken ACL still gets the passphrase
+/// prompt; auto-recovery is only safe to attempt at the start of a
+/// fresh daemon process where the boot path orchestrates the rekey.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum AclBreakRecoveryMode {
+    /// Default. On `BackendUnavailable -25308` the wrapper falls
+    /// through to the existing passphrase-prompt fallback unchanged.
+    #[default]
+    Disabled,
+    /// On `BackendUnavailable -25308` the wrapper short-circuits with
+    /// [`KeyStoreError::AclBreakNeedsRekey`] BEFORE engaging the
+    /// passphrase fallback. The daemon's boot path catches the
+    /// sentinel, verifies the running binary's codesign Designated
+    /// Requirement against the persisted trust anchor, and auto-rekeys
+    /// the vault under a freshly-minted master key.
+    Auto,
 }
 
 /// How to pick an adapter when the native OS keychain cannot be used.
@@ -280,7 +328,7 @@ pub fn default_keystore(config: &KeystoreConfig) -> Result<Box<dyn KeyStore>, Ke
     match config.fallback {
         FallbackMode::Passphrase => Ok(Box::new(PassphraseKeyStore::from_prompt(&config.home)?)),
         FallbackMode::Auto | FallbackMode::None => {
-            native_or_fallback(&config.home, config.fallback)
+            native_or_fallback(&config.home, config.fallback, config.acl_break_recovery)
         }
     }
 }
@@ -295,12 +343,14 @@ pub fn default_keystore(config: &KeystoreConfig) -> Result<Box<dyn KeyStore>, Ke
 fn maybe_wrap_native(
     home: &std::path::Path,
     fallback: FallbackMode,
+    acl_break_recovery: AclBreakRecoveryMode,
     native: Box<dyn KeyStore>,
 ) -> Result<Box<dyn KeyStore>, KeyStoreError> {
     match fallback {
         FallbackMode::Auto => Ok(Box::new(fallback::FallbackKeyStore::production(
             home.to_path_buf(),
             fallback,
+            acl_break_recovery,
             native,
         )?)),
         FallbackMode::None | FallbackMode::Passphrase => Ok(native),
@@ -338,12 +388,13 @@ fn marker_short_circuit(
 fn native_or_fallback(
     home: &std::path::Path,
     fallback: FallbackMode,
+    acl_break_recovery: AclBreakRecoveryMode,
 ) -> Result<Box<dyn KeyStore>, KeyStoreError> {
     if let Some(passphrase) = marker_short_circuit(home, fallback)? {
         return Ok(passphrase);
     }
     match MacKeyStore::new() {
-        Ok(ks) => maybe_wrap_native(home, fallback, Box::new(ks)),
+        Ok(ks) => maybe_wrap_native(home, fallback, acl_break_recovery, Box::new(ks)),
         Err(e) if fallback == FallbackMode::Auto && is_backend_unavailable(&e) => {
             log_fallback("apple", &e);
             Ok(Box::new(PassphraseKeyStore::from_prompt(home)?))
@@ -356,12 +407,13 @@ fn native_or_fallback(
 fn native_or_fallback(
     home: &std::path::Path,
     fallback: FallbackMode,
+    acl_break_recovery: AclBreakRecoveryMode,
 ) -> Result<Box<dyn KeyStore>, KeyStoreError> {
     if let Some(passphrase) = marker_short_circuit(home, fallback)? {
         return Ok(passphrase);
     }
     match LinuxKeyStore::new() {
-        Ok(ks) => maybe_wrap_native(home, fallback, Box::new(ks)),
+        Ok(ks) => maybe_wrap_native(home, fallback, acl_break_recovery, Box::new(ks)),
         Err(e) if fallback == FallbackMode::Auto && is_backend_unavailable(&e) => {
             log_fallback("libsecret", &e);
             Ok(Box::new(PassphraseKeyStore::from_prompt(home)?))
@@ -374,12 +426,13 @@ fn native_or_fallback(
 fn native_or_fallback(
     home: &std::path::Path,
     fallback: FallbackMode,
+    acl_break_recovery: AclBreakRecoveryMode,
 ) -> Result<Box<dyn KeyStore>, KeyStoreError> {
     if let Some(passphrase) = marker_short_circuit(home, fallback)? {
         return Ok(passphrase);
     }
     match WindowsKeyStore::new() {
-        Ok(ks) => maybe_wrap_native(home, fallback, Box::new(ks)),
+        Ok(ks) => maybe_wrap_native(home, fallback, acl_break_recovery, Box::new(ks)),
         Err(e) if fallback == FallbackMode::Auto && is_backend_unavailable(&e) => {
             log_fallback("windows", &e);
             Ok(Box::new(PassphraseKeyStore::from_prompt(home)?))
@@ -392,6 +445,7 @@ fn native_or_fallback(
 fn native_or_fallback(
     home: &std::path::Path,
     fallback: FallbackMode,
+    _acl_break_recovery: AclBreakRecoveryMode,
 ) -> Result<Box<dyn KeyStore>, KeyStoreError> {
     if fallback == FallbackMode::None {
         return Err(KeyStoreError::PlatformError {

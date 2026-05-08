@@ -81,7 +81,9 @@
 pub use macos_impl::{capture_self_designated_requirement, verify_self_against};
 
 pub use error::CodesignError;
-pub use trust_anchor::{read_trust_anchor, trust_anchor_path, write_trust_anchor};
+pub use trust_anchor::{
+    read_trust_anchor, trust_anchor_path, write_trust_anchor, write_trust_anchor_force,
+};
 
 #[cfg(not(target_os = "macos"))]
 pub fn capture_self_designated_requirement() -> Result<String, CodesignError> {
@@ -215,10 +217,7 @@ mod trust_anchor {
             Err(e) => return Err(e),
         };
         let s = String::from_utf8(bytes).map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                "trust anchor file is not valid UTF-8",
-            )
+            io::Error::new(io::ErrorKind::InvalidData, "trust anchor file is not valid UTF-8")
         })?;
         // Validate the content parses as a SecRequirement. On non-macOS
         // this returns PlatformUnsupported and we treat it as
@@ -236,9 +235,9 @@ mod trust_anchor {
                 io::ErrorKind::InvalidData,
                 "trust anchor file content is not a valid SecRequirement string",
             )),
-            CodesignError::PlatformUnsupported => Err(io::Error::other(
-                "trust anchor parse-validation requires macOS",
-            )),
+            CodesignError::PlatformUnsupported => {
+                Err(io::Error::other("trust anchor parse-validation requires macOS"))
+            }
             CodesignError::Other { code, message } => Err(io::Error::other(format!(
                 "trust anchor parse-validation failed (OSStatus {code}): {message}"
             ))),
@@ -407,7 +406,9 @@ mod error {
         /// `<home>/keystore/codesign-trust-anchor.req` could not be
         /// parsed by `SecRequirementCreateWithString`. The file is
         /// corrupted or hand-edited.
-        #[error("stored codesign requirement string is malformed (could not parse as a SecRequirement)")]
+        #[error(
+            "stored codesign requirement string is malformed (could not parse as a SecRequirement)"
+        )]
         RequirementParseFailed {
             #[source]
             source: security_framework::base::Error,
@@ -538,9 +539,8 @@ mod macos_impl {
     /// 4. `SecRequirementCopyString(req, 0, &mut cfstr)` → render to text.
     /// 5. `CFString` → Rust `String`.
     pub fn capture_self_designated_requirement() -> Result<String, CodesignError> {
-        let me = SecCode::for_self(Flags::NONE).map_err(|e| {
-            CodesignError::SecFrameworkCall { source: e }
-        })?;
+        let me = SecCode::for_self(Flags::NONE)
+            .map_err(|e| CodesignError::SecFrameworkCall { source: e })?;
 
         // SAFETY: We hand `SecCodeCopySigningInformation` a valid
         // `SecCodeRef` (just constructed via `for_self`, kept alive by
@@ -590,8 +590,7 @@ mod macos_impl {
         // for the duration of the SecRequirementCopyString call. The
         // CFDictionary `info` keeps the underlying object alive.
         let dr_string = unsafe {
-            let req_ref: SecRequirementRef =
-                dr_value.as_CFTypeRef() as SecRequirementRef;
+            let req_ref: SecRequirementRef = dr_value.as_CFTypeRef() as SecRequirementRef;
             let mut text_ptr: core_foundation_sys::string::CFStringRef = ptr::null();
             let status = SecRequirementCopyString(req_ref, 0, &mut text_ptr);
             if status != 0 {
@@ -618,26 +617,23 @@ mod macos_impl {
     /// `RequirementMismatch`, parse failure → `RequirementParseFailed`,
     /// other Security framework errors → `SecFrameworkCall` / `Other`.
     pub fn verify_self_against(stored_dr: &str) -> Result<(), CodesignError> {
-        let req = SecRequirement::from_str(stored_dr).map_err(|e| {
-            CodesignError::RequirementParseFailed { source: e }
-        })?;
-        let me = SecCode::for_self(Flags::NONE).map_err(|e| {
-            CodesignError::SecFrameworkCall { source: e }
-        })?;
+        let req = SecRequirement::from_str(stored_dr)
+            .map_err(|e| CodesignError::RequirementParseFailed { source: e })?;
+        let me = SecCode::for_self(Flags::NONE)
+            .map_err(|e| CodesignError::SecFrameworkCall { source: e })?;
         // `Flags::NONE` is the correct flag set for a *dynamic* SecCode
         // (the running process). `CHECK_ALL_ARCHITECTURES` is only valid
         // for static codes (binaries on disk via `SecStaticCodeCreateWithPath`)
         // and would return errSecCSInvalidFlags (-67070) here. For
         // dynamic verification of the running process, the running
         // architecture is implicit — no architecture-walk needed.
-        me.check_validity(Flags::NONE, &req)
-            .map_err(|e| match e.code() {
-                ERR_SEC_CS_UNSIGNED => CodesignError::Unsigned,
-                ERR_SEC_CS_REQ_FAILED => CodesignError::RequirementMismatch {
-                    stored_dr_preview: truncate_for_display(stored_dr),
-                },
-                _ => CodesignError::SecFrameworkCall { source: e },
-            })
+        me.check_validity(Flags::NONE, &req).map_err(|e| match e.code() {
+            ERR_SEC_CS_UNSIGNED => CodesignError::Unsigned,
+            ERR_SEC_CS_REQ_FAILED => CodesignError::RequirementMismatch {
+                stored_dr_preview: truncate_for_display(stored_dr),
+            },
+            _ => CodesignError::SecFrameworkCall { source: e },
+        })
     }
 
     /// Map a non-zero `OSStatus` from a raw FFI call to a `CodesignError`.
@@ -722,8 +718,7 @@ mod macos_impl {
         fn verify_against_mismatched_dr_returns_requirement_mismatch() {
             // A clearly-different identifier the running binary cannot match.
             let mismatched_dr = r#"identifier "com.never.matches.permitlayer.test""#;
-            let err = verify_self_against(mismatched_dr)
-                .expect_err("mismatched DR must reject");
+            let err = verify_self_against(mismatched_dr).expect_err("mismatched DR must reject");
             match err {
                 CodesignError::RequirementMismatch { stored_dr_preview } => {
                     assert!(
@@ -743,8 +738,7 @@ mod macos_impl {
         fn verify_against_malformed_dr_returns_parse_failure() {
             // Not valid Code Signing Requirement Language.
             let garbage = "this is not a sec requirement string at all !!!~~~";
-            let err = verify_self_against(garbage)
-                .expect_err("garbage DR must reject");
+            let err = verify_self_against(garbage).expect_err("garbage DR must reject");
             assert!(
                 matches!(err, CodesignError::RequirementParseFailed { .. }),
                 "expected RequirementParseFailed, got {err:?}"
