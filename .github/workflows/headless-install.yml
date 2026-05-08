@@ -1,0 +1,303 @@
+# Story 7.17 Task 5 — scripted-install smoke workflow.
+#
+# Validates the scripted-install command sequence end-to-end on a
+# macos-14 runner, against a mockito-served Google OAuth surface.
+# Catches regressions in:
+#
+# - the `agent register --json | jq -r .bearer_token` capture pattern,
+# - the `agent register --token-out <path>` 0o600 file write,
+# - the `connect --device-flow --device-flow-timeout` argument grammar,
+# - the device-flow polling loop (against mockito, not real Google),
+# - the daemon binary's clean boot on macos-14.
+#
+# ─────────────────────────────────────────────────────────────────────
+# What this workflow does NOT validate (Story 7.17 Task 5.2 callout)
+# ─────────────────────────────────────────────────────────────────────
+#
+# The macos-14 runner has a GUI session, so launchd's `gui/$UID`
+# domain happens to be available even when the code paths to
+# `user/$UID` are wrong. This workflow CANNOT catch a regression in
+# the SSH-only / no-GUI launchd path that Story 7.16 fixed. That path
+# is verified manually on Angie's box (Story 7.16 Task 5).
+#
+# Specifically, this workflow does NOT validate:
+#   - that `agentsso autostart enable` works on a real SSH-only Mac
+#     (gui/$UID vs user/$UID — Story 7.16 Task 5 manual verification);
+#   - that device-flow works against the real Google API (manual
+#     verification only — we have no headful browser in CI);
+#   - that the OAuth client of type "TV/limited-input device" is
+#     correctly configured by the operator (the mockito server accepts
+#     any client_id; the real failure mode is `invalid_grant` mid-poll
+#     against Google, surfaced as `device_flow_protocol`).
+#
+# It DOES validate:
+#   - the scripted command sequence is well-formed and exits 0,
+#   - `agent register --json` produces parseable JSON with a valid bearer,
+#   - `agent register --token-out` writes a 0o600 file with no trailing newline,
+#   - the device-flow OAuth library completes against a mock Google,
+#   - the daemon binary starts cleanly on macos-14.
+
+name: headless-install
+
+on:
+  pull_request:
+    paths:
+      - "crates/permitlayer-daemon/src/cli/agent.rs"
+      - "crates/permitlayer-daemon/src/cli/connect.rs"
+      - "crates/permitlayer-daemon/src/cli/atomic_write.rs"
+      - "crates/permitlayer-oauth/src/google/device_flow.rs"
+      - "crates/permitlayer-oauth/src/error.rs"
+      - ".github/workflows/headless-install.yml"
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-Dwarnings"
+
+jobs:
+  smoke:
+    name: Scripted-install smoke (macos-14)
+    runs-on: macos-14
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add rustfmt clippy
+
+      - name: Cache cargo registry
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: headless-install-macos-14
+
+      - name: Build agentsso (release)
+        run: cargo build --release -p permitlayer-daemon
+
+      # ─────────────────────────────────────────────────────────────
+      # Self-test: deliberately introduce a known-bad command and
+      # assert this step's `run` block detects the failure. Without
+      # this, a silent breakage in the assertion machinery below
+      # would let the workflow report green on a regressed CLI.
+      # Story 7.17 Task 5.3 callout.
+      # ─────────────────────────────────────────────────────────────
+      - name: Self-test — failure detection works
+        run: |
+          set -euo pipefail
+          # `agentsso agent register` against a non-existent daemon
+          # MUST exit non-zero. If this exits 0, the rest of the
+          # workflow's "assert exit 0" checks are not actually
+          # validating anything.
+          if ./target/release/agentsso agent register self-test-name --policy default --json; then
+            echo "::error::Self-test failed: register against dead daemon should not succeed"
+            exit 1
+          fi
+          echo "Self-test ok: failure detection is wired"
+
+      # ─────────────────────────────────────────────────────────────
+      # Smoke test 1: clap argument grammar.
+      # Validates --device-flow + --headless rejection (AC #5) AND
+      # --device-flow-timeout requires --device-flow (AC #5).
+      # No daemon needed — clap parses before any I/O.
+      # ─────────────────────────────────────────────────────────────
+      - name: Clap grammar — --device-flow + --headless mutually exclusive
+        run: |
+          set -euo pipefail
+          # Use a fake (non-existent) oauth client path; clap fires
+          # before file I/O. Status MUST be 2 (clap convention) AND
+          # stderr MUST name the conflicting flag.
+          set +e
+          STDERR=$(./target/release/agentsso connect gmail \
+            --agent x --oauth-client /tmp/does-not-exist.json \
+            --device-flow --headless 2>&1)
+          STATUS=$?
+          set -e
+          [ $STATUS -eq 2 ] || { echo "::error::Expected exit 2, got $STATUS"; exit 1; }
+          echo "$STDERR" | grep -E -- '--device-flow|--headless' >/dev/null \
+            || { echo "::error::stderr did not name conflict: $STDERR"; exit 1; }
+          echo "Clap grammar test ok"
+
+      # ─────────────────────────────────────────────────────────────
+      # Smoke test 2: --device-flow-timeout without --device-flow is
+      # rejected by clap.
+      # ─────────────────────────────────────────────────────────────
+      - name: Clap grammar — --device-flow-timeout requires --device-flow
+        run: |
+          set -euo pipefail
+          set +e
+          ./target/release/agentsso connect gmail \
+            --agent x --oauth-client /tmp/does-not-exist.json \
+            --device-flow-timeout 60 2>/dev/null
+          STATUS=$?
+          set -e
+          [ $STATUS -eq 2 ] || { echo "::error::Expected exit 2, got $STATUS"; exit 1; }
+          echo "Clap requires-violation test ok"
+
+      # ─────────────────────────────────────────────────────────────
+      # Smoke test 3: live daemon + agent register --json | jq.
+      # Boots the daemon under an ephemeral home, registers an agent,
+      # captures the bearer via the documented `jq -r` pipeline,
+      # then asserts the captured bearer is a real agt_v2_-prefixed
+      # token. This is the headline AC for Story 7.17.
+      # ─────────────────────────────────────────────────────────────
+      - name: Scripted bearer capture via --json
+        run: |
+          set -euo pipefail
+
+          # Ephemeral data dir.
+          export AGENTSSO_PATHS__HOME="$RUNNER_TEMP/agentsso-home"
+          rm -rf "$AGENTSSO_PATHS__HOME"
+          mkdir -p "$AGENTSSO_PATHS__HOME/policies"
+
+          # Seed a default policy so register has something valid to bind to.
+          cat > "$AGENTSSO_PATHS__HOME/policies/default.toml" <<'EOF'
+          [[policies]]
+          name = "default"
+          scopes = ["gmail.readonly"]
+          resources = ["*"]
+          approval-mode = "auto"
+          EOF
+
+          # Pin the master key via the test seam so the daemon doesn't
+          # touch the real macOS keychain (which would prompt and hang
+          # the runner). The seam is debug-only at the source level but
+          # we shipped a release build above; for CI we toggle to a
+          # debug build of the daemon for this step only.
+          # NOTE: This is the test-only path — the release binary
+          # doesn't honor AGENTSSO_TEST_MASTER_KEY_HEX. Switch to debug.
+          cargo build -p permitlayer-daemon
+          BIN=./target/debug/agentsso
+
+          export AGENTSSO_TEST_MASTER_KEY_HEX="00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+          export AGENTSSO_HTTP__BIND_ADDR="127.0.0.1:0"
+
+          # Spawn the daemon; capture its stdout to read the bound port.
+          DAEMON_LOG="$RUNNER_TEMP/daemon.log"
+          $BIN start >"$DAEMON_LOG" 2>&1 &
+          DAEMON_PID=$!
+
+          cleanup() {
+            kill $DAEMON_PID 2>/dev/null || true
+            wait $DAEMON_PID 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          # Wait for the daemon to print AGENTSSO_BOUND_ADDR; bail if
+          # it hasn't within 30s.
+          for i in $(seq 1 60); do
+            if grep -qE 'AGENTSSO_BOUND_ADDR=127\.0\.0\.1:[0-9]+' "$DAEMON_LOG" 2>/dev/null; then
+              break
+            fi
+            sleep 0.5
+          done
+          BOUND=$(grep -oE 'AGENTSSO_BOUND_ADDR=127\.0\.0\.1:[0-9]+' "$DAEMON_LOG" | head -1 | sed 's/AGENTSSO_BOUND_ADDR=//')
+          if [ -z "$BOUND" ]; then
+            echo "::error::Daemon never bound a port; log:"
+            cat "$DAEMON_LOG"
+            exit 1
+          fi
+          export AGENTSSO_HTTP__BIND_ADDR="$BOUND"
+
+          # Capture bearer via the documented pipeline.
+          OUT=$($BIN agent register ci-bot --policy default --json)
+          echo "register output: $OUT"
+          TOKEN=$(echo "$OUT" | jq -r .bearer_token)
+          if [ -z "$TOKEN" ] || [ "$TOKEN" = "null" ]; then
+            echo "::error::jq could not extract bearer_token from: $OUT"
+            exit 1
+          fi
+          case "$TOKEN" in
+            agt_v2_*) ;;
+            *) echo "::error::Bearer must use agt_v2_ prefix: $TOKEN"; exit 1 ;;
+          esac
+
+          # Assert response is single-line compact JSON (no embedded \n).
+          LINES=$(echo "$OUT" | wc -l | tr -d ' ')
+          [ "$LINES" = "1" ] || { echo "::error::JSON output must be single-line; got $LINES lines"; exit 1; }
+          # Assert no pretty-print indentation snuck in.
+          echo "$OUT" | grep '  "' >/dev/null && { echo "::error::Output has pretty-print indentation"; exit 1; } || true
+
+          echo "Bearer capture via --json works: ${TOKEN:0:14}…"
+
+      # ─────────────────────────────────────────────────────────────
+      # Smoke test 4: --token-out file write.
+      # Boots the daemon, registers with --token-out, asserts the file
+      # contents are exactly the bearer (no trailing newline) and the
+      # mode is 0o600.
+      # ─────────────────────────────────────────────────────────────
+      - name: Scripted bearer capture via --token-out
+        run: |
+          set -euo pipefail
+
+          export AGENTSSO_PATHS__HOME="$RUNNER_TEMP/agentsso-home-token-out"
+          rm -rf "$AGENTSSO_PATHS__HOME"
+          mkdir -p "$AGENTSSO_PATHS__HOME/policies"
+          cat > "$AGENTSSO_PATHS__HOME/policies/default.toml" <<'EOF'
+          [[policies]]
+          name = "default"
+          scopes = ["gmail.readonly"]
+          resources = ["*"]
+          approval-mode = "auto"
+          EOF
+
+          BIN=./target/debug/agentsso
+          export AGENTSSO_TEST_MASTER_KEY_HEX="00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+          export AGENTSSO_HTTP__BIND_ADDR="127.0.0.1:0"
+
+          DAEMON_LOG="$RUNNER_TEMP/daemon-token-out.log"
+          $BIN start >"$DAEMON_LOG" 2>&1 &
+          DAEMON_PID=$!
+          trap "kill $DAEMON_PID 2>/dev/null || true" EXIT
+
+          for i in $(seq 1 60); do
+            if grep -qE 'AGENTSSO_BOUND_ADDR=' "$DAEMON_LOG" 2>/dev/null; then
+              break
+            fi
+            sleep 0.5
+          done
+          BOUND=$(grep -oE 'AGENTSSO_BOUND_ADDR=127\.0\.0\.1:[0-9]+' "$DAEMON_LOG" | head -1 | sed 's/AGENTSSO_BOUND_ADDR=//')
+          export AGENTSSO_HTTP__BIND_ADDR="$BOUND"
+
+          TOKEN_PATH="$RUNNER_TEMP/bearer.tok"
+          $BIN agent register ci-bot --policy default --token-out "$TOKEN_PATH"
+
+          # File exists, mode 0o600, no trailing newline, agt_v2_-prefixed.
+          [ -f "$TOKEN_PATH" ] || { echo "::error::token file missing"; exit 1; }
+          MODE=$(stat -f '%Mp%Lp' "$TOKEN_PATH")
+          [ "$MODE" = "0600" ] || { echo "::error::token file mode must be 0600, got $MODE"; exit 1; }
+
+          BYTES=$(wc -c <"$TOKEN_PATH" | tr -d ' ')
+          # Last byte should NOT be 0x0a.
+          LAST=$(tail -c 1 "$TOKEN_PATH" | od -An -tx1 | tr -d ' ')
+          [ "$LAST" != "0a" ] || { echo "::error::token file has trailing newline"; exit 1; }
+
+          # Read the token via the canonical pipeline (`cat`).
+          TOKEN=$(cat "$TOKEN_PATH")
+          case "$TOKEN" in
+            agt_v2_*) ;;
+            *) echo "::error::Bearer must use agt_v2_ prefix: $TOKEN"; exit 1 ;;
+          esac
+
+          echo "Token-out file is 0o600, no trailing newline, $BYTES bytes"
+
+      # ─────────────────────────────────────────────────────────────
+      # Smoke test 5: device-flow library against a mock Google.
+      # The full live device-flow E2E lives in
+      # `crates/permitlayer-daemon/tests/integration/device_flow_e2e.rs`
+      # under `#[ignore]` because it needs keystore access. The
+      # CI-light tests in that same file (clap grammar) run on every
+      # PR via the workspace test suite. The unit tests in
+      # `crates/permitlayer-oauth/src/google/device_flow.rs` cover the
+      # polling protocol against mockito directly.
+      # ─────────────────────────────────────────────────────────────
+      - name: Device-flow library tests (mockito)
+        run: |
+          set -euo pipefail
+          cargo test -p permitlayer-oauth google::device_flow
+
+      - name: Cleanup
+        if: always()
+        run: |
+          rm -rf "$RUNNER_TEMP/agentsso-home" "$RUNNER_TEMP/agentsso-home-token-out" || true

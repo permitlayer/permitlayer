@@ -116,10 +116,24 @@ agentsso connect gmail --oauth-client ./client_secret.json --agent <name> --head
 ```
 
 For truly headless boxes (no browser available at all on the target
-machine), use `--device-flow` instead — the daemon prints a URL + code
-and you complete consent on any device with a browser. This requires a
-separate OAuth client of type "TV/limited-input device" (see Story 7.17
-docs).
+machine, e.g. CI runners, cloud-init provisioning, fully-headless
+servers), use `--device-flow` instead. The daemon prints a URL + code,
+you complete consent on any device with a browser (laptop, phone), and
+polling completes without operator interaction at the target machine:
+
+```sh
+# Scripted-install scenario (CI, Ansible, cloud-init):
+# OAuth client must be type "TV and Limited Input Device" (NOT "Desktop app").
+# See docs/user-guide/install.md → "Device-flow OAuth client setup".
+agentsso connect gmail --oauth-client ./client_secret_device.json --agent ci-bot \
+  --device-flow --device-flow-timeout 300 --non-interactive
+AGENTSSO_BEARER_TOKEN=$(agentsso agent register ci-bot --policy default --json | jq -r .bearer_token)
+agentsso autostart enable
+```
+
+`--device-flow` is mutually exclusive with `--headless` (the paste-
+redirect flow takes a different code path). It is compatible with
+`--non-interactive` — that's the canonical scripted-headless invocation.
 
 In headless mode the daemon prints the authorization URL, attempts to
 copy it to your terminal's clipboard via OSC 52 (works in iTerm2,

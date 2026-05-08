@@ -269,6 +269,36 @@ pub enum OAuthError {
         "pasted redirect URL has the wrong `state` parameter — possible stale paste or CSRF attempt"
     )]
     PastedUrlStateMismatch,
+
+    // --- Story 7.17 OAuth 2.0 device flow (RFC 8628) variants ---
+    /// Google's `expires_in` window for the device code elapsed before
+    /// the operator approved consent. Distinct from `DeviceFlowTimeout`,
+    /// which is the operator-configured local timeout firing first.
+    #[error("device flow expired — Google's device code window elapsed before consent was granted")]
+    DeviceCodeExpired,
+    /// The operator-configured `--device-flow-timeout` elapsed before
+    /// Google reported consent. The device code may still be valid
+    /// upstream; re-running the connect command issues a fresh code.
+    #[error("device flow timed out after {timeout_secs}s waiting for consent")]
+    DeviceFlowTimeout {
+        /// Elapsed seconds waited before giving up.
+        timeout_secs: u64,
+    },
+    /// The operator clicked "Deny" on Google's device-flow consent page.
+    #[error("operator denied consent on Google's device-flow consent page")]
+    DeviceCodeDenied,
+    /// RFC 8628 error code we don't model individually, plus any
+    /// non-2xx/non-RFC-8628 HTTP error during polling. The `error_code`
+    /// is the upstream-reported value (`invalid_grant`, `invalid_client`,
+    /// etc.); the `description` is either the upstream `error_description`
+    /// or our HTTP-status synthesis (e.g., `"http 502: bad gateway"`).
+    #[error("device flow protocol error: {error_code}: {description}")]
+    DeviceFlowProtocol {
+        /// Upstream `error` field or synthesized HTTP status code.
+        error_code: String,
+        /// Upstream `error_description` or HTTP body excerpt.
+        description: String,
+    },
 }
 
 /// Friendly short-name for a known Google API service identifier.
@@ -369,6 +399,19 @@ impl OAuthError {
             Self::PastedUrlStateMismatch => {
                 "The pasted URL is from a different setup session. Run `agentsso setup gmail --headless` again to start a fresh flow."
             }
+            // Story 7.17 device flow:
+            Self::DeviceCodeExpired => {
+                "Re-run `agentsso connect <service> --device-flow` to issue a fresh device code, then approve consent before it expires."
+            }
+            Self::DeviceFlowTimeout { .. } => {
+                "Re-run `agentsso connect <service> --device-flow` and approve consent more quickly, or extend the deadline with `--device-flow-timeout <seconds>`."
+            }
+            Self::DeviceCodeDenied => {
+                "Re-run `agentsso connect <service> --device-flow` and click 'Allow' on the Google consent page."
+            }
+            Self::DeviceFlowProtocol { .. } => {
+                "Verify the OAuth client is of type 'TV and Limited Input Device' (not 'Desktop app'). Re-run `agentsso connect <service> --device-flow --oauth-client <path>` once the client type is fixed."
+            }
         }
     }
 
@@ -395,6 +438,10 @@ impl OAuthError {
             Self::PastedUrlMissingCode => "pasted_url_missing_code",
             Self::PastedUrlMissingState => "pasted_url_missing_state",
             Self::PastedUrlStateMismatch => "pasted_url_state_mismatch",
+            Self::DeviceCodeExpired => "device_code_expired",
+            Self::DeviceFlowTimeout { .. } => "device_flow_timeout",
+            Self::DeviceCodeDenied => "device_code_denied",
+            Self::DeviceFlowProtocol { .. } => "device_flow_protocol",
         }
     }
 

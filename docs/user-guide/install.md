@@ -385,6 +385,89 @@ credential sealing + policy update + agent rebind in one idempotent
 command. Pass `--device-flow` (Story 7.17) for truly headless boxes
 where no browser is reachable on the target.
 
+## Device-flow OAuth client setup (scripted install — Story 7.17)
+
+The default `--oauth-client ./client_secret.json` flow uses an OAuth
+client of type **Desktop app**. The `--device-flow` path requires a
+*different* OAuth client type — Google's **TV and Limited Input
+Device** type — because the device-flow grant is registered server-
+side per client. Reusing a Desktop-app client with `--device-flow`
+causes Google to return `invalid_grant` mid-polling, which permitlayer
+surfaces as `device_flow_protocol`.
+
+You only need this if you're scripting `agentsso connect` on a box
+without a browser (CI runners, cloud-init provisioning,
+fully-headless servers). Scenarios #1 (interactive) and #2
+(SSH + `--headless`) keep using the existing Desktop-app client.
+
+### Create the device-flow OAuth client
+
+1. Open [Google Cloud Console → APIs & Services → Credentials](https://console.cloud.google.com/apis/credentials).
+2. Click **Create Credentials → OAuth client ID**.
+3. **Application type:** select **TV and Limited Input Device** (NOT
+   "Desktop app" — that's the type the existing client uses).
+4. Give the client a name like `permitlayer-device-flow`.
+5. Click **Create**, then **Download JSON**. Save the file as
+   `client_secret_device.json` (the name is convention; only the path
+   matters to the CLI).
+
+The downloaded JSON has the same `{"installed": {...}}` wrapper as
+the Desktop-app client; the JSON shape does not by itself distinguish
+device-flow from loopback clients. The distinction is server-side
+metadata Google associates with the client ID.
+
+### Run the scripted-install scenario
+
+```sh
+agentsso connect gmail \
+  --oauth-client ./client_secret_device.json \
+  --agent ci-bot \
+  --device-flow \
+  --device-flow-timeout 300 \
+  --non-interactive
+
+AGENTSSO_BEARER_TOKEN=$(agentsso agent register ci-bot --policy default --json | jq -r .bearer_token)
+
+agentsso autostart enable
+```
+
+What each flag does:
+
+- `--device-flow` — switches the OAuth dispatch from loopback /
+  paste-redirect to RFC 8628 device flow. Mutually exclusive with
+  `--headless`.
+- `--device-flow-timeout 300` — bound the operator's local wait at
+  300 seconds. Hard ceiling at Google's `expires_in` (typically
+  1800s). Without this flag the default is 120s.
+- `--non-interactive` — skip all prompts. Compatible with
+  `--device-flow` (the canonical scripted-headless invocation).
+- `agent register --json` — emit the bearer-token response as compact
+  single-line JSON to stdout for safe `jq -r` capture (no human-
+  formatted text to parse with `awk`).
+- `--token-out <path>` — alternative to `--json` when you want only
+  the token bytes written to a 0o600 file (no stdout pollution at
+  all).
+
+> **Tip:** put `client_secret_device.json` in your CI's secrets store
+> rather than checking it in. The JSON contains the client secret;
+> exposure lets a third party impersonate your OAuth application
+> (though not your users — they still have to consent).
+
+### What happens at run time
+
+1. The CLI POSTs to Google's `/device/code` endpoint and prints a
+   verification URL + short user code on stdout.
+2. The operator opens the URL on any device with a browser (laptop,
+   phone, kiosk), enters the user code, and approves consent.
+3. Meanwhile the target box is polling `/token` once every 5
+   seconds (RFC 8628). When Google records consent, `/token`
+   returns 200 with `access_token`, and `agentsso connect` continues
+   into Phase 4 (seal + store) exactly like the loopback flow.
+
+If the operator never approves, the polling loop terminates at
+`--device-flow-timeout` with a structured `device_flow_timeout` error
+on stderr and exit code 3.
+
 ## Uninstall — clean removal
 
 `agentsso uninstall` is a single-command teardown for the binary, the

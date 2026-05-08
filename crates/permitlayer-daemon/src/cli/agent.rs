@@ -18,8 +18,11 @@
 //! lookup key — both derived values that cannot be used to forge a
 //! token without the daemon's master-derived HMAC subkey.
 
+use std::path::PathBuf;
+
 use anyhow::Result;
 use clap::{Args, Subcommand};
+use serde::{Deserialize, Serialize};
 
 use crate::cli::kill::{
     error_block_daemon_unreachable, error_block_protocol_error, http_get, http_post_json,
@@ -66,6 +69,26 @@ pub struct RegisterArgs {
     /// `~/.agentsso/policies/`.
     #[arg(long)]
     pub policy: String,
+    /// Output the response as compact JSON to stdout. Mutually exclusive
+    /// with --token-out.
+    ///
+    /// Story 7.17 Task 1: scripted-install path. Pipes safely into `jq`
+    /// without parsing pretty-printed human output. The success shape is
+    /// `{"status":"ok","name":"...","policy_name":"...","bearer_token":"..."}`;
+    /// error shape is `{"status":"error","code":"...","message":"..."}`.
+    /// Single-line output (no embedded newlines) so line-oriented
+    /// pipelines and JSONL log collectors handle it without a parser.
+    #[arg(long, conflicts_with = "token_out")]
+    pub json: bool,
+    /// Write only the bearer token bytes (no decoration, no trailing
+    /// newline) to this path with mode 0o600.
+    ///
+    /// Story 7.17 Task 1. Owner-only mode: this file holds the same
+    /// secret as the in-memory token, so it gets the strictest perms.
+    /// For cross-user handoff use `agentsso connect --mcp-config-out`
+    /// (Story 7.13) which writes 0o644 by design.
+    #[arg(long, value_name = "PATH")]
+    pub token_out: Option<PathBuf>,
 }
 
 #[derive(Args)]
@@ -95,6 +118,30 @@ pub async fn run(args: AgentArgs) -> Result<()> {
 // ──────────────────────────────────────────────────────────────────
 // Subcommand implementations
 // ──────────────────────────────────────────────────────────────────
+
+/// Story 7.17 Task 1.3: typed JSON-render shape for `--json` mode.
+///
+/// Hand-rolled struct (NOT ad-hoc `serde_json::Value`) so the contract
+/// is grep-able and the field set is enforced at compile time. The
+/// scripted-install path in `headless-install.yml` pipes `jq -r .bearer_token`
+/// over this shape; future field additions are additive.
+#[derive(Serialize, Deserialize, Debug)]
+struct RegisterResponseJson {
+    status: &'static str,
+    name: String,
+    policy_name: String,
+    bearer_token: String,
+}
+
+/// Story 7.17 Task 1.5: typed JSON-render shape for `--json` error responses.
+///
+/// Mirrors the success shape so `jq` callers can branch on `.status`.
+#[derive(Serialize, Deserialize, Debug)]
+struct RegisterErrorJson {
+    status: &'static str,
+    code: String,
+    message: String,
+}
 
 async fn register_agent(args: RegisterArgs) -> Result<()> {
     let config = load_daemon_config_or_default_with_warn("agent register");
@@ -153,20 +200,40 @@ async fn register_agent(args: RegisterArgs) -> Result<()> {
     if status == Some("error") {
         let code = parsed["code"].as_str().unwrap_or("agent.unknown_error").to_owned();
         let message = parsed["message"].as_str().unwrap_or("(no message provided)").to_owned();
-        let suggested = match code.as_str() {
-            "agent.duplicate_name" => format!("agentsso agent remove {}", args.name),
-            "agent.unknown_policy" => {
-                "edit ~/.agentsso/policies/ then `agentsso reload`".to_owned()
+        // Story 7.17 Task 1.5: --json error responses go to stdout (the
+        // contract caller is `jq`, which expects machine output on stdout).
+        // Human/file paths keep the existing error_block stderr render so
+        // operators see the structured remediation block.
+        if args.json {
+            let payload = RegisterErrorJson { status: "error", code: code.clone(), message };
+            // Compact single-line; no `to_string_pretty`.
+            match serde_json::to_string(&payload) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    tracing::error!(error = %e, "register --json error serialization failed");
+                    eprint!("{}", error_block_protocol_error());
+                    std::process::exit(3);
+                }
             }
-            // Story 1.15 removed `agent.no_master_key` — the master key
-            // is now eagerly bootstrapped at daemon start, so this code
-            // can no longer be emitted by the daemon.
-            _ => "see message above".to_owned(),
-        };
-        eprint!("{}", error_block(&code, &message, &suggested, None));
+        } else {
+            let suggested = match code.as_str() {
+                "agent.duplicate_name" => format!("agentsso agent remove {}", args.name),
+                "agent.unknown_policy" => {
+                    "edit ~/.agentsso/policies/ then `agentsso reload`".to_owned()
+                }
+                // Story 1.15 removed `agent.no_master_key` — the master
+                // key is now eagerly bootstrapped at daemon start, so
+                // this code can no longer be emitted by the daemon.
+                _ => "see message above".to_owned(),
+            };
+            eprint!("{}", error_block(&code, &message, &suggested, None));
+        }
         // Story 7.11 review-round-2 Q2: route through the shared
         // `agent_control_exit_code` helper so register/list/remove/
         // rebind agree on exit codes for the same error code.
+        // Story 7.17 Task 1.5: exit-code mapping is identical across
+        // human and --json paths — scripts and humans get the same
+        // signal.
         std::process::exit(agent_control_exit_code(&code));
     } else if status != Some("ok") {
         tracing::debug!(
@@ -186,7 +253,41 @@ async fn register_agent(args: RegisterArgs) -> Result<()> {
         std::process::exit(3);
     }
 
-    render_register_success(&name, &policy_name, &token);
+    // Story 7.17 Task 1.2: branch on render path AFTER name/policy/token
+    // extraction. All three paths consume the same source values — there
+    // is no parallel-parse drift between them.
+    if args.json {
+        render_register_json(&name, &policy_name, &token);
+    } else if let Some(path) = args.token_out.as_deref() {
+        if let Err(e) = render_register_token_file(&name, &policy_name, &token, path) {
+            tracing::debug!(error = %e, path = %path.display(), "--token-out write failed");
+            let kind = e.kind();
+            let (code, msg, remediation) = match kind {
+                std::io::ErrorKind::NotFound => (
+                    "agent.token_out_parent_missing",
+                    format!("parent directory does not exist: {}", path.display()),
+                    "create the parent directory or pick a different path".to_owned(),
+                ),
+                std::io::ErrorKind::InvalidInput => (
+                    "agent.token_out_invalid_path",
+                    format!("refusing to write token: {e}"),
+                    "remove the existing symlink or pick a different path".to_owned(),
+                ),
+                _ => (
+                    "agent.token_out_write_failed",
+                    format!("could not write bearer token to {}: {e}", path.display()),
+                    "check the parent directory's permissions and disk space".to_owned(),
+                ),
+            };
+            eprint!("{}", error_block(code, &msg, &remediation, None));
+            // exit 4 keeps token_out write failures distinct from auth/
+            // protocol errors (3) and operator-correctable input (2).
+            // Scripts can map exit 4 → "filesystem-side fix needed."
+            std::process::exit(4);
+        }
+    } else {
+        render_register_success(&name, &policy_name, &token);
+    }
     Ok(())
 }
 
@@ -208,6 +309,57 @@ fn render_register_success(name: &str, policy_name: &str, token: &str) {
     println!();
     println!("  this token will not be shown again.");
     println!();
+}
+
+/// Story 7.17 Task 1.3: emit the success response as compact JSON on a
+/// single stdout line.
+///
+/// `serde_json::to_string` (NOT `to_string_pretty`) is the load-bearing
+/// detail — line-oriented pipelines (`while read line; do jq … <<<"$line"; done`)
+/// and JSONL collectors (Vector, Fluent Bit) tolerate one record per line
+/// only.
+fn render_register_json(name: &str, policy_name: &str, token: &str) {
+    let payload = RegisterResponseJson {
+        status: "ok",
+        name: name.to_owned(),
+        policy_name: policy_name.to_owned(),
+        bearer_token: token.to_owned(),
+    };
+    match serde_json::to_string(&payload) {
+        Ok(s) => println!("{s}"),
+        Err(e) => {
+            // The struct is owned, primitive-typed, and finite — `to_string`
+            // can only fail under serde-internal invariants. If it does we
+            // surface a protocol error rather than continue with a phony
+            // success.
+            tracing::error!(error = %e, "register --json serialization failed");
+            eprint!("{}", error_block_protocol_error());
+            std::process::exit(3);
+        }
+    }
+}
+
+/// Story 7.17 Task 1.4: write the bearer token bytes (no decoration, no
+/// trailing newline) to `path` with mode 0o600 on Unix.
+///
+/// Stdout receives a confirmation line with the path but **never** the
+/// token bytes — the file is the canonical retrieval path and stdout
+/// could land in a log file via `tee` or shell redirect.
+fn render_register_token_file(
+    name: &str,
+    policy_name: &str,
+    token: &str,
+    path: &std::path::Path,
+) -> std::io::Result<()> {
+    crate::cli::atomic_write::write_atomic_with_mode(path, token.as_bytes(), 0o600)?;
+    // Plain stdout — no token bytes. `policy_name` flagged so scripts can
+    // confirm the policy bound at register-time without re-querying the
+    // daemon.
+    println!();
+    println!("✓ agent '{name}' registered → policy '{policy_name}'");
+    println!("  bearer token written to {} (mode 0o600)", path.display());
+    println!();
+    Ok(())
 }
 
 async fn list_agents() -> Result<()> {
@@ -702,5 +854,121 @@ mod tests {
         // "fix your input."
         assert_eq!(agent_control_exit_code("agent.future_unknown"), 3);
         assert_eq!(agent_control_exit_code(""), 3);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Story 7.17 Task 1.7: --json and --token-out unit tests
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn register_args_json_flag_parses() {
+        let parsed =
+            CliWrapper::parse_from(["agent", "register", "ci-test", "--policy=default", "--json"]);
+        match parsed.cmd {
+            AgentCommand::Register(r) => {
+                assert!(r.json);
+                assert!(r.token_out.is_none());
+            }
+            _ => panic!("expected Register variant"),
+        }
+    }
+
+    #[test]
+    fn register_args_token_out_flag_parses() {
+        let parsed = CliWrapper::parse_from([
+            "agent",
+            "register",
+            "ci-test",
+            "--policy=default",
+            "--token-out=/tmp/agent.tok",
+        ]);
+        match parsed.cmd {
+            AgentCommand::Register(r) => {
+                assert!(!r.json);
+                assert_eq!(r.token_out.as_deref(), Some(std::path::Path::new("/tmp/agent.tok")));
+            }
+            _ => panic!("expected Register variant"),
+        }
+    }
+
+    #[test]
+    fn register_args_json_and_token_out_are_mutually_exclusive() {
+        // Story 7.17 AC #3: clap-level conflict (no runtime check needed).
+        let result = CliWrapper::try_parse_from([
+            "agent",
+            "register",
+            "ci-test",
+            "--policy=default",
+            "--json",
+            "--token-out=/tmp/agent.tok",
+        ]);
+        assert!(result.is_err(), "--json + --token-out must fail clap parse");
+    }
+
+    #[test]
+    fn register_response_json_serializes_compact_single_line() {
+        // Story 7.17 Task 1.7: assert the wire shape pipelines depend on.
+        let payload = RegisterResponseJson {
+            status: "ok",
+            name: "ci-test".to_owned(),
+            policy_name: "default".to_owned(),
+            bearer_token: "agt_v2_abc".to_owned(),
+        };
+        let s = serde_json::to_string(&payload).unwrap();
+        // Single-line: no embedded newlines.
+        assert!(!s.contains('\n'), "compact JSON must be single-line: {s}");
+        // No spaces between key and value (the cheap canary for
+        // `to_string_pretty` regression).
+        assert!(s.contains("\"status\":\"ok\""), "compact JSON must omit key/value spaces: {s}");
+        // Round-trips back through the parser as the expected shape.
+        let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed["status"], "ok");
+        assert_eq!(parsed["name"], "ci-test");
+        assert_eq!(parsed["policy_name"], "default");
+        assert_eq!(parsed["bearer_token"], "agt_v2_abc");
+    }
+
+    #[test]
+    fn register_error_json_has_status_error_field() {
+        // Story 7.17 Task 1.7: --json error responses have a stable
+        // shape `jq` callers can branch on (`.status == "error"`).
+        let payload = RegisterErrorJson {
+            status: "error",
+            code: "agent.duplicate_name".to_owned(),
+            message: "agent 'ci-test' already exists".to_owned(),
+        };
+        let s = serde_json::to_string(&payload).unwrap();
+        assert!(!s.contains('\n'));
+        let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(parsed["status"], "error");
+        assert_eq!(parsed["code"], "agent.duplicate_name");
+        assert!(parsed["message"].as_str().unwrap().contains("already exists"));
+    }
+
+    #[test]
+    fn token_file_writes_bytes_with_no_trailing_newline() {
+        // Story 7.17 Task 1.7: --token-out writes raw bytes only — no
+        // newline, no decoration. Pipelines reading the file with
+        // `cat` or `read -r` get exactly the bearer.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bearer.tok");
+        let token = "agt_v2_abc";
+        crate::cli::atomic_write::write_atomic_with_mode(&path, token.as_bytes(), 0o600).unwrap();
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes, token.as_bytes());
+        assert_eq!(bytes.last(), Some(&b'c')); // no trailing 0x0a
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn token_file_is_0o600_on_unix() {
+        // Story 7.17 Task 1.7: AC #2 contract — owner-only mode.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("bearer.tok");
+        crate::cli::atomic_write::write_atomic_with_mode(&path, b"agt_v2_x", 0o600).unwrap();
+        let md = std::fs::metadata(&path).unwrap();
+        let mode = md.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "--token-out file must be 0o600 (owner-only)");
     }
 }

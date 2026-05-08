@@ -518,9 +518,7 @@ pub(crate) enum BrewMigrationReason {
 /// — the file is malformed enough that we can't make a confident decision,
 /// and the safest action is to skip migration (operator's hand-rolled
 /// config stays untouched).
-pub(crate) fn inspect_brew_plist_path(
-    home: &Path,
-) -> std::io::Result<Option<BrewPlistInspection>> {
+pub(crate) fn inspect_brew_plist_path(home: &Path) -> std::io::Result<Option<BrewPlistInspection>> {
     // Per-user `brew services` writes to `~/Library/LaunchAgents/`.
     // System-wide `sudo brew services` writes to `/Library/LaunchAgents/`
     // — that path is intentionally NOT inspected here: rc.16's onboarding
@@ -785,7 +783,6 @@ fn backup_path_for(original: &Path) -> PathBuf {
     backup
 }
 
-
 /// Pull the absolute daemon path out of a rendered plist by finding
 /// the first `<string>` inside `<key>ProgramArguments</key><array>...</array>`.
 ///
@@ -873,10 +870,7 @@ fn current_user_id() -> std::io::Result<u32> {
     if let Ok(sudo_uid) = std::env::var("SUDO_UID")
         && let Ok(parsed) = sudo_uid.parse::<u32>()
         && parsed != 0
-        && matches!(
-            nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(parsed)),
-            Ok(Some(_))
-        )
+        && matches!(nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(parsed)), Ok(Some(_)))
     {
         return Ok(parsed);
     }
@@ -1015,7 +1009,11 @@ mod tests {
 
         // Assert call sequence: brew-list + brew-stop + launchctl-bootout + launchctl-bootstrap.
         let calls = mock.calls.borrow();
-        assert_eq!(calls.len(), 4, "expected 4 calls (brew list, brew stop, launchctl bootout, launchctl bootstrap), got {calls:?}");
+        assert_eq!(
+            calls.len(),
+            4,
+            "expected 4 calls (brew list, brew stop, launchctl bootout, launchctl bootstrap), got {calls:?}"
+        );
         assert_eq!(calls[0].0, "brew");
         assert_eq!(calls[0].1[0], "services");
         assert_eq!(calls[0].1[1], "list");
@@ -1414,7 +1412,8 @@ mod tests {
             label: "homebrew.mxcl.agentsso".to_owned(),
             program_args_first: expected.to_path_buf(),
         };
-        let bad_label = BrewPlistInspection { label: "homebrew.mxcl.evil".to_owned(), ..valid.clone() };
+        let bad_label =
+            BrewPlistInspection { label: "homebrew.mxcl.evil".to_owned(), ..valid.clone() };
         let bad_args = BrewPlistInspection {
             program_args_first: PathBuf::from("/usr/bin/false"),
             ..valid.clone()
@@ -1468,11 +1467,8 @@ mod tests {
         // makes decide_brew_migration return Migrate{Both} (when
         // combined with the active brew status below).
         let daemon = current_daemon_path().unwrap();
-        let original_plist = write_brew_plist_fixture(
-            tmp.path(),
-            "homebrew.mxcl.agentsso",
-            &daemon,
-        );
+        let original_plist =
+            write_brew_plist_fixture(tmp.path(), "homebrew.mxcl.agentsso", &daemon);
 
         let mock = MockExec::default();
         // brew services list --json (returns active)
@@ -1488,19 +1484,14 @@ mod tests {
         assert!(matches!(outcome, EnableOutcome::Registered { .. }));
 
         // Original plist file should NO LONGER exist at its primary path.
-        assert!(
-            !original_plist.exists(),
-            "original brew plist should have been renamed to backup"
-        );
+        assert!(!original_plist.exists(), "original brew plist should have been renamed to backup");
         // A backup file MUST exist in the same directory matching `*.bak.*`.
         let backup_dir = original_plist.parent().unwrap();
         let backup_count = std::fs::read_dir(backup_dir)
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .contains("homebrew.mxcl.agentsso.plist.bak.")
+                e.file_name().to_string_lossy().contains("homebrew.mxcl.agentsso.plist.bak.")
             })
             .count();
         assert_eq!(backup_count, 1, "expected exactly one backup file in {}", backup_dir.display());
@@ -1514,11 +1505,8 @@ mod tests {
     fn migration_uses_plist_path_when_brew_status_unreliable() {
         let tmp = tempfile::TempDir::new().unwrap();
         let daemon = current_daemon_path().unwrap();
-        let original_plist = write_brew_plist_fixture(
-            tmp.path(),
-            "homebrew.mxcl.agentsso",
-            &daemon,
-        );
+        let original_plist =
+            write_brew_plist_fixture(tmp.path(), "homebrew.mxcl.agentsso", &daemon);
 
         let mock = MockExec::default();
         // brew services list returns empty (status probe failed/empty)
@@ -1545,11 +1533,8 @@ mod tests {
     fn migration_tolerates_bootout_exit_125() {
         let tmp = tempfile::TempDir::new().unwrap();
         let daemon = current_daemon_path().unwrap();
-        let original_plist = write_brew_plist_fixture(
-            tmp.path(),
-            "homebrew.mxcl.agentsso",
-            &daemon,
-        );
+        let original_plist =
+            write_brew_plist_fixture(tmp.path(), "homebrew.mxcl.agentsso", &daemon);
 
         let mock = MockExec::default();
         mock.push_reply(MockExec::ok(r#"[{"name":"agentsso","status":"started"}]"#));
