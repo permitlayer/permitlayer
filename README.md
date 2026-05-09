@@ -174,14 +174,18 @@ master-key entry. Symptom on rc.16 and earlier: the next `agentsso
 start &` logs `keychain backend 'apple' is unavailable: User
 interaction is not allowed. (OSStatus -25308)`.
 
-**Behavior on rc.17 and later (Story 7.22):** the daemon auto-detects
-the ACL break, verifies the new binary's codesign Designated
-Requirement against a trust anchor captured on first boot, and atomic-
-rekeys the vault under a freshly-minted master key. The vault, every
-sealed credential, and **every operator-held bearer token** are
-preserved across the rekey — operators don't need to re-run `connect`,
-re-OAuth-consent, or update MCP-client configs. The daemon stays up;
-launchd-managed installs auto-recover with no operator action.
+**Behavior on rc.18 and later (Story 7.22 + Story 7.23):** the daemon
+auto-detects the ACL break, verifies the new binary's codesign
+Designated Requirement against a trust anchor captured on first boot,
+and atomic-rekeys the vault under a freshly-minted master key. The
+vault, every sealed credential, and **every operator-held bearer
+token** are preserved across the rekey — operators don't need to
+re-run `connect`, re-OAuth-consent, or update MCP-client configs. The
+daemon stays up; launchd-managed installs auto-recover with no
+operator action. (rc.17 shipped the recovery code path but a
+launchd-spawned-binary capture bug — Story 7.23 — kept the trust
+anchor from being written; rc.18 is the first release where the
+contract works headlessly end-to-end.)
 
 The auto-recovery path activates only when the new binary's codesign
 DR matches the persisted anchor. Mismatches (different signing
@@ -189,6 +193,28 @@ identity, completely-unsigned binary) hard-fail with exit code 7 and
 a structured banner pointing at manual re-trust — this is the security
 gate that prevents an attacker-installed binary from inheriting the
 previous binary's vault.
+
+##### If your rc.17 daemon is in a respawn loop
+
+rc.17 shipped a launchd-spawned-binary codesign capture bug: the
+trust anchor never got written, so when the keychain ACL invalidated
+on the next `brew upgrade`, auto-recovery refused with exit code 7
+(`AclBreakNoTrustAnchor`) and launchd's `KeepAlive` respawn-looped
+the daemon every ~10 seconds. Diagnostic signature in
+`~/.agentsso/logs/autostart.log`:
+
+```
+ERROR no codesign trust anchor on disk — cannot auto-recover headlessly
+```
+
+One-step fix:
+
+```sh
+brew upgrade permitlayer/tap/agentsso
+```
+
+rc.18 captures the anchor correctly on first boot (Story 7.23 fix)
+and recovery proceeds normally. No manual cleanup required.
 
 Behavior on rc.16 and earlier, by context:
 
@@ -203,27 +229,6 @@ Behavior on rc.16 and earlier, by context:
   The daemon fails fast with a structured `PassphrasePromptUnavailable`
   error. The recovery path is the same manual `connect` re-run from
   an interactive shell.
-
-##### One-time crossover from rc.16 → rc.17
-
-If you upgrade directly from rc.16 (or earlier) to rc.17 over SSH
-**without a TTY** (no interactive shell on the install), the rc.17
-trust-anchor capture step doesn't run before the next launchd-driven
-boot — there's no captured anchor to verify the new binary against,
-and auto-recovery refuses (exit code 7, `AclBreakNoTrustAnchor`).
-One-time fix:
-
-```sh
-# From an interactive terminal (TTY-attached):
-agentsso start
-# Engage the passphrase prompt once. rc.17's first-boot capture
-# writes ~/.agentsso/keystore/codesign-trust-anchor.req under your
-# binary's codesign DR. From that point onward, every `brew upgrade`
-# auto-recovers headlessly.
-```
-
-For all subsequent upgrades (rc.17 → rc.18, rc.18 → rc.19, …) the
-auto-recovery path is fully headless.
 
 For diagnostic detail, run with `AGENTSSO_LOG__LEVEL=debug` (the daemon
 does not honor `RUST_LOG`).

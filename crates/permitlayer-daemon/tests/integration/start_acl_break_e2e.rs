@@ -170,28 +170,39 @@ fn start_refuses_acl_break_recovery_when_dr_mismatches() {
 
     let (code, stderr) = wait_for_exit(handle, Duration::from_secs(10));
 
+    // Either of two exit-code-7 banners satisfies the test's load-
+    // bearing assertion ("daemon refused to auto-recover under a bogus
+    // anchor"):
+    //
+    // - `AclBreakDrMismatch` ("Designated Requirement mismatch") on
+    //   any host where the daemon process is properly adhoc-signed
+    //   (dev hardware, macos-14 hosted runners, brew-installed
+    //   binary on Angie's box). `verify_self_against` returns
+    //   `RequirementMismatch`.
+    // - `CodesignVerifyFailed` ("codesign verification failed during
+    //   auto-recovery") on hosts where the daemon process is
+    //   genuinely unsigned (observed on macos-15-intel hosted
+    //   runners). `verify_self_against` returns `Unsigned` — accurate
+    //   per Story 7.23, since `SecCodeCopyDesignatedRequirement`
+    //   correctly reports the unsigned daemon binary.
+    //
+    // Both prove the verification step ran and refused the bogus
+    // anchor. The truncation contract (DR-mismatch banner only —
+    // the CodesignVerifyFailed banner doesn't include the stored
+    // DR) is enforced on the dr-mismatch path only.
     assert_eq!(
         code,
         Some(7),
         "expected exit code 7 (AclBreakDrMismatch or CodesignVerifyFailed), \
          got {code:?}\nstderr:\n{stderr}"
     );
-    // The dispatch reached the codesign-verification step. On dev
-    // hardware + macos-14 hosted runners, `verify_self_against` returns
-    // `RequirementMismatch` and the banner names the mismatch. On
-    // hosted macos-15-intel runners the daemon's process can't extract
-    // codesign info (no `kSecCodeInfoDesignatedRequirement` in its
-    // signing dictionary), so verification surfaces as
-    // `CodesignVerifyFailed` instead — distinct exit-code-7 banner.
-    // Both prove the verification step ran and refused the bogus
-    // anchor, which is the test's load-bearing assertion.
     let dr_mismatch_path = stderr.contains("Designated Requirement mismatch");
     let codesign_verify_failed_path =
         stderr.contains("codesign verification failed during auto-recovery");
     assert!(
         dr_mismatch_path || codesign_verify_failed_path,
-        "stderr should name either DR mismatch (dev hardware / macos-14) or \
-         codesign verification failure (macos-15-intel hosted runners), got:\n{stderr}"
+        "stderr should name DR mismatch (signed daemon) or codesign verify failure \
+         (unsigned daemon on macos-15-intel hosted runner), got:\n{stderr}"
     );
     if dr_mismatch_path {
         assert!(
@@ -199,10 +210,8 @@ fn start_refuses_acl_break_recovery_when_dr_mismatches() {
             "AclBreakDrMismatch banner should explain the rejection is \
              security-relevant, got:\n{stderr}"
         );
-        // Truncation contract (only enforced on the DR-mismatch path,
-        // since CodesignVerifyFailed banner doesn't include the stored
-        // DR at all): the bogus DR is 95 chars; the banner truncates to
-        // 80 + ellipsis. The full string MUST NOT appear.
+        // Truncation contract: the bogus DR is 95 chars; the banner
+        // truncates to 80 + ellipsis. The full string MUST NOT appear.
         assert!(
             !stderr.contains("synthetic.identifier.that.no.real.binary.would.use"),
             "AclBreakDrMismatch banner must truncate the stored DR \
@@ -212,32 +221,24 @@ fn start_refuses_acl_break_recovery_when_dr_mismatches() {
 }
 
 /// Task 3.7: ACL break detected on boot, anchor matches → daemon
-/// auto-rekeys and boots cleanly.
+/// auto-rekeys and boots cleanly end-to-end.
 ///
-/// **Currently asserts a near-success outcome rather than a fully
-/// healthy daemon.** Driving the full happy-path requires the test
-/// process and the spawned daemon binary to share an exact codesign
-/// chain so `verify_self_against` succeeds. Under `cargo test`, both
-/// run from the workspace target dir as adhoc-signed builds, but
-/// each binary's CDHash is per-build-output. The companion test
+/// **Currently `#[ignore]`d pending Story 7.24** (Apple Developer
+/// ID enrollment + release.yml signing job). Under adhoc signing,
+/// the cargo-test process and the spawned daemon binary have
+/// different CDHashes per build, so a "matching DR" pre-seed isn't
+/// achievable without real Developer-ID-signed binaries. The
+/// companion test
 /// `start_acl_break_dispatch_reaches_auto_rekey_stub_when_dr_matches`
-/// pins the dispatch is structurally wired (DR verify → AutoRecover
-/// rotation → rotation-error path); a real end-to-end happy-path
-/// run is exercised by Task 7's manual verification on Angie's box.
-///
-/// Pre-Task-4: the rekey returned `phase: "task4-pending"`.
-/// Post-Task-4: the rekey succeeds OR fails with a real rotation
-/// error from `run_rotation`. Either way, the test process and the
-/// daemon-under-test do NOT share CDHashes, so we typically observe
-/// the DR-mismatch outcome — see the companion test for the full
-/// dispatch-reach assertion.
+/// proves the dispatch path is structurally wired; a real
+/// end-to-end happy-path run is exercised by manual verification
+/// on Angie's box (Story 7.23 Task 5) until Story 7.24 lands.
 #[test]
+#[ignore = "pending Story 7.24 Developer-ID signing — adhoc CDHash \
+            drift between cargo-test and daemon-under-test prevents \
+            a matching-DR pre-seed in the cargo-test harness"]
 fn start_handles_acl_break_with_valid_dr_recovers() {
-    // Test body is consolidated into
-    // `start_acl_break_dispatch_reaches_auto_rekey_stub_when_dr_matches`,
-    // which verifies the same dispatch path with semantics that
-    // accept either outcome (DR mismatch from CDHash drift, or a
-    // real rotation error from run_rotation under AutoRecover).
+    // Test body deferred to Story 7.24.
 }
 
 /// Task 3.7 (pre-Task-4 stand-in): ACL break detected, anchor
@@ -250,7 +251,9 @@ fn start_handles_acl_break_with_valid_dr_recovers() {
 /// non-`#[ignore]`d Task 3.7 above.
 #[test]
 fn start_acl_break_dispatch_reaches_auto_rekey_stub_when_dr_matches() {
-    use permitlayer_keystore::{capture_self_designated_requirement, write_trust_anchor};
+    use permitlayer_keystore::{
+        CodesignError, capture_self_designated_requirement, write_trust_anchor,
+    };
 
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("config")).unwrap();
@@ -258,44 +261,35 @@ fn start_acl_break_dispatch_reaches_auto_rekey_stub_when_dr_matches() {
     let port = free_port();
 
     // Capture THIS test process's DR and persist it as the trust
-    // anchor. The daemon process under test will have the SAME
-    // codesign signature (same cargo target/debug binary) so
-    // `verify_self_against` succeeds.
+    // anchor. The daemon-under-test has a different CDHash (different
+    // cargo build artifact), so `verify_self_against` will fail with
+    // `RequirementMismatch` — which still proves the dispatch reached
+    // the codesign-verification step.
     //
-    // Caveat: this test relies on the test process and the
-    // spawned daemon binary having identical codesign chains. Under
-    // `cargo test`, both run from the workspace target dir with
-    // adhoc-signed builds — the CDHashes differ per binary, but
-    // the IDENTIFIER component of the DR matches because they share
-    // a build profile. `verify_self_against` checks the full DR via
-    // `check_validity`, which under adhoc compares CDHash; so we
-    // capture the daemon's DR by reading from the binary path itself
-    // rather than the test process.
-    //
-    // For now, capture the test-process DR and accept that this
-    // test will likely surface as `AclBreakDrMismatch` rather than
-    // `AutoRekeyFailed` on first run. The negative assertion below
-    // covers EITHER outcome — both prove dispatch reached the
-    // codesign-verification step.
-    // On some macOS hosted runners (observed on macos-15-intel) the
-    // cargo-test process has no `kSecCodeInfoDesignatedRequirement` in
-    // its signing info dictionary — `capture_self_designated_requirement`
-    // returns `Other { code: 0, message: "signing information dictionary
-    // missing kSecCodeInfoDesignatedRequirement" }`. Without a
-    // capturable DR we can't seed an anchor that would even potentially
-    // match the daemon's binary, so this test's specific dispatch
-    // assertion (DR-match path → rekey stub) is unreachable. Skip
-    // gracefully on those hosts; macos-14 runners + dev hardware
-    // produce a capturable DR and exercise the dispatch end-to-end.
+    // **macos-15-intel hosted runner caveat.** Story 7.23 fixed the
+    // rc.17 dictionary-traversal capture path, which was incorrectly
+    // returning a vague "missing key" error for adhoc-signed binaries.
+    // After the fix, capture via `SecCodeCopyDesignatedRequirement`
+    // works correctly for any properly-signed binary — including
+    // adhoc-signed ones (Angie's brew-installed binary, dev hardware
+    // builds, macos-14 hosted runners). On hosted macos-15-intel
+    // runners, however, the cargo-test binary is **genuinely unsigned**
+    // (not adhoc-signed), and the new API correctly returns
+    // `CodesignError::Unsigned`. That's an accurate report of the
+    // host environment, not a regression. Skip the test on those
+    // hosts; the production binary path (brew tarball + scp-built
+    // local binary) is exercised by Angie's-box field verification.
     let test_proc_dr = match capture_self_designated_requirement() {
         Ok(dr) => dr,
-        Err(e) => {
+        Err(CodesignError::Unsigned) => {
             eprintln!(
-                "skipping: test process has no capturable codesign DR \
-                 (typical on hosted CI runners): {e}"
+                "skipping: cargo-test binary on this host is genuinely unsigned \
+                 (typical on hosted macos-15-intel CI runners); the production \
+                 capture path is verified on Angie's box (Story 7.23 Task 5)."
             );
             return;
         }
+        Err(other) => panic!("unexpected capture error on this host: {other:?}"),
     };
     write_trust_anchor(home.path(), &test_proc_dr).expect("write trust anchor to test home");
 
@@ -319,7 +313,7 @@ fn start_acl_break_dispatch_reaches_auto_rekey_stub_when_dr_matches() {
     // The dispatch reached at least the codesign-verification step.
     // Either:
     // - the daemon's DR matched the anchor and we hit AutoRecover
-    //   rotation (which under the test env may succeed or surface a
+    //   rotation (under the test env this may succeed or surface a
     //   `rotation` phase error — both end at exit code 7), OR
     // - the DR didn't match (CDHash drift between cargo-test process
     //   and the daemon-under-test binary) → AclBreakDrMismatch.

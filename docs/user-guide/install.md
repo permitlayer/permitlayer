@@ -69,12 +69,12 @@ new binary's hash no longer matches the keychain ACL on the previous
 binary's master-key entry, so the keychain returns OSStatus -25308
 ("User interaction is not allowed") on the next master-key lookup.
 
-**rc.17+ auto-recovers.** On boot the daemon:
+**rc.18+ auto-recovers headlessly.** On boot the daemon:
 
 1. Detects the -25308.
 2. Reads the persisted codesign trust anchor at
    `~/.agentsso/keystore/codesign-trust-anchor.req` (captured on
-   first rc.17 boot via macOS's `SecCodeCopySelf`).
+   first rc.18 boot via macOS's `SecCodeCopyDesignatedRequirement`).
 3. Verifies the new binary's Designated Requirement against the
    stored anchor. If it matches (legitimate publisher upgrade), the
    daemon proceeds; if it doesn't (different signing identity, or a
@@ -90,6 +90,17 @@ binary's master-key entry, so the keychain returns OSStatus -25308
    captured on first boot).
 6. Continues normal boot under the new master key.
 
+> **rc.17 caveat:** rc.17 shipped this code path but a launchd-spawned
+> capture bug kept the trust anchor from being written, so the
+> daemon respawn-looped under launchd after every `brew upgrade`.
+> Story 7.23 (rc.18) fixed the capture by switching from
+> `SecCodeCopySigningInformation`'s dictionary lookup (which fails
+> for adhoc-signed binaries) to `SecCodeCopyDesignatedRequirement`
+> (which derives the implicit DR for adhoc). If you ever consult
+> rc.17-era docs that mention the older API name, the behavior they
+> describe is the *intent*; rc.18 is the version where it actually
+> works end-to-end.
+
 **Bearer tokens are preserved across the rekey.** Operators with
 existing MCP-client configs continue to authenticate with their
 existing `agt_v2_*` tokens after the upgrade — the rekey changes
@@ -99,6 +110,14 @@ If verification fails (exit code 7, `AclBreakDrMismatch` banner), the
 recovery path is to investigate before removing the trust anchor.
 This is a security-relevant rejection: if the new binary was NOT
 installed by you, do NOT clear the anchor.
+
+> **Switching install methods is treated as a binary swap.** A binary
+> built by `cargo install` has a different CDHash than the brew-
+> tarball binary, so the trust anchor written by one won't match the
+> other. Switching install methods after first-boot triggers the
+> manual re-trust path (delete `~/.agentsso/keystore/codesign-trust-anchor.req`
+> and re-launch from a TTY-attached session). Stick with one install
+> method per host to avoid this friction.
 
 ### Uninstalling
 

@@ -256,22 +256,31 @@ mod trust_anchor {
         /// Helper: capture a real DR from the running test binary.
         /// Used as the "valid input" for round-trip tests.
         ///
-        /// Returns `None` on hosts where the test process has no
-        /// capturable DR (observed on hosted macos-15-intel runners).
-        /// Tests using this helper should early-return on `None` so
-        /// they skip gracefully there. Dev hardware + macos-14
-        /// runners always return `Some`.
+        /// After Story 7.23's switch to `SecCodeCopyDesignatedRequirement`,
+        /// the API correctly reports the host's signing state:
+        /// adhoc-signed binaries (dev hardware, macos-14 hosted
+        /// runners, brew-installed binaries) get a usable DR;
+        /// genuinely unsigned binaries (observed on hosted
+        /// macos-15-intel runners) return `CodesignError::Unsigned`.
+        ///
+        /// Tests using this helper early-return on `None` to skip
+        /// gracefully on unsigned hosts. The skip is environmental,
+        /// not a bug workaround — the production capture path that
+        /// matters (brew-installed and scp-installed binaries on
+        /// Angie's box) is exercised by Story 7.23 Task 5 field
+        /// verification.
         #[cfg(target_os = "macos")]
         fn real_dr() -> Option<String> {
             match super::super::capture_self_designated_requirement() {
                 Ok(dr) => Some(dr),
-                Err(e) => {
+                Err(super::super::CodesignError::Unsigned) => {
                     eprintln!(
-                        "skipping trust-anchor test: test binary has no capturable DR \
-                         (typical on hosted macos-15-intel CI runners): {e}"
+                        "skipping trust-anchor test: cargo-test binary on this host \
+                         is genuinely unsigned (typical on hosted macos-15-intel runners)"
                     );
                     None
                 }
+                Err(other) => panic!("unexpected capture error on this host: {other:?}"),
             }
         }
 
@@ -477,14 +486,35 @@ mod macos_impl {
     //!    and `SecCode::check_validity` are wrapped cleanly. Used by
     //!    `verify_self_against`.
     //!
-    //! 2. **Raw FFI for `SecCodeCopySigningInformation`** + CFDictionary
-    //!    traversal for `kSecCodeInfoDesignatedRequirement`: NOT yet
-    //!    wrapped in `security-framework` 3.7's safe layer. ~30 LOC of
-    //!    `unsafe` block. Used by `capture_self_designated_requirement`.
+    //! 2. **Raw FFI for `SecCodeCopyDesignatedRequirement`**: NOT yet
+    //!    wrapped in `security-framework-sys` 2.17. ~5 LOC of `unsafe`
+    //!    block. Used by `capture_self_designated_requirement`.
     //!
-    //! Both pull through `core-foundation` 0.10's safe `CFString` /
-    //! `CFDictionary` types where possible to keep `unsafe` blocks
-    //! narrow.
+    //! ## rc.17 → rc.18 bug-fix history (Story 7.23)
+    //!
+    //! rc.17 (Story 7.22) used `SecCodeCopySigningInformation(code,
+    //! kSecCSRequirementInformation, &dict)` followed by a dictionary
+    //! lookup of `kSecCodeInfoDesignatedRequirement`. That key is
+    //! ONLY populated for binaries with an *explicit* DR embedded at
+    //! signing time. For adhoc-signed binaries (which is everything
+    //! `release.yml` ships today — ed25519/minisign signatures only,
+    //! no Developer ID) the DR is *implicit* — derived at query time
+    //! from CDHash + identifier — and the dictionary key is absent.
+    //! rc.17 therefore failed every launchd-spawned first boot with
+    //! `Other { code: 0, message: "signing information dictionary
+    //! missing kSecCodeInfoDesignatedRequirement" }` (Angie's box,
+    //! 2026-05-09 autostart.log).
+    //!
+    //! `SecCodeCopyDesignatedRequirement` returns the implicit DR
+    //! cleanly. Per Apple docs (developer.apple.com/documentation/
+    //! security/1395363-seccodecopydesignatedrequirement): "If the
+    //! code has no explicit Designated Requirement, an appropriate
+    //! implicit one is derived from the code's signing information."
+    //! Forward-compatible with Developer-ID-signed code (Story 7.24).
+    //!
+    //! Pulls through `core-foundation` 0.10's safe `CFString` and
+    //! `security-framework`'s safe `SecRequirement` to keep the
+    //! `unsafe` block narrow.
     //!
     //! # `SecCSFlags` choice
     //!
@@ -495,11 +525,10 @@ mod macos_impl {
     //! don't have network yet.
 
     use core_foundation::base::TCFType;
-    use core_foundation::dictionary::{CFDictionary, CFDictionaryRef};
     use core_foundation::string::CFString;
     use core_foundation_sys::base::OSStatus;
     use security_framework::os::macos::code_signing::{Flags, SecCode, SecRequirement};
-    use security_framework_sys::code_signing::{SecCodeRef, SecRequirementRef};
+    use security_framework_sys::code_signing::{SecRequirementRef, SecStaticCodeRef};
     use std::ptr;
     use std::str::FromStr;
 
@@ -510,22 +539,49 @@ mod macos_impl {
     /// Apple `OSStatus` for `errSecCSReqFailed`. Signature exists but
     /// doesn't satisfy the requirement.
     const ERR_SEC_CS_REQ_FAILED: i32 = -67050;
-    /// Apple flag bit for `kSecCSRequirementInformation` in
-    /// `SecCodeCopySigningInformation`'s flags arg.
-    /// (Not exposed by `security-framework-sys` 2.17 either.)
-    const K_SEC_CS_REQUIREMENT_INFORMATION: u32 = 1 << 2;
 
     unsafe extern "C" {
-        /// `SecCodeCopySigningInformation(SecCodeRef, SecCSFlags, CFDictionaryRef*) -> OSStatus`.
+        /// `SecCodeCopyDesignatedRequirement(SecStaticCodeRef, SecCSFlags, SecRequirementRef*) -> OSStatus`.
         ///
-        /// Not wrapped in `security-framework-sys` 2.17 yet; declared here
-        /// directly. Returns a CFDictionary whose keys vary by the
-        /// `flags` arg. With `kSecCSRequirementInformation`, the dict
-        /// contains `kSecCodeInfoDesignatedRequirement` (a SecRequirement).
-        fn SecCodeCopySigningInformation(
-            code: SecCodeRef,
+        /// Apple's documented primitive for retrieving a code's
+        /// Designated Requirement. Available since macOS 10.6. Per
+        /// Apple's docs page (developer.apple.com/documentation/
+        /// security/1395363-seccodecopydesignatedrequirement): "If
+        /// the code has no explicit Designated Requirement, an
+        /// appropriate implicit one is derived from the code's
+        /// signing information."
+        ///
+        /// **rc.17 → rc.18 bug-fix history (Story 7.23):** rc.17 used
+        /// `SecCodeCopySigningInformation` + dictionary lookup of
+        /// `kSecCodeInfoDesignatedRequirement`. That key is ONLY
+        /// populated for binaries with an *explicit* embedded DR.
+        /// Adhoc-signed binaries (every rc.X ship today) have an
+        /// *implicit* DR derived at query time from CDHash +
+        /// identifier; the dictionary key is absent. rc.17 therefore
+        /// failed every launchd-spawned first boot with the field-
+        /// log line "signing information dictionary missing
+        /// kSecCodeInfoDesignatedRequirement" (Angie's box,
+        /// 2026-05-09). This API surfaces the implicit DR cleanly.
+        ///
+        /// **Why `SecStaticCodeRef` parameter, not `SecCodeRef`:**
+        /// matches Apple's `Security/SecCode.h:327` declaration. Per
+        /// Apple's `SecCode.h:74` note: "many API functions taking
+        /// SecStaticCodeRef arguments will also directly accept a
+        /// SecCodeRef and apply this translation implicitly." The
+        /// call site casts `SecCodeRef` (from `for_self`) to
+        /// `SecStaticCodeRef` to satisfy the typed FFI signature
+        /// while leveraging Apple's documented runtime tolerance.
+        /// Declaring as `SecCodeRef` would compile and work at
+        /// runtime but is technically UB-adjacent (mismatched opaque
+        /// pointer types) and could trip a future Clippy/Miri pass.
+        ///
+        /// Returns a `+1` retained `SecRequirementRef`; caller wraps
+        /// with `SecRequirement::wrap_under_create_rule` to manage
+        /// the retain count via `TCFType` Drop.
+        fn SecCodeCopyDesignatedRequirement(
+            code: SecStaticCodeRef,
             flags: u32,
-            information: *mut CFDictionaryRef,
+            requirement: *mut SecRequirementRef,
         ) -> OSStatus;
 
         /// `SecRequirementCopyString(SecRequirementRef, SecCSFlags, CFStringRef*) -> OSStatus`.
@@ -545,80 +601,96 @@ mod macos_impl {
             status: OSStatus,
             reserved: *mut std::ffi::c_void,
         ) -> core_foundation_sys::string::CFStringRef;
-
-        /// Apple-supplied symbol for the `kSecCodeInfoDesignatedRequirement`
-        /// CFString key. We resolve it at runtime to look up the DR
-        /// inside the CFDictionary returned by
-        /// `SecCodeCopySigningInformation`.
-        static kSecCodeInfoDesignatedRequirement: core_foundation_sys::string::CFStringRef;
     }
 
     /// Capture the running binary's Designated Requirement string.
     ///
-    /// Called at first-run TOFU (Task 2 in Story 7.22) and at Phase G
-    /// re-capture after a successful auto-recovery rotation (Task 4.6).
+    /// Called at first-run TOFU (Story 7.22 Task 2) and at Phase G
+    /// re-capture after a successful auto-recovery rotation (Story
+    /// 7.22 Task 4.6).
     ///
-    /// Steps:
-    /// 1. `SecCode::for_self(Flags::NONE)` — get the dynamic SecCode for the running process.
-    /// 2. `SecCodeCopySigningInformation(code, kSecCSRequirementInformation, &mut dict)`.
-    /// 3. Look up `kSecCodeInfoDesignatedRequirement` inside the dict — yields a `SecRequirementRef`.
-    /// 4. `SecRequirementCopyString(req, 0, &mut cfstr)` → render to text.
-    /// 5. `CFString` → Rust `String`.
+    /// # rc.17 → rc.18 bug fix (Story 7.23)
+    ///
+    /// rc.17 used `SecCodeCopySigningInformation(code,
+    /// kSecCSRequirementInformation, &dict)` followed by a dictionary
+    /// lookup of `kSecCodeInfoDesignatedRequirement`. That key is ONLY
+    /// populated when the binary carries an *explicit* DR — i.e., one
+    /// embedded by the signer at codesign time. For adhoc-signed code
+    /// (which is what `release.yml` ships today; see this module's
+    /// rc.17 → rc.18 doc-comment), the DR is *implicit* — derived at
+    /// query time from CDHash + identifier — and the dictionary key
+    /// is absent. rc.17 therefore failed every launchd-spawned first
+    /// boot with `Other { code: 0, message: "signing information
+    /// dictionary missing kSecCodeInfoDesignatedRequirement" }`
+    /// (Angie's box autostart.log, 2026-05-09).
+    ///
+    /// `SecCodeCopyDesignatedRequirement` returns the implicit DR
+    /// cleanly (Apple docs: "If the code has no explicit Designated
+    /// Requirement, an appropriate implicit one is derived from the
+    /// code's signing information"). The implicit DR derived here is
+    /// the canonical DR `SecCodeCheckValidity` uses internally —
+    /// capture and verify are symmetric for adhoc and Developer-ID
+    /// code alike. Forward-compatible with Developer-ID-signed code
+    /// when Story 7.24 lands.
+    ///
+    /// # Steps
+    ///
+    /// 1. `SecCode::for_self(Flags::NONE)` — dynamic SecCode for the running process.
+    /// 2. `SecCodeCopyDesignatedRequirement(code, 0, &mut req)` — implicit-or-explicit DR.
+    /// 3. `SecRequirementCopyString(req, 0, &mut text)` — render to text.
+    /// 4. `CFString` → Rust `String`.
+    ///
+    /// # Flags
+    ///
+    /// Pass `0` (`kSecCSDefaultFlags`). Do NOT use
+    /// `Flags::CHECK_ALL_ARCHITECTURES` — that's a static-code-only
+    /// flag and would return `errSecCSInvalidFlags (-67070)` for
+    /// dynamic code.
     pub fn capture_self_designated_requirement() -> Result<String, CodesignError> {
         let me = SecCode::for_self(Flags::NONE)
             .map_err(|e| CodesignError::SecFrameworkCall { source: e })?;
 
-        // SAFETY: We hand `SecCodeCopySigningInformation` a valid
-        // `SecCodeRef` (just constructed via `for_self`, kept alive by
-        // `me`'s ownership of the underlying CF object via TCFType),
-        // a flags constant, and an out-parameter pointing at a properly
-        // typed local. The function fills `info_ptr` with a +1
-        // CFDictionary that we wrap with `wrap_under_create_rule` to
-        // tie its lifetime to the `info` binding. If the call fails we
-        // bail before any use.
-        let info: CFDictionary<CFString, core_foundation::base::CFType> = unsafe {
-            let mut info_ptr: CFDictionaryRef = ptr::null();
-            let status = SecCodeCopySigningInformation(
-                me.as_concrete_TypeRef(),
-                K_SEC_CS_REQUIREMENT_INFORMATION,
-                &mut info_ptr,
+        // SAFETY: We hand `SecCodeCopyDesignatedRequirement` a valid
+        // `SecCodeRef` (just constructed via `for_self`, kept alive
+        // by `me`'s ownership of the underlying CF object via
+        // `TCFType`), cast to `SecStaticCodeRef` to match Apple's
+        // typed declaration in `Security/SecCode.h:327`. Per Apple's
+        // `SecCode.h:74` note ("many API functions taking
+        // SecStaticCodeRef arguments will also directly accept a
+        // SecCodeRef and apply this translation implicitly"), this
+        // cast is documented-supported. Flags arg is `0`
+        // (kSecCSDefaultFlags). On success the function fills
+        // `req_ptr` with a `+1` retained `SecRequirementRef` we wrap
+        // with `wrap_under_create_rule` (lifetime tied to `req`). On
+        // failure we bail before any use.
+        let req = unsafe {
+            let mut req_ptr: SecRequirementRef = ptr::null_mut();
+            let status = SecCodeCopyDesignatedRequirement(
+                me.as_concrete_TypeRef() as SecStaticCodeRef,
+                0,
+                &mut req_ptr,
             );
             if status != 0 {
                 return Err(map_oss_status(status));
             }
-            if info_ptr.is_null() {
+            if req_ptr.is_null() {
                 return Err(CodesignError::Other {
                     code: 0,
-                    message: "SecCodeCopySigningInformation returned NULL dictionary".to_owned(),
+                    message: "SecCodeCopyDesignatedRequirement returned NULL requirement"
+                        .to_owned(),
                 });
             }
-            CFDictionary::wrap_under_create_rule(info_ptr)
+            SecRequirement::wrap_under_create_rule(req_ptr)
         };
 
-        // Look up the Designated Requirement entry.
-        // SAFETY: `kSecCodeInfoDesignatedRequirement` is an Apple-supplied
-        // static; we wrap it under "get rule" (no retain) to construct
-        // a temporary CFString key. The dictionary's `find` returns a
-        // borrowed reference if the key exists.
-        let dr_value = unsafe {
-            let key = CFString::wrap_under_get_rule(kSecCodeInfoDesignatedRequirement);
-            info.find(&key)
-        };
-        let dr_value = dr_value.ok_or_else(|| CodesignError::Other {
-            code: 0,
-            message: "signing information dictionary missing kSecCodeInfoDesignatedRequirement"
-                .to_owned(),
-        })?;
-
-        // The value is a SecRequirement (CFTypeRef). Cast through the
-        // type-id check to make sure that's actually what we got.
-        // SAFETY: we treat the borrowed CFTypeRef as a SecRequirementRef
-        // for the duration of the SecRequirementCopyString call. The
-        // CFDictionary `info` keeps the underlying object alive.
+        // SAFETY: `req` owns a valid `+1` `SecRequirement` via
+        // `TCFType`. We call `SecRequirementCopyString` with `flags=0`
+        // and a typed out-parameter; on success we wrap the `+1`
+        // `CFString` and convert to Rust `String`. `req` keeps the
+        // underlying object alive for the duration of the call.
         let dr_string = unsafe {
-            let req_ref: SecRequirementRef = dr_value.as_CFTypeRef() as SecRequirementRef;
             let mut text_ptr: core_foundation_sys::string::CFStringRef = ptr::null();
-            let status = SecRequirementCopyString(req_ref, 0, &mut text_ptr);
+            let status = SecRequirementCopyString(req.as_concrete_TypeRef(), 0, &mut text_ptr);
             if status != 0 {
                 return Err(map_oss_status(status));
             }
@@ -628,9 +700,7 @@ mod macos_impl {
                     message: "SecRequirementCopyString returned NULL".to_owned(),
                 });
             }
-            // Wrap +1 CFString and convert to Rust String.
-            let cf = CFString::wrap_under_create_rule(text_ptr);
-            cf.to_string()
+            CFString::wrap_under_create_rule(text_ptr).to_string()
         };
 
         Ok(dr_string)
@@ -710,39 +780,44 @@ mod macos_impl {
     mod tests {
         use super::*;
 
-        /// Capturing the running binary's DR returns a non-empty
-        /// string that round-trips through `SecRequirement::from_str`.
+        /// Helper: skip the test on hosts where the cargo-test binary
+        /// is genuinely unsigned (observed on hosted macos-15-intel
+        /// runners). Returns the captured DR on signed hosts, prints
+        /// a skip message and returns `None` on unsigned hosts.
         ///
-        /// Helper: skip the test when the host's `cargo test` process
-        /// has no capturable codesign DR (observed on hosted
-        /// macos-15-intel runners where `SecCodeCopySigningInformation`
-        /// returns no `kSecCodeInfoDesignatedRequirement` for cargo-
-        /// test binaries). Returns `Some(dr)` to proceed, `None` to
-        /// skip with an `eprintln!`. Dev hardware + macos-14 runners
-        /// always return `Some`.
-        fn capture_or_skip(test_name: &str) -> Option<String> {
+        /// Story 7.23 changed the rc.17 dictionary-traversal API to
+        /// `SecCodeCopyDesignatedRequirement`, which correctly reports
+        /// the host's signing state instead of vague missing-key
+        /// errors. On adhoc-signed hosts (dev hardware, macos-14
+        /// hosted runners, brew-installed binaries) capture works.
+        /// On unsigned hosts (macos-15-intel cargo-test builds)
+        /// capture returns `Unsigned` — that's accurate, not a bug.
+        fn capture_or_skip_if_unsigned() -> Option<String> {
             match capture_self_designated_requirement() {
                 Ok(dr) => Some(dr),
-                Err(e) => {
+                Err(CodesignError::Unsigned) => {
                     eprintln!(
-                        "skipping {test_name}: test process has no capturable codesign DR \
-                         (typical on hosted macos-15-intel CI runners): {e}"
+                        "skipping: cargo-test binary on this host is genuinely unsigned \
+                         (typical on hosted macos-15-intel CI runners)"
                     );
                     None
                 }
+                Err(other) => panic!("unexpected capture error on this host: {other:?}"),
             }
         }
 
-        /// This is the load-bearing TOFU path — if `cargo test`'s test
-        /// binary can't capture its own DR, neither can the production
-        /// daemon at first-run. (On macos-15-intel hosted runners the
-        /// cargo-test binary genuinely lacks the DR; skip there.)
+        /// Capturing the running binary's DR returns a non-empty
+        /// string that round-trips through `SecRequirement::from_str`.
+        ///
+        /// This is the load-bearing TOFU path. After Story 7.23's
+        /// switch to `SecCodeCopyDesignatedRequirement`, this works
+        /// on every macOS host where the binary is at least
+        /// adhoc-signed; on hosts where the cargo-test binary is
+        /// genuinely unsigned (macos-15-intel hosted runners), the
+        /// API correctly returns `Unsigned` and the test skips.
         #[test]
         fn capture_self_dr_returns_nonempty_parseable_string() {
-            let Some(dr) = capture_or_skip("capture_self_dr_returns_nonempty_parseable_string")
-            else {
-                return;
-            };
+            let Some(dr) = capture_or_skip_if_unsigned() else { return };
             assert!(!dr.is_empty(), "DR string must be non-empty");
             // Round-trip: the captured DR string must parse as a valid
             // SecRequirement. If this fails, our captured string is
@@ -754,24 +829,26 @@ mod macos_impl {
         /// succeeds. This is the steady-state recovery success path.
         #[test]
         fn verify_self_against_own_dr_succeeds() {
-            let Some(dr) = capture_or_skip("verify_self_against_own_dr_succeeds") else {
-                return;
-            };
+            let Some(dr) = capture_or_skip_if_unsigned() else { return };
             verify_self_against(&dr).expect(
                 "the running binary should verify successfully against its own captured DR",
             );
         }
 
-        /// Verifying against a DR that doesn't match must REJECT the
-        /// running binary. The expected error code on properly-codesigned
-        /// hosts (dev hardware + macos-14 hosted runners) is
-        /// `RequirementMismatch`. On hosts where the test process has
-        /// no codesign info at all (observed on macos-15-intel hosted
-        /// runners where `SecCodeCopySigningInformation` returns no
-        /// `kSecCodeInfoDesignatedRequirement`), `check_validity`
-        /// returns `errSecCSUnsigned` instead — also a rejection,
-        /// distinct error code, but the test's load-bearing assertion
-        /// ("rejected, not auto-recovered") holds. Accept either path.
+        /// Verifying against a DR that doesn't match returns either
+        /// `RequirementMismatch` (signed host) or `Unsigned` (genuinely
+        /// unsigned host — observed on macos-15-intel hosted runners
+        /// where the cargo-test binary has no signature at all). Both
+        /// outcomes prove the load-bearing assertion ("rejected, not
+        /// auto-recovered"); the host-divergence is environmental,
+        /// not a bug.
+        ///
+        /// On signed hosts: `verify_self_against` parses the bogus DR
+        /// → `check_validity` returns `errSecCSReqFailed` →
+        /// `RequirementMismatch`.
+        ///
+        /// On unsigned hosts: `verify_self_against` parses the bogus DR
+        /// → `check_validity` returns `errSecCSUnsigned` → `Unsigned`.
         #[test]
         fn verify_against_mismatched_dr_returns_requirement_mismatch() {
             // A clearly-different identifier the running binary cannot match.
@@ -785,16 +862,15 @@ mod macos_impl {
                     );
                 }
                 CodesignError::Unsigned => {
-                    // Hosted macos-15-intel runner: test binary has no
-                    // codesign info, so verification surfaces as
-                    // Unsigned. Still a rejection (the load-bearing
-                    // contract). No `stored_dr_preview` to assert on.
                     eprintln!(
                         "verify_against_mismatched_dr: surfaced as Unsigned \
-                         (typical on hosted macos-15-intel CI runners)"
+                         (cargo-test binary on this host is genuinely unsigned, \
+                         typical on hosted macos-15-intel runners)"
                     );
                 }
-                other => panic!("expected RequirementMismatch or Unsigned, got {other:?}"),
+                other => {
+                    panic!("expected RequirementMismatch or Unsigned, got {other:?}")
+                }
             }
         }
 
