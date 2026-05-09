@@ -794,9 +794,7 @@ mod macos_impl {
                          (typical on hosted macos-15-intel CI runners)"
                     );
                 }
-                other => panic!(
-                    "expected RequirementMismatch or Unsigned, got {other:?}"
-                ),
+                other => panic!("expected RequirementMismatch or Unsigned, got {other:?}"),
             }
         }
 
