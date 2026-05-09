@@ -456,6 +456,61 @@ impl AgentIdentityStore for AgentIdentityFsStore {
         Ok(true)
     }
 
+    async fn update_lookup_key_only(
+        &self,
+        name: &str,
+        new_lookup_key_hex: String,
+    ) -> Result<bool, StoreError> {
+        // Story 7.22 auto-recovery rotation. Reads the current on-disk
+        // record and rewrites ONLY `lookup_key_hex`; every other field —
+        // including `token_hash` — is preserved verbatim. Same atomic-
+        // write discipline as `put`, `touch_last_seen`,
+        // `update_policy`, and `update_lookup_key_and_token`.
+        //
+        // Bearer-token immutability across master-key rotation is the
+        // load-bearing UX invariant of auto-recovery: operators with
+        // MCP-client configs would all break if recovery silently re-
+        // minted tokens after every brew upgrade. Operator-driven
+        // rotation (the existing two-field method) DOES re-mint tokens
+        // because that's its intentional contract.
+        if validate_agent_name(name).is_err() {
+            return Err(StoreError::InvalidAgentName { input: name.to_owned() });
+        }
+
+        // Per-name lock makes get-then-write atomic against concurrent
+        // put / remove / update_policy / update_lookup_key_and_token /
+        // touch_last_seen on the same name.
+        let lock = self.name_lock_for(name);
+        let _name_lock = lock.lock().await;
+
+        let current = match self.get(name).await? {
+            Some(c) => c,
+            // Agent went away between AutoRecover's enumeration and
+            // the rewrite — treat as "nothing to update". The
+            // rotation's Phase E loop tolerates Ok(false) and moves on.
+            None => return Ok(false),
+        };
+
+        // Re-construct the identity with the new lookup-key.
+        // `AgentIdentity::new` re-validates `name` (defense in depth).
+        // `token_hash` is passed through unchanged.
+        let updated = AgentIdentity::new(
+            current.name().to_owned(),
+            current.policy_name.clone(),
+            current.token_hash.clone(),
+            new_lookup_key_hex,
+            current.created_at,
+            current.last_seen_at,
+        )
+        .map_err(|e| StoreError::AgentSerializationFailed {
+            reason: format!("identity reconstruction failed during auto-recovery: {e}"),
+            source: Some(Box::new(e)),
+        })?;
+
+        self.write_atomic(&updated).await?;
+        Ok(true)
+    }
+
     async fn update_policy(&self, name: &str, new_policy_name: String) -> Result<bool, StoreError> {
         // Story 7.11. Reads the current on-disk record and rewrites
         // ONLY `policy_name`; every other field — including the token-

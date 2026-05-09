@@ -25,12 +25,44 @@ use permitlayer_core::agent::{
 };
 use permitlayer_core::store::fs::{AgentIdentityFsStore, CredentialFsStore};
 use permitlayer_core::store::{AgentIdentityStore, CredentialStore};
-use permitlayer_keystore::KeyStore;
+use permitlayer_keystore::{KeyStore, MASTER_KEY_LEN};
 use permitlayer_vault::{MasterKey, Vault, reseal};
 use zeroize::Zeroizing;
 
 use super::marker::{self, KeystorePhase, RotationStateMarker};
 use super::{exit3, exit4, exit5, step_glyphs};
+
+/// Story 7.22: which caller is driving this rotation.
+///
+/// The phases A→D, F are identical for both. The difference is in
+/// Phase E (agent registry) and Phase E.5 (token-output file):
+///
+/// - **Operator**: invoked by `agentsso rotate-key`. Phase E mints
+///   fresh `agt_v2_*` bearer tokens and Phase E.5 persists them to
+///   `<home>/rotate-key-output.<pid>` for the operator to copy into
+///   their MCP-client configs. Phase G banner points at the file.
+/// - **AutoRecover**: invoked by `start.rs::handle_acl_break_recovery`
+///   after the codesign Designated Requirement has been verified
+///   against the persisted trust anchor. Phase E recomputes each
+///   agent's HMAC lookup-key off the new master subkey via the
+///   sibling [`AgentIdentityStore::update_lookup_key_only`] method,
+///   leaving every operator's `token_hash` byte-identical. Phase E.5
+///   writes nothing — operators with existing MCP-client configs
+///   continue to authenticate with their existing bearer tokens
+///   across the binary swap. Phase G additionally re-captures the
+///   trust anchor under `SecCodeCopySelf` (Codex Finding 5) so a
+///   subsequent rc.17→rc.18 upgrade verifies against the binary that
+///   actually completed the rotation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub(crate) enum RotationMode {
+    /// `agentsso rotate-key` driven — operator-visible, mints fresh
+    /// bearer tokens.
+    Operator,
+    /// Story 7.22 boot-time keychain-ACL-break recovery — silent,
+    /// preserves bearer tokens across the rekey.
+    AutoRecover,
+}
 
 /// Crash-injection seam: the boundary at which the rotation aborts
 /// when the env var `AGENTSSO_TEST_ROTATE_CRASH_AT_PHASE` is set to
@@ -58,14 +90,25 @@ fn maybe_inject_crash(phase: &str) {
 #[inline(always)]
 fn maybe_inject_crash(_phase: &str) {}
 
-/// Run the Phase A→G rotation. Caller has already verified daemon is
-/// stopped, brew-services not managing, keystore is native, and the
-/// confirmation prompt passed (or `--yes`).
+/// Run the Phase A→G rotation. For [`RotationMode::Operator`] the
+/// caller has already verified daemon is stopped, brew-services not
+/// managing, keystore is native, and the confirmation prompt passed
+/// (or `--yes`). For [`RotationMode::AutoRecover`] the caller is
+/// `start.rs::handle_acl_break_recovery`, which has just verified
+/// the running binary's codesign Designated Requirement against the
+/// persisted trust anchor.
+///
+/// On success, returns the freshly-minted master key bytes — the
+/// AutoRecover caller threads these into the rest of daemon boot
+/// (so the post-rekey daemon starts using the new key without a
+/// second keystore round-trip). The Operator caller binds to `_`
+/// and discards (rotate-key is a CLI; the daemon is stopped).
 pub(crate) async fn run_rotation(
     home: &Path,
     keystore: &dyn KeyStore,
     started: Instant,
-) -> Result<()> {
+    mode: RotationMode,
+) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>> {
     let g = step_glyphs();
     let vault_dir = home.join("vault");
     let store = CredentialFsStore::new(home.to_path_buf())
@@ -318,10 +361,37 @@ pub(crate) async fn run_rotation(
                 );
             }
             drop(vault_lock);
-            println!(
-                "rotate-key: previous rotation was already complete (orphan marker cleaned up)"
-            );
-            return Ok(());
+            // Story 7.22: AutoRecover hitting this path means a prior
+            // boot's rotation Phase F committed but the marker delete
+            // crashed; the daemon's master key in the keystore IS the
+            // new key. The operator-driven path normally also reads
+            // the current key here, but for the operator's CLI the
+            // post-cleanup key isn't load-bearing (the daemon is
+            // stopped). Re-fetch from the keystore so the AutoRecover
+            // caller can continue boot under the live key.
+            match keystore.master_key().await {
+                Ok(k) => {
+                    if matches!(mode, RotationMode::Operator) {
+                        println!(
+                            "rotate-key: previous rotation was already complete \
+                             (orphan marker cleaned up)"
+                        );
+                    }
+                    return Ok(k);
+                }
+                Err(e) => {
+                    // AutoRecover here is a deep edge case (keystore
+                    // -25308 fired AND a prior rotation was committed).
+                    // The current binary cannot read the post-rotation
+                    // key — operator must manually recover.
+                    tracing::error!(
+                        error = %e,
+                        "rotate-key: orphan-marker cleanup found committed rotation, \
+                         but keystore.master_key() also failed; manual recovery required"
+                    );
+                    return Err(exit5());
+                }
+            }
         }
     };
 
@@ -344,6 +414,12 @@ pub(crate) async fn run_rotation(
     // Build the old/new Vault wrappers used by `reseal`. From this
     // point until Phase F's clear, every crash is recoverable by
     // re-running rotate-key (the previous-slot stays populated).
+    // Story 7.22: clone the new key bytes before consuming them in
+    // `Vault::new` so we can return them to the caller after Phase G.
+    // The AutoRecover caller threads them into the rest of daemon
+    // boot; the Operator caller discards. Clone of `Zeroizing<[u8; 32]>`
+    // is a 32-byte copy.
+    let new_key_bytes_for_return = new_key_bytes.clone();
     let old_vault = Vault::new(old_key_bytes, old_key_id);
     let new_vault = Vault::new(new_key_bytes, new_key_id);
 
@@ -488,6 +564,14 @@ pub(crate) async fn run_rotation(
     // For each agent: if its on-disk `lookup_key_hex` already
     // matches HMAC(new_subkey, name), it was rewritten by a previous
     // (crashed) attempt — skip. Otherwise rebuild.
+    //
+    // Story 7.22: Operator mode mints fresh `agt_v2_*` tokens via
+    // `update_lookup_key_and_token`. AutoRecover mode preserves
+    // existing token hashes byte-for-byte and updates ONLY the
+    // lookup-key via `update_lookup_key_only` — so operators with
+    // MCP-client configs continue to authenticate with their
+    // existing bearer tokens after a brew-upgrade-triggered ACL
+    // break recovery.
     let mut new_tokens: Vec<(String, String)> = Vec::with_capacity(agents.len());
     let mut agents_rerolled_count: u32 = 0;
     for agent in agents {
@@ -500,56 +584,91 @@ pub(crate) async fn run_rotation(
             );
             continue;
         }
-        // Mint a fresh v2 token for this agent.
-        let random = generate_bearer_token_bytes();
-        let new_token = format!("agt_v2_{}_{}", agent.name(), base64_url_no_pad_encode(&random));
-        let new_token_hash = match hash_token(new_token.as_bytes()) {
-            Ok(h) => h,
-            Err(e) => {
-                tracing::error!(
-                    agent_name = %agent.name(),
-                    error = %e,
-                    "Phase E: hash_token failed"
-                );
-                emit_master_key_rotation_failed_audit(
-                    home,
-                    "E",
-                    &format!("hash_token failed for agent '{}': {e}", agent.name()),
-                    "agents-mid-rebuild",
-                )
-                .await;
-                return Err(exit5());
-            }
-        };
         let new_lookup_hex = lookup_key_to_hex(&recomputed);
-        match agent_store
-            .update_lookup_key_and_token(agent.name(), new_lookup_hex, new_token_hash)
-            .await
-        {
-            Ok(true) => {
-                new_tokens.push((agent.name().to_owned(), new_token));
-                agents_rerolled_count += 1;
+        match mode {
+            RotationMode::Operator => {
+                // Mint a fresh v2 token for this agent.
+                let random = generate_bearer_token_bytes();
+                let new_token =
+                    format!("agt_v2_{}_{}", agent.name(), base64_url_no_pad_encode(&random));
+                let new_token_hash = match hash_token(new_token.as_bytes()) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        tracing::error!(
+                            agent_name = %agent.name(),
+                            error = %e,
+                            "Phase E: hash_token failed"
+                        );
+                        emit_master_key_rotation_failed_audit(
+                            home,
+                            "E",
+                            &format!("hash_token failed for agent '{}': {e}", agent.name()),
+                            "agents-mid-rebuild",
+                        )
+                        .await;
+                        return Err(exit5());
+                    }
+                };
+                match agent_store
+                    .update_lookup_key_and_token(agent.name(), new_lookup_hex, new_token_hash)
+                    .await
+                {
+                    Ok(true) => {
+                        new_tokens.push((agent.name().to_owned(), new_token));
+                        agents_rerolled_count += 1;
+                    }
+                    Ok(false) => {
+                        tracing::warn!(
+                            agent_name = %agent.name(),
+                            "Phase E: agent vanished between list and update; skipping"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            agent_name = %agent.name(),
+                            error = %e,
+                            "Phase E: agent rewrite failed"
+                        );
+                        emit_master_key_rotation_failed_audit(
+                            home,
+                            "E",
+                            &format!("update_lookup_key_and_token('{}') failed: {e}", agent.name()),
+                            "agents-mid-rebuild",
+                        )
+                        .await;
+                        return Err(exit5());
+                    }
+                }
             }
-            Ok(false) => {
-                tracing::warn!(
-                    agent_name = %agent.name(),
-                    "Phase E: agent vanished between list and update; skipping"
-                );
-            }
-            Err(e) => {
-                tracing::error!(
-                    agent_name = %agent.name(),
-                    error = %e,
-                    "Phase E: agent rewrite failed"
-                );
-                emit_master_key_rotation_failed_audit(
-                    home,
-                    "E",
-                    &format!("update_lookup_key_and_token('{}') failed: {e}", agent.name()),
-                    "agents-mid-rebuild",
-                )
-                .await;
-                return Err(exit5());
+            RotationMode::AutoRecover => {
+                // Story 7.22: lookup-key only — token preserved.
+                match agent_store.update_lookup_key_only(agent.name(), new_lookup_hex).await {
+                    Ok(true) => {
+                        agents_rerolled_count += 1;
+                    }
+                    Ok(false) => {
+                        tracing::warn!(
+                            agent_name = %agent.name(),
+                            "Phase E (AutoRecover): agent vanished between list and update; \
+                             skipping"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::error!(
+                            agent_name = %agent.name(),
+                            error = %e,
+                            "Phase E (AutoRecover): agent lookup-key rewrite failed"
+                        );
+                        emit_master_key_rotation_failed_audit(
+                            home,
+                            "E",
+                            &format!("update_lookup_key_only('{}') failed: {e}", agent.name()),
+                            "agents-mid-rebuild",
+                        )
+                        .await;
+                        return Err(exit5());
+                    }
+                }
             }
         }
     }
@@ -570,7 +689,10 @@ pub(crate) async fn run_rotation(
     // (mode 0o600) BEFORE Phase F. On success: print and delete the
     // file in Phase G. On Phase F failure: leave the file so the
     // operator can `cat` it after the retry succeeds.
-    let tokens_path = if !new_tokens.is_empty() {
+    //
+    // Story 7.22: AutoRecover mode does NOT mint new tokens, so
+    // there's nothing to persist. Skip the file write entirely.
+    let tokens_path = if matches!(mode, RotationMode::Operator) && !new_tokens.is_empty() {
         let path = home.join(format!("rotate-key-output.{}", std::process::id()));
         if let Err(e) = write_tokens_file(&path, &new_tokens) {
             tracing::error!(
@@ -633,8 +755,58 @@ pub(crate) async fn run_rotation(
     }
 
     // ── Phase G: audit + cleanup ───────────────────────────────────
+    //
+    // Story 7.22 Codex Finding 5: under AutoRecover, re-capture the
+    // running binary's Designated Requirement and overwrite the
+    // persisted trust anchor BEFORE we drop the vault lock and emit
+    // the audit event. This handles the rc.17→crash→rc.18 corner: if
+    // a future binary upgrade lands AFTER auto-rekey completes, the
+    // anchor reflects the binary that actually completed the
+    // rotation, so the next ACL break verifies cleanly (or fails
+    // cleanly with a structured AclBreakDrMismatch instead of
+    // stranding the operator with a half-rotated keystore).
+    //
+    // We re-capture BEFORE dropping the vault lock and emitting the
+    // audit event. (The marker file was already finalized after
+    // Phase F, above.) The re-capture happens within the vault-lock
+    // window so a concurrent rotate-key attempt cannot race with it.
+    // Re-capture failure is a warning, not a blocker — the rotation
+    // is already committed at the keystore level.
+    #[cfg(target_os = "macos")]
+    if matches!(mode, RotationMode::AutoRecover) {
+        match permitlayer_keystore::capture_self_designated_requirement() {
+            Ok(dr) => match permitlayer_keystore::write_trust_anchor_force(home, &dr) {
+                Ok(()) => {
+                    tracing::info!(
+                        "Phase G (AutoRecover): refreshed codesign trust anchor under \
+                         the binary that completed the rotation"
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        "Phase G (AutoRecover): failed to refresh codesign trust anchor \
+                         (rotation already committed; future binary swaps may require \
+                         manual re-trust)"
+                    );
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "Phase G (AutoRecover): failed to re-capture codesign DR for trust \
+                     anchor refresh (rotation already committed)"
+                );
+            }
+        }
+    }
+
     drop(vault_lock); // explicit RAII release
     let elapsed_ms = started.elapsed().as_millis() as u64;
+    let trigger = match mode {
+        RotationMode::Operator => "operator",
+        RotationMode::AutoRecover => "acl-break-recovery",
+    };
     emit_master_key_rotated_audit(
         home,
         &old_keyid,
@@ -643,49 +815,70 @@ pub(crate) async fn run_rotation(
         agents_rerolled_count,
         elapsed_ms,
         tokens_path.as_deref(),
+        trigger,
     )
     .await;
 
-    println!();
-    println!(
-        "{} master key rotated  {} {} → {} ({} entries, {} agents rerolled, {}ms)",
-        g.arrow,
-        g.check,
-        old_keyid,
-        new_keyid,
-        vault_reseal_count,
-        agents_rerolled_count,
-        elapsed_ms
-    );
+    // Story 7.22: stdout output is operator-driven only. AutoRecover
+    // is a silent boot-path operation (the daemon is in the middle
+    // of starting up — there's no operator at a TTY watching).
+    if matches!(mode, RotationMode::Operator) {
+        println!();
+        println!(
+            "{} master key rotated  {} {} → {} ({} entries, {} agents rerolled, {}ms)",
+            g.arrow,
+            g.check,
+            old_keyid,
+            new_keyid,
+            vault_reseal_count,
+            agents_rerolled_count,
+            elapsed_ms
+        );
 
-    // Story 7.6b round-1 review (re-triage 2026-04-28): plaintext
-    // tokens are NEVER printed to stdout. Terminal scrollback,
-    // multiplexer scrollback (tmux/screen/zellij), shell history,
-    // process accounting, screen recording, screen sharing, CI log
-    // capture, and operator-uploaded screenshots are all out of our
-    // control. The mode-0o600 file written at Phase E.5 is the
-    // ONLY plaintext-bearing surface; Phase G points the operator
-    // at it and instructs them to read+remove it manually.
-    if let Some(ref path) = tokens_path {
+        // Story 7.6b round-1 review (re-triage 2026-04-28): plaintext
+        // tokens are NEVER printed to stdout. Terminal scrollback,
+        // multiplexer scrollback (tmux/screen/zellij), shell history,
+        // process accounting, screen recording, screen sharing, CI log
+        // capture, and operator-uploaded screenshots are all out of our
+        // control. The mode-0o600 file written at Phase E.5 is the
+        // ONLY plaintext-bearing surface; Phase G points the operator
+        // at it and instructs them to read+remove it manually.
+        if let Some(ref path) = tokens_path {
+            println!();
+            println!("New agent tokens written to:");
+            println!("  {}", path.display());
+            println!();
+            println!("Read the file (mode 0600), update your agent configs, then `rm` it.");
+            println!("The previous agt_v1_*/agt_v2_* tokens are now invalid.");
+        }
+
+        // The tokens file is intentionally LEFT on disk for the
+        // operator. Removing it from rotate-key would (a) lose the
+        // tokens if the operator's terminal closes before they update
+        // agent configs and (b) require us to print plaintext tokens to
+        // stdout to compensate, which is the very thing we just stopped
+        // doing. The file is mode 0o600 and the operator removes it
+        // manually after saving the tokens.
+
         println!();
-        println!("New agent tokens written to:");
-        println!("  {}", path.display());
-        println!();
-        println!("Read the file (mode 0600), update your agent configs, then `rm` it.");
-        println!("The previous agt_v1_*/agt_v2_* tokens are now invalid.");
+        println!("  next: agentsso start    # bring the daemon back up");
+    } else {
+        tracing::info!(
+            old_keyid = %old_keyid,
+            new_keyid = %new_keyid,
+            vault_reseal_count,
+            agents_rerolled_count,
+            elapsed_ms,
+            "AutoRecover rotation complete"
+        );
     }
 
-    // The tokens file is intentionally LEFT on disk for the
-    // operator. Removing it from rotate-key would (a) lose the
-    // tokens if the operator's terminal closes before they update
-    // agent configs and (b) require us to print plaintext tokens to
-    // stdout to compensate, which is the very thing we just stopped
-    // doing. The file is mode 0o600 and the operator removes it
-    // manually after saving the tokens.
-
-    println!();
-    println!("  next: agentsso start    # bring the daemon back up");
-    Ok(())
+    // Story 7.22: hand the new master key bytes back to the caller.
+    // The Operator caller (rotate-key CLI) discards (the daemon is
+    // stopped during rotate-key by precondition, so the live key
+    // doesn't matter for that flow). The AutoRecover caller threads
+    // these bytes into the rest of daemon boot.
+    Ok(new_key_bytes_for_return)
 }
 
 /// Story 7.6b round-1 review (Decision 1+2): begin a fresh rotation
@@ -1360,6 +1553,7 @@ fn derive_agent_lookup_subkey(master_key: &[u8; 32]) -> Result<Zeroizing<[u8; LO
 /// the daemon subkey derivation) — was `"OsRng"` in Story 7.6, which
 /// was a misnomer (round-1 P10 fix). `agents_invalidated` renamed to
 /// `agents_rerolled_count` to reflect Q4-A semantics.
+#[allow(clippy::too_many_arguments)]
 async fn emit_master_key_rotated_audit(
     home: &Path,
     old_keyid: &str,
@@ -1368,6 +1562,7 @@ async fn emit_master_key_rotated_audit(
     agents_rerolled_count: u32,
     elapsed_ms: u64,
     tokens_path: Option<&Path>,
+    trigger: &str,
 ) {
     use permitlayer_core::audit::event::AuditEvent;
     use permitlayer_core::scrub::{ScrubEngine, builtin_rules};
@@ -1413,6 +1608,10 @@ async fn emit_master_key_rotated_audit(
         "agents_rerolled_count": agents_rerolled_count,
         "elapsed_ms": elapsed_ms,
         "tokens_path": tokens_path.map(|p| p.display().to_string()),
+        // Story 7.22: distinguishes operator-driven rotation from
+        // boot-time auto-recovery. Forensic reviewers can correlate
+        // a rotation with the reason it ran.
+        "trigger": trigger,
     });
 
     if let Err(e) = store.append(event).await {
@@ -1652,7 +1851,7 @@ mod tests {
         let (home, old_key, _agent_names) = seed_home(2, 3).await;
         let keystore = MockKeyStore::with_primary(old_key);
 
-        run_rotation(home.path(), &keystore, Instant::now()).await.unwrap();
+        run_rotation(home.path(), &keystore, Instant::now(), RotationMode::Operator).await.unwrap();
 
         // Assert primary slot changed; previous slot cleared.
         let primary = keystore.primary.lock().unwrap();
@@ -1728,7 +1927,7 @@ mod tests {
             previous: Mutex::new(Some(old_key)),
         };
 
-        run_rotation(home.path(), &keystore, Instant::now()).await.unwrap();
+        run_rotation(home.path(), &keystore, Instant::now(), RotationMode::Operator).await.unwrap();
 
         // Both envelopes should now be at key_id=1.
         let bytes = std::fs::read(home.path().join("vault").join("old-svc.sealed")).unwrap();
@@ -1762,7 +1961,9 @@ mod tests {
         };
 
         // Note: no marker::begin call.
-        let err = run_rotation(home.path(), &keystore, Instant::now()).await.unwrap_err();
+        let err = run_rotation(home.path(), &keystore, Instant::now(), RotationMode::Operator)
+            .await
+            .unwrap_err();
         // The error chain is `cli error already printed` (SilentCliError)
         // wrapping `RotateKeyExitCode5`. Verify the inner type via
         // chain inspection.
@@ -1791,7 +1992,9 @@ mod tests {
         let old_key = [0x42u8; MASTER_KEY_LEN];
         let keystore = MockKeyStore::with_primary(old_key);
 
-        let err = run_rotation(home.path(), &keystore, Instant::now()).await.unwrap_err();
+        let err = run_rotation(home.path(), &keystore, Instant::now(), RotationMode::Operator)
+            .await
+            .unwrap_err();
         let downcast = err
             .chain()
             .find_map(|e| e.downcast_ref::<crate::cli::rotate_key::RotateKeyExitCode5>());
@@ -1820,7 +2023,9 @@ mod tests {
             previous: Mutex::new(Some(old_key)),
         };
 
-        let err = run_rotation(home.path(), &keystore, Instant::now()).await.unwrap_err();
+        let err = run_rotation(home.path(), &keystore, Instant::now(), RotationMode::Operator)
+            .await
+            .unwrap_err();
         let downcast = err
             .chain()
             .find_map(|e| e.downcast_ref::<crate::cli::rotate_key::RotateKeyExitCode5>());
@@ -1878,7 +2083,7 @@ mod tests {
             previous: Mutex::new(Some(old_key)),
         };
 
-        run_rotation(home.path(), &keystore, Instant::now()).await.unwrap();
+        run_rotation(home.path(), &keystore, Instant::now(), RotationMode::Operator).await.unwrap();
 
         // svc-old must be at key_id=1 (resealed).
         let bytes = std::fs::read(home.path().join("vault").join("svc-old.sealed")).unwrap();
@@ -1925,7 +2130,7 @@ mod tests {
         // not be caught by an empty Phase D.
         let (home, old_key, agent_names) = seed_home(1, 1).await;
         let keystore = MockKeyStore::with_primary(old_key);
-        run_rotation(home.path(), &keystore, Instant::now()).await.unwrap();
+        run_rotation(home.path(), &keystore, Instant::now(), RotationMode::Operator).await.unwrap();
 
         // (a) the rotate-key-output file is on disk after Phase G.
         let leftover: Vec<String> = std::fs::read_dir(home.path())
@@ -1982,7 +2187,7 @@ mod tests {
         // rotation — proves the AEAD round-trip survives.
         let (home, old_key, _) = seed_home(0, 1).await;
         let keystore = MockKeyStore::with_primary(old_key);
-        run_rotation(home.path(), &keystore, Instant::now()).await.unwrap();
+        run_rotation(home.path(), &keystore, Instant::now(), RotationMode::Operator).await.unwrap();
 
         let new_master = *keystore.primary.lock().unwrap().as_ref().unwrap();
         let store = CredentialFsStore::new(home.path().to_path_buf()).unwrap();
@@ -2056,7 +2261,9 @@ mod tests {
             previous: Mutex::new(Some(old_key)),
         };
 
-        let err = run_rotation(home.path(), &keystore, Instant::now()).await.unwrap_err();
+        let err = run_rotation(home.path(), &keystore, Instant::now(), RotationMode::Operator)
+            .await
+            .unwrap_err();
         let downcast = err
             .chain()
             .find_map(|e| e.downcast_ref::<crate::cli::rotate_key::RotateKeyExitCode5>());
@@ -2105,7 +2312,9 @@ mod tests {
         .unwrap();
 
         let keystore = MockKeyStore::with_primary(old_key);
-        let err = run_rotation(home.path(), &keystore, Instant::now()).await.unwrap_err();
+        let err = run_rotation(home.path(), &keystore, Instant::now(), RotationMode::Operator)
+            .await
+            .unwrap_err();
         let downcast = err
             .chain()
             .find_map(|e| e.downcast_ref::<crate::cli::rotate_key::RotateKeyExitCode4>());
@@ -2129,7 +2338,7 @@ mod tests {
         // forward-progress's Phase F runs only AFTER Phase E.
         let (home, old_key, _) = seed_home(1, 1).await;
         let keystore = MockKeyStore::with_primary(old_key);
-        run_rotation(home.path(), &keystore, Instant::now()).await.unwrap();
+        run_rotation(home.path(), &keystore, Instant::now(), RotationMode::Operator).await.unwrap();
 
         assert!(
             keystore.previous.lock().unwrap().is_none(),
@@ -2155,7 +2364,9 @@ mod tests {
             permitlayer_core::VaultLock::try_acquire(home.path()).expect("test holds the lock");
 
         let keystore = MockKeyStore::with_primary(old_key);
-        let err = run_rotation(home.path(), &keystore, Instant::now()).await.unwrap_err();
+        let err = run_rotation(home.path(), &keystore, Instant::now(), RotationMode::Operator)
+            .await
+            .unwrap_err();
         let downcast = err
             .chain()
             .find_map(|e| e.downcast_ref::<crate::cli::rotate_key::RotateKeyExitCode3>());
@@ -2163,5 +2374,195 @@ mod tests {
             downcast.is_some(),
             "rotate-key must surface RotateKeyExitCode3 when VaultLock is held by another process"
         );
+    }
+
+    // ── Story 7.22 RotationMode::AutoRecover unit tests ─────────────
+
+    /// Story 7.22 Task 4.3e: AutoRecover preserves bearer-token hashes
+    /// byte-for-byte. The agent's `lookup_key_hex` is updated under
+    /// the new daemon subkey, but `token_hash` is unchanged.
+    /// Operators with existing MCP-client configs continue to
+    /// authenticate after a brew-upgrade-triggered ACL break recovery.
+    #[tokio::test]
+    async fn auto_recover_preserves_bearer_token_hash() {
+        let (home, old_key, agent_names) = seed_home(2, 1).await;
+        let keystore = MockKeyStore::with_primary(old_key);
+
+        // Snapshot pre-rotation token hashes.
+        let agent_store = AgentIdentityFsStore::new(home.path().to_path_buf()).unwrap();
+        let pre_hashes: Vec<(String, String)> = {
+            let mut v = Vec::new();
+            for name in &agent_names {
+                let agent = agent_store.get(name).await.unwrap().unwrap();
+                v.push((name.clone(), agent.token_hash.clone()));
+            }
+            v
+        };
+
+        // Run AutoRecover.
+        run_rotation(home.path(), &keystore, Instant::now(), RotationMode::AutoRecover)
+            .await
+            .unwrap();
+
+        // Assert: every agent's token_hash is byte-equal post-rotation.
+        for (name, pre_hash) in &pre_hashes {
+            let agent = agent_store.get(name).await.unwrap().unwrap();
+            assert_eq!(
+                &agent.token_hash, pre_hash,
+                "AutoRecover MUST preserve token_hash for agent '{name}' \
+                 (existing bearer tokens stay valid across the rekey)"
+            );
+        }
+
+        // Sanity: lookup_key_hex IS updated under the new subkey.
+        let new_primary = keystore.primary.lock().unwrap().unwrap();
+        let new_subkey = derive_agent_lookup_subkey(&new_primary).unwrap();
+        for name in &agent_names {
+            let agent = agent_store.get(name).await.unwrap().unwrap();
+            let recomputed = compute_lookup_key(&new_subkey, name.as_bytes());
+            let stored = lookup_key_from_hex(&agent.lookup_key_hex);
+            assert_eq!(
+                stored,
+                Some(recomputed),
+                "AutoRecover MUST update lookup_key_hex to match the new daemon subkey"
+            );
+        }
+    }
+
+    /// Story 7.22 Task 4.7: AutoRecover does not write a token-output
+    /// file. The Operator path persists `<home>/rotate-key-output.<pid>`
+    /// for the operator to copy fresh tokens; AutoRecover has no
+    /// new tokens to persist.
+    #[tokio::test]
+    async fn auto_recover_mode_skips_token_output_file() {
+        let (home, old_key, _) = seed_home(2, 1).await;
+        let keystore = MockKeyStore::with_primary(old_key);
+
+        run_rotation(home.path(), &keystore, Instant::now(), RotationMode::AutoRecover)
+            .await
+            .unwrap();
+
+        // Assert: no rotate-key-output.* file was written under home.
+        let any_token_file = std::fs::read_dir(home.path()).unwrap().any(|e| {
+            let entry = e.unwrap();
+            entry.file_name().to_string_lossy().starts_with("rotate-key-output.")
+        });
+        assert!(
+            !any_token_file,
+            "AutoRecover MUST NOT write a rotate-key-output.<pid> file (no fresh tokens to persist)"
+        );
+    }
+
+    /// Story 7.22 Task 4.6: cross-mode comparison — Operator changes
+    /// `token_hash` (mints a fresh bearer token), AutoRecover does
+    /// NOT (preserves operator-held tokens across the rekey). Both
+    /// modes update `lookup_key_hex`. This is the structural
+    /// invariant pinned by the dedicated `update_lookup_key_only`
+    /// method on `AgentIdentityStore`.
+    ///
+    /// We can't compare token_hash strings across two `seed_home()`
+    /// invocations (Argon2id uses a random salt, so the same
+    /// plaintext token hashes to different strings). Instead, snapshot
+    /// each home's pre-rotation hash and assert change/no-change
+    /// against its own snapshot.
+    #[tokio::test]
+    async fn auto_recover_mode_skips_phase_e_token_remint() {
+        let (home_op, old_key_op, names_op) = seed_home(1, 1).await;
+        let (home_auto, old_key_auto, names_auto) = seed_home(1, 1).await;
+        let name = &names_op[0];
+        assert_eq!(names_op, names_auto);
+
+        let agent_store_op = AgentIdentityFsStore::new(home_op.path().to_path_buf()).unwrap();
+        let agent_store_auto = AgentIdentityFsStore::new(home_auto.path().to_path_buf()).unwrap();
+
+        let pre_op = agent_store_op.get(name).await.unwrap().unwrap();
+        let pre_auto = agent_store_auto.get(name).await.unwrap().unwrap();
+
+        let keystore_op = MockKeyStore::with_primary(old_key_op);
+        let keystore_auto = MockKeyStore::with_primary(old_key_auto);
+        run_rotation(home_op.path(), &keystore_op, Instant::now(), RotationMode::Operator)
+            .await
+            .unwrap();
+        run_rotation(home_auto.path(), &keystore_auto, Instant::now(), RotationMode::AutoRecover)
+            .await
+            .unwrap();
+
+        let post_op = agent_store_op.get(name).await.unwrap().unwrap();
+        let post_auto = agent_store_auto.get(name).await.unwrap().unwrap();
+
+        assert_ne!(
+            post_op.token_hash, pre_op.token_hash,
+            "Operator mode MUST mint a fresh bearer token (token_hash changes)"
+        );
+        assert_eq!(
+            post_auto.token_hash, pre_auto.token_hash,
+            "AutoRecover mode MUST preserve token_hash byte-for-byte"
+        );
+        // Both updated lookup_key_hex.
+        assert_ne!(post_op.lookup_key_hex, pre_op.lookup_key_hex);
+        assert_ne!(post_auto.lookup_key_hex, pre_auto.lookup_key_hex);
+    }
+
+    /// Story 7.22 Codex Finding 5 / Task 4.6: AutoRecover Phase G
+    /// re-captures the running binary's Designated Requirement and
+    /// overwrites `<home>/keystore/codesign-trust-anchor.req` with
+    /// it. Defends against the rc.17→crash→rc.18 corner where a
+    /// future binary upgrade would otherwise verify against the
+    /// older anchor.
+    ///
+    /// macOS-only: the trust-anchor is captured via SecCodeCopySelf,
+    /// which is macOS-specific. On other platforms the re-capture
+    /// step is a no-op (gated by `cfg(target_os = "macos")`).
+    #[cfg(target_os = "macos")]
+    #[tokio::test]
+    async fn auto_recover_phase_g_overwrites_trust_anchor() {
+        use permitlayer_keystore::{read_trust_anchor, write_trust_anchor};
+
+        // Pre-flight: this test depends on the test process having a
+        // capturable codesign DR. On hosted macos-15-intel runners
+        // `SecCodeCopySigningInformation` returns no
+        // `kSecCodeInfoDesignatedRequirement` for cargo-test binaries,
+        // so Phase G's `capture_self_designated_requirement` fails and
+        // (per the production warning-not-blocker contract) the
+        // anchor is left in place. The test's "MUST overwrite"
+        // assertion can't be satisfied on those hosts; skip
+        // gracefully. Dev hardware + macos-14 hosted runners have a
+        // capturable DR and exercise the assertion end-to-end.
+        if permitlayer_keystore::capture_self_designated_requirement().is_err() {
+            eprintln!(
+                "skipping: test process has no capturable codesign DR \
+                 (typical on hosted macos-15-intel CI runners)"
+            );
+            return;
+        }
+
+        let (home, old_key, _) = seed_home(0, 0).await;
+
+        // Pre-write a "bogus" anchor that we expect Phase G to overwrite.
+        std::fs::create_dir_all(home.path().join("keystore")).unwrap();
+        let bogus_dr = "identifier \"com.bogus.previous-binary-anchor\"";
+        write_trust_anchor(home.path(), bogus_dr).unwrap();
+
+        // Sanity: read-back returns the bogus value pre-rotation.
+        let pre = read_trust_anchor(home.path()).unwrap().unwrap();
+        assert_eq!(pre, bogus_dr);
+
+        // Run AutoRecover.
+        let keystore = MockKeyStore::with_primary(old_key);
+        run_rotation(home.path(), &keystore, Instant::now(), RotationMode::AutoRecover)
+            .await
+            .unwrap();
+
+        // Assert: the anchor is now the running test binary's DR,
+        // NOT the bogus pre-write.
+        let post = read_trust_anchor(home.path()).unwrap().unwrap();
+        assert_ne!(
+            post, bogus_dr,
+            "Phase G under AutoRecover MUST overwrite the trust anchor with the \
+             running binary's DR (defends against rc.17→crash→rc.18 stranding)"
+        );
+        // Sanity: post-rotation anchor matches the running test binary.
+        let captured = permitlayer_keystore::capture_self_designated_requirement().unwrap();
+        assert_eq!(post, captured);
     }
 }

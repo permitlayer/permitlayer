@@ -170,11 +170,27 @@ interaction is not allowed`.
 
 `brew upgrade agentsso` reinstalls the binary with a different codesign
 hash, which invalidates the macOS Keychain ACL on the existing
-master-key entry. Symptom: the next `agentsso start &` logs
-`keychain backend 'apple' is unavailable: User interaction is not allowed.
-(OSStatus -25308)`.
+master-key entry. Symptom on rc.16 and earlier: the next `agentsso
+start &` logs `keychain backend 'apple' is unavailable: User
+interaction is not allowed. (OSStatus -25308)`.
 
-Behavior on rc.12 and later, by context:
+**Behavior on rc.17 and later (Story 7.22):** the daemon auto-detects
+the ACL break, verifies the new binary's codesign Designated
+Requirement against a trust anchor captured on first boot, and atomic-
+rekeys the vault under a freshly-minted master key. The vault, every
+sealed credential, and **every operator-held bearer token** are
+preserved across the rekey — operators don't need to re-run `connect`,
+re-OAuth-consent, or update MCP-client configs. The daemon stays up;
+launchd-managed installs auto-recover with no operator action.
+
+The auto-recovery path activates only when the new binary's codesign
+DR matches the persisted anchor. Mismatches (different signing
+identity, completely-unsigned binary) hard-fail with exit code 7 and
+a structured banner pointing at manual re-trust — this is the security
+gate that prevents an attacker-installed binary from inheriting the
+previous binary's vault.
+
+Behavior on rc.16 and earlier, by context:
 
 - **Interactive terminal (or SSH with TTY)**: the daemon drops to a
   passphrase prompt automatically. Type any passphrase you'll
@@ -183,40 +199,34 @@ Behavior on rc.12 and later, by context:
   remember the choice across restarts. **The fallback's derived key
   cannot unseal credentials sealed under the previous native key**,
   so existing connectors are stale until you re-run `connect`.
-- **launchd-managed contexts (legacy `brew services start agentsso`,
-  Story 7.16's `agentsso autostart enable`) / `ssh -T`**: no
-  controlling terminal. The daemon fails fast with a structured
-  `PassphrasePromptUnavailable` error. The recovery path is one of
-  the manual steps below, run from an interactive shell.
+- **launchd-managed contexts / `ssh -T`**: no controlling terminal.
+  The daemon fails fast with a structured `PassphrasePromptUnavailable`
+  error. The recovery path is the same manual `connect` re-run from
+  an interactive shell.
 
-Two recovery paths after fallback fires (or for the headless case):
+##### One-time crossover from rc.16 → rc.17
 
-1. **(Preferred)** Re-run `agentsso connect gmail --oauth-client ... --agent <name>`
-   under the new master key. Any other configured connectors must be
-   re-connected too. The vault is preserved; only the OAuth seal
-   regenerates.
-2. **(Faster, but loses unrelated state)** Wipe the keychain entry,
-   the passphrase fallback state, and the vault, then let the daemon
-   mint a fresh master key on next boot:
+If you upgrade directly from rc.16 (or earlier) to rc.17 over SSH
+**without a TTY** (no interactive shell on the install), the rc.17
+trust-anchor capture step doesn't run before the next launchd-driven
+boot — there's no captured anchor to verify the new binary against,
+and auto-recovery refuses (exit code 7, `AclBreakNoTrustAnchor`).
+One-time fix:
 
-   ```sh
-   agentsso stop 2>/dev/null
-   security delete-generic-password -s io.permitlayer.master-key -a master
-   rm -rf ~/.agentsso/vault ~/.agentsso/keystore/passphrase.state
-   agentsso start &
-   ```
+```sh
+# From an interactive terminal (TTY-attached):
+agentsso start
+# Engage the passphrase prompt once. rc.17's first-boot capture
+# writes ~/.agentsso/keystore/codesign-trust-anchor.req under your
+# binary's codesign DR. From that point onward, every `brew upgrade`
+# auto-recovers headlessly.
+```
+
+For all subsequent upgrades (rc.17 → rc.18, rc.18 → rc.19, …) the
+auto-recovery path is fully headless.
 
 For diagnostic detail, run with `AGENTSSO_LOG__LEVEL=debug` (the daemon
 does not honor `RUST_LOG`).
-
-> **Known gap (still tracked for v0.4):** headless launchd recovery
-> remains unsolved. Both legacy `brew services start agentsso` (now
-> dropped per Story 7.16) and `agentsso autostart enable` cannot prompt
-> for a passphrase from a non-interactive launchd context, so they
-> still require manual `security` / `agentsso connect` recovery from an
-> interactive shell. Real fix options under consideration:
-> `--passphrase-from-env`, vault rekey on detected ACL break, or keychain
-> partition-list authorization on install.
 
 ### Running the daemon and the agent under different OS users
 

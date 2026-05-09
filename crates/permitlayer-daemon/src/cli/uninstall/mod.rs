@@ -41,7 +41,8 @@ use crate::design::render;
 use crate::design::terminal::ColorSupport;
 use crate::lifecycle::autostart::{self, AutostartError, AutostartStatus, DisableOutcome};
 use permitlayer_keystore::{
-    DeleteOutcome, FallbackMode, KeyStoreError, KeystoreConfig, default_keystore,
+    AclBreakRecoveryMode, DeleteOutcome, FallbackMode, KeyStoreError, KeystoreConfig,
+    default_keystore,
 };
 
 /// Binary-path resolver and `BinaryRemover` abstraction.
@@ -690,6 +691,11 @@ async fn delete_keychain_entry_warn_on_fail(home: &Path) -> StepOutcome {
         // native backend; treat backend-unavailable as warn-and-continue.
         fallback: FallbackMode::None,
         home: home.to_path_buf(),
+        // Story 7.22: explicit `Disabled` so any future change to the
+        // wrapping rules cannot accidentally route uninstall into
+        // boot-only auto-rekey. Uninstall must never auto-rekey — it's
+        // tearing the install down.
+        acl_break_recovery: AclBreakRecoveryMode::Disabled,
     };
     let keystore = match default_keystore(&config) {
         Ok(k) => k,

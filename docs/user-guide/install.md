@@ -61,6 +61,45 @@ brew-services plist still exists at
 `agentsso autostart enable` will migrate it (back up + remove)
 and bootstrap our user-domain plist.
 
+### What happens during a `brew upgrade`
+
+Each `brew upgrade agentsso` swap installs a binary with a different
+codesign hash. macOS treats this as a security-relevant event: the
+new binary's hash no longer matches the keychain ACL on the previous
+binary's master-key entry, so the keychain returns OSStatus -25308
+("User interaction is not allowed") on the next master-key lookup.
+
+**rc.17+ auto-recovers.** On boot the daemon:
+
+1. Detects the -25308.
+2. Reads the persisted codesign trust anchor at
+   `~/.agentsso/keystore/codesign-trust-anchor.req` (captured on
+   first rc.17 boot via macOS's `SecCodeCopySelf`).
+3. Verifies the new binary's Designated Requirement against the
+   stored anchor. If it matches (legitimate publisher upgrade), the
+   daemon proceeds; if it doesn't (different signing identity, or a
+   completely-unsigned binary), it hard-fails with exit code 7 and
+   a structured banner pointing at manual re-trust.
+4. Atomically rekeys the vault under a freshly-minted master key
+   (the same crash-safe state machine as `agentsso rotate-key`):
+   each sealed credential is re-sealed under the new key; each
+   registered agent's `lookup_key_hex` is recomputed under the new
+   daemon subkey.
+5. Re-captures the trust anchor under the running binary's DR (so
+   the next upgrade verifies against THIS binary, not whatever was
+   captured on first boot).
+6. Continues normal boot under the new master key.
+
+**Bearer tokens are preserved across the rekey.** Operators with
+existing MCP-client configs continue to authenticate with their
+existing `agt_v2_*` tokens after the upgrade — the rekey changes
+the master key + lookup-key, not the token itself.
+
+If verification fails (exit code 7, `AclBreakDrMismatch` banner), the
+recovery path is to investigate before removing the trust anchor.
+This is a security-relevant rejection: if the new binary was NOT
+installed by you, do NOT clear the anchor.
+
 ### Uninstalling
 
 ```sh

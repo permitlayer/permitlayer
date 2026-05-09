@@ -515,9 +515,14 @@ async fn refresh_credentials(args: RefreshArgs) -> anyhow::Result<()> {
     // moot because the refusal also fires before vault checks.
 
     // Keystore → master key → vault.
+    // Story 7.22: `acl_break_recovery: Disabled` preserves the
+    // existing passphrase-prompt fallback. Only the daemon boot path
+    // opts into `Auto` — `agentsso credentials refresh` from a TTY
+    // with a broken ACL still gets the passphrase prompt.
     let keystore_config = permitlayer_keystore::KeystoreConfig {
         fallback: permitlayer_keystore::FallbackMode::Auto,
         home: home.clone(),
+        acl_break_recovery: permitlayer_keystore::AclBreakRecoveryMode::Disabled,
     };
     let keystore = match permitlayer_keystore::default_keystore(&keystore_config) {
         Ok(k) => k,

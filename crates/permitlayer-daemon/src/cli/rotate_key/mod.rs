@@ -72,13 +72,15 @@ use clap::Args;
 use crate::cli::silent_cli_error;
 use crate::design::render;
 use crate::design::terminal::ColorSupport;
-use permitlayer_keystore::{FallbackMode, KeyStoreKind, KeystoreConfig, default_keystore};
+use permitlayer_keystore::{
+    AclBreakRecoveryMode, FallbackMode, KeyStoreKind, KeystoreConfig, default_keystore,
+};
 
 pub(crate) mod keystore_clear_previous;
 pub(crate) mod marker;
 mod rotation;
 
-pub(crate) use rotation::run_rotation;
+pub(crate) use rotation::{RotationMode, run_rotation};
 
 // ── Typed exit-code markers (AC #9) ────────────────────────────────
 //
@@ -309,7 +311,17 @@ pub async fn run(args: RotateKeyArgs) -> Result<()> {
     // propagate to the operator banner directly. The
     // `kind() == Passphrase` gate below still applies for users who
     // explicitly configured `[keystore].fallback = "passphrase"`.
-    let keystore_config = KeystoreConfig { fallback: FallbackMode::None, home: home.clone() };
+    // Story 7.22: rotate-key uses `FallbackMode::None` so the
+    // wrapper isn't installed at all — `acl_break_recovery` is
+    // structurally unreachable for this call site, but we set it
+    // explicitly to `Disabled` anyway so any future change to
+    // `default_keystore`'s wrapping rules cannot accidentally promote
+    // this site into the boot-only auto-rekey path.
+    let keystore_config = KeystoreConfig {
+        fallback: FallbackMode::None,
+        home: home.clone(),
+        acl_break_recovery: AclBreakRecoveryMode::Disabled,
+    };
     let keystore = if let Some(test_ks) = test_file_keystore {
         test_ks
     } else {
@@ -367,7 +379,12 @@ pub async fn run(args: RotateKeyArgs) -> Result<()> {
 
     // ── Run the rotation ───────────────────────────────────────────
     let started = Instant::now();
-    run_rotation(&home, keystore.as_ref(), started).await
+    // Story 7.22: operator-driven rotate-key uses RotationMode::Operator;
+    // the returned new master key is unused (the daemon is stopped during
+    // rotate-key by precondition). The AutoRecover variant is invoked from
+    // start.rs::handle_acl_break_recovery → cli::auto_rekey::run.
+    run_rotation(&home, keystore.as_ref(), started, RotationMode::Operator).await?;
+    Ok(())
 }
 
 /// Build the manifest block printed before the confirmation prompt

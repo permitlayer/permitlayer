@@ -39,7 +39,7 @@
 
 use anyhow::Result;
 use clap::Args;
-use permitlayer_keystore::{FallbackMode, KeystoreConfig, default_keystore};
+use permitlayer_keystore::{AclBreakRecoveryMode, FallbackMode, KeystoreConfig, default_keystore};
 
 use crate::cli::silent_cli_error;
 use crate::design::render;
@@ -168,7 +168,15 @@ pub async fn run(args: KeystoreClearPreviousArgs) -> Result<()> {
     }
 
     // ── Build keystore + clear previous slot + delete marker ──────
-    let keystore_config = KeystoreConfig { fallback: FallbackMode::Auto, home: home.clone() };
+    // Story 7.22: `acl_break_recovery: Disabled` preserves the
+    // existing passphrase-prompt fallback. `keystore-clear-previous`
+    // is an operator-driven recovery command; auto-rekey is owned by
+    // the daemon boot path only.
+    let keystore_config = KeystoreConfig {
+        fallback: FallbackMode::Auto,
+        home: home.clone(),
+        acl_break_recovery: AclBreakRecoveryMode::Disabled,
+    };
     let keystore = default_keystore(&keystore_config).map_err(|e| {
         eprint!(
             "{}",
