@@ -173,23 +173,42 @@ fn start_refuses_acl_break_recovery_when_dr_mismatches() {
     assert_eq!(
         code,
         Some(7),
-        "expected exit code 7 (AclBreakDrMismatch), got {code:?}\nstderr:\n{stderr}"
+        "expected exit code 7 (AclBreakDrMismatch or CodesignVerifyFailed), \
+         got {code:?}\nstderr:\n{stderr}"
     );
+    // The dispatch reached the codesign-verification step. On dev
+    // hardware + macos-14 hosted runners, `verify_self_against` returns
+    // `RequirementMismatch` and the banner names the mismatch. On
+    // hosted macos-15-intel runners the daemon's process can't extract
+    // codesign info (no `kSecCodeInfoDesignatedRequirement` in its
+    // signing dictionary), so verification surfaces as
+    // `CodesignVerifyFailed` instead — distinct exit-code-7 banner.
+    // Both prove the verification step ran and refused the bogus
+    // anchor, which is the test's load-bearing assertion.
+    let dr_mismatch_path = stderr.contains("Designated Requirement mismatch");
+    let codesign_verify_failed_path =
+        stderr.contains("codesign verification failed during auto-recovery");
     assert!(
-        stderr.contains("Designated Requirement mismatch"),
-        "stderr should name the DR-mismatch failure, got:\n{stderr}"
+        dr_mismatch_path || codesign_verify_failed_path,
+        "stderr should name either DR mismatch (dev hardware / macos-14) or \
+         codesign verification failure (macos-15-intel hosted runners), got:\n{stderr}"
     );
-    assert!(
-        stderr.contains("security-relevant rejection"),
-        "stderr should explain the rejection is security-relevant, got:\n{stderr}"
-    );
-    // Truncation contract: the bogus DR is 95 chars; the banner
-    // truncates to 80 + ellipsis. The full string MUST NOT appear.
-    assert!(
-        !stderr.contains("synthetic.identifier.that.no.real.binary.would.use"),
-        "AclBreakDrMismatch banner must truncate the stored DR (no Team-ID leak); \
-         got:\n{stderr}"
-    );
+    if dr_mismatch_path {
+        assert!(
+            stderr.contains("security-relevant rejection"),
+            "AclBreakDrMismatch banner should explain the rejection is \
+             security-relevant, got:\n{stderr}"
+        );
+        // Truncation contract (only enforced on the DR-mismatch path,
+        // since CodesignVerifyFailed banner doesn't include the stored
+        // DR at all): the bogus DR is 95 chars; the banner truncates to
+        // 80 + ellipsis. The full string MUST NOT appear.
+        assert!(
+            !stderr.contains("synthetic.identifier.that.no.real.binary.would.use"),
+            "AclBreakDrMismatch banner must truncate the stored DR \
+             (no Team-ID leak); got:\n{stderr}"
+        );
+    }
 }
 
 /// Task 3.7: ACL break detected on boot, anchor matches → daemon
