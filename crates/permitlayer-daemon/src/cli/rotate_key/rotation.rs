@@ -2519,12 +2519,25 @@ mod tests {
         use permitlayer_keystore::{read_trust_anchor, write_trust_anchor};
 
         // After Story 7.23's switch to `SecCodeCopyDesignatedRequirement`,
-        // capture works unconditionally on macos-13/14/15 hosted runners
-        // + dev hardware (the rc.17 dictionary-traversal path that
-        // failed for adhoc-signed cargo-test binaries on macos-15-intel
-        // is gone). Phase G's re-capture also benefits automatically
-        // because it goes through the same `capture_self_designated_requirement`
-        // function — no host-divergence skip needed.
+        // capture correctly reports the host's signing state. On
+        // genuinely-unsigned hosts (observed on macos-15-intel hosted
+        // runners where the cargo-test binary has no signature at all),
+        // capture returns `Unsigned`, Phase G's re-capture logs a
+        // warning and continues per the production warning-not-blocker
+        // contract, and the bogus pre-write isn't overwritten. The
+        // test's "MUST overwrite" assertion can't be satisfied there;
+        // skip cleanly. Other capture errors are unexpected and panic.
+        match permitlayer_keystore::capture_self_designated_requirement() {
+            Ok(_) => {} // proceed
+            Err(permitlayer_keystore::CodesignError::Unsigned) => {
+                eprintln!(
+                    "skipping: cargo-test binary on this host is genuinely unsigned \
+                     (typical on hosted macos-15-intel CI runners)"
+                );
+                return;
+            }
+            Err(other) => panic!("unexpected capture error on this host: {other:?}"),
+        }
 
         let (home, old_key, _) = seed_home(0, 0).await;
 
