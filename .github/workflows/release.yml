@@ -28,9 +28,31 @@
 #     to "1". See Story 7.1 (_bmad-output/implementation-artifacts/
 #     7-1-homebrew-formula.md) for the full rationale.
 #
+# One inline step layers on top of `build-local-artifacts`:
+#
+#   - "Ad-hoc codesign x86_64-apple-darwin binaries (Story 7.24)" —
+#     conditional on the x86_64-apple-darwin matrix target. Apple's
+#     linker auto-applies `linker-signed` adhoc to arm64 Mach-Os
+#     during `cargo build`, but does NOT do so for x86_64. We
+#     post-codesign x86_64 explicitly to satisfy Story 7.22's
+#     trust-anchor capture flow on Intel macOS — Story 7.23 made the
+#     daemon-side capture work for both adhoc and Developer-ID, but
+#     it can only capture what's there; if the binary is unsigned,
+#     no daemon-side fix can synthesize one. The step extracts the
+#     tarball, runs `codesign --sign=- --force` (pattern from
+#     `scripts/xprotect-runner.sh:95`), re-archives, and regenerates
+#     the .sha256 sidecar. Post-conditions: `codesign -v` (verify
+#     exit 0) plus `codesign -dvvv | grep -q '^Signature=adhoc'`
+#     plus a post-loop `signed_count` assertion (so an empty glob
+#     can't silently exit 0). All three fail the job loudly if
+#     signing silently no-ops. The downstream `sign` and `host`
+#     jobs see the codesigned tarball unchanged.
+#
 # Cross-platform signing (Apple notarization, GPG, Authenticode) is
 # deferred to later Epic 7 stories when Linux/Windows targets land.
-# For macOS today, ed25519/minisign satisfies the AC in Story 1.12.
+# For macOS today, ed25519/minisign satisfies the AC in Story 1.12;
+# adhoc-codesign on x86_64 satisfies Story 7.22's trust-anchor flow
+# (Story 7.24).
 
 name: Release
 permissions:
@@ -196,6 +218,152 @@ jobs:
           # Actually do builds and make zips and whatnot
           dist build ${{ needs.plan.outputs.tag-flag }} --print=linkage --output-format=json ${{ matrix.dist_args }} > dist-manifest.json
           echo "dist ran successfully"
+      # Story 7.24: ad-hoc codesign x86_64-apple-darwin binaries.
+      #
+      # Apple's linker auto-applies `linker-signed` adhoc to arm64
+      # Mach-Os during `cargo build`, but does NOT do so for x86_64.
+      # Confirmed by `codesign -dvv` on rc.18's published tarballs:
+      # aarch64 → `Signature=adhoc, linker-signed`; x86_64 → `code
+      # object is not signed at all`. Same `dist build` invocation,
+      # both built on `macos-15-intel` hosted runners.
+      #
+      # Story 7.22's auto-recovery contract requires every binary to
+      # carry a verifiable codesign DR (TOFU-captured at first boot,
+      # verified on ACL-break recovery). Story 7.23 fixed the daemon-
+      # side capture API (`SecCodeCopyDesignatedRequirement` correctly
+      # handles adhoc), but no daemon-side fix can synthesize a
+      # signature that isn't there. So we post-codesign x86_64
+      # explicitly here.
+      #
+      # Pattern from `scripts/xprotect-runner.sh:95` — Story 8.8b's
+      # XProtect-bypass adhoc-sign primitive. Battle-tested.
+      - name: "Ad-hoc codesign x86_64-apple-darwin binaries (Story 7.24)"
+        if: contains(matrix.targets, 'x86_64-apple-darwin')
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+
+          # Process every x86_64-apple-darwin tarball cargo-dist emitted.
+          # Glob both .tar.xz (current default) and .tar.gz (forward-compat
+          # in case dist's defaults change).
+          signed_count=0
+          for tarball in target/distrib/permitlayer-daemon-x86_64-apple-darwin*.tar.xz \
+                         target/distrib/permitlayer-daemon-x86_64-apple-darwin*.tar.gz; do
+            tarball_basename=$(basename "$tarball")
+            echo "::group::Ad-hoc codesigning ${tarball_basename}"
+
+            # Determine compression flag from extension.
+            case "$tarball" in
+              *.tar.xz) tar_compression_flag="J" ;;
+              *.tar.gz) tar_compression_flag="z" ;;
+              *) echo "::error::Unrecognized tarball extension: $tarball"; exit 1 ;;
+            esac
+
+            tmp_dir=$(mktemp -d)
+            trap 'rm -rf "$tmp_dir"' RETURN
+
+            # Extract.
+            tar -x"${tar_compression_flag}"f "$tarball" -C "$tmp_dir"
+
+            # Locate the binary. cargo-dist's archive layout puts the
+            # binary at <archive-name>/agentsso. The archive-name dir is
+            # the tarball basename minus the compression extension.
+            binary_path=$(find "$tmp_dir" -type f -name agentsso | head -n 1)
+            if [ -z "$binary_path" ]; then
+              echo "::error::No 'agentsso' binary found inside $tarball_basename"
+              exit 1
+            fi
+            echo "Binary: $binary_path"
+
+            # Pre-condition: log the current signature state for forensics.
+            echo "Pre-codesign state:"
+            codesign -dv "$binary_path" 2>&1 | head -3 || true
+
+            # Sign. Pattern from scripts/xprotect-runner.sh:95.
+            #   --sign=- : ad-hoc (no identity, no keychain).
+            #   --force  : replace any prior signature (defensive; should
+            #              be a no-op on a truly unsigned binary).
+            #   --timestamp=none : skip Apple timestamp authority round-trip.
+            #   --preserve-metadata=entitlements : preserve any embedded
+            #              entitlements (we don't ship any today, but
+            #              forward-compat).
+            codesign --sign=- --force --timestamp=none \
+                     --preserve-metadata=entitlements "$binary_path"
+
+            # Post-condition (AC #9): the codesign call must have actually
+            # applied a signature. Use `codesign -v` (verify) which
+            # exits non-zero on unsigned/invalid signatures rather than
+            # `codesign -dv` (display) whose output format varies with
+            # macOS caching behavior. Combined with the verbose
+            # display below for forensic logging.
+            if ! codesign -v "$binary_path" 2>&1; then
+              echo "::error::codesign post-condition failed: \`codesign -v\` rejected the binary after \`codesign --sign=-\`"
+              codesign -dvvv "$binary_path" 2>&1 || true
+              exit 1
+            fi
+            # Also positively confirm the signature is adhoc (not some
+            # other identity that snuck in via env). `codesign -dvvv`
+            # always emits the full info; grep against the verbose form.
+            # Match `^Signature=adhoc` without a trailing `$` so the
+            # `Signature=adhoc, linker-signed` variant (which AC #1
+            # explicitly accepts, and which a future Apple linker rev
+            # may emit even after our explicit `--sign=-` re-sign) is
+            # not falsely rejected.
+            if ! codesign -dvvv "$binary_path" 2>&1 | grep -q '^Signature=adhoc'; then
+              echo "::error::codesign post-condition failed: signature is not adhoc"
+              codesign -dvvv "$binary_path" 2>&1 || true
+              exit 1
+            fi
+
+            # Defensive: ensure execute bit is preserved across
+            # the tar round-trip. macOS BSD `tar` should preserve mode
+            # bits, but explicit chmod is cheap insurance.
+            chmod +x "$binary_path"
+
+            # Re-archive. Preserve the internal directory layout exactly.
+            # cargo-dist puts the binary inside a single directory whose
+            # name matches the archive-base; reuse that directory.
+            archive_root=$(basename "$(dirname "$binary_path")")
+            tarball_abs=$(cd "$(dirname "$tarball")" && pwd)/"$tarball_basename"
+            (
+              cd "$tmp_dir"
+              tar -c"${tar_compression_flag}"f "$tarball_abs.tmp" "$archive_root/"
+            )
+            mv "$tarball_abs.tmp" "$tarball_abs"
+
+            # Regenerate the .sha256 sidecar to match the new tarball
+            # bytes. cargo-dist emits the GNU-style format
+            # `<hash> *<basename>` (binary mode, asterisk-prefixed
+            # filename). `shasum -ba 256 <basename>` produces the
+            # exact same format. Verified empirically against rc.18's
+            # published `.sha256` before settling on this flag combo.
+            (
+              cd "$(dirname "$tarball")"
+              shasum -ba 256 "$tarball_basename" > "$tarball_basename.sha256"
+            )
+
+            echo "✓ ${tarball_basename}: ad-hoc codesign complete"
+            rm -rf "$tmp_dir"
+            trap - RETURN
+            echo "::endgroup::"
+            signed_count=$((signed_count + 1))
+          done
+
+          # AC #9 silent-no-op guard. The step's `if:` gate fires when
+          # `matrix.targets` contains x86_64-apple-darwin, but if the
+          # glob then matches zero tarballs (cargo-dist artifact-naming
+          # drift, dist-args matrix mismatch, dist build emitting to a
+          # different path, etc.) the for-loop iterates zero times and
+          # the step would otherwise exit 0 with no signing performed.
+          # Fail loudly instead.
+          if [ "$signed_count" -eq 0 ]; then
+            echo "::error::Codesign step fired (matrix target contains x86_64-apple-darwin) but zero tarballs matched the glob. Expected at least one of target/distrib/permitlayer-daemon-x86_64-apple-darwin*.tar.{xz,gz}."
+            echo "Contents of target/distrib/ for diagnosis:"
+            ls -la target/distrib/ || true
+            exit 1
+          fi
+          echo "Codesigned $signed_count x86_64-apple-darwin tarball(s)."
       - id: cargo-dist
         name: Post-build
         # We force bash here just because github makes it really hard to get values up

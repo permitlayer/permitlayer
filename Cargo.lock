@@ -2124,14 +2124,14 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "permitlayer-connectors"
-version = "0.3.0-rc.18"
+version = "0.3.0-rc.19"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "permitlayer-core"
-version = "0.3.0-rc.18"
+version = "0.3.0-rc.19"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -2164,7 +2164,7 @@ dependencies = [
 
 [[package]]
 name = "permitlayer-credential"
-version = "0.3.0-rc.18"
+version = "0.3.0-rc.19"
 dependencies = [
  "serde",
  "static_assertions",
@@ -2174,7 +2174,7 @@ dependencies = [
 
 [[package]]
 name = "permitlayer-daemon"
-version = "0.3.0-rc.18"
+version = "0.3.0-rc.19"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2235,7 +2235,7 @@ dependencies = [
 
 [[package]]
 name = "permitlayer-keystore"
-version = "0.3.0-rc.18"
+version = "0.3.0-rc.19"
 dependencies = [
  "argon2",
  "async-trait",
@@ -2259,7 +2259,7 @@ dependencies = [
 
 [[package]]
 name = "permitlayer-oauth"
-version = "0.3.0-rc.18"
+version = "0.3.0-rc.19"
 dependencies = [
  "axum",
  "mockito",
@@ -2281,7 +2281,7 @@ dependencies = [
 
 [[package]]
 name = "permitlayer-plugins"
-version = "0.3.0-rc.18"
+version = "0.3.0-rc.19"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -2303,7 +2303,7 @@ dependencies = [
 
 [[package]]
 name = "permitlayer-proxy"
-version = "0.3.0-rc.18"
+version = "0.3.0-rc.19"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2346,7 +2346,7 @@ dependencies = [
 
 [[package]]
 name = "permitlayer-vault"
-version = "0.3.0-rc.18"
+version = "0.3.0-rc.19"
 dependencies = [
  "aes-gcm",
  "hkdf",
@@ -4660,7 +4660,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.3.0-rc.18"
+version = "0.3.0-rc.19"
 dependencies = [
  "anyhow",
  "clap",

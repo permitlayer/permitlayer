@@ -69,12 +69,17 @@ new binary's hash no longer matches the keychain ACL on the previous
 binary's master-key entry, so the keychain returns OSStatus -25308
 ("User interaction is not allowed") on the next master-key lookup.
 
-**rc.18+ auto-recovers headlessly.** On boot the daemon:
+**rc.19+ auto-recovers headlessly on Apple Silicon and Intel macOS
+alike.** (Apple Silicon worked from rc.18; Intel macOS required
+Story 7.24's release-pipeline ad-hoc codesign fix to land in rc.19.)
+On boot the daemon:
 
 1. Detects the -25308.
 2. Reads the persisted codesign trust anchor at
    `~/.agentsso/keystore/codesign-trust-anchor.req` (captured on
-   first rc.18 boot via macOS's `SecCodeCopyDesignatedRequirement`).
+   first boot via macOS's `SecCodeCopyDesignatedRequirement` — see
+   the rc.17 / rc.18 caveat below for why "first boot" means "first
+   rc.18 boot on Apple Silicon, first rc.19 boot on Intel macOS").
 3. Verifies the new binary's Designated Requirement against the
    stored anchor. If it matches (legitimate publisher upgrade), the
    daemon proceeds; if it doesn't (different signing identity, or a
@@ -90,16 +95,21 @@ binary's master-key entry, so the keychain returns OSStatus -25308
    captured on first boot).
 6. Continues normal boot under the new master key.
 
-> **rc.17 caveat:** rc.17 shipped this code path but a launchd-spawned
-> capture bug kept the trust anchor from being written, so the
-> daemon respawn-looped under launchd after every `brew upgrade`.
-> Story 7.23 (rc.18) fixed the capture by switching from
-> `SecCodeCopySigningInformation`'s dictionary lookup (which fails
-> for adhoc-signed binaries) to `SecCodeCopyDesignatedRequirement`
-> (which derives the implicit DR for adhoc). If you ever consult
-> rc.17-era docs that mention the older API name, the behavior they
-> describe is the *intent*; rc.18 is the version where it actually
-> works end-to-end.
+> **rc.17 / rc.18 caveat:** rc.17 shipped this code path but a
+> launchd-spawned capture bug kept the trust anchor from being
+> written, so the daemon respawn-looped under launchd after every
+> `brew upgrade`. Story 7.23 (rc.18) fixed the capture by switching
+> from `SecCodeCopySigningInformation`'s dictionary lookup (which
+> fails for adhoc-signed binaries) to `SecCodeCopyDesignatedRequirement`
+> (which derives the implicit DR for adhoc). However, the
+> `x86_64-apple-darwin` release tarball shipped *unsigned* — Apple's
+> Intel linker doesn't auto-adhoc-sign during `cargo build` the way
+> the arm64 linker does — so on Intel macOS the daemon-side fix
+> still had no codesign to capture, and rc.18 respawn-looped on
+> Intel boxes. Story 7.24 (rc.19) ad-hoc codesigns the x86_64
+> tarball in CI before publish; rc.19 is the first release where
+> the contract works headlessly end-to-end on **both** Apple Silicon
+> and Intel macOS.
 
 **Bearer tokens are preserved across the rekey.** Operators with
 existing MCP-client configs continue to authenticate with their

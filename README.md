@@ -174,18 +174,22 @@ master-key entry. Symptom on rc.16 and earlier: the next `agentsso
 start &` logs `keychain backend 'apple' is unavailable: User
 interaction is not allowed. (OSStatus -25308)`.
 
-**Behavior on rc.18 and later (Story 7.22 + Story 7.23):** the daemon
-auto-detects the ACL break, verifies the new binary's codesign
-Designated Requirement against a trust anchor captured on first boot,
-and atomic-rekeys the vault under a freshly-minted master key. The
-vault, every sealed credential, and **every operator-held bearer
-token** are preserved across the rekey — operators don't need to
-re-run `connect`, re-OAuth-consent, or update MCP-client configs. The
-daemon stays up; launchd-managed installs auto-recover with no
+**Behavior on rc.19 and later (Story 7.22 + Story 7.23 + Story 7.24):**
+the daemon auto-detects the ACL break, verifies the new binary's
+codesign Designated Requirement against a trust anchor captured on
+first boot, and atomic-rekeys the vault under a freshly-minted master
+key. The vault, every sealed credential, and **every operator-held
+bearer token** are preserved across the rekey — operators don't need
+to re-run `connect`, re-OAuth-consent, or update MCP-client configs.
+The daemon stays up; launchd-managed installs auto-recover with no
 operator action. (rc.17 shipped the recovery code path but a
 launchd-spawned-binary capture bug — Story 7.23 — kept the trust
-anchor from being written; rc.18 is the first release where the
-contract works headlessly end-to-end.)
+anchor from being written; rc.18 fixed the daemon-side capture API
+but the x86_64-apple-darwin release tarball shipped unsigned, so
+Intel macOS still couldn't capture an anchor. Story 7.24 ad-hoc
+codesigns the x86_64 binary in the release pipeline, making rc.19
+the first release where the contract works headlessly end-to-end on
+**both** Apple Silicon and Intel macOS.)
 
 The auto-recovery path activates only when the new binary's codesign
 DR matches the persisted anchor. Mismatches (different signing
@@ -194,14 +198,18 @@ a structured banner pointing at manual re-trust — this is the security
 gate that prevents an attacker-installed binary from inheriting the
 previous binary's vault.
 
-##### If your rc.17 daemon is in a respawn loop
+##### If your rc.17 or rc.18 daemon is in a respawn loop
 
-rc.17 shipped a launchd-spawned-binary codesign capture bug: the
-trust anchor never got written, so when the keychain ACL invalidated
-on the next `brew upgrade`, auto-recovery refused with exit code 7
-(`AclBreakNoTrustAnchor`) and launchd's `KeepAlive` respawn-looped
-the daemon every ~10 seconds. Diagnostic signature in
-`~/.agentsso/logs/autostart.log`:
+Two related bugs caused the same `AclBreakNoTrustAnchor` exit-7
+respawn loop on different release lines:
+
+- **rc.17** shipped a launchd-spawned-binary codesign capture bug
+  (Story 7.23): the trust anchor never got written.
+- **rc.18** fixed the capture API but the x86_64-apple-darwin
+  release tarball shipped unsigned (Story 7.24), so on Intel macOS
+  there was no codesign for the daemon to capture.
+
+Diagnostic signature in `~/.agentsso/logs/autostart.log`:
 
 ```
 ERROR no codesign trust anchor on disk — cannot auto-recover headlessly
@@ -213,8 +221,9 @@ One-step fix:
 brew upgrade permitlayer/tap/agentsso
 ```
 
-rc.18 captures the anchor correctly on first boot (Story 7.23 fix)
-and recovery proceeds normally. No manual cleanup required.
+rc.19 captures the anchor correctly on first boot on **both** Apple
+Silicon (since rc.18) and Intel macOS (new in rc.19), and recovery
+proceeds normally. No manual cleanup required.
 
 Behavior on rc.16 and earlier, by context:
 
