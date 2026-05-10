@@ -45,8 +45,17 @@
 #     exit 0) plus `codesign -dvvv | grep -q '^Signature=adhoc'`
 #     plus a post-loop `signed_count` assertion (so an empty glob
 #     can't silently exit 0). All three fail the job loudly if
-#     signing silently no-ops. The downstream `sign` and `host`
-#     jobs see the codesigned tarball unchanged.
+#     signing silently no-ops. After signing, the step also patches
+#     `target/distrib/dist-manifest.json`'s
+#     `.artifacts[<tarball>].checksums.sha256` field for each
+#     re-archived tarball — `dist build` recorded the *pre-codesign*
+#     hash there, and `build-global-artifacts` + `host` propagate
+#     that manifest into the brew formula's `sha256` declaration.
+#     Without the patch, `brew install` fails with "Formula reports
+#     different checksum" against the actual published bytes (rc.19
+#     ship surfaced this; Story 7.24 follow-up). The downstream
+#     `sign` and `host` jobs then see both the codesigned tarball
+#     AND the corrected manifest.
 #
 # Cross-platform signing (Apple notarization, GPG, Authenticode) is
 # deferred to later Epic 7 stories when Linux/Windows targets land.
@@ -364,6 +373,56 @@ jobs:
             exit 1
           fi
           echo "Codesigned $signed_count x86_64-apple-darwin tarball(s)."
+
+          # rc.19 ship surfaced a downstream consequence of re-archiving:
+          # cargo-dist's `dist build` (line 219) writes the *pre-codesign*
+          # tarball hash into `target/distrib/dist-manifest.json` under
+          # `.artifacts[<tarball>].checksums.sha256`. Later jobs
+          # (`build-global-artifacts`, `host`) propagate that manifest
+          # into the brew formula's `sha256` field — but the actual
+          # uploaded tarball bytes are the post-codesign hash. Result:
+          # `brew install` fails with "Formula reports different
+          # checksum" (rc.19 smoke-min-os-macos-15-intel job).
+          #
+          # Fix: patch the manifest's checksum entries to match the
+          # post-codesign tarball hashes that we just regenerated in the
+          # `.sha256` sidecar(s). This is `jq` over a single JSON file
+          # with a structurally-stable schema (cargo-dist 0.31).
+          # Idempotent: running with the already-correct hash is a no-op.
+          manifest=target/distrib/dist-manifest.json
+          if [ ! -f "$manifest" ]; then
+            echo "::error::Expected manifest not present at $manifest after codesigning. cargo-dist layout drift or dist build did not run?"
+            exit 1
+          fi
+          patched_count=0
+          for sidecar in target/distrib/permitlayer-daemon-x86_64-apple-darwin*.tar.xz.sha256 \
+                         target/distrib/permitlayer-daemon-x86_64-apple-darwin*.tar.gz.sha256; do
+            sidecar_basename=$(basename "$sidecar")
+            tarball_basename="${sidecar_basename%.sha256}"
+            # `shasum -ba 256` format: `<hash> *<basename>`. Take field 1.
+            new_hash=$(awk '{print $1}' "$sidecar")
+            if [ -z "$new_hash" ] || [ ${#new_hash} -ne 64 ]; then
+              echo "::error::Sidecar $sidecar did not parse to a 64-char sha256 (got: '$new_hash')"
+              exit 1
+            fi
+            # Confirm the manifest knows about this artifact before patching.
+            if ! jq -e --arg n "$tarball_basename" '.artifacts[$n]' "$manifest" >/dev/null; then
+              echo "::error::Manifest has no artifact entry for '$tarball_basename'"
+              jq '.artifacts | keys' "$manifest" || true
+              exit 1
+            fi
+            old_hash=$(jq -r --arg n "$tarball_basename" '.artifacts[$n].checksums.sha256 // ""' "$manifest")
+            jq --arg n "$tarball_basename" --arg h "$new_hash" \
+               '.artifacts[$n].checksums.sha256 = $h' \
+               "$manifest" > "$manifest.tmp" && mv "$manifest.tmp" "$manifest"
+            echo "✓ manifest checksum patched for $tarball_basename: $old_hash → $new_hash"
+            patched_count=$((patched_count + 1))
+          done
+          if [ "$patched_count" -ne "$signed_count" ]; then
+            echo "::error::patched_count=$patched_count does not match signed_count=$signed_count — sidecar/tarball pairing drift"
+            exit 1
+          fi
+          echo "Manifest checksum patches applied: $patched_count"
       - id: cargo-dist
         name: Post-build
         # We force bash here just because github makes it really hard to get values up
