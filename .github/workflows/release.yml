@@ -389,9 +389,20 @@ jobs:
           # `.sha256` sidecar(s). This is `jq` over a single JSON file
           # with a structurally-stable schema (cargo-dist 0.31).
           # Idempotent: running with the already-correct hash is a no-op.
-          manifest=target/distrib/dist-manifest.json
+          #
+          # cargo-dist's `dist build` step (this job, line 219) writes
+          # `dist-manifest.json` to the CWD (the repo root), not to
+          # `target/distrib/`. The `cp dist-manifest.json
+          # "$BUILD_MANIFEST_NAME"` at line 379 (the next step) is what
+          # places a copy at `target/distrib/<targets>-dist-manifest.json`
+          # for the upload artifact. At our point in the pipeline only the
+          # CWD copy exists, so patch that one. The next step's `cp` then
+          # propagates our patched bytes downstream.
+          manifest=dist-manifest.json
           if [ ! -f "$manifest" ]; then
-            echo "::error::Expected manifest not present at $manifest after codesigning. cargo-dist layout drift or dist build did not run?"
+            echo "::error::Expected manifest not present at $manifest (CWD) after codesigning. cargo-dist layout drift or dist build did not run?"
+            ls -la . || true
+            ls -la target/distrib/ || true
             exit 1
           fi
           patched_count=0
