@@ -3252,6 +3252,20 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     // reference. Moving avoids holding a redundant Arc for the rest of
     // `run()`; the subkey bytes are reachable through the middleware
     // closure and through `ControlState` for the daemon's lifetime.
+    //
+    // Story 7.27 AC #2 (split-listener): on macOS, the control router
+    // moves to its own UDS listener at
+    // `paths::control_socket_path()`; the TCP listener at
+    // `127.0.0.1:3820` serves only the MCP + REST routes (preserves
+    // OpenClaw / Claude Desktop / Cursor compatibility because MCP
+    // Streamable HTTP requires HTTP-over-TCP). On Linux + Windows
+    // the rc.21 single-listener model is preserved (those redesigns
+    // are 7.18 + 7.19).
+    #[cfg(target_os = "macos")]
+    let control_router_for_uds = control_router.layer(axum::middleware::from_fn(
+        crate::server::control_listener::record_peer_credentials_layer,
+    ));
+    #[cfg(not(target_os = "macos"))]
     let app = app.merge(control_router);
 
     tracing::info!(addr = %bind_addr, pid = std::process::id(), "daemon ready");
@@ -3280,6 +3294,75 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     // for their loopback-only guard. It is a drop-in replacement for plain
     // `into_make_service()` at the serve level — pre-existing handlers that
     // don't extract `ConnectInfo` are unaffected.
+    //
+    // Story 7.27 AC #2 (split-listener, macOS): a second
+    // `axum::serve` instance binds a UDS at
+    // `paths::control_socket_path()` and serves `control_router_for_uds`
+    // with `ConnectInfo<PeerCredentials>` so handlers (or future
+    // middleware) can attest the caller's kernel UID. Both serve
+    // futures run concurrently via `tokio::join!`; either failing
+    // is fatal.
+    #[cfg(target_os = "macos")]
+    let control_serve_fut = {
+        use crate::server::control_listener::{
+            UdsConnectInfo, bind_control_listener, bind_control_listener_no_perms,
+        };
+        // Honor the `AGENTSSO_PATHS__HOME` test override (same
+        // discipline as `agentsso_home()` in cli/mod.rs). Under
+        // override, `control.sock` lives at
+        // `<override>/run/control.sock` and we skip the root-owned
+        // chown step (tests don't run as root + the
+        // `permitlayer-clients` group doesn't exist on dev boxes
+        // that haven't run `service install`).
+        let home_override =
+            std::env::var("AGENTSSO_PATHS__HOME").ok().map(std::path::PathBuf::from);
+        let sock_path = permitlayer_core::paths::control_socket_path(home_override.as_deref());
+        // Best-effort: ensure the runtime parent dir exists. `service
+        // install` creates `/var/run/permitlayer/` as root:wheel
+        // 0755; under an override the parent may not exist yet —
+        // create permissively (operator-owned dir in that case).
+        if let Some(parent) = sock_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|source| StartError::BindFailed { addr: bind_addr, source })?;
+        }
+        let uds_listener = if home_override.is_some() {
+            // Test/dev path: bind without chown (no root, no group).
+            bind_control_listener_no_perms(&sock_path)
+                .map_err(|source| StartError::BindFailed { addr: bind_addr, source })?
+        } else {
+            // Production path: requires root + `permitlayer-clients`
+            // group. The typed "missing group" error from
+            // `bind_control_listener` tells operators to run
+            // `sudo agentsso service install` first.
+            bind_control_listener(&sock_path, "permitlayer-clients")
+                .map_err(|source| StartError::BindFailed { addr: bind_addr, source })?
+        };
+        tracing::info!(
+            path = %sock_path.display(),
+            "control plane UDS listener bound (mode 0660 root:permitlayer-clients)"
+        );
+        // Mirror the TCP listener's `AGENTSSO_BOUND_ADDR` stdout
+        // emit for test harnesses that need to discover the UDS
+        // path. Preserves the existing line so existing scripts
+        // continue to grep `AGENTSSO_BOUND_ADDR`.
+        {
+            use std::io::Write;
+            let mut stdout = std::io::stdout().lock();
+            let _ = writeln!(stdout, "AGENTSSO_CONTROL_SOCK={}", sock_path.display());
+            let _ = stdout.flush();
+        }
+        // Per-listener graceful-shutdown trigger. The single
+        // `drain_notify` from above signals both axum serves.
+        let drain_notify_uds = Arc::clone(&drain_notify);
+        let graceful_fut_uds = async move {
+            drain_notify_uds.notified().await;
+        };
+        axum::serve(
+            uds_listener,
+            control_router_for_uds.into_make_service_with_connect_info::<UdsConnectInfo>(),
+        )
+        .with_graceful_shutdown(graceful_fut_uds)
+    };
     let serve_fut = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(graceful_fut);
     // 25 seconds reserved for axum connection draining; the remaining
@@ -3294,9 +3377,20 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
             AXUM_DRAIN_BUDGET.as_secs()
         );
     };
-    tokio::select! {
-        result = serve_fut => { result.map_err(|source| StartError::ServeFailed { source })?; }
-        () = drain_deadline => {}
+    #[cfg(target_os = "macos")]
+    {
+        tokio::select! {
+            result = serve_fut => { result.map_err(|source| StartError::ServeFailed { source })?; }
+            result = control_serve_fut => { result.map_err(|source| StartError::ServeFailed { source })?; }
+            () = drain_deadline => {}
+        }
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        tokio::select! {
+            result = serve_fut => { result.map_err(|source| StartError::ServeFailed { source })?; }
+            () = drain_deadline => {}
+        }
     }
 
     // 11. Shutdown sequence.

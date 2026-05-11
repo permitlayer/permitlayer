@@ -2215,6 +2215,7 @@ dependencies = [
  "permitlayer-credential",
  "permitlayer-keystore",
  "permitlayer-oauth",
+ "permitlayer-platform-macos",
  "permitlayer-plugins",
  "permitlayer-proxy",
  "permitlayer-vault",
