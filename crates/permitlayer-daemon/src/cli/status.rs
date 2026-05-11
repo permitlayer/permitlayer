@@ -246,9 +246,26 @@ async fn fetch_connections(
     addr: SocketAddr,
     control_token: Option<&str>,
 ) -> anyhow::Result<ConnectionsResponse> {
-    let (status, body) =
-        crate::cli::kill::http_get_with_status(addr, "/v1/control/connections", control_token)
-            .await?;
+    // Story 7.27: control endpoints move to UDS on macOS. Resolve
+    // the endpoint here so callers don't need to know about the
+    // transport split.
+    #[cfg(target_os = "macos")]
+    let endpoint = {
+        let _ = addr;
+        let home_override =
+            std::env::var("AGENTSSO_PATHS__HOME").ok().map(std::path::PathBuf::from);
+        crate::cli::kill::ControlEndpoint::Uds(permitlayer_core::paths::control_socket_path(
+            home_override.as_deref(),
+        ))
+    };
+    #[cfg(not(target_os = "macos"))]
+    let endpoint = crate::cli::kill::ControlEndpoint::Tcp(addr);
+    let (status, body) = crate::cli::kill::http_get_with_status_via(
+        &endpoint,
+        "/v1/control/connections",
+        control_token,
+    )
+    .await?;
     if !(200..300).contains(&status) {
         // Try to extract the daemon's structured error code; fall
         // back to the raw body if unparseable. The control plane's

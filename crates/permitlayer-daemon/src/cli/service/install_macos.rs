@@ -341,11 +341,23 @@ fn create_state_dirs() -> Result<()> {
     Ok(())
 }
 
-/// Resolve the source binary path for the install. Refuses unsafe
-/// source locations unless overridden by `--from`.
+/// Resolve the source binary path for the install.
+///
+/// Story 7.27 research finding: matches Tailscale's `install_darwin.go`
+/// pattern — trust `current_exe()` rather than maintaining a brittle
+/// safe-source allowlist. The previous draft refused custom-prefix
+/// brew installs (`HOMEBREW_PREFIX=/foo`) with wrong remediation
+/// advice ("re-run from /opt/homebrew/bin/agentsso" — which doesn't
+/// exist on a custom-prefix system). Tailscale's production-realistic
+/// posture is: the operator just `sudo`ed to this binary; they own
+/// the outcome. We canonicalize, copy, and let the operator verify
+/// via `codesign -v /Library/PrivilegedHelperTools/agentsso` if they
+/// want post-install confirmation.
+///
+/// `--from <path>` is preserved for dev workflows (e.g.,
+/// `cargo build --release` testing where the binary lives under
+/// `target/release/`).
 fn resolve_binary_source(args: &InstallArgs) -> Result<PathBuf> {
-    let safe_sources: &[&str] =
-        &["/usr/local/bin/agentsso", "/opt/homebrew/bin/agentsso", PRIVILEGED_HELPER_PATH];
     let candidate = match args.from.as_ref() {
         Some(p) => p.clone(),
         None => std::env::current_exe()
@@ -353,28 +365,6 @@ fn resolve_binary_source(args: &InstallArgs) -> Result<PathBuf> {
             .canonicalize()
             .context("failed to canonicalize current_exe()")?,
     };
-    // If `--from` is set, trust the operator (dev workflow). Otherwise
-    // refuse anything outside the safe-source allowlist.
-    if args.from.is_none() {
-        let canon = candidate.canonicalize().unwrap_or_else(|_| candidate.clone());
-        let canon_str = canon.to_string_lossy();
-        if !safe_sources.iter().any(|s| canon_str == *s) {
-            eprint!(
-                "{}",
-                error_block(
-                    "service.install.unsafe_source_binary",
-                    &format!(
-                        "refusing to install daemon from `{canon_str}` (not under brew prefix \
-                         or privileged-helper path)"
-                    ),
-                    "re-run from /usr/local/bin/agentsso or /opt/homebrew/bin/agentsso,\n  \
-                     or pass `--from <path>` for dev-only override",
-                    None,
-                )
-            );
-            return Err(silent_cli_error("unsafe source binary path"));
-        }
-    }
     Ok(candidate)
 }
 

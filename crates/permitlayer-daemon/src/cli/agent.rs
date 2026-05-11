@@ -25,8 +25,8 @@ use clap::{Args, Subcommand};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::kill::{
-    error_block_daemon_unreachable, error_block_protocol_error, http_get, http_post_json,
-    load_daemon_config_or_default_with_warn,
+    error_block_daemon_unreachable, error_block_protocol_error, http_get_via, http_post_json_via,
+    load_daemon_config_or_default_with_warn, resolve_control_endpoint,
 };
 use crate::design::render::{TableCell, empty_state, error_block, table};
 use crate::design::terminal::{ColorSupport, TableLayout};
@@ -165,23 +165,22 @@ async fn register_agent(args: RegisterArgs) -> Result<()> {
         "policy_name": args.policy,
     })
     .to_string();
+    // Story 7.27: dispatch over the platform-appropriate transport
+    // (UDS on macOS, TCP loopback on Linux/Windows).
+    let endpoint = resolve_control_endpoint(&config);
     let bind_addr = config.http.bind_addr;
     let token = crate::cli::kill::read_control_token(&config.paths.home);
-    let response = match http_post_json(
-        bind_addr,
-        "/v1/control/agent/register",
-        &body,
-        token.as_deref(),
-    )
-    .await
-    {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::debug!(error = %e, addr = %bind_addr, "agent register request failed");
-            eprint!("{}", error_block_daemon_unreachable("agent register", bind_addr));
-            std::process::exit(3);
-        }
-    };
+    let response =
+        match http_post_json_via(&endpoint, "/v1/control/agent/register", &body, token.as_deref())
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!(error = %e, endpoint = %endpoint, "agent register request failed");
+                eprint!("{}", error_block_daemon_unreachable("agent register", bind_addr));
+                std::process::exit(3);
+            }
+        };
 
     // 3. Parse response. Distinguishes ok vs structured error bodies.
     let parsed: serde_json::Value = match serde_json::from_str(&response) {
@@ -371,12 +370,13 @@ async fn list_agents() -> Result<()> {
     // call's existing error-block path. `home` is still resolved
     // because it's used by `Theme::load` further down for rendering.
 
+    let endpoint = resolve_control_endpoint(&config);
     let bind_addr = config.http.bind_addr;
     let token = crate::cli::kill::read_control_token(&home);
-    let response = match http_get(bind_addr, "/v1/control/agent/list", token.as_deref()).await {
+    let response = match http_get_via(&endpoint, "/v1/control/agent/list", token.as_deref()).await {
         Ok(b) => b,
         Err(e) => {
-            tracing::debug!(error = %e, addr = %bind_addr, "agent list request failed");
+            tracing::debug!(error = %e, endpoint = %endpoint, "agent list request failed");
             eprint!("{}", error_block_daemon_unreachable("agent list", bind_addr));
             std::process::exit(3);
         }
@@ -510,23 +510,20 @@ async fn remove_agent(args: RemoveArgs) -> Result<()> {
     // `/v1/control/*` is the canonical gate.
 
     let body = serde_json::json!({"name": args.name}).to_string();
+    let endpoint = resolve_control_endpoint(&config);
     let bind_addr = config.http.bind_addr;
     let token = crate::cli::kill::read_control_token(&home);
-    let response = match http_post_json(
-        bind_addr,
-        "/v1/control/agent/remove",
-        &body,
-        token.as_deref(),
-    )
-    .await
-    {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::debug!(error = %e, addr = %bind_addr, "agent remove request failed");
-            eprint!("{}", error_block_daemon_unreachable("agent remove", bind_addr));
-            std::process::exit(3);
-        }
-    };
+    let response =
+        match http_post_json_via(&endpoint, "/v1/control/agent/remove", &body, token.as_deref())
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!(error = %e, endpoint = %endpoint, "agent remove request failed");
+                eprint!("{}", error_block_daemon_unreachable("agent remove", bind_addr));
+                std::process::exit(3);
+            }
+        };
 
     let parsed: serde_json::Value = match serde_json::from_str(&response) {
         Ok(v) => v,
@@ -582,23 +579,20 @@ async fn rebind_agent(args: RebindArgs) -> Result<()> {
         "policy_name": args.policy,
     })
     .to_string();
+    let endpoint = resolve_control_endpoint(&config);
     let bind_addr = config.http.bind_addr;
     let token = crate::cli::kill::read_control_token(&home);
-    let response = match http_post_json(
-        bind_addr,
-        "/v1/control/agent/rebind",
-        &body,
-        token.as_deref(),
-    )
-    .await
-    {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::debug!(error = %e, addr = %bind_addr, "agent rebind request failed");
-            eprint!("{}", error_block_daemon_unreachable("agent rebind", bind_addr));
-            std::process::exit(3);
-        }
-    };
+    let response =
+        match http_post_json_via(&endpoint, "/v1/control/agent/rebind", &body, token.as_deref())
+            .await
+        {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!(error = %e, endpoint = %endpoint, "agent rebind request failed");
+                eprint!("{}", error_block_daemon_unreachable("agent rebind", bind_addr));
+                std::process::exit(3);
+            }
+        };
 
     let parsed: serde_json::Value = match serde_json::from_str(&response) {
         Ok(v) => v,

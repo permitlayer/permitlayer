@@ -25,7 +25,7 @@
 //! `KillSwitchLayer` so resume still works when killed.
 
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -59,13 +59,19 @@ pub async fn run(_args: KillArgs) -> Result<()> {
 
     // POST /v1/control/kill with the operator token from <home>/control.token
     // (or from AGENTSSO_CONTROL_TOKEN env for cross-user invocation).
+    //
+    // Story 7.27: dispatch over the platform-appropriate transport.
+    // macOS goes through the UDS at
+    // `/var/run/permitlayer/control.sock`; Linux + Windows stay on
+    // the rc.21 loopback TCP path (their redesigns are 7.18/7.19).
+    let endpoint = resolve_control_endpoint(&config);
     let bind_addr = config.http.bind_addr;
     let token = read_control_token(&home);
     let response_body =
-        match http_post_empty_json(bind_addr, "/v1/control/kill", token.as_deref()).await {
+        match http_post_empty_json_via(&endpoint, "/v1/control/kill", token.as_deref()).await {
             Ok(body) => body,
             Err(e) => {
-                tracing::debug!(error = %e, addr = %bind_addr, "kill request failed");
+                tracing::debug!(error = %e, endpoint = %endpoint, "kill request failed");
                 eprint!("{}", error_block_daemon_unreachable("kill", bind_addr));
                 std::process::exit(3);
             }
@@ -226,18 +232,220 @@ pub(crate) fn read_control_token(home: &std::path::Path) -> Option<String> {
     if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) }
 }
 
+/// Control-plane endpoint — either loopback TCP (rc.21 model, still
+/// in use on Linux + Windows in rc.22) or a Unix domain socket (rc.22
+/// macOS model per Story 7.27 split-listener AC #2).
+///
+/// The CLI helpers below dispatch over the right transport based on
+/// which variant is present. [`resolve_control_endpoint`] picks the
+/// correct one for the current platform + config + override env.
+#[derive(Debug, Clone)]
+pub(crate) enum ControlEndpoint {
+    /// Loopback TCP — rc.21 fallback / Linux + Windows path.
+    #[allow(dead_code)] // unreachable on macOS where every CLI uses UDS
+    Tcp(SocketAddr),
+    /// Unix domain socket — rc.22 macOS path.
+    #[allow(dead_code)] // unreachable on non-macOS where every CLI uses TCP
+    Uds(PathBuf),
+}
+
+impl std::fmt::Display for ControlEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tcp(addr) => write!(f, "{addr}"),
+            Self::Uds(path) => write!(f, "unix:{}", path.display()),
+        }
+    }
+}
+
+/// Resolve the control-plane endpoint to use for `/v1/control/*` CLI
+/// dispatch. On macOS, prefers the UDS path at
+/// `permitlayer_core::paths::control_socket_path()` (honoring the
+/// `AGENTSSO_PATHS__HOME` test override). On Linux + Windows, returns
+/// the configured loopback TCP `bind_addr` (rc.21 model preserved).
+///
+/// Story 7.27 AC #2: control routes move to UDS on macOS; MCP routes
+/// stay on TCP (loopback :3820) for OpenClaw / Claude Desktop /
+/// Cursor compatibility.
+pub(crate) fn resolve_control_endpoint(config: &DaemonConfig) -> ControlEndpoint {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = config;
+        let home_override =
+            std::env::var("AGENTSSO_PATHS__HOME").ok().map(std::path::PathBuf::from);
+        let sock = permitlayer_core::paths::control_socket_path(home_override.as_deref());
+        ControlEndpoint::Uds(sock)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        ControlEndpoint::Tcp(config.http.bind_addr)
+    }
+}
+
 /// Minimal HTTP/1.1 POST `{}` → read full response → extract JSON body.
 ///
 /// Uses raw TCP matching the pattern in `cli/status.rs`. Handles both
 /// `Content-Length`-delimited and connection-closed bodies. We control
 /// both endpoints (the request and the daemon) and the body is always
 /// `Content-Length` small JSON, so we don't implement chunked decoding.
+///
+/// Story 7.27: superseded by [`http_post_empty_json_via`] which
+/// dispatches over UDS on macOS. Retained as a TCP-only convenience
+/// wrapper for callers that explicitly need TCP (none in production
+/// after 7.27, but the helper stays to keep the test fixtures
+/// compiling).
+#[allow(dead_code)]
 pub(crate) async fn http_post_empty_json(
     addr: SocketAddr,
     path: &str,
     control_token: Option<&str>,
 ) -> Result<String> {
     http_post_json(addr, path, "{}", control_token).await
+}
+
+/// Endpoint-aware POST `{}`. Dispatches over UDS or TCP based on
+/// `endpoint`. Story 7.27.
+pub(crate) async fn http_post_empty_json_via(
+    endpoint: &ControlEndpoint,
+    path: &str,
+    control_token: Option<&str>,
+) -> Result<String> {
+    http_post_json_via(endpoint, path, "{}", control_token).await
+}
+
+/// Endpoint-aware POST with a caller-supplied JSON body.
+pub(crate) async fn http_post_json_via(
+    endpoint: &ControlEndpoint,
+    path: &str,
+    body: &str,
+    control_token: Option<&str>,
+) -> Result<String> {
+    match endpoint {
+        ControlEndpoint::Tcp(addr) => http_post_json(*addr, path, body, control_token).await,
+        ControlEndpoint::Uds(sock_path) => tokio::time::timeout(
+            HTTP_DEADLINE,
+            http_post_json_inner_uds(sock_path, path, body, control_token),
+        )
+        .await
+        .with_context(|| format!("HTTP POST {path} (UDS) timed out after {HTTP_DEADLINE:?}"))?,
+    }
+}
+
+/// Endpoint-aware GET.
+pub(crate) async fn http_get_via(
+    endpoint: &ControlEndpoint,
+    path: &str,
+    control_token: Option<&str>,
+) -> Result<String> {
+    match endpoint {
+        ControlEndpoint::Tcp(addr) => http_get(*addr, path, control_token).await,
+        ControlEndpoint::Uds(sock_path) => {
+            tokio::time::timeout(HTTP_DEADLINE, http_get_inner_uds(sock_path, path, control_token))
+                .await
+                .with_context(|| {
+                    format!("HTTP GET {path} (UDS) timed out after {HTTP_DEADLINE:?}")
+                })?
+        }
+    }
+}
+
+/// Endpoint-aware GET that returns the status code alongside the body.
+pub(crate) async fn http_get_with_status_via(
+    endpoint: &ControlEndpoint,
+    path: &str,
+    control_token: Option<&str>,
+) -> Result<(u16, String)> {
+    match endpoint {
+        ControlEndpoint::Tcp(addr) => http_get_with_status(*addr, path, control_token).await,
+        ControlEndpoint::Uds(sock_path) => tokio::time::timeout(
+            HTTP_DEADLINE,
+            http_get_with_status_inner_uds(sock_path, path, control_token),
+        )
+        .await
+        .with_context(|| format!("HTTP GET {path} (UDS) timed out after {HTTP_DEADLINE:?}"))?,
+    }
+}
+
+async fn http_post_json_inner_uds(
+    sock_path: &Path,
+    path: &str,
+    body: &str,
+    control_token: Option<&str>,
+) -> Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+
+    let mut stream = UnixStream::connect(sock_path)
+        .await
+        .with_context(|| format!("connect to {}", sock_path.display()))?;
+
+    let auth_header =
+        control_token.map(|t| format!("X-Agentsso-Control: {t}\r\n")).unwrap_or_default();
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{auth_header}Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await.context("write HTTP request")?;
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.context("read HTTP response")?;
+    let response = String::from_utf8_lossy(&response).into_owned();
+
+    extract_body(&response).ok_or_else(|| anyhow::anyhow!("malformed HTTP response"))
+}
+
+async fn http_get_inner_uds(
+    sock_path: &Path,
+    path: &str,
+    control_token: Option<&str>,
+) -> Result<String> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+
+    let mut stream = UnixStream::connect(sock_path)
+        .await
+        .with_context(|| format!("connect to {}", sock_path.display()))?;
+
+    let auth_header =
+        control_token.map(|t| format!("X-Agentsso-Control: {t}\r\n")).unwrap_or_default();
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{auth_header}Connection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.context("write HTTP request")?;
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.context("read HTTP response")?;
+    let response = String::from_utf8_lossy(&response).into_owned();
+
+    extract_body(&response).ok_or_else(|| anyhow::anyhow!("malformed HTTP response"))
+}
+
+async fn http_get_with_status_inner_uds(
+    sock_path: &Path,
+    path: &str,
+    control_token: Option<&str>,
+) -> Result<(u16, String)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+
+    let mut stream = UnixStream::connect(sock_path)
+        .await
+        .with_context(|| format!("connect to {}", sock_path.display()))?;
+
+    let auth_header =
+        control_token.map(|t| format!("X-Agentsso-Control: {t}\r\n")).unwrap_or_default();
+    let request =
+        format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n{auth_header}Connection: close\r\n\r\n");
+    stream.write_all(request.as_bytes()).await.context("write HTTP request")?;
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.context("read HTTP response")?;
+    let response_str = String::from_utf8_lossy(&response).into_owned();
+
+    let status = parse_status_code(&response_str)
+        .ok_or_else(|| anyhow::anyhow!("malformed HTTP response status line"))?;
+    let body =
+        extract_body(&response_str).ok_or_else(|| anyhow::anyhow!("malformed HTTP response"))?;
+    Ok((status, body))
 }
 
 /// Minimal HTTP/1.1 POST with a caller-supplied JSON body. Used by

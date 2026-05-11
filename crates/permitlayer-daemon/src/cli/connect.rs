@@ -224,13 +224,13 @@ async fn probe_daemon_kill_state_or_exit() -> anyhow::Result<()> {
         return Ok(());
     }
 
-    let bind_addr = config.http.bind_addr;
+    let endpoint = crate::cli::kill::resolve_control_endpoint(&config);
     let probe_deadline = std::time::Duration::from_millis(500);
     let control_token = crate::cli::kill::read_control_token(home);
 
     let probe_result = tokio::time::timeout(
         probe_deadline,
-        crate::cli::kill::http_get(bind_addr, "/v1/control/state", control_token.as_deref()),
+        crate::cli::kill::http_get_via(&endpoint, "/v1/control/state", control_token.as_deref()),
     )
     .await;
 
