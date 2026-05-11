@@ -3281,9 +3281,36 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     // the rc.21 single-listener model is preserved (those redesigns
     // are 7.18 + 7.19).
     #[cfg(target_os = "macos")]
-    let control_router_for_uds = control_router.layer(axum::middleware::from_fn(
-        crate::server::control_listener::record_peer_credentials_layer,
-    ));
+    let control_router_for_uds = {
+        // Story 7.27 AC #2: `/health` + `/v1/health` are duplicated
+        // on both listeners so operators can liveness-probe either
+        // transport. The health routes are merged AFTER the auth
+        // layer is applied to control_router so they stay unauth'd,
+        // mirroring how `control_router` itself is carved out of
+        // KillSwitchLayer.
+        //
+        // We use a minimal stateless health handler here (rather
+        // than reusing the full `health_handler` from the TCP path)
+        // because the latter takes `State<AppState>` while
+        // control_router takes `State<ControlState>` — merging two
+        // routers with different state types is not supported by
+        // axum's Router::merge. The control-plane liveness probe
+        // only needs to confirm "the daemon is up + the UDS
+        // listener is alive"; richer health info (bind_addr,
+        // active_connections, version) is on the TCP /health.
+        async fn uds_health_handler() -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "status": "ok",
+                "transport": "uds",
+            }))
+        }
+        let health_router = Router::<()>::new()
+            .route("/health", get(uds_health_handler))
+            .route("/v1/health", get(uds_health_handler));
+        control_router.merge(health_router).layer(axum::middleware::from_fn(
+            crate::server::control_listener::record_peer_credentials_layer,
+        ))
+    };
     #[cfg(not(target_os = "macos"))]
     let app = app.merge(control_router);
 
