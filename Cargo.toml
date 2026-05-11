@@ -10,6 +10,7 @@ members = [
     "crates/permitlayer-plugins",
     "crates/permitlayer-connectors",
     "crates/permitlayer-daemon",
+    "crates/permitlayer-platform-macos",
     "xtask",
 ]
 
@@ -44,6 +45,9 @@ permitlayer-oauth      = { path = "crates/permitlayer-oauth",      version = "0.
 permitlayer-proxy      = { path = "crates/permitlayer-proxy",      version = "0.3.0-rc.21" }
 permitlayer-plugins    = { path = "crates/permitlayer-plugins",    version = "0.3.0-rc.21" }
 permitlayer-connectors = { path = "crates/permitlayer-connectors", version = "0.3.0-rc.21" }
+# Story 7.26 scaffolding: macOS-only platform integration crate. No call
+# sites yet — Story 7.27 wires it in for UDS+peercred + renameatx_np.
+permitlayer-platform-macos = { path = "crates/permitlayer-platform-macos", version = "0.3.0-rc.21" }
 
 # Credential type discipline
 zeroize = { version = "1.8", features = ["zeroize_derive"] }

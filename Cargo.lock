@@ -2281,6 +2281,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "permitlayer-platform-macos"
+version = "0.3.0-rc.21"
+dependencies = [
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "permitlayer-plugins"
 version = "0.3.0-rc.21"
 dependencies = [

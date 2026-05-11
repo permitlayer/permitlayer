@@ -1,0 +1,22 @@
+[package]
+name = "permitlayer-platform-macos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "macOS-specific platform integration (UDS+peercred, renameatx_np, System.keychain helpers). Carries unsafe FFI; deliberately NOT under #![forbid(unsafe_code)]."
+
+[dependencies]
+thiserror.workspace = true
+
+# Story 7.27 will add target-gated deps here for the LOCAL_PEERCRED
+# struct unpacking, renameatx_np FFI, and any SecAccessCreate
+# helpers not covered by the standard `keyring` crate surface. Story
+# 7.26 lands this crate as empty scaffolding so 7.27's diff is "code
+# into the crate" without ALSO being "create the crate."
+
+[lints]
+workspace = true
