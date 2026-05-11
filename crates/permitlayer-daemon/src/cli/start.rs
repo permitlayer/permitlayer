@@ -78,6 +78,11 @@ struct AppState {
     /// metadata in a fresh sandboxed context. Subsequent request
     /// dispatch (a future story) re-uses the same runtime for
     /// per-call `with_host_api` execution.
+    // Only read by `debug_plugin_echo_handler` (`#[cfg(debug_assertions)]`).
+    // Release builds drop the consumer; the field's `Arc` is still
+    // built + dropped at boot. `#[allow(dead_code)]` keeps the
+    // release-clippy gate green without #[cfg]-splitting the struct.
+    #[allow(dead_code)]
     pub(crate) plugin_runtime: Arc<permitlayer_plugins::PluginRuntime>,
     /// Story 6.3: plugin registry populated by `loader::load_all`
     /// at boot. Built-in connectors (Gmail, Calendar, Drive) always
@@ -3187,7 +3192,21 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         }
         // rest_router is Router<()> (stateless — captures Arc<ProxyService> in closures).
         // Merge it before applying .with_state(state) so axum can coerce it.
+        //
+        // `mut` is only needed in debug builds where the
+        // plugin-echo route below reassigns. Release builds compile
+        // out the reassignment, so the `mut` is cfg-gated to keep
+        // `cargo clippy --release` clean. (Pre-7.27 latent warning
+        // caught by the rc.22 release-clippy gate.)
+        #[cfg(debug_assertions)]
         let mut router = Router::new()
+            .route("/health", get(health_handler))
+            .route("/v1/health", get(health_handler))
+            .nest_service("/mcp", gmail_mcp)
+            .nest_service("/mcp/calendar", calendar_mcp)
+            .nest_service("/mcp/drive", drive_mcp);
+        #[cfg(not(debug_assertions))]
+        let router = Router::new()
             .route("/health", get(health_handler))
             .route("/v1/health", get(health_handler))
             .nest_service("/mcp", gmail_mcp)
