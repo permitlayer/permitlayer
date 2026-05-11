@@ -47,7 +47,9 @@ const MECHANISM: &str = "task-scheduler";
 /// the embedded daemon path back out (mirrors macOS plist + Linux unit
 /// patterns; lets Story 7.5 detect post-upgrade path drift).
 pub(crate) fn xml_record_path(home: &Path) -> PathBuf {
-    home.join(".agentsso").join("autostart").join("task-scheduler.xml")
+    permitlayer_core::paths::daemon_state_dir(Some(home))
+        .join("autostart")
+        .join("task-scheduler.xml")
 }
 
 /// Resolve the Story 7.2 Startup-folder shortcut path. Filename pinned

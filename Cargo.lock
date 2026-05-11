@@ -2195,6 +2195,7 @@ dependencies = [
  "http-body-util",
  "indicatif",
  "insta",
+ "keyring",
  "libc",
  "minisign",
  "minisign-verify",

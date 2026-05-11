@@ -126,6 +126,14 @@ flate2 = "1.0"
 tar = { workspace = true }
 semver = { workspace = true }
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Story 7.26 code review (P11): `agentsso uninstall` on macOS sweeps
+# the legacy rc.21 service id (`io.permitlayer.master-key`) from the
+# user's login.keychain as a best-effort cleanup, since the rc.22
+# path targets System.keychain under a different service id and
+# would otherwise leave the rc.21 entry orphaned.
+keyring.workspace = true
+
 [target.'cfg(unix)'.dependencies]
 nix.workspace = true
 # Story 7.6b round-2 review: rotation-state marker file uses

@@ -239,7 +239,7 @@ pub(crate) fn enable(exec: &impl Engine, home: &Path) -> Result<EnableOutcome, A
     // (`daemon` resolved earlier for the brew-migration decision; reuse.)
     super::require_utf8_path(&daemon)?;
     super::require_utf8_path(home)?;
-    let log_path = home.join(".agentsso").join("logs").join("autostart.log");
+    let log_path = permitlayer_core::paths::daemon_log_dir(Some(home)).join("autostart.log");
 
     // P31 (code review round 3): the previous code returned
     // `AlreadyEnabled` when the plist file existed AT ALL, which was
@@ -1330,7 +1330,8 @@ mod tests {
         let plist = plist_path(tmp.path());
         std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
         let daemon = current_daemon_path().unwrap();
-        let log_path = tmp.path().join(".agentsso").join("logs").join("autostart.log");
+        let log_path =
+            permitlayer_core::paths::daemon_log_dir(Some(tmp.path())).join("autostart.log");
         let xml = render_plist(&daemon, &log_path, tmp.path());
         std::fs::write(&plist, &xml).unwrap();
 
@@ -1367,7 +1368,8 @@ mod tests {
         std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
         // Pre-write the EXACT content enable() would write.
         let daemon = current_daemon_path().unwrap();
-        let log_path = tmp.path().join(".agentsso").join("logs").join("autostart.log");
+        let log_path =
+            permitlayer_core::paths::daemon_log_dir(Some(tmp.path())).join("autostart.log");
         let xml = render_plist(&daemon, &log_path, tmp.path());
         std::fs::write(&plist, &xml).unwrap();
 

@@ -1641,22 +1641,54 @@ impl StartError {
                 banner
             }
             Self::MasterKeyCall { source } => {
+                // Story 7.26 AC #1 step 3 (corrupted-bytes refuse-to-start):
+                // when the keychain item exists but its bytes don't
+                // decode to a 32-byte key (hex-encoding contract
+                // violated), surface the rc.22 System.keychain
+                // remediation pointer specifically. The generic
+                // banner below assumes a missing/locked entry on
+                // login.keychain and would mislead the operator.
+                if matches!(source, permitlayer_keystore::KeyStoreError::MalformedMasterKey { .. })
+                {
+                    let mut banner = "error: the OS keychain holds a master-key entry with corrupted contents.\n\
+                     \n\
+                     the daemon refuses to start when the stored bytes do not\n\
+                     decode to a valid 32-byte key — silently re-minting would\n\
+                     orphan whatever vault data the prior key encrypted.\n\
+                     \n\
+                     recovery:\n\
+                     - on macOS (rc.22+, System.keychain):\n  \
+                       sudo security delete-generic-password \\\n  \
+                         -s dev.permitlayer.master-key \\\n  \
+                         /Library/Keychains/System.keychain\n  \
+                       sudo agentsso service uninstall && sudo agentsso service install\n  \
+                       (the vault directory will be re-initialized; any\n  \
+                       credentials encrypted by the corrupted key are not\n  \
+                       recoverable.)\n\
+                     - on linux/windows (legacy login keystore):\n  \
+                       remove the io.permitlayer.master-key entry via\n  \
+                       secret-tool / cmdkey, then re-run `agentsso start`.\n\
+                     \n\
+                     run with `AGENTSSO_LOG__LEVEL=debug` for the underlying error.\n"
+                        .to_owned();
+                    append_structured_keystore_tail(&mut banner, source);
+                    return banner;
+                }
                 let mut banner = "error: failed to provision the vault master key.\n\
                  \n\
                  the daemon cannot boot without a master key — every authenticated\n\
                  request would return 401 and the vault cannot decrypt credentials.\n\
                  \n\
                  common causes:\n\
-                 - on macOS: the login keychain is locked — unlock it and retry.\n\
-                   After `brew upgrade agentsso`, the new binary's codesign hash\n\
-                   invalidates the keychain ACL on the existing master-key entry;\n\
-                   on a TTY-attached session (interactive terminal, SSH with TTY)\n\
-                   the daemon should have dropped to a passphrase prompt. If you\n\
-                   see this banner instead, you are likely running under launchd\n\
-                   (`brew services start agentsso`), `ssh -T`, or another\n\
-                   non-interactive context where the prompt cannot be displayed.\n\
-                   See README \"Recovery after `brew upgrade agentsso`\" for\n\
-                   recovery steps.\n\
+                 - on macOS (rc.22+): the daemon writes the master key to\n\
+                   System.keychain under `dev.permitlayer.master-key`; on first\n\
+                   boot it expects root privileges (run via `sudo agentsso\n\
+                   service install` rather than `agentsso start` directly).\n\
+                 - on macOS (rc.21 and earlier): the login keychain is locked —\n\
+                   unlock it and retry. After `brew upgrade agentsso`, the new\n\
+                   binary's codesign hash invalidates the keychain ACL on the\n\
+                   existing master-key entry; on a TTY-attached session the\n\
+                   daemon should have dropped to a passphrase prompt.\n\
                  - on linux: the secret-service daemon is not running\n\
                    (install `libsecret` / `gnome-keyring-daemon` and start a session)\n\
                  - on fresh CI containers: no keyring backend available —\n\

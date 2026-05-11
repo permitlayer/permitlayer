@@ -98,16 +98,28 @@ pub const MASTER_KEY_LEN: usize = 32;
 /// their own service strings, which structurally eliminates path-
 /// traversal and delimiter-collision concerns.
 ///
-/// **Renamed in Story 7.26 from `io.permitlayer.master-key` to
-/// `dev.permitlayer.master-key`** to align with the rc.22 macOS
+/// **Renamed on macOS in Story 7.26 from `io.permitlayer.master-key`
+/// to `dev.permitlayer.master-key`** to align with the rc.22 macOS
 /// LaunchDaemon redesign's service identifier convention
 /// (`dev.permitlayer.daemon` for the LaunchDaemon plist label).
-/// rc.21 → rc.22 is a breaking change with no in-place migration —
-/// rc.21 operators run `agentsso service install` (Story 7.27) which
-/// creates a fresh keychain entry under the new service id. The old
-/// `io.permitlayer.master-key` entry in login.keychain is orphaned;
-/// `agentsso service uninstall` cleans it up (Story 7.27).
+/// macOS rc.21 → rc.22 is a breaking change with no in-place
+/// migration — rc.21 operators run `agentsso service install`
+/// (Story 7.27) which creates a fresh keychain entry under the new
+/// service id. The old `io.permitlayer.master-key` entry in
+/// login.keychain is orphaned; `agentsso uninstall` cleans it up
+/// (best-effort sweep added in Story 7.26 code review).
+///
+/// **Linux + Windows retain `io.permitlayer.master-key`** per AC #9
+/// path (b) and AC #7 ("Linux + Windows preserved"). Those platforms
+/// have not yet been redesigned; renaming the service id there would
+/// silently strand rc.21 users' secret-service / CredMan entries
+/// with no migration path. The rename happens when those platforms
+/// get their own redesigns in future stories.
+#[cfg(target_os = "macos")]
 pub const MASTER_KEY_SERVICE: &str = "dev.permitlayer.master-key";
+
+#[cfg(not(target_os = "macos"))]
+pub const MASTER_KEY_SERVICE: &str = "io.permitlayer.master-key";
 
 /// Account identifier for the master-key entry. At MVP there is exactly
 /// one key per machine; this may become a slot identifier when key
@@ -557,10 +569,15 @@ mod factory_tests {
         // These constants are baked into on-disk state (OS keychain).
         // Changing them without a migration is a breaking change.
         // Story 7.26 renamed io.permitlayer.master-key →
-        // dev.permitlayer.master-key as part of the rc.22 macOS
-        // LaunchDaemon redesign (no in-place migration; new entry in
-        // System.keychain via `service install`).
+        // dev.permitlayer.master-key on macOS only as part of the
+        // rc.22 macOS LaunchDaemon redesign (System.keychain entry
+        // created fresh by `service install`). Linux + Windows
+        // retain the legacy `io.permitlayer.master-key` until those
+        // platforms get their own redesigns.
+        #[cfg(target_os = "macos")]
         assert_eq!(MASTER_KEY_SERVICE, "dev.permitlayer.master-key");
+        #[cfg(not(target_os = "macos"))]
+        assert_eq!(MASTER_KEY_SERVICE, "io.permitlayer.master-key");
         assert_eq!(MASTER_KEY_ACCOUNT, "master");
     }
 }

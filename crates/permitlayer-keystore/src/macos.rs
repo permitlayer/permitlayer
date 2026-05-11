@@ -249,7 +249,11 @@ fn read_or_mint_master_key(
     // `/usr/bin/security` returned only after its own commit + flush,
     // so a `NoEntry` here means the write genuinely did not persist.
     match read_account(account)? {
-        Some(verified) if verified.as_slice() == new_key.as_slice() => {
+        // P5 (Story 7.26 code review): constant-time comparison via
+        // `subtle::ConstantTimeEq` to match the discipline already
+        // enforced by `keyring_shared::constant_time_eq` on the
+        // Linux/Windows path.
+        Some(verified) if ct_eq(verified.as_slice(), new_key.as_slice()) => {
             tracing::info!(
                 event = "master_key.boot.first_boot_complete",
                 fingerprint = %fingerprint(new_key.as_slice()),
@@ -259,12 +263,33 @@ fn read_or_mint_master_key(
             );
             Ok(new_key)
         }
-        Some(_) => Err(KeyStoreError::PlatformError {
-            backend: BACKEND,
-            message: "first-boot mint read-back returned different bytes — concurrent first-boot \
-                      race won by another process; restart to pick up the persisted key"
-                .into(),
-        }),
+        // P8 (Story 7.26 code review): concurrent first-boot self-heal.
+        // If the read-back returns *different* bytes, another daemon
+        // raced us to mint and its key is the one persisted (our `-U`
+        // upsert may have clobbered it, or its `-U` clobbered ours;
+        // either way, whatever survived is the canonical entry). The
+        // recovery is to re-read and use the surviving key rather than
+        // forcing the operator to restart. We mint at most one extra
+        // 32-byte buffer that immediately drops/zeroizes.
+        Some(_) => match read_account(account)? {
+            Some(canonical) => {
+                tracing::info!(
+                    event = "master_key.boot.first_boot_race_recovered",
+                    fingerprint = %fingerprint(canonical.as_slice()),
+                    keychain_target = KEYCHAIN_TARGET,
+                    service_id = MASTER_KEY_SERVICE,
+                    "first-boot race detected; adopted the surviving key from System.keychain"
+                );
+                Ok(canonical)
+            }
+            None => Err(KeyStoreError::PlatformError {
+                backend: BACKEND,
+                message: "first-boot mint read-back returned different bytes, then NoEntry on \
+                          re-read — keychain state changed under us (concurrent delete?). \
+                          Restart the daemon to retry the first-boot gate."
+                    .into(),
+            }),
+        },
         None => Err(KeyStoreError::PlatformError {
             backend: BACKEND,
             message: "first-boot mint succeeded per `security` exit 0 but read-back returned \
@@ -272,6 +297,14 @@ fn read_or_mint_master_key(
                 .into(),
         }),
     }
+}
+
+/// Constant-time byte comparison for read-back equality. Mirrors
+/// [`keyring_shared::constant_time_eq`] (which is Linux/Windows-only
+/// on rc.22+ and therefore not reachable from this module).
+fn ct_eq(a: &[u8], b: &[u8]) -> bool {
+    use subtle::ConstantTimeEq;
+    a.ct_eq(b).into()
 }
 
 /// Operator-mode WRITE for `agentsso rotate-key` (post-first-boot).
@@ -282,7 +315,8 @@ fn write_then_verify_at_account(
 ) -> Result<(), KeyStoreError> {
     write_master_key_via_security_a(account, key)?;
     match read_account(account)? {
-        Some(verified) if verified.as_slice() == key.as_slice() => Ok(()),
+        // P5 (Story 7.26 code review): constant-time read-back equality.
+        Some(verified) if ct_eq(verified.as_slice(), key.as_slice()) => Ok(()),
         Some(_) => Err(KeyStoreError::PlatformError {
             backend: BACKEND,
             message: "set_master_key read-back did not match written value".into(),
@@ -337,9 +371,36 @@ fn write_master_key_via_security_a(
     account: &str,
     key: &[u8; MASTER_KEY_LEN],
 ) -> Result<(), KeyStoreError> {
-    let mut secret_hex: String = key.iter().map(|b| format!("{:02x}", b)).collect();
+    // P4 (Story 7.26 code review): write into a single pre-allocated
+    // buffer using `write!` rather than per-byte `format!`+`collect`.
+    // The old form allocated 32 short-lived 2-char `String`s that
+    // dropped without zeroization, leaving byte fragments of the
+    // master key on the freed heap. One buffer, one zeroize.
+    //
+    // P3 (Story 7.26 code review): wrap the buffer in a value that
+    // zeroizes on Drop so EVERY exit path scrubs it — the prior
+    // `?` on `Command::output()` skipped the explicit zeroize when
+    // the spawn itself failed.
+    use std::fmt::Write;
+    struct ZeroizingHex(String);
+    impl Drop for ZeroizingHex {
+        fn drop(&mut self) {
+            self.0.zeroize();
+        }
+    }
+    let mut secret_hex = ZeroizingHex(String::with_capacity(MASTER_KEY_LEN * 2));
+    for b in key.iter() {
+        // `write!` into a `String` is infallible (the impl of
+        // `fmt::Write` for `String` never returns an error), so the
+        // `Result` here can be safely discarded.
+        let _ = write!(&mut secret_hex.0, "{:02x}", b);
+    }
 
     let output = Command::new("/usr/bin/security")
+        // P6 (Story 7.26 code review): explicitly null stdin so the
+        // daemon never blocks if `security` decides to prompt
+        // (e.g., locked-keychain unlock prompt).
+        .stdin(std::process::Stdio::null())
         .args([
             "add-generic-password",
             "-s",
@@ -349,16 +410,13 @@ fn write_master_key_via_security_a(
             "-A", // no DR-bound ACL (load-bearing — produces allowAllForm)
             "-U", // upsert OK; read-before-write gate is the source of truth for "first boot"
             "-w",
-            &secret_hex,
+            secret_hex.0.as_str(),
             SYSTEM_KEYCHAIN_PATH,
         ])
         .output()
         .map_err(|e| KeyStoreError::BackendUnavailable { backend: BACKEND, source: Box::new(e) })?;
-
-    // Zeroize the hex string immediately. The argv copy in the
-    // kernel's process table is outside our control (that's the `-w`
-    // tradeoff), but the heap copy in our address space goes away.
-    secret_hex.zeroize();
+    // `secret_hex` is dropped at end-of-scope; its Drop impl zeroizes
+    // the buffer regardless of which branch below returns.
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -479,11 +537,27 @@ mod tests {
         let test_account = "test-7-26-round-trip";
         let key: [u8; MASTER_KEY_LEN] = [0x7eu8; MASTER_KEY_LEN];
 
+        // P7 (Story 7.26 code review): Drop-based cleanup guard so a
+        // panicking assertion does not leave the test entry stranded
+        // in System.keychain. The guard's Drop runs even on panic
+        // unwind; failure to delete is tolerated (it'll surface as a
+        // double-cleanup error from the explicit delete below, or
+        // the dev can clean up by hand).
+        struct CleanupGuard(&'static str);
+        impl Drop for CleanupGuard {
+            fn drop(&mut self) {
+                let _ = delete_account(self.0);
+            }
+        }
+        let _cleanup = CleanupGuard(test_account);
+
         write_master_key_via_security_a(test_account, &key).expect("write failed");
         let read_back = read_account(test_account).expect("read failed").expect("no entry");
-        assert_eq!(read_back.as_slice(), key.as_slice());
+        assert!(ct_eq(read_back.as_slice(), key.as_slice()), "round-trip bytes mismatch");
 
         let outcome = delete_account(test_account).expect("delete failed");
         assert_eq!(outcome, DeleteOutcome::Removed);
+        // CleanupGuard re-runs delete here on scope exit — idempotent
+        // (returns AlreadyAbsent), no-op on the happy path.
     }
 }
