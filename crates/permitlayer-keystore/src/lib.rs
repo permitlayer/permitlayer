@@ -105,9 +105,15 @@ pub const MASTER_KEY_LEN: usize = 32;
 /// macOS rc.21 → rc.22 is a breaking change with no in-place
 /// migration — rc.21 operators run `agentsso service install`
 /// (Story 7.27) which creates a fresh keychain entry under the new
-/// service id. The old `io.permitlayer.master-key` entry in
-/// login.keychain is orphaned; `agentsso uninstall` cleans it up
-/// (best-effort sweep added in Story 7.26 code review).
+/// service id. The old `io.permitlayer.master-key` entry in the
+/// unprivileged user's login.keychain is orphaned; `agentsso
+/// uninstall` warns about it (both in the pre-confirm prompt
+/// manifest and on stderr at the end of the run) and prints the
+/// `security delete-generic-password` command to remove it. The
+/// programmatic sweep was attempted in round-1 review patches and
+/// rejected in round 2 because uninstall runs under `sudo`, and
+/// `keyring 3.6`'s macOS API has no target-user knob — the sweep
+/// would have targeted root's keychain, not the operator's.
 ///
 /// **Linux + Windows retain `io.permitlayer.master-key`** per AC #9
 /// path (b) and AC #7 ("Linux + Windows preserved"). Those platforms

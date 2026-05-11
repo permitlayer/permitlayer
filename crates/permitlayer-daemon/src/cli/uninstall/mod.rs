@@ -291,6 +291,23 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
     print_step(&g, &keystore_outcome);
     outcomes.push(keystore_outcome);
 
+    // Story 7.26 code-review round 3 (P12): the rc.21 → rc.22 macOS
+    // upgrade may leave an `io.permitlayer.master-key` entry in the
+    // unprivileged user's login.keychain. The pre-confirm manifest
+    // already warns about this, but operators using `--yes` (CI,
+    // scripted flows) never see the manifest. Mirror the warning on
+    // stderr so the canonical scripted path also surfaces it.
+    #[cfg(target_os = "macos")]
+    {
+        eprintln!(
+            "{} note: legacy rc.21 keychain entry, if present, is NOT removed by this uninstall.\n    \
+             To remove it, run as your unprivileged user (NOT via sudo):\n      \
+             security delete-generic-password -s io.permitlayer.master-key -a {}",
+            g.arrow,
+            permitlayer_keystore::MASTER_KEY_ACCOUNT,
+        );
+    }
+
     // 4. Remove the data dir (or just keystore/ + pid on --keep-data).
     let data_outcome = remove_data_dir_warn_on_fail(&home, args.keep_data);
     print_step(&g, &data_outcome);
@@ -380,15 +397,17 @@ fn build_prompt_manifest(
     // login.keychain, not the operator's. A best-effort programmatic
     // sweep from inside uninstall would be a silent no-op in the
     // canonical flow. Surface the cleanup command operators can run
-    // as their unprivileged user instead.
+    // as their unprivileged user instead. Round-3 (P12) also mirrors
+    // this to stderr in the closing flow so `--yes` runs see it.
     #[cfg(target_os = "macos")]
     {
-        out.push_str(
+        out.push_str(&format!(
             "  • (note) if you upgraded from rc.21 or earlier, an orphan entry may remain\n    \
-             in your user login.keychain at `io.permitlayer.master-key / master`.\n    \
+             in your user login.keychain at `io.permitlayer.master-key / {account}`.\n    \
              To remove it, run as your unprivileged user (NOT via sudo):\n      \
-             security delete-generic-password -s io.permitlayer.master-key -a master\n",
-        );
+             security delete-generic-password -s io.permitlayer.master-key -a {account}\n",
+            account = permitlayer_keystore::MASTER_KEY_ACCOUNT,
+        ));
     }
 
     // Autostart line.
