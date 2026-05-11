@@ -372,6 +372,25 @@ fn build_prompt_manifest(
         permitlayer_keystore::MASTER_KEY_ACCOUNT
     ));
 
+    // Story 7.26 code-review round 2 (R2): on macOS, rc.21 → rc.22
+    // upgraders carry a legacy `io.permitlayer.master-key` entry in
+    // their unprivileged user's login.keychain. Uninstall runs under
+    // `sudo` per the rc.22 install banner — the effective uid is
+    // root, and `keyring`'s default-target API resolves to root's
+    // login.keychain, not the operator's. A best-effort programmatic
+    // sweep from inside uninstall would be a silent no-op in the
+    // canonical flow. Surface the cleanup command operators can run
+    // as their unprivileged user instead.
+    #[cfg(target_os = "macos")]
+    {
+        out.push_str(
+            "  • (note) if you upgraded from rc.21 or earlier, an orphan entry may remain\n    \
+             in your user login.keychain at `io.permitlayer.master-key / master`.\n    \
+             To remove it, run as your unprivileged user (NOT via sudo):\n      \
+             security delete-generic-password -s io.permitlayer.master-key -a master\n",
+        );
+    }
+
     // Autostart line.
     // P20 (review): distinguish "Disabled" (status query succeeded,
     // confirmed nothing registered) from `None` (status query failed
@@ -752,29 +771,15 @@ async fn delete_keychain_entry_warn_on_fail(home: &Path) -> StepOutcome {
         }
     };
 
-    let outcome = keystore.delete_master_key().await;
-
-    // P11 (Story 7.26 code review): on macOS, best-effort sweep of the
-    // legacy rc.21 service id (`io.permitlayer.master-key`) in the
-    // user's login.keychain. The rc.22 macOS path targets
-    // System.keychain with `dev.permitlayer.master-key`, so the
-    // primary `delete_master_key()` above never reaches the rc.21
-    // orphan. We tolerate every failure mode (no entry / no backend /
-    // locked keychain) — this is cosmetic cleanup, not load-bearing.
-    #[cfg(target_os = "macos")]
-    {
-        let _ = tokio::task::spawn_blocking(|| {
-            if let Ok(entry) = keyring::Entry::new(
-                "io.permitlayer.master-key",
-                permitlayer_keystore::MASTER_KEY_ACCOUNT,
-            ) {
-                let _ = entry.delete_credential();
-            }
-        })
-        .await;
-    }
-
-    match outcome {
+    // Story 7.26 code-review round 2 (R2): the previous round's P11
+    // programmatic sweep of the legacy rc.21 `io.permitlayer.master-key`
+    // login.keychain entry was removed — it targeted root's keychain
+    // under the canonical `sudo agentsso service uninstall` flow and
+    // was a silent no-op in the case it was meant to clean up. The
+    // operator-facing guidance now lives in `build_prompt_manifest`
+    // (see the rc.21-orphan note appended on macOS) which tells the
+    // operator the exact command to run as their unprivileged user.
+    match keystore.delete_master_key().await {
         Ok(DeleteOutcome::Removed) => StepOutcome::Done {
             step: "removing keychain entry",
             detail: format!(

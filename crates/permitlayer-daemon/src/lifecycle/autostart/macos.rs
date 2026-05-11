@@ -239,7 +239,19 @@ pub(crate) fn enable(exec: &impl Engine, home: &Path) -> Result<EnableOutcome, A
     // (`daemon` resolved earlier for the brew-migration decision; reuse.)
     super::require_utf8_path(&daemon)?;
     super::require_utf8_path(home)?;
-    let log_path = permitlayer_core::paths::daemon_log_dir(Some(home)).join("autostart.log");
+    // Story 7.26 code-review round 2 (R1): this site receives the user's
+    // home directory (from `autostart::home_dir()`, which returns
+    // `dirs::home_dir()` — NOT a state-dir root). Routing through
+    // `paths::daemon_log_dir(Some(home))` would drop the `.agentsso`
+    // segment in production (`/Users/alice/logs/autostart.log` instead
+    // of `/Users/alice/.agentsso/logs/autostart.log`) because the
+    // override contract anchors at the state-dir root. AC #5's
+    // centralization target is the daemon state dir (which moves to
+    // `/Library/Application Support/permitlayer/` under the rc.22
+    // LaunchDaemon model); per-user LaunchAgent log files stay
+    // anchored to the user's home dir and are intentionally exempt
+    // from the centralized path module.
+    let log_path = home.join(".agentsso").join("logs").join("autostart.log");
 
     // P31 (code review round 3): the previous code returned
     // `AlreadyEnabled` when the plist file existed AT ALL, which was
@@ -1330,8 +1342,7 @@ mod tests {
         let plist = plist_path(tmp.path());
         std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
         let daemon = current_daemon_path().unwrap();
-        let log_path =
-            permitlayer_core::paths::daemon_log_dir(Some(tmp.path())).join("autostart.log");
+        let log_path = tmp.path().join(".agentsso").join("logs").join("autostart.log");
         let xml = render_plist(&daemon, &log_path, tmp.path());
         std::fs::write(&plist, &xml).unwrap();
 
@@ -1368,8 +1379,7 @@ mod tests {
         std::fs::create_dir_all(plist.parent().unwrap()).unwrap();
         // Pre-write the EXACT content enable() would write.
         let daemon = current_daemon_path().unwrap();
-        let log_path =
-            permitlayer_core::paths::daemon_log_dir(Some(tmp.path())).join("autostart.log");
+        let log_path = tmp.path().join(".agentsso").join("logs").join("autostart.log");
         let xml = render_plist(&daemon, &log_path, tmp.path());
         std::fs::write(&plist, &xml).unwrap();
 
