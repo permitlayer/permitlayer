@@ -1113,6 +1113,28 @@ pub(crate) struct RegisterAgentResponse {
     pub policy_name: String,
     pub bearer_token: String,
     pub created_at: String,
+    /// Story 7.27 AC #8: when the request came over the UDS
+    /// control listener, the daemon writes the plaintext bearer
+    /// token to `<home>/.agentsso/agent-bearer.token`. If that
+    /// write fails (e.g., parent dir is a symlink), the agent is
+    /// still registered successfully — this field carries the
+    /// per-user-file failure message so the calling CLI can
+    /// surface a partial-success warning to the operator. `None`
+    /// on the happy path AND on TCP-served requests (which don't
+    /// have a kernel-attested peer to write the file for).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer_token_file: Option<BearerTokenFileWriteResult>,
+}
+
+/// Per-user `agent-bearer.token` file write result, surfaced in
+/// `RegisterAgentResponse::bearer_token_file`. `Ok` carries the
+/// path the daemon wrote to; `Err` carries the error message so
+/// the operator can take corrective action.
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub(crate) enum BearerTokenFileWriteResult {
+    Written { path: String, replace_existing: bool },
+    Failed { message: String },
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1201,6 +1223,21 @@ pub(crate) async fn register_agent_handler(
     }
 
     let request_id = read_request_id(&req);
+
+    // Story 7.27 AC #6 + #8: snapshot kernel-attested peer
+    // credentials (injected by
+    // `server::control_listener::record_peer_credentials_layer` on
+    // the macOS UDS serve path) BEFORE the request body is
+    // consumed. On TCP-served requests (Linux/Windows or pre-
+    // 7.27 macOS fallback) the extension is absent and the
+    // per-user token-write step is skipped.
+    //
+    // The value is `Copy` (`PeerCredentials { uid, gid }`) so we
+    // dereference + copy out immediately, releasing the borrow on
+    // `req.extensions()` before the body-consumption step.
+    #[cfg(target_os = "macos")]
+    let _peer_creds_for_register: Option<crate::server::control_listener::PeerCredentials> =
+        req.extensions().get::<crate::server::control_listener::PeerCredentials>().copied();
 
     // Rate-limit concurrent agent CRUD. `try_acquire_owned` returns
     // immediately with an error when the semaphore is exhausted rather
@@ -1465,12 +1502,128 @@ pub(crate) async fn register_agent_handler(
         "agent registered via control endpoint"
     );
 
+    // Story 7.27 AC #6 + #8 + #14: when the request came over the
+    // UDS control listener, the daemon writes the plaintext bearer
+    // token to the kernel-attested peer's
+    // `<home>/.agentsso/agent-bearer.token` using the
+    // tmp+chown+fchmod+renameatx_np(RENAME_EXCL)+O_NOFOLLOW pattern.
+    // The peer credentials are injected into request extensions by
+    // `server::control_listener::record_peer_credentials_layer` on
+    // the UDS serve path; TCP-served requests (the rc.21 fallback
+    // on non-macOS) have no extension, so we skip the per-user
+    // file write. The agent registration itself has already
+    // committed by this point — a token-write failure is logged +
+    // surfaced as a partial-success response field but does NOT
+    // undo the registration (the operator can re-run register to
+    // retry the token-write step idempotently).
+    #[cfg(target_os = "macos")]
+    let bearer_token_file: Option<BearerTokenFileWriteResult> = {
+        if let Some(creds) = _peer_creds_for_register {
+            let token_bytes = bearer_token.clone().into_bytes();
+            let state_dir = permitlayer_core::paths::daemon_state_dir(
+                std::env::var("AGENTSSO_PATHS__HOME").ok().map(std::path::PathBuf::from).as_deref(),
+            );
+            match crate::server::agent_token::write_bearer_token_to_user_home(
+                &token_bytes,
+                creds.uid,
+                creds.gid,
+                &state_dir,
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    tracing::info!(
+                        target: "control",
+                        request_id = %request_id,
+                        peer_uid = creds.uid,
+                        target = %outcome.target_path.display(),
+                        replace_existing = outcome.replace_existing,
+                        "bearer-token written to per-user file"
+                    );
+                    if let Some(audit) = &state.audit_store {
+                        let event_type = if outcome.replace_existing {
+                            "bearer-token-replaced"
+                        } else {
+                            "bearer-token-written"
+                        };
+                        let mut event = AuditEvent::with_request_id(
+                            request_id.clone(),
+                            payload.name.clone(),
+                            "permitlayer".to_owned(),
+                            "-".to_owned(),
+                            "agent-bearer-token".to_owned(),
+                            "ok".to_owned(),
+                            event_type.to_owned(),
+                        );
+                        event.extra = serde_json::json!({
+                            "peer_uid": creds.uid,
+                            "target_path": outcome.target_path.to_string_lossy(),
+                            "replace_existing": outcome.replace_existing,
+                        });
+                        if let Err(e) = audit.append(event).await {
+                            tracing::warn!(error = %e, "bearer-token audit write failed (best-effort)");
+                        }
+                    }
+                    Some(BearerTokenFileWriteResult::Written {
+                        path: outcome.target_path.to_string_lossy().into_owned(),
+                        replace_existing: outcome.replace_existing,
+                    })
+                }
+                Err(e) => {
+                    let symlink_attack = matches!(
+                        e,
+                        crate::server::agent_token::TokenWriteError::SymlinkInParentPath(_)
+                    );
+                    tracing::warn!(
+                        target: "control",
+                        request_id = %request_id,
+                        peer_uid = creds.uid,
+                        error = %e,
+                        symlink_attack,
+                        "bearer-token write to per-user file failed (partial success)"
+                    );
+                    if let Some(audit) = &state.audit_store {
+                        let event_type = if symlink_attack {
+                            "bearer-token-symlink-attack-blocked"
+                        } else {
+                            "bearer-token-write-failed"
+                        };
+                        let mut event = AuditEvent::with_request_id(
+                            request_id.clone(),
+                            payload.name.clone(),
+                            "permitlayer".to_owned(),
+                            "-".to_owned(),
+                            "agent-bearer-token".to_owned(),
+                            "error".to_owned(),
+                            event_type.to_owned(),
+                        );
+                        event.extra = serde_json::json!({
+                            "peer_uid": creds.uid,
+                            "error": e.to_string(),
+                        });
+                        if let Err(audit_err) = audit.append(event).await {
+                            tracing::warn!(error = %audit_err, "audit append failed (best-effort)");
+                        }
+                    }
+                    Some(BearerTokenFileWriteResult::Failed {
+                        message: format!("bearer-token file write failed: {e}"),
+                    })
+                }
+            }
+        } else {
+            None
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let bearer_token_file: Option<BearerTokenFileWriteResult> = None;
+
     let body = RegisterAgentResponse {
         status: "ok",
         name: payload.name,
         policy_name: payload.policy_name,
         bearer_token,
         created_at: format_audit_timestamp(created_at),
+        bearer_token_file,
     };
     (StatusCode::OK, Json(body)).into_response()
 }

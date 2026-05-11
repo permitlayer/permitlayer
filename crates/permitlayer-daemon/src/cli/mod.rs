@@ -7,6 +7,14 @@ pub mod audit_anomaly;
 pub mod audit_export;
 pub mod audit_follow;
 pub mod auto_rekey;
+// Story 7.27: `agentsso autostart` removed from the CLI surface in
+// favor of `agentsso service install/uninstall/status` (rc.22
+// "burn the boats" direction). The module stays in-tree but is
+// compiled out via `#[cfg(any())]` (always-false attribute) so
+// 7.28 can `git rm` it cleanly. An interceptor in `main.rs`
+// catches stale `agentsso autostart` invocations and emits a
+// remediation block pointing operators at the replacement.
+#[cfg(any())]
 pub mod autostart;
 pub mod config;
 pub mod connect;
@@ -20,6 +28,7 @@ pub mod reload;
 pub mod resume;
 pub mod rotate_key;
 pub mod scrub;
+pub mod service;
 pub mod start;
 pub mod status;
 pub mod stop;

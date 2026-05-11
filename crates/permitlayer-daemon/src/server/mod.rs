@@ -1,3 +1,5 @@
+#[cfg(target_os = "macos")]
+pub mod agent_token;
 pub mod conn_tracker;
 pub mod control;
 #[cfg(target_os = "macos")]

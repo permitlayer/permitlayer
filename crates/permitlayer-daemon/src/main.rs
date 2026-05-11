@@ -69,8 +69,11 @@ enum Commands {
     Agent(cli::agent::AgentArgs),
     /// List plugin connectors loaded by the daemon (built-in + user-installed) — FR40
     Connectors(cli::connectors::ConnectorsArgs),
-    /// Manage opt-in autostart at login (FR7) — enable/disable/status
-    Autostart(cli::autostart::AutostartArgs),
+    /// Manage the daemon as a macOS system service (Story 7.27 +
+    /// rc.22). Replaces `agentsso autostart`. Three subcommands:
+    /// `install` (root-required one-time setup), `uninstall`
+    /// (root-required teardown), `status` (no-root state report).
+    Service(cli::service::ServiceArgs),
     /// Uninstall permitlayer cleanly: stop daemon, remove keychain
     /// entry, autostart, data dir, and binary (FR8). Destructive —
     /// requires interactive confirmation OR --yes.
@@ -133,6 +136,30 @@ async fn main() -> ExitCode {
         return ExitCode::from(2);
     }
 
+    // Story 7.27 — legacy `agentsso autostart` interceptor.
+    //
+    // The `autostart` subcommand was replaced by
+    // `agentsso service install/uninstall/status` in rc.22 (Sprint
+    // Change Proposal 2026-05-10, "burn the boats" direction).
+    // Operators (or scripts) still typing `agentsso autostart enable`
+    // get a structured remediation block instead of clap's terse
+    // "unrecognized subcommand" error.
+    if std::env::args().nth(1).as_deref() == Some("autostart") {
+        eprint!(
+            "{}",
+            crate::design::render::error_block(
+                "autostart.removed",
+                "`agentsso autostart` was replaced by `agentsso service install/uninstall/status` \
+                 in rc.22",
+                "sudo agentsso service install   # one-time setup, root required\n  \
+                 agentsso service status         # report state (no root)\n  \
+                 sudo agentsso service uninstall # teardown, root required",
+                None,
+            )
+        );
+        return ExitCode::from(2);
+    }
+
     let cli = Cli::parse();
     match cli.command {
         Some(Commands::Start(args)) => match cli::start::run(args).await {
@@ -184,7 +211,7 @@ async fn main() -> ExitCode {
         Some(Commands::Resume(args)) => anyhow_to_exit_code(cli::resume::run(args).await),
         Some(Commands::Agent(args)) => anyhow_to_exit_code(cli::agent::run(args).await),
         Some(Commands::Connectors(args)) => anyhow_to_exit_code(cli::connectors::run(args).await),
-        Some(Commands::Autostart(args)) => anyhow_to_exit_code(cli::autostart::run(args).await),
+        Some(Commands::Service(args)) => anyhow_to_exit_code(cli::service::run(args).await),
         Some(Commands::Uninstall(args)) => uninstall_to_exit_code(cli::uninstall::run(args).await),
         Some(Commands::Update(args)) => update_to_exit_code(cli::update::run(args).await),
         Some(Commands::RotateKey(args)) => {
