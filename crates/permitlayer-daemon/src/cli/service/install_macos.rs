@@ -320,9 +320,27 @@ fn create_state_dirs() -> Result<()> {
         std::fs::create_dir_all(dir)
             .with_context(|| format!("failed to mkdir -p {}", dir.display()))?;
     }
-    // State dir + its subdirs are 0700 root:wheel.
-    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o700))
-        .with_context(|| format!("chmod 0700 {}", state.display()))?;
+    // State dir is 0710 root:permitlayer-clients so members of the
+    // group can `cd` into it (traverse) to reach `control.token`
+    // (which the daemon mints at 0640 root:permitlayer-clients for
+    // the operator-CLI cross-user auth flow). Listing the dir's
+    // contents is denied (no read bit for the group) and the
+    // subdirs (vault, agents, plugins, .tokens) keep 0700 root:wheel
+    // so even a permitlayer-clients member can't enumerate them.
+    // Story 7.27 cross-user CLI fix.
+    let clients_gid = nix::unistd::Group::from_name(CLIENTS_GROUP)
+        .ok()
+        .flatten()
+        .map(|g| g.gid.as_raw())
+        .unwrap_or(0);
+    nix::unistd::chown(
+        &state,
+        Some(nix::unistd::Uid::from_raw(0)),
+        Some(nix::unistd::Gid::from_raw(clients_gid)),
+    )
+    .with_context(|| format!("chown root:{CLIENTS_GROUP} {}", state.display()))?;
+    std::fs::set_permissions(&state, std::fs::Permissions::from_mode(0o710))
+        .with_context(|| format!("chmod 0710 {}", state.display()))?;
     for sub in ["vault", "agents", "plugins", ".tokens"] {
         let p = state.join(sub);
         std::fs::create_dir_all(&p).with_context(|| format!("mkdir -p {}", p.display()))?;

@@ -239,6 +239,40 @@ impl ControlToken {
                 .map_err(|source| ControlTokenError::Io { path: path.to_owned(), source })?;
         }
 
+        // Story 7.27 cross-user CLI fix: on macOS the daemon runs as
+        // root via LaunchDaemon, but the operator-CLI (`agentsso
+        // agent register` etc.) runs as the unprivileged operator.
+        // The CLI reads this token to send as `X-Agentsso-Control`;
+        // it can't read a root-owned 0600 file. Re-chmod to 0640 +
+        // chgrp `permitlayer-clients` so operators in that group
+        // (added by `service install`) can read the secret without
+        // gaining write/delete access. The kernel-attested peer UID
+        // from `LOCAL_PEERCRED` on the UDS connection remains the
+        // primary identity attestation (per AC #15); this just
+        // makes the supplementary token-check work cross-user.
+        //
+        // If the group doesn't resolve (operator never ran `service
+        // install`, or running outside the rc.22 model), fall back
+        // to leaving the file 0600 owned by the writer — same
+        // behavior as Linux + Windows.
+        #[cfg(target_os = "macos")]
+        if nix::unistd::getuid().is_root() {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(Some(group)) = nix::unistd::Group::from_name("permitlayer-clients") {
+                let _ = nix::unistd::chown(
+                    path,
+                    Some(nix::unistd::Uid::from_raw(0)),
+                    Some(nix::unistd::Gid::from_raw(group.gid.as_raw())),
+                );
+                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640));
+                tracing::info!(
+                    target: "control_token",
+                    path = %path.display(),
+                    "control.token chgrp'd to permitlayer-clients mode 0640 for cross-user CLI access"
+                );
+            }
+        }
+
         Ok(Self { encoded: Zeroizing::new(encoded) })
     }
 }
