@@ -36,12 +36,16 @@ impl WindowsKeyStore {
 
 #[async_trait::async_trait]
 impl KeyStore for WindowsKeyStore {
-    async fn master_key(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyStoreError> {
-        tokio::task::spawn_blocking(|| {
+    async fn master_key(&self) -> Result<crate::MasterKeyOutcome, KeyStoreError> {
+        // Story 7.27 AC #16: see Linux impl rationale — Windows
+        // CredMan path reports `first_boot: false` unconditionally
+        // until 7.19 redesigns the Windows backend.
+        let key = tokio::task::spawn_blocking(|| {
             shared::fetch_or_create_master_key_at_account(BACKEND, MASTER_KEY_ACCOUNT)
         })
         .await
-        .map_err(|e| shared::join_err(BACKEND, e))?
+        .map_err(|e| shared::join_err(BACKEND, e))??;
+        Ok(crate::MasterKeyOutcome { key, first_boot: false })
     }
 
     async fn set_master_key(&self, key: &[u8; MASTER_KEY_LEN]) -> Result<(), KeyStoreError> {

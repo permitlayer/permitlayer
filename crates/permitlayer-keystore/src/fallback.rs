@@ -229,12 +229,12 @@ impl FallbackKeyStore {
 
 #[async_trait]
 impl KeyStore for FallbackKeyStore {
-    async fn master_key(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyStoreError> {
+    async fn master_key(&self) -> Result<crate::MasterKeyOutcome, KeyStoreError> {
         if let Some(fb) = self.fallback.get() {
             return fb.master_key().await;
         }
         match self.native.master_key().await {
-            Ok(bytes) => Ok(bytes),
+            Ok(outcome) => Ok(outcome),
             Err(native_err) => match self.try_engage_fallback(&native_err).await? {
                 Some(fb) => fb.master_key().await,
                 None => Err(native_err),
@@ -366,7 +366,7 @@ mod fallback_tests {
 
     #[async_trait]
     impl KeyStore for ErroringNative {
-        async fn master_key(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyStoreError> {
+        async fn master_key(&self) -> Result<crate::MasterKeyOutcome, KeyStoreError> {
             self.master_key_calls.fetch_add(1, Ordering::SeqCst);
             Err(self.take_error())
         }
@@ -400,8 +400,11 @@ mod fallback_tests {
 
     #[async_trait]
     impl KeyStore for SyntheticFallback {
-        async fn master_key(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyStoreError> {
-            Ok(Zeroizing::new([0xAA; MASTER_KEY_LEN]))
+        async fn master_key(&self) -> Result<crate::MasterKeyOutcome, KeyStoreError> {
+            Ok(crate::MasterKeyOutcome {
+                key: Zeroizing::new([0xAA; MASTER_KEY_LEN]),
+                first_boot: false,
+            })
         }
         async fn set_master_key(&self, _: &[u8; MASTER_KEY_LEN]) -> Result<(), KeyStoreError> {
             Err(KeyStoreError::PassphraseAdapterImmutable)

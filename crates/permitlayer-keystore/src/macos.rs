@@ -112,7 +112,7 @@ impl MacKeyStore {
 
 #[async_trait::async_trait]
 impl KeyStore for MacKeyStore {
-    async fn master_key(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyStoreError> {
+    async fn master_key(&self) -> Result<crate::MasterKeyOutcome, KeyStoreError> {
         tokio::task::spawn_blocking(|| read_or_mint_master_key(MASTER_KEY_ACCOUNT))
             .await
             .map_err(|e| shared::join_err(BACKEND, e))?
@@ -221,9 +221,7 @@ fn read_account(account: &str) -> Result<Option<Zeroizing<[u8; MASTER_KEY_LEN]>>
 /// `tracing::info!` event with `event = "master_key.boot.first_boot_complete"`
 /// plus a fingerprint that the daemon-side caller correlates into an
 /// audit record.
-fn read_or_mint_master_key(
-    account: &str,
-) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyStoreError> {
+fn read_or_mint_master_key(account: &str) -> Result<crate::MasterKeyOutcome, KeyStoreError> {
     if let Some(key) = read_account(account)? {
         tracing::info!(
             event = "master_key.boot.existing",
@@ -232,7 +230,7 @@ fn read_or_mint_master_key(
             service_id = MASTER_KEY_SERVICE,
             "loaded existing master key from System.keychain"
         );
-        return Ok(key);
+        return Ok(crate::MasterKeyOutcome { key, first_boot: false });
     }
 
     // Fresh install: mint + write + verify.
@@ -254,6 +252,12 @@ fn read_or_mint_master_key(
         // enforced by `keyring_shared::constant_time_eq` on the
         // Linux/Windows path.
         Some(verified) if ct_eq(verified.as_slice(), new_key.as_slice()) => {
+            // Story 7.27 AC #16: replace the `tracing::info!` with
+            // the typed `master-key-first-boot` audit event emitted
+            // at the daemon-level call site (which holds the
+            // dispatcher). Keep the tracing event as a backup
+            // operations-log signal — different consumer (ops grep
+            // vs compliance-audit reader).
             tracing::info!(
                 event = "master_key.boot.first_boot_complete",
                 fingerprint = %fingerprint(new_key.as_slice()),
@@ -261,7 +265,7 @@ fn read_or_mint_master_key(
                 service_id = MASTER_KEY_SERVICE,
                 "minted fresh master key in System.keychain"
             );
-            Ok(new_key)
+            Ok(crate::MasterKeyOutcome { key: new_key, first_boot: true })
         }
         // P8 (Story 7.26 code review): concurrent first-boot self-heal.
         // If the read-back returns *different* bytes, another daemon
@@ -271,6 +275,15 @@ fn read_or_mint_master_key(
         // recovery is to re-read and use the surviving key rather than
         // forcing the operator to restart. We mint at most one extra
         // 32-byte buffer that immediately drops/zeroizes.
+        //
+        // Story 7.27: race-recovered branch reports
+        // `first_boot: false` — strictly speaking we *did* mint a
+        // key in this call, but the surviving entry was minted by
+        // the racing daemon. Reporting `first_boot: true` would
+        // cause both daemons to fire the audit event for the same
+        // keychain entry. The losing daemon's audit log gets the
+        // tracing event below; the daemon-level call site emits the
+        // typed audit event only on the unambiguous mint path.
         Some(_) => match read_account(account)? {
             Some(canonical) => {
                 tracing::info!(
@@ -280,7 +293,7 @@ fn read_or_mint_master_key(
                     service_id = MASTER_KEY_SERVICE,
                     "first-boot race detected; adopted the surviving key from System.keychain"
                 );
-                Ok(canonical)
+                Ok(crate::MasterKeyOutcome { key: canonical, first_boot: false })
             }
             None => Err(KeyStoreError::PlatformError {
                 backend: BACKEND,

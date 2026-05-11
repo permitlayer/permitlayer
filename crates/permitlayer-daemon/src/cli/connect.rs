@@ -673,7 +673,7 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
             acl_break_recovery: AclBreakRecoveryMode::Disabled,
         };
         let keystore = default_keystore(&keystore_config)?;
-        let master_key = keystore.master_key().await?;
+        let master_key = keystore.master_key().await?.key;
         let active_key_id = super::start::compute_active_key_id(&home.join("vault"));
         let vault = Vault::new(master_key, active_key_id);
         let client = permitlayer_oauth::OAuthClient::new(
@@ -1351,7 +1351,7 @@ async fn read_access_token(
         acl_break_recovery: AclBreakRecoveryMode::Disabled,
     };
     let keystore = default_keystore(&keystore_config)?;
-    let master_key = keystore.master_key().await?;
+    let master_key = keystore.master_key().await?.key;
     let active_key_id = super::start::compute_active_key_id(&home.join("vault"));
     let vault = Vault::new(master_key, active_key_id);
     let store = CredentialFsStore::new(home.to_path_buf())?;

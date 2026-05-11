@@ -105,17 +105,17 @@ impl FileBackedKeyStore {
 
 #[async_trait]
 impl KeyStore for FileBackedKeyStore {
-    async fn master_key(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyStoreError> {
+    async fn master_key(&self) -> Result<crate::MasterKeyOutcome, KeyStoreError> {
         let path = self.primary_path();
         match read_key_file(&path)? {
-            Some(k) => Ok(k),
+            Some(key) => Ok(crate::MasterKeyOutcome { key, first_boot: false }),
             None => {
                 use rand::RngCore;
                 let mut key = Zeroizing::new([0u8; MASTER_KEY_LEN]);
                 rand::rngs::OsRng.fill_bytes(&mut *key);
                 let _g = self.write_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 write_key_file(&path, &key)?;
-                Ok(key)
+                Ok(crate::MasterKeyOutcome { key, first_boot: true })
             }
         }
     }

@@ -165,13 +165,36 @@ pub enum DeleteOutcome {
 /// All methods are async; platform FFI calls MUST be dispatched to a
 /// blocking worker via `tokio::task::spawn_blocking` inside the
 /// implementation (AC #3).
+/// Outcome of [`KeyStore::master_key`].
+///
+/// Story 7.27 AC #16: callers need to know whether the master key
+/// was just minted (first boot) so they can emit the
+/// `master-key-first-boot` audit event. Previously the keystore
+/// emitted a `tracing::info!` event internally (Story 7.26 first
+/// cut), but the daemon-level call site has the audit dispatcher in
+/// scope — it's the right layer to emit typed events from.
+#[derive(Debug)]
+pub struct MasterKeyOutcome {
+    /// The 32-byte master key, zeroized on drop.
+    pub key: Zeroizing<[u8; MASTER_KEY_LEN]>,
+    /// `true` when this call minted a fresh key (first boot of the
+    /// daemon against this keychain); `false` when an existing key
+    /// was read back.
+    pub first_boot: bool,
+}
+
 #[async_trait::async_trait]
 pub trait KeyStore: Send + Sync {
     /// Fetch the 32-byte master key, generating and persisting a fresh
     /// random key on first call if none exists (for adapters that
     /// persist). The returned buffer is zeroized on drop.
+    ///
+    /// Story 7.27 AC #16: returns [`MasterKeyOutcome`] (was
+    /// `Zeroizing<[u8; MASTER_KEY_LEN]>`) so the daemon-level caller
+    /// can emit a typed `master-key-first-boot` audit event when
+    /// `first_boot == true`.
     #[must_use = "master key result must not be silently discarded"]
-    async fn master_key(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyStoreError>;
+    async fn master_key(&self) -> Result<MasterKeyOutcome, KeyStoreError>;
 
     /// Replace the stored master key. Used by `agentsso rotate-key`
     /// (Story 7.6). Returns [`KeyStoreError::PassphraseAdapterImmutable`]
@@ -549,8 +572,8 @@ mod factory_tests {
         let boxed: Box<dyn KeyStore> = Box::new(concrete);
         // Drive master_key through the trait object to prove async fn
         // dispatch works through dyn.
-        let key = boxed.master_key().await.unwrap();
-        assert_eq!(key.len(), MASTER_KEY_LEN);
+        let outcome = boxed.master_key().await.unwrap();
+        assert_eq!(outcome.key.len(), MASTER_KEY_LEN);
         // set_master_key on passphrase adapter must be immutable.
         let err = boxed.set_master_key(&[0u8; MASTER_KEY_LEN]).await.unwrap_err();
         assert!(matches!(err, KeyStoreError::PassphraseAdapterImmutable));

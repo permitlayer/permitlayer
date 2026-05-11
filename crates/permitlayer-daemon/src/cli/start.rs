@@ -2265,12 +2265,13 @@ fn capture_trust_anchor_on_first_boot(home: &std::path::Path) {
 pub(crate) async fn bootstrap_from_keystore(
     keystore: &dyn permitlayer_keystore::KeyStore,
 ) -> Result<zeroize::Zeroizing<[u8; permitlayer_keystore::MASTER_KEY_LEN]>, StartError> {
-    let key = keystore.master_key().await.map_err(|source| StartError::MasterKeyCall { source })?;
+    let outcome =
+        keystore.master_key().await.map_err(|source| StartError::MasterKeyCall { source })?;
 
     // Zero-key validation: a buggy keystore returning all-zero bytes
     // would produce a deterministic (trivially recoverable) HKDF
     // subkey downstream. Fail-closed at the boundary.
-    if key.as_slice() == [0u8; permitlayer_keystore::MASTER_KEY_LEN] {
+    if outcome.key.as_slice() == [0u8; permitlayer_keystore::MASTER_KEY_LEN] {
         return Err(StartError::MasterKeyCall {
             source: permitlayer_keystore::KeyStoreError::MalformedMasterKey {
                 expected_len: permitlayer_keystore::MASTER_KEY_LEN,
@@ -2279,8 +2280,49 @@ pub(crate) async fn bootstrap_from_keystore(
         });
     }
 
+    // Story 7.27 AC #16: stash the first-boot flag on the
+    // process-global `FIRST_BOOT_OBSERVED` so the `run()` site can
+    // emit a typed `master-key-first-boot` audit event once the
+    // audit dispatcher is constructed (which happens after this
+    // function returns). The flag is `false`-by-default and set
+    // `true` exactly once per process; subsequent calls (test
+    // re-entries) leave it alone.
+    if outcome.first_boot {
+        FIRST_BOOT_OBSERVED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     tracing::info!("master key bootstrapped");
-    Ok(key)
+    Ok(outcome.key)
+}
+
+/// Per-process "the master-key bootstrap call observed first-boot
+/// semantics" flag. Set by [`bootstrap_from_keystore`] when the
+/// keystore reports `MasterKeyOutcome::first_boot == true`; read by
+/// the audit-dispatcher emit site in [`run()`].
+///
+/// Story 7.27 AC #16: chose a static `AtomicBool` over (a) plumbing
+/// `first_boot: bool` through `ensure_master_key_bootstrapped`'s 5
+/// call sites (test seams + production) and (b) a parallel return-
+/// value tuple (`(key, bool)`) because the flag is process-global
+/// (set exactly once per daemon lifetime, regardless of which test
+/// seam fired the keystore call) and the receive site is a single
+/// place in `run()`. The signature-change blast radius would have
+/// been disproportionate to the single bit of information.
+pub(crate) static FIRST_BOOT_OBSERVED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Compute the first 8 hex characters of `SHA-256(master_key)` for
+/// audit-event fingerprinting. Matches the macOS keystore's
+/// `tracing::info!` fingerprint format so operators can grep-
+/// correlate the operations log with the audit log. Never emits the
+/// master-key bytes themselves.
+pub(crate) fn master_key_fingerprint_first8(
+    key: &zeroize::Zeroizing<[u8; permitlayer_keystore::MASTER_KEY_LEN]>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(key.as_slice());
+    let hex: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
+    hex
 }
 
 /// Parse `AGENTSSO_TEST_MASTER_KEY_HEX` into a 32-byte master key if
@@ -2807,6 +2849,34 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
             "master key bootstrap failed — refusing to boot",
         );
     })?;
+
+    // Story 7.27 AC #16: emit a typed `master-key-first-boot` audit
+    // event when the bootstrap call observed `first_boot == true`
+    // from the keystore. The flag is process-global (set inside
+    // `bootstrap_from_keystore`); this is the first place after
+    // dispatcher construction where we can fire a typed event. On
+    // macOS the keystore-side `tracing::info!` already emitted the
+    // same fact to the operations log layer; the audit-event side
+    // is for the tamper-evident compliance log.
+    if FIRST_BOOT_OBSERVED.load(std::sync::atomic::Ordering::SeqCst) {
+        let fingerprint = master_key_fingerprint_first8(&master_key);
+        let keychain_target = if cfg!(target_os = "macos") { "System" } else { "default" };
+        let service_id = permitlayer_keystore::MASTER_KEY_SERVICE;
+        let mut event = permitlayer_core::audit::event::AuditEvent::new(
+            "daemon".to_owned(),
+            "keystore".to_owned(),
+            "n/a".to_owned(),
+            "master-key".to_owned(),
+            "ok".to_owned(),
+            "master-key-first-boot".to_owned(),
+        );
+        event.extra = serde_json::json!({
+            "fingerprint": fingerprint,
+            "keychain_target": keychain_target,
+            "service_id": service_id,
+        });
+        audit_dispatcher.dispatch(event).await;
+    }
 
     // Story 7.6a AC #12: walk the vault and compute the active
     // `key_id` as `max(envelope.key_id over all .sealed files)`,
@@ -3679,7 +3749,9 @@ mod tests {
 
     #[async_trait]
     impl KeyStore for FakeKeyStore {
-        async fn master_key(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyStoreError> {
+        async fn master_key(
+            &self,
+        ) -> Result<permitlayer_keystore::MasterKeyOutcome, KeyStoreError> {
             *self.call_count.lock().unwrap() += 1;
 
             // Take the error slot if it's set — one-shot.
@@ -3691,8 +3763,9 @@ mod tests {
             // invent one (using a deterministic pattern so tests can
             // assert on specific bytes) and persist it.
             let mut slot = self.stored.lock().unwrap();
+            let first_boot = slot.is_none();
             let key = slot.get_or_insert([0x42u8; MASTER_KEY_LEN]);
-            Ok(Zeroizing::new(*key))
+            Ok(permitlayer_keystore::MasterKeyOutcome { key: Zeroizing::new(*key), first_boot })
         }
 
         async fn set_master_key(&self, key: &[u8; MASTER_KEY_LEN]) -> Result<(), KeyStoreError> {

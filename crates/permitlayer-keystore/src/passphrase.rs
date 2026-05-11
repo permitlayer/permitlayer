@@ -205,11 +205,17 @@ impl PassphraseKeyStore {
 
 #[async_trait::async_trait]
 impl KeyStore for PassphraseKeyStore {
-    async fn master_key(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyStoreError> {
+    async fn master_key(&self) -> Result<crate::MasterKeyOutcome, KeyStoreError> {
         // Copy the already-derived key into a fresh Zeroizing buffer
         // so callers get an owned, drop-zeroized copy. Argon2id
         // derivation has already happened in the constructor.
-        Ok(Zeroizing::new(*self.derived_key))
+        //
+        // Story 7.27 AC #16: passphrase mode has no concept of
+        // first-boot vs re-derivation (the key is re-derived on
+        // every process start from the same passphrase + salt).
+        // Reporting `first_boot: false` unconditionally is correct
+        // — there's no audit-significant "mint" event to fire.
+        Ok(crate::MasterKeyOutcome { key: Zeroizing::new(*self.derived_key), first_boot: false })
     }
 
     async fn set_master_key(&self, _key: &[u8; MASTER_KEY_LEN]) -> Result<(), KeyStoreError> {
@@ -546,8 +552,8 @@ mod tests {
     async fn master_key_is_idempotent() {
         let home = TempDir::new().unwrap();
         let ks = PassphraseKeyStore::from_passphrase(home.path(), TEST_PASSPHRASE).unwrap();
-        let k1 = ks.master_key().await.unwrap();
-        let k2 = ks.master_key().await.unwrap();
+        let k1 = ks.master_key().await.unwrap().key;
+        let k2 = ks.master_key().await.unwrap().key;
         assert_eq!(&*k1, &*k2);
         assert_eq!(k1.len(), MASTER_KEY_LEN);
     }
@@ -556,11 +562,11 @@ mod tests {
     async fn master_key_stable_across_adapter_instances() {
         let home = TempDir::new().unwrap();
         let ks1 = PassphraseKeyStore::from_passphrase(home.path(), TEST_PASSPHRASE).unwrap();
-        let k1 = ks1.master_key().await.unwrap();
+        let k1 = ks1.master_key().await.unwrap().key;
         drop(ks1);
 
         let ks2 = PassphraseKeyStore::from_passphrase(home.path(), TEST_PASSPHRASE).unwrap();
-        let k2 = ks2.master_key().await.unwrap();
+        let k2 = ks2.master_key().await.unwrap().key;
         assert_eq!(&*k1, &*k2);
     }
 

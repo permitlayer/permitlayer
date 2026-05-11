@@ -239,7 +239,7 @@ pub(crate) async fn run_rotation(
     };
 
     let old_master_key = match keystore.master_key().await {
-        Ok(k) => k,
+        Ok(outcome) => outcome.key,
         Err(e) => {
             emit_master_key_rotation_failed_audit(
                 home,
@@ -370,14 +370,14 @@ pub(crate) async fn run_rotation(
             // stopped). Re-fetch from the keystore so the AutoRecover
             // caller can continue boot under the live key.
             match keystore.master_key().await {
-                Ok(k) => {
+                Ok(outcome) => {
                     if matches!(mode, RotationMode::Operator) {
                         println!(
                             "rotate-key: previous rotation was already complete \
                              (orphan marker cleaned up)"
                         );
                     }
-                    return Ok(k);
+                    return Ok(outcome.key);
                 }
                 Err(e) => {
                     // AutoRecover here is a deep edge case (keystore
@@ -1344,7 +1344,7 @@ async fn verify_primary_matches(
 ) -> Result<()> {
     use subtle::ConstantTimeEq;
     let read_back = match keystore.master_key().await {
-        Ok(b) => b,
+        Ok(outcome) => outcome.key,
         Err(e) => {
             emit_master_key_rotation_failed_audit(
                 home,
@@ -1752,9 +1752,14 @@ mod tests {
 
     #[async_trait]
     impl KeyStore for MockKeyStore {
-        async fn master_key(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyStoreError> {
+        async fn master_key(
+            &self,
+        ) -> Result<permitlayer_keystore::MasterKeyOutcome, KeyStoreError> {
             match *self.primary.lock().unwrap() {
-                Some(k) => Ok(Zeroizing::new(k)),
+                Some(k) => Ok(permitlayer_keystore::MasterKeyOutcome {
+                    key: Zeroizing::new(k),
+                    first_boot: false,
+                }),
                 None => Err(KeyStoreError::PlatformError {
                     backend: "mock",
                     message: "no primary".into(),
