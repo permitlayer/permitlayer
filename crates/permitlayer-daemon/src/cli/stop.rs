@@ -66,7 +66,7 @@ pub fn run() -> anyhow::Result<()> {
 
 /// Resolve the agentsso home directory from config (defaults → TOML → env).
 fn resolve_home() -> PathBuf {
-    DaemonConfig::load(&CliOverrides::default()).map(|c| c.paths.home).unwrap_or_else(|_| {
-        dirs::home_dir().map(|h| h.join(".agentsso")).unwrap_or_else(|| PathBuf::from(".agentsso"))
-    })
+    DaemonConfig::load(&CliOverrides::default())
+        .map(|c| c.paths.home)
+        .unwrap_or_else(|_| permitlayer_core::paths::daemon_state_dir(None))
 }

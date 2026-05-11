@@ -2139,6 +2139,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "criterion",
+ "dirs",
  "fs4",
  "hmac",
  "insta",

@@ -26,17 +26,23 @@ pub mod stop;
 pub mod uninstall;
 pub mod update;
 
-/// Resolve the `~/.agentsso/` home directory.
+/// Resolve the daemon state-dir.
 ///
-/// Honors the `AGENTSSO_PATHS__HOME` environment variable (same as the
-/// daemon's config layer) for testing and custom deployments.
+/// Honors the `AGENTSSO_PATHS__HOME` environment variable (the
+/// integration-test override seam used by the daemon's config layer
+/// and 12+ test files); otherwise delegates to
+/// [`permitlayer_core::paths::daemon_state_dir`] for the per-platform
+/// default.
+///
+/// Returns `Err` only when no override is set AND the per-platform
+/// default cannot be resolved (Linux/Windows: `dirs::home_dir()`
+/// returned `None` AND no env override is set — vanishingly rare,
+/// but the `?` callers depend on the fallible signature).
 pub(crate) fn agentsso_home() -> anyhow::Result<PathBuf> {
     if let Ok(override_path) = std::env::var("AGENTSSO_PATHS__HOME") {
         return Ok(PathBuf::from(override_path));
     }
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
-    Ok(home.join(".agentsso"))
+    Ok(permitlayer_core::paths::daemon_state_dir(None))
 }
 
 /// Marker error wrapped inside an `anyhow::Error` to tell

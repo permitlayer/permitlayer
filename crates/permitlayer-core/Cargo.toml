@@ -46,6 +46,10 @@ fs4.workspace = true
 # Story 7.6b round-1 review: AgentRegistry holds a Zeroizing-wrapped
 # copy of the daemon HMAC subkey so the bytes are scrubbed at drop.
 zeroize.workspace = true
+# Story 7.26: paths::legacy_dot_agentsso() resolves $HOME for Linux +
+# Windows defaults. macOS callers go through the new system paths
+# under /Library/Application Support/permitlayer/ (no home-dir lookup).
+dirs.workspace = true
 # Unix-only: O_NOFOLLOW constant for the lock-file open path
 # (closes the symlink-plant TOCTOU window in `vault::lock`).
 [target.'cfg(unix)'.dependencies]

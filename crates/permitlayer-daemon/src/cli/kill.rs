@@ -387,9 +387,9 @@ fn extract_body(response: &str) -> Option<String> {
 /// vault. Mirrors the helper in `cli/stop.rs` and `cli/reload.rs`.
 #[allow(dead_code)] // kept for parity with other CLI modules; resume.rs has its own copy
 pub(crate) fn resolve_home() -> PathBuf {
-    DaemonConfig::load(&CliOverrides::default()).map(|c| c.paths.home).unwrap_or_else(|_| {
-        dirs::home_dir().map(|h| h.join(".agentsso")).unwrap_or_else(|| PathBuf::from(".agentsso"))
-    })
+    DaemonConfig::load(&CliOverrides::default())
+        .map(|c| c.paths.home)
+        .unwrap_or_else(|_| permitlayer_core::paths::daemon_state_dir(None))
 }
 
 /// Load `DaemonConfig` with the default overrides, falling back to the

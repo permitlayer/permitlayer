@@ -361,7 +361,7 @@ fn default_bind_addr() -> SocketAddr {
 }
 
 fn default_home_dir() -> PathBuf {
-    dirs::home_dir().map(|h| h.join(".agentsso")).unwrap_or_else(|| PathBuf::from(".agentsso"))
+    permitlayer_core::paths::daemon_state_dir(None)
 }
 
 fn default_log_level() -> String {
