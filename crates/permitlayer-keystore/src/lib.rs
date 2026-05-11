@@ -52,7 +52,12 @@ compile_error!(
 
 pub mod codesign_macos;
 pub mod error;
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+// Story 7.26: macOS no longer wraps native in FallbackKeyStore (the
+// macOS native path is System.keychain unconditionally; passphrase
+// fallback was a workaround for login.keychain being unwritable from
+// non-Aqua sessions). Story 7.28 deletes this module entirely after
+// Linux + Windows migrate.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) mod fallback;
 #[cfg(feature = "test-seam")]
 pub mod file_backed;
@@ -92,7 +97,17 @@ pub const MASTER_KEY_LEN: usize = 32;
 /// to the OS keychain. Compile-time constant — callers cannot supply
 /// their own service strings, which structurally eliminates path-
 /// traversal and delimiter-collision concerns.
-pub const MASTER_KEY_SERVICE: &str = "io.permitlayer.master-key";
+///
+/// **Renamed in Story 7.26 from `io.permitlayer.master-key` to
+/// `dev.permitlayer.master-key`** to align with the rc.22 macOS
+/// LaunchDaemon redesign's service identifier convention
+/// (`dev.permitlayer.daemon` for the LaunchDaemon plist label).
+/// rc.21 → rc.22 is a breaking change with no in-place migration —
+/// rc.21 operators run `agentsso service install` (Story 7.27) which
+/// creates a fresh keychain entry under the new service id. The old
+/// `io.permitlayer.master-key` entry in login.keychain is orphaned;
+/// `agentsso service uninstall` cleans it up (Story 7.27).
+pub const MASTER_KEY_SERVICE: &str = "dev.permitlayer.master-key";
 
 /// Account identifier for the master-key entry. At MVP there is exactly
 /// one key per machine; this may become a slot identifier when key
@@ -339,7 +354,7 @@ pub fn default_keystore(config: &KeystoreConfig) -> Result<Box<dyn KeyStore>, Ke
 /// `BackendUnavailable` from `master_key()` etc. engage lazy fallback
 /// — without it, the daemon hard-fails on probe-vs-runtime
 /// disagreement (rc.10/rc.11 onboarding hit this twice).
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn maybe_wrap_native(
     home: &std::path::Path,
     fallback: FallbackMode,
@@ -369,7 +384,7 @@ fn maybe_wrap_native(
 /// and we should short-circuit native entirely. Returns `None` when
 /// the marker is absent and the caller should proceed with the
 /// normal native-or-fallback flow.
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn marker_short_circuit(
     home: &std::path::Path,
     fallback: FallbackMode,
@@ -386,21 +401,37 @@ fn marker_short_circuit(
 
 #[cfg(target_os = "macos")]
 fn native_or_fallback(
-    home: &std::path::Path,
-    fallback: FallbackMode,
-    acl_break_recovery: AclBreakRecoveryMode,
+    _home: &std::path::Path,
+    _fallback: FallbackMode,
+    _acl_break_recovery: AclBreakRecoveryMode,
 ) -> Result<Box<dyn KeyStore>, KeyStoreError> {
-    if let Some(passphrase) = marker_short_circuit(home, fallback)? {
-        return Ok(passphrase);
-    }
-    match MacKeyStore::new() {
-        Ok(ks) => maybe_wrap_native(home, fallback, acl_break_recovery, Box::new(ks)),
-        Err(e) if fallback == FallbackMode::Auto && is_backend_unavailable(&e) => {
-            log_fallback("apple", &e);
-            Ok(Box::new(PassphraseKeyStore::from_prompt(home)?))
-        }
-        Err(e) => Err(e),
-    }
+    // Story 7.26 (rc.22 macOS LaunchDaemon redesign): the macOS
+    // boot path is now System.keychain unconditionally. The
+    // pre-rc.22 marker_short_circuit (passphrase fallback marker)
+    // and maybe_wrap_native (FallbackKeyStore wrapper with
+    // AclBreakRecoveryMode) machinery are bypassed here:
+    //
+    // - Passphrase fallback was a workaround for login.keychain
+    //   being unwritable from non-Aqua sessions. System.keychain
+    //   has no such constraint when the caller is root.
+    // - AclBreakRecovery was a workaround for default DR-bound
+    //   ACLs failing cross-CDHash reads after `brew upgrade`.
+    //   System.keychain + `-A` ACL is structurally immune (per
+    //   V2-EXT-α-doc gate; Apple Security source review 2026-05-10).
+    //
+    // Rc.21 operators with a `passphrase.state` marker engaged
+    // will silently switch back to native System.keychain after
+    // upgrade. Acceptable per "burn the boats" rc.22 contract:
+    // they need to re-OAuth their connectors anyway because the
+    // vault is not migrated. Story 7.27 lands `service install
+    // --migrate-from-rc21` for operators who want to preserve
+    // their vault.
+    //
+    // Story 7.28 deletes marker_short_circuit + maybe_wrap_native +
+    // the entire FallbackKeyStore + codesign_macos.rs +
+    // auto_rekey.rs + RotationMode::AutoRecover after they're
+    // unreachable from all macOS code paths.
+    Ok(Box::new(MacKeyStore::new()?))
 }
 
 #[cfg(target_os = "linux")]
@@ -459,7 +490,7 @@ fn native_or_fallback(
 /// Only `BackendUnavailable` triggers auto-fallback. Genuine platform
 /// failures (`PlatformError`) surface to the caller so a misconfigured
 /// keychain doesn't silently drop users into passphrase mode.
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) fn is_backend_unavailable(e: &KeyStoreError) -> bool {
     matches!(e, KeyStoreError::BackendUnavailable { .. })
 }
@@ -467,7 +498,7 @@ pub(crate) fn is_backend_unavailable(e: &KeyStoreError) -> bool {
 /// Log the native backend's error before falling back. This is the ONE
 /// place the error chain is surfaced for debugging — without it, users
 /// see an unexplained passphrase prompt.
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn log_fallback(backend: &'static str, e: &KeyStoreError) {
     eprintln!("keystore: native backend '{backend}' unavailable, falling back to passphrase: {e}");
 }
@@ -478,7 +509,7 @@ fn log_fallback(backend: &'static str, e: &KeyStoreError) {
 /// tell which decision point fired. Carries the full error chain via
 /// `{e}` — Plan A's `BackendUnavailable: {source}` Display still
 /// surfaces the OSStatus.
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) fn log_fallback_runtime(e: &KeyStoreError) {
     eprintln!("keystore: native backend unavailable at runtime, engaging passphrase fallback: {e}");
 }
@@ -524,8 +555,12 @@ mod factory_tests {
     #[test]
     fn master_key_service_and_account_are_stable() {
         // These constants are baked into on-disk state (OS keychain).
-        // Changing them without a migration breaks existing installs.
-        assert_eq!(MASTER_KEY_SERVICE, "io.permitlayer.master-key");
+        // Changing them without a migration is a breaking change.
+        // Story 7.26 renamed io.permitlayer.master-key →
+        // dev.permitlayer.master-key as part of the rc.22 macOS
+        // LaunchDaemon redesign (no in-place migration; new entry in
+        // System.keychain via `service install`).
+        assert_eq!(MASTER_KEY_SERVICE, "dev.permitlayer.master-key");
         assert_eq!(MASTER_KEY_ACCOUNT, "master");
     }
 }

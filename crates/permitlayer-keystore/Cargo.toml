@@ -24,6 +24,11 @@ async-trait.workspace = true
 zeroize.workspace = true
 tempfile.workspace = true
 subtle.workspace = true
+# Story 7.26: structured boot-event logging from
+# `MacKeyStore::master_key()` (existing/first-boot detection +
+# fingerprint surface). The daemon-side caller correlates these
+# `tracing` events into `MasterKeyFirstBoot` audit-log records.
+tracing.workspace = true
 
 # macOS-only: downcast `keyring::Error::PlatformFailure`'s boxed source
 # to inspect the OSStatus and route ACL denials (-25308 / -25293) to

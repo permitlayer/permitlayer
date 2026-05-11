@@ -362,8 +362,10 @@ fn build_prompt_manifest(
         ));
     }
 
-    // Keychain line — always.
-    out.push_str("  • the OS keychain master-key entry (io.permitlayer.master-key / master)\n");
+    // Keychain line — always. Service id renamed in Story 7.26
+    // (io.permitlayer.master-key → dev.permitlayer.master-key) per
+    // the rc.22 macOS LaunchDaemon redesign convention.
+    out.push_str("  • the OS keychain master-key entry (dev.permitlayer.master-key / master)\n");
 
     // Autostart line.
     // P20 (review): distinguish "Disabled" (status query succeeded,
@@ -748,7 +750,7 @@ async fn delete_keychain_entry_warn_on_fail(home: &Path) -> StepOutcome {
     match keystore.delete_master_key().await {
         Ok(DeleteOutcome::Removed) => StepOutcome::Done {
             step: "removing keychain entry",
-            detail: "io.permitlayer.master-key / master removed".to_owned(),
+            detail: "dev.permitlayer.master-key / master removed".to_owned(),
         },
         Ok(DeleteOutcome::AlreadyAbsent) => StepOutcome::Done {
             step: "removing keychain entry",
@@ -1144,7 +1146,7 @@ mod tests {
         assert!(out.contains("This will remove:"));
         assert!(out.contains("the agentsso binary at /usr/local/bin/agentsso"));
         assert!(out.contains("/home/maya/.agentsso/ (vault, audit log, policies"));
-        assert!(out.contains("io.permitlayer.master-key / master"));
+        assert!(out.contains("dev.permitlayer.master-key / master"));
         assert!(out.contains("autostart at login (systemd-user)"));
     }
 

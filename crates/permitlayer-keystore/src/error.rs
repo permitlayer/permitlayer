@@ -134,6 +134,10 @@ impl KeyStoreError {
     /// in some variants do not implement `Clone` (e.g.,
     /// `Box<dyn Error>` on `BackendUnavailable`'s source), so we
     /// stringify them rather than try to deep-clone.
+    ///
+    /// Linux + Windows only post-Story 7.26 (macOS no longer wraps
+    /// native in FallbackKeyStore — see `fallback` module gate).
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     pub(crate) fn clone_for_chain(&self) -> Self {
         match self {
             Self::BackendUnavailable { backend, source } => {
