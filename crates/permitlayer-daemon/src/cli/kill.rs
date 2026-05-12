@@ -71,7 +71,16 @@ pub async fn run(_args: KillArgs) -> Result<()> {
             Ok(body) => body,
             Err(e) => {
                 tracing::debug!(error = %e, endpoint = %endpoint, "kill request failed");
-                eprint!("{}", error_block_daemon_unreachable_endpoint("kill", &endpoint));
+                // Round-3 review fix (R3-C5-P2): pass the underlying
+                // error so the operator-facing block can classify
+                // ENOENT/EACCES/ECONNREFUSED and emit a targeted
+                // remediation hint (instead of one-size-fits-all
+                // "agentsso start" which misleads for the common
+                // "not in permitlayer-clients group" case).
+                eprint!(
+                    "{}",
+                    error_block_daemon_unreachable_endpoint_classified("kill", &endpoint, Some(&e),)
+                );
                 std::process::exit(3);
             }
         };
@@ -197,12 +206,62 @@ pub(crate) fn error_block_daemon_unreachable_endpoint(
     verb: &str,
     endpoint: &ControlEndpoint,
 ) -> String {
-    error_block(
-        "daemon_unreachable",
-        &format!("cannot reach daemon at {endpoint} (during {verb})"),
-        "agentsso start  (or, if the daemon is running under a different user, set AGENTSSO_HTTP__BIND_ADDR=<addr> to match; on macOS the UDS path is fixed)",
-        None,
-    )
+    error_block_daemon_unreachable_endpoint_classified(verb, endpoint, None)
+}
+
+/// Round-3 review fix (R3-C5-P2): error-kind-aware variant. The
+/// Round-2 `error_block_daemon_unreachable_endpoint` rendered the
+/// same generic "agentsso start" remediation regardless of cause:
+/// the most common 7.27 misconfig — operator not in
+/// `permitlayer-clients` group — produces `EACCES` on UDS connect
+/// and gets a misleading "agentsso start" hint that just deepens
+/// confusion. This variant accepts an optional underlying
+/// `anyhow::Error`, extracts its `io::ErrorKind` when downcastable,
+/// and renders one of three branches:
+///   - `NotFound`  → daemon not running ("agentsso start")
+///   - `PermissionDenied` → not in clients group
+///   - `ConnectionRefused` → stale socket inode
+///   - anything else → generic fallback (same shape as Round-2).
+///
+/// Call sites that have the underlying error in scope pass it
+/// through; others can call the wrapper above with `None`.
+pub(crate) fn error_block_daemon_unreachable_endpoint_classified(
+    verb: &str,
+    endpoint: &ControlEndpoint,
+    cause: Option<&anyhow::Error>,
+) -> String {
+    let kind = cause.and_then(|e| {
+        // Walk the source chain looking for an io::Error.
+        let mut cur: Option<&dyn std::error::Error> = Some(e.as_ref());
+        while let Some(err) = cur {
+            if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
+                return Some(io_err.kind());
+            }
+            cur = err.source();
+        }
+        None
+    });
+    let (msg, remediation): (String, &str) = match kind {
+        Some(std::io::ErrorKind::NotFound) => (
+            format!("daemon not running (during {verb}): no socket at {endpoint}"),
+            "start the daemon: `sudo agentsso service install` (one-time setup) followed by `sudo launchctl bootstrap system /Library/LaunchDaemons/dev.permitlayer.daemon.plist`, OR `agentsso start` for ad-hoc dev use",
+        ),
+        Some(std::io::ErrorKind::PermissionDenied) => (
+            format!("permission denied reaching daemon at {endpoint} (during {verb})"),
+            "add yourself to the permitlayer-clients group: `sudo dseditgroup -o edit -a $USER -t user permitlayer-clients` then log out and back in (group membership is cached per-session)",
+        ),
+        Some(std::io::ErrorKind::ConnectionRefused) => (
+            format!(
+                "daemon socket exists at {endpoint} but no listener (during {verb}); likely a stale socket from a force-killed daemon"
+            ),
+            "remove the stale socket and re-start: `sudo rm /var/run/permitlayer/control.sock && sudo launchctl kickstart -k system/dev.permitlayer.daemon`",
+        ),
+        _ => (
+            format!("cannot reach daemon at {endpoint} (during {verb})"),
+            "agentsso start  (or, if the daemon is running under a different user, set AGENTSSO_HTTP__BIND_ADDR=<addr> to match; on macOS the UDS path is fixed)",
+        ),
+    };
+    error_block("daemon_unreachable", &msg, remediation, None)
 }
 
 /// Error text for the "daemon_protocol_error" condition (response body is

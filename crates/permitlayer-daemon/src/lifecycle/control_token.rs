@@ -303,14 +303,33 @@ impl ControlToken {
                         Some(nix::unistd::Gid::from_raw(group.gid.as_raw())),
                     );
                     if let Err(e) = chown_result {
+                        // Round-3 review fix (R3-C5-P6): force 0o600
+                        // on chgrp failure. The Round-2 warn said
+                        // "file stays at the prior owner" — but if
+                        // a previous boot already chgrp'd to
+                        // `permitlayer-clients`, the file remains
+                        // `0640 :permitlayer-clients` group-readable
+                        // while this code path believes "stays at
+                        // prior owner". Re-narrowing to 0o600
+                        // closes the read surface defensively;
+                        // operators see the warn and know cross-user
+                        // CLI access is broken until they fix the
+                        // group membership.
+                        let mode_after = std::fs::metadata(path).ok().map(|m| {
+                            std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o777
+                        });
+                        let _ =
+                            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
                         tracing::warn!(
                             target: "control_token",
                             event = "control_token.chgrp_failed",
                             path = %path.display(),
                             error = %e,
+                            prior_mode = ?mode_after.map(|m| format!("0o{m:o}")),
                             "failed to chgrp control.token to permitlayer-clients; \
-                             file stays at the prior owner — operator-CLI cross-user auth \
-                             may not work"
+                             re-narrowed to 0o600 to close the read surface (operator-CLI \
+                             cross-user auth will not work until the group membership is \
+                             fixed)"
                         );
                     } else if let Err(e) =
                         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640))

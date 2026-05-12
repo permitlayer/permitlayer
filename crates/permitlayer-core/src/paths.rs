@@ -73,10 +73,50 @@ use std::path::{Path, PathBuf};
 /// daemon bound in CWD, CLI connected from a different CWD, fail.
 /// Treating empty/whitespace as `None` falls back to the platform-
 /// default system path layout.
+///
+/// Round-3 review note (R3-C5-P8): the returned PathBuf is NOT
+/// canonicalized — if the override points at a symlink and the
+/// target is rewritten between daemon-start and CLI-start, the
+/// daemon binds the socket at one realpath while the CLI connects
+/// to another (the kernel resolves through symlinks on
+/// `bind`/`connect`, so this usually works, but it's fragile).
+/// Operators should set this to the canonical absolute path of a
+/// real directory, not a symlink.
 pub fn home_override() -> Option<PathBuf> {
     std::env::var("AGENTSSO_PATHS__HOME").ok().and_then(|s| {
         let trimmed = s.trim();
-        if trimmed.is_empty() { None } else { Some(PathBuf::from(trimmed)) }
+        if trimmed.is_empty() {
+            return None;
+        }
+        // Round-3 review fix (R3-C5-P1): the Round-2 fix rejected the
+        // empty/whitespace case but accepted everything else verbatim,
+        // including relative paths and NUL-containing strings. A
+        // relative path (`AGENTSSO_PATHS__HOME=tmp/run`) flows into
+        // `control_socket_path()` and the daemon `bind`s in CWD while
+        // the CLI `connect`s from a different CWD — same split-brain
+        // failure mode the empty-string fix closed, just one layer
+        // down. A NUL byte fails with `EINVAL` deep in libc with no
+        // attributable context. Reject both up front with a structured
+        // warn so operators see the misconfig.
+        if trimmed.contains('\0') {
+            tracing::warn!(
+                event = "paths.home_override.invalid",
+                reason = "embedded_nul",
+                "AGENTSSO_PATHS__HOME contains an embedded NUL byte; ignoring (falling back to platform default)",
+            );
+            return None;
+        }
+        let path = std::path::Path::new(trimmed);
+        if !path.is_absolute() {
+            tracing::warn!(
+                event = "paths.home_override.invalid",
+                reason = "not_absolute",
+                value = trimmed,
+                "AGENTSSO_PATHS__HOME must be an absolute path; ignoring (falling back to platform default). Daemon and CLI need to agree on the path regardless of CWD.",
+            );
+            return None;
+        }
+        Some(PathBuf::from(trimmed))
     })
 }
 

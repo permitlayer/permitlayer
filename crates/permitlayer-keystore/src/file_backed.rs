@@ -108,14 +108,14 @@ impl KeyStore for FileBackedKeyStore {
     async fn master_key(&self) -> Result<crate::MasterKeyOutcome, KeyStoreError> {
         let path = self.primary_path();
         match read_key_file(&path)? {
-            Some(key) => Ok(crate::MasterKeyOutcome { key, first_boot: false }),
+            Some(key) => Ok(crate::MasterKeyOutcome::new(key, false)),
             None => {
                 use rand::RngCore;
                 let mut key = Zeroizing::new([0u8; MASTER_KEY_LEN]);
                 rand::rngs::OsRng.fill_bytes(&mut *key);
                 let _g = self.write_lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
                 write_key_file(&path, &key)?;
-                Ok(crate::MasterKeyOutcome { key, first_boot: true })
+                Ok(crate::MasterKeyOutcome::new(key, true))
             }
         }
     }
@@ -203,6 +203,7 @@ fn read_key_file(path: &Path) -> Result<Option<Zeroizing<[u8; MASTER_KEY_LEN]>>,
         return Err(KeyStoreError::MalformedMasterKey {
             expected_len: MASTER_KEY_LEN,
             actual_len: bytes.len(),
+            reason: crate::MalformedReason::BadLength,
         });
     }
     let mut key = Zeroizing::new([0u8; MASTER_KEY_LEN]);
@@ -298,13 +299,25 @@ mod tests {
         // Pre-existing key file (operator-restored from backup, or
         // an upgrade-from-older-format scenario). First call should
         // report `first_boot=false` because the file is already there.
+        // Round-3 review fix: previous version of this test only made
+        // ONE call after the seed write — `idempotent` requires two
+        // calls returning the same bytes. Now exercises both.
         let dir = TempDir::new().expect("tempdir");
         let store = FileBackedKeyStore::new(dir.path()).expect("create store");
         let preset = [0x42u8; MASTER_KEY_LEN];
         write_key_file(&store.primary_path(), &Zeroizing::new(preset)).expect("preset write");
 
-        let outcome = store.master_key().await.expect("master_key call");
-        assert!(!outcome.first_boot, "existing-file master_key must report first_boot=false");
-        assert!(subtle_eq(&outcome.key, &Zeroizing::new(preset)));
+        let outcome1 = store.master_key().await.expect("first master_key call");
+        assert!(!outcome1.first_boot, "existing-file master_key must report first_boot=false");
+        assert!(subtle_eq(&outcome1.key, &Zeroizing::new(preset)));
+
+        // Second call must return the same key bytes; `first_boot`
+        // remains false.
+        let outcome2 = store.master_key().await.expect("second master_key call");
+        assert!(!outcome2.first_boot);
+        assert!(
+            subtle_eq(&outcome1.key, &outcome2.key),
+            "idempotent: second master_key call must return identical bytes"
+        );
     }
 }

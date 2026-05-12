@@ -19,7 +19,7 @@ const PLIST_PATH: &str = "/Library/LaunchDaemons/dev.permitlayer.daemon.plist";
 const PRIVILEGED_HELPER_PATH: &str = "/Library/PrivilegedHelperTools/agentsso";
 const CLIENTS_GROUP: &str = "permitlayer-clients";
 
-pub async fn run(_args: UninstallArgs) -> Result<()> {
+pub async fn run(args: UninstallArgs) -> Result<()> {
     if !Uid::effective().is_root() {
         eprint!(
             "{}",
@@ -35,11 +35,22 @@ pub async fn run(_args: UninstallArgs) -> Result<()> {
 
     // Story 7.27 Round-2 review fix (P2): acquire the install-lock
     // so concurrent install+uninstall invocations don't race on
-    // state-dir + dscl operations. Reuse the install-side helper
-    // — same lock file (`/var/run/permitlayer/.install.lock` or
-    // `/tmp/.permitlayer-install.lock` fallback), same stale-lock
-    // mtime detection. Lock drops at end of `run()` via RAII.
-    let _install_lock = crate::cli::service::install_macos::acquire_install_lock_pub()?;
+    // state-dir + dscl operations. Reuse the install-side helper.
+    //
+    // Round-3 review fix (R3-C4-P9): `--force` bypasses the
+    // install-lock so an operator can clean up after a crashed
+    // install. Without `--force`, a fresh crashed install (kernel
+    // hasn't yet released the lock fd, or the lockfile reflects a
+    // wedged process) blocks recovery — uninstall waits forever
+    // for a lock that may never release. `--force` skips the
+    // acquisition entirely and accepts the (operator-acknowledged)
+    // risk of racing another install.
+    let _install_lock = if args.force {
+        eprintln!("→ `--force` specified: skipping install-lock acquisition");
+        crate::cli::service::install_macos::acquire_install_lock_pub_force()
+    } else {
+        crate::cli::service::install_macos::acquire_install_lock_pub()?
+    };
 
     // Story 7.27 Round-2 review fix (P2): clean up rc.21
     // LaunchAgents BEFORE the rc.22 bootout, mirroring the install
@@ -71,6 +82,9 @@ pub async fn run(_args: UninstallArgs) -> Result<()> {
         Ok(out) => {
             let code = out.status.code().unwrap_or(-1);
             let stderr = String::from_utf8_lossy(&out.stderr);
+            // Round-3 review fix (R3-C4-P10) doc-only: substring
+            // match on stderr is the reliable cross-version signal;
+            // exit codes `36`/`3` are best-effort fallbacks.
             let not_loaded = code == 36
                 || code == 3
                 || stderr.contains("Could not find specified service")
@@ -238,21 +252,35 @@ fn remove_per_user_bearer_tokens() -> u32 {
 /// commentary; this is the uninstall-side analogue.
 fn safe_resolve_token(home: &Path) -> Option<PathBuf> {
     use std::os::fd::AsRawFd;
-    let dot_agentsso_path = home.join(".agentsso");
-    let dot_meta = permitlayer_platform_macos::fstatat_nofollow(
-        permitlayer_platform_macos::open_dir_nofollow(home).ok()?.as_raw_fd(),
-        ".agentsso",
-    )
-    .ok()?;
+    // Round-3 review fix (R3-C4-P8): refuse if `home` itself is a
+    // symlink before walking. The install side already does this via
+    // `safe_resolve_rc21_plist`'s initial `open_dir_nofollow(home)`
+    // (ELOOP on symlink); the Round-2 uninstall side missed the
+    // explicit check at the home level. Add it here so an attacker
+    // who plants `/Users/me` as a symlink to `/etc/` does not lead
+    // the token sweep into deleting `/etc/agentsso/...`.
+    let home_meta = std::fs::symlink_metadata(home).ok()?;
+    if home_meta.file_type().is_symlink() {
+        return None;
+    }
+    // Round-3 review fix (R3-C4-P1): true openat-anchored walk.
+    // The Round-2 implementation re-opened `.agentsso` by full path
+    // after the fstatat check, leaving a TOCTOU window. Now we use
+    // `open_dir_nofollow_at(home_fd, ".agentsso")` so the new fd
+    // resolves relative to the home fd we already hold.
+    let home_fd = permitlayer_platform_macos::open_dir_nofollow(home).ok()?;
+    let dot_meta =
+        permitlayer_platform_macos::fstatat_nofollow(home_fd.as_raw_fd(), ".agentsso").ok()?;
     if (dot_meta.st_mode & libc::S_IFMT) != libc::S_IFDIR {
         return None;
     }
-    let dot_fd = permitlayer_platform_macos::open_dir_nofollow(&dot_agentsso_path).ok()?;
+    let dot_fd =
+        permitlayer_platform_macos::open_dir_nofollow_at(home_fd.as_raw_fd(), ".agentsso").ok()?;
     let leaf_meta =
         permitlayer_platform_macos::fstatat_nofollow(dot_fd.as_raw_fd(), "agent-bearer.token")
             .ok()?;
     if (leaf_meta.st_mode & libc::S_IFMT) != libc::S_IFREG {
         return None;
     }
-    Some(dot_agentsso_path.join("agent-bearer.token"))
+    Some(home.join(".agentsso").join("agent-bearer.token"))
 }

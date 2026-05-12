@@ -35,17 +35,22 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::RawFd;
 use std::path::Path;
 
-/// Reject path-component names that contain `/` or `..`. The dir-fd-
-/// anchored security model assumes `from_name`/`to_name` are single
-/// path components; a `/` in the name would resolve relative to the
-/// dir fd but traverse upward/inward, defeating the anchoring. A `..`
-/// component would let a caller escape the dir entirely.
+/// Reject path-component names that contain `/`, `..`, or embedded
+/// NUL bytes. The dir-fd-anchored security model assumes
+/// `from_name`/`to_name` are single path components; a `/` in the
+/// name would resolve relative to the dir fd but traverse
+/// upward/inward, defeating the anchoring. A `..` component would let
+/// a caller escape the dir entirely. An embedded NUL would otherwise
+/// be caught by `CString::new` downstream, but explicit rejection
+/// here keeps the failure attributable to the validator — and lets
+/// the test below assert that the validator (not the downstream
+/// `CString` path) is what rejected the name.
 ///
 /// Current call-sites pass fixed literals so this is defense-in-depth
 /// only — but the public API surface accepts arbitrary `&str` and a
 /// future caller could pass attacker-controlled input.
 fn validate_single_component(name: &str) -> io::Result<()> {
-    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') || name.contains('\0') {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("not a single path component: {name:?}"),
@@ -149,6 +154,26 @@ pub fn rename_excl_at(
 /// `renameat(from_dir_fd, from_name, to_dir_fd, to_name)` — plain
 /// POSIX rename relative to dir fds, no `RENAME_EXCL`. Used by the
 /// token-rotation fallback after the EEXIST audit event is emitted.
+///
+/// **Threat model.** This is the *clobbering* variant — it overwrites
+/// the destination unconditionally. Between an exclusive
+/// [`rename_excl_at`] that returned `EEXIST` and a subsequent
+/// `rename_at` over the same destination, an attacker who can write
+/// into the parent dir could swap the destination inode (TOCTOU). To
+/// stay safe, callers MUST guarantee:
+/// - The parent dir is mode `0700` (or tighter) and owned by a
+///   principal the attacker cannot impersonate, OR
+/// - The destination name lives in a per-peer-UID dir whose
+///   ownership the caller has just attested via [`crate::fs_safe`]
+///   (`fstatat_nofollow` + `open_dir_nofollow` chain), AND
+/// - The caller validates the destination inode post-rename
+///   (`S_ISREG` + expected uid/gid/mode) before treating the rename
+///   as authoritative.
+///
+/// Story 7.27 callers (`agent_token.rs` rotation flow) satisfy this:
+/// the parent dir is `<home>/.agentsso/` validated via a dir-fd chain
+/// before the call, and a post-rename `fstatat_nofollow` checks
+/// owner/mode/`S_ISREG`. Other callers MUST replicate the pattern.
 pub fn rename_at(
     from_dirfd: RawFd,
     from_name: &str,
@@ -242,19 +267,69 @@ mod tests {
     #[test]
     fn rename_excl_at_rejects_path_separator_in_name() {
         // Defense-in-depth: dir-fd-anchored renames must reject names
-        // containing `/` or `..` so a caller cannot escape the
-        // anchoring.
+        // containing `/`, `..`, or embedded NUL so a caller cannot
+        // escape the anchoring. Round-3 review fix: the previous test
+        // included `"..\0nul"` and asserted `InvalidInput`, but the
+        // validator did not check for NUL bytes; the rejection came
+        // from `CString::new` downstream. With NUL now in the
+        // validator, the assertion below verifies the validator
+        // (not `CString`) refused the name.
         let dir = tempdir().unwrap();
         let dir_fd = crate::open_dir_nofollow(dir.path()).expect("open_dir_nofollow");
         let raw = dir_fd.as_raw_fd();
-        for bad in ["with/slash", "..", "./inner", "", "..\0nul"] {
+        for bad in ["with/slash", "..", "./inner", "", "has\0nul"] {
             let err = rename_excl_at(raw, bad, raw, "ok")
                 .expect_err(&format!("rename_excl_at must reject {bad:?}"));
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            // The validator wraps its rejection in `io::Error::new`
+            // with a `String` message; a `CString::NulError` would
+            // wrap a `NulError` typed cause. Verify the cause is the
+            // validator's string-error (no NulError downcast available).
+            let inner = err.into_inner().expect("validator must attach an inner cause");
+            assert!(
+                inner.downcast::<std::ffi::NulError>().is_err(),
+                "rejection must come from validator, not CString"
+            );
+
             let err = rename_at(raw, "ok", raw, bad)
                 .expect_err(&format!("rename_at must reject {bad:?}"));
             assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
         }
+    }
+
+    #[test]
+    fn rename_excl_at_actually_anchors_to_dir_fd() {
+        // Positive test: `rename_excl_at` must resolve `from_name` /
+        // `to_name` relative to the supplied dir fds, NOT relative to
+        // the process's current working directory. Round-3 review fix
+        // (Edge Case Hunter): previous tests only exercised the
+        // negative path (bad names rejected); no test asserted that
+        // the rename actually anchored on the dir fd.
+        //
+        // Setup: create two tempdirs (A and B). Chdir to A. Create
+        // `src` inside B and dir-fd-anchor a rename of `src` → `dst`
+        // in B. Then verify:
+        //   1. The file lives at B/dst, NOT at A/dst.
+        //   2. Neither A/src nor A/dst exists.
+        let dir_a = tempdir().unwrap();
+        let dir_b = tempdir().unwrap();
+        fs::write(dir_b.path().join("src.txt"), b"anchored").unwrap();
+
+        let prev_cwd = std::env::current_dir().unwrap();
+        std::env::set_current_dir(dir_a.path()).expect("chdir to A");
+
+        let b_fd = crate::open_dir_nofollow(dir_b.path()).expect("open B");
+        let result = rename_excl_at(b_fd.as_raw_fd(), "src.txt", b_fd.as_raw_fd(), "dst.txt");
+
+        std::env::set_current_dir(&prev_cwd).expect("restore cwd");
+        result.expect("rename must succeed when anchored to B");
+
+        // File moved within B.
+        assert!(!dir_b.path().join("src.txt").exists(), "B/src must be gone");
+        assert_eq!(fs::read(dir_b.path().join("dst.txt")).unwrap(), b"anchored");
+        // A is untouched.
+        assert!(!dir_a.path().join("src.txt").exists(), "A/src must not exist");
+        assert!(!dir_a.path().join("dst.txt").exists(), "A/dst must not exist");
     }
 
     #[test]

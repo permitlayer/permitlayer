@@ -26,7 +26,13 @@ use thiserror::Error;
 
 /// Errors surfaced by [`write_bearer_token_to_user_home`]. Mapped
 /// 1:1 to operator-facing audit events in the handler.
-#[derive(Debug, Error)]
+// Round-3 review fix (R3-C3-P11): `#[derive(Debug)]` was leaking the
+// full PathBuf via `?err` formatting on the `SymlinkInParentPath`
+// variant, even though the Display impl redacts to filename-only.
+// Hand-roll `Debug` so both `{:?}` and `{}` formats redact
+// consistently. The other variants (UnknownPeerUser / Io / Chown)
+// don't carry filesystem paths so their derived shape is preserved.
+#[derive(Error)]
 pub enum TokenWriteError {
     /// The kernel-attested peer UID does not map to a `User` record
     /// — extremely unlikely on a healthy macOS box but documented
@@ -57,6 +63,24 @@ pub enum TokenWriteError {
     /// or target path.
     #[error("token-write chown failure: {0}")]
     Chown(nix::Error),
+}
+
+impl std::fmt::Debug for TokenWriteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownPeerUser(uid) => f.debug_tuple("UnknownPeerUser").field(uid).finish(),
+            // Round-3 review fix (R3-C3-P11): redact PathBuf to
+            // filename-only in Debug, mirroring the Display impl.
+            // Tracing's `?err` formatting otherwise leaks the
+            // operator's home dir layout / username into the log.
+            Self::SymlinkInParentPath(path) => f
+                .debug_tuple("SymlinkInParentPath")
+                .field(&path.file_name().and_then(|s| s.to_str()).unwrap_or("<unknown>"))
+                .finish(),
+            Self::Io(e) => f.debug_tuple("Io").field(e).finish(),
+            Self::Chown(e) => f.debug_tuple("Chown").field(e).finish(),
+        }
+    }
 }
 
 /// Outcome of a successful token write.
@@ -238,14 +262,26 @@ fn acquire_rotation_lock(
     tokens_dir: &Path,
     peer_uid: u32,
 ) -> Result<nix::fcntl::Flock<std::fs::File>, TokenWriteError> {
-    let lock_path = tokens_dir.join(format!("agent-bearer.token.lock.{peer_uid}"));
-    let lock_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .mode(0o600)
-        .open(&lock_path)?;
+    // Round-3 review fix (R3-C3-P7): open the lockfile via `openat`
+    // against a freshly-acquired `O_NOFOLLOW | O_DIRECTORY` dir fd,
+    // not by path. In production `<state>/.tokens/` is root-only-
+    // writable so path resolution is structurally safe — but under
+    // `AGENTSSO_PATHS__HOME` override the parent chain is operator-
+    // writable, and a hostile sibling could swap a parent component
+    // to a symlink between the daemon's earlier `open_dir_nofollow`
+    // (line 136) and the path-based `OpenOptions::open(&lock_path)`
+    // below. Anchoring the open on the dir fd closes that window.
+    // Daemon is `#![forbid(unsafe_code)]`; the openat syscall lives
+    // behind `permitlayer_platform_macos::openat_rw_create_nofollow`.
+    let lock_dir_fd = permitlayer_platform_macos::open_dir_nofollow(tokens_dir)?;
+    let lock_name = format!("agent-bearer.token.lock.{peer_uid}");
+    use std::os::unix::io::AsRawFd;
+    let owned = permitlayer_platform_macos::openat_rw_create_nofollow(
+        lock_dir_fd.as_raw_fd(),
+        &lock_name,
+        0o600,
+    )?;
+    let lock_file: std::fs::File = owned.into();
     nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusive).map_err(
         |(_file, errno)| TokenWriteError::Io(std::io::Error::from_raw_os_error(errno as i32)),
     )
@@ -270,21 +306,53 @@ fn open_dot_agentsso_nofollow(
     }
     match permitlayer_platform_macos::open_dir_nofollow(dot_agentsso) {
         Ok(fd) => {
-            // Story 7.27 Round-2 review fix (P2): correct an
-            // existing `.agentsso/` dir's mode/owner if a prior
-            // tool created it with permissive perms or wrong
-            // ownership. Self-healing: chown to the peer + chmod
-            // 0o700 unconditionally. Pre-fix, an attacker who
-            // could pre-create a world-readable `.agentsso/` in
-            // the peer's home would see the token file inherit
-            // the parent dir's loose perms (defense-in-depth on
-            // parent perms was best-effort only on first-create).
-            // The peer's home is peer-owned by convention; this
-            // self-heal is a no-op on a healthy install.
-            permitlayer_platform_macos::fchown_fd(fd.as_raw_fd(), peer_uid, peer_gid)
+            // Round-3 review fix (R3-C3-P8): detect-first self-heal.
+            // The Round-2 patch unconditionally `fchown_fd` +
+            // `fchmod_fd(0o700)` on every register call, which
+            // silently overrides any legitimate operator config
+            // (e.g., a shared `dev` group at 0o750 — rare but
+            // possible). Read the existing inode's owner + mode
+            // first via `fstatat_nofollow("." against the fd)`;
+            // only correct if mismatched, and emit a
+            // `tracing::info!` self-heal event so operators see the
+            // audit trail of the change.
+            //
+            // Note: `fstatat` with `"."` as the name + a dir fd
+            // returns the dir's own stat (POSIX-defined). This
+            // avoids re-traversing the path (which would re-incur
+            // the symlink-defense work `open_dir_nofollow` already
+            // did).
+            let st = permitlayer_platform_macos::fstatat_nofollow(fd.as_raw_fd(), ".")
                 .map_err(TokenWriteError::Io)?;
-            permitlayer_platform_macos::fchmod_fd(fd.as_raw_fd(), 0o700)
-                .map_err(TokenWriteError::Io)?;
+            let mode_bits = u32::from(st.st_mode) & 0o777;
+            let owner_ok = st.st_uid == peer_uid && st.st_gid == peer_gid;
+            let mode_ok = mode_bits == 0o700;
+            if !owner_ok {
+                tracing::info!(
+                    target: "agent_token",
+                    event = "dot_agentsso.self_heal_owner",
+                    path = %dot_agentsso.display(),
+                    prev_uid = st.st_uid,
+                    prev_gid = st.st_gid,
+                    new_uid = peer_uid,
+                    new_gid = peer_gid,
+                    "correcting ~/.agentsso/ ownership to peer uid:gid"
+                );
+                permitlayer_platform_macos::fchown_fd(fd.as_raw_fd(), peer_uid, peer_gid)
+                    .map_err(TokenWriteError::Io)?;
+            }
+            if !mode_ok {
+                tracing::info!(
+                    target: "agent_token",
+                    event = "dot_agentsso.self_heal_mode",
+                    path = %dot_agentsso.display(),
+                    prev_mode = format!("0o{mode_bits:o}"),
+                    new_mode = "0o700",
+                    "correcting ~/.agentsso/ mode to 0o700"
+                );
+                permitlayer_platform_macos::fchmod_fd(fd.as_raw_fd(), 0o700)
+                    .map_err(TokenWriteError::Io)?;
+            }
             Ok(fd)
         }
         Err(e) if is_symlink_refusal(&e) => {

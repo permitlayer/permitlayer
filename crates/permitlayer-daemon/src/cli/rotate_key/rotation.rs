@@ -239,7 +239,7 @@ pub(crate) async fn run_rotation(
     };
 
     let old_master_key = match keystore.master_key().await {
-        Ok(outcome) => outcome.key,
+        Ok(outcome) => outcome.key.into_inner(),
         Err(e) => {
             emit_master_key_rotation_failed_audit(
                 home,
@@ -377,7 +377,7 @@ pub(crate) async fn run_rotation(
                              (orphan marker cleaned up)"
                         );
                     }
-                    return Ok(outcome.key);
+                    return Ok(outcome.key.into_inner());
                 }
                 Err(e) => {
                     // AutoRecover here is a deep edge case (keystore
@@ -1344,7 +1344,7 @@ async fn verify_primary_matches(
 ) -> Result<()> {
     use subtle::ConstantTimeEq;
     let read_back = match keystore.master_key().await {
-        Ok(outcome) => outcome.key,
+        Ok(outcome) => outcome.key.into_inner(),
         Err(e) => {
             emit_master_key_rotation_failed_audit(
                 home,

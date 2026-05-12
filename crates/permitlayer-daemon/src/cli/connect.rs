@@ -673,7 +673,7 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
             acl_break_recovery: AclBreakRecoveryMode::Disabled,
         };
         let keystore = default_keystore(&keystore_config)?;
-        let master_key = keystore.master_key().await?.key;
+        let master_key = keystore.master_key().await?.key.into_inner();
         let active_key_id = super::start::compute_active_key_id(&home.join("vault"));
         let vault = Vault::new(master_key, active_key_id);
         let client = permitlayer_oauth::OAuthClient::new(
@@ -1351,7 +1351,7 @@ async fn read_access_token(
         acl_break_recovery: AclBreakRecoveryMode::Disabled,
     };
     let keystore = default_keystore(&keystore_config)?;
-    let master_key = keystore.master_key().await?.key;
+    let master_key = keystore.master_key().await?.key.into_inner();
     let active_key_id = super::start::compute_active_key_id(&home.join("vault"));
     let vault = Vault::new(master_key, active_key_id);
     let store = CredentialFsStore::new(home.to_path_buf())?;
@@ -1379,14 +1379,36 @@ async fn post_reload(home: &Path) -> anyhow::Result<()> {
     let config = crate::cli::kill::load_daemon_config_or_default_with_warn("connect reload");
     let endpoint = crate::cli::kill::resolve_control_endpoint(&config);
     let token = crate::cli::kill::read_control_token(home);
-    let response = crate::cli::kill::http_post_json_via(
+    let response = match crate::cli::kill::http_post_json_via(
         &endpoint,
         "/v1/control/reload",
         "{}",
         token.as_deref(),
     )
     .await
-    .map_err(|e| anyhow::anyhow!("daemon reload request failed: {e}"))?;
+    {
+        Ok(r) => r,
+        Err(e) => {
+            // Round-3 review fix (R3-C5-P3): emit the structured
+            // endpoint-aware error block for transport failures —
+            // matches the pattern in kill.rs / agent.rs / etc. The
+            // caller's existing `connect.reload_failed` error block
+            // is preserved as a fallthrough for non-transport errors
+            // (malformed response, non-ok status); only the
+            // unreachable-daemon path now classifies ENOENT/EACCES/
+            // ECONNREFUSED with targeted remediations.
+            tracing::debug!(error = %e, endpoint = %endpoint, "connect reload transport failure");
+            eprint!(
+                "{}",
+                crate::cli::kill::error_block_daemon_unreachable_endpoint_classified(
+                    "connect reload",
+                    &endpoint,
+                    Some(&e),
+                )
+            );
+            return Err(silent_err_for_code("connect.reload_failed", "reload transport failure"));
+        }
+    };
     let parsed: serde_json::Value = serde_json::from_str(&response)
         .map_err(|e| anyhow::anyhow!("malformed reload response: {e} (body: {response})"))?;
     if parsed["status"].as_str() == Some("ok") {
@@ -1406,14 +1428,34 @@ async fn post_rebind(home: &Path, agent: &str, policy: &str) -> anyhow::Result<(
     let endpoint = crate::cli::kill::resolve_control_endpoint(&config);
     let token = crate::cli::kill::read_control_token(home);
     let body = serde_json::json!({"name": agent, "policy_name": policy}).to_string();
-    let response = crate::cli::kill::http_post_json_via(
+    let response = match crate::cli::kill::http_post_json_via(
         &endpoint,
         "/v1/control/agent/rebind",
         &body,
         token.as_deref(),
     )
     .await
-    .map_err(|e| anyhow::anyhow!("agent rebind request failed: {e}"))?;
+    {
+        Ok(r) => r,
+        Err(e) => {
+            // Round-3 review fix (R3-C5-P3): see `post_reload` —
+            // same structured endpoint-aware error-block discipline
+            // for transport failures.
+            tracing::debug!(error = %e, endpoint = %endpoint, "agent rebind transport failure");
+            eprint!(
+                "{}",
+                crate::cli::kill::error_block_daemon_unreachable_endpoint_classified(
+                    "agent rebind",
+                    &endpoint,
+                    Some(&e),
+                )
+            );
+            return Err(silent_err_for_code(
+                "agent.rebind_transport_failure",
+                "rebind transport failure",
+            ));
+        }
+    };
     let parsed: serde_json::Value = serde_json::from_str(&response)
         .map_err(|e| anyhow::anyhow!("malformed rebind response: {e} (body: {response})"))?;
     if parsed["status"].as_str() == Some("ok") {

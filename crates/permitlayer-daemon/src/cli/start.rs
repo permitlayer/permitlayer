@@ -2281,6 +2281,7 @@ pub(crate) async fn bootstrap_from_keystore(
             source: permitlayer_keystore::KeyStoreError::MalformedMasterKey {
                 expected_len: permitlayer_keystore::MASTER_KEY_LEN,
                 actual_len: 0,
+                reason: permitlayer_keystore::MalformedReason::BadLength,
             },
         });
     }
@@ -2297,7 +2298,7 @@ pub(crate) async fn bootstrap_from_keystore(
     }
 
     tracing::info!("master key bootstrapped");
-    Ok(outcome.key)
+    Ok(outcome.key.into_inner())
 }
 
 /// Per-process "the master-key bootstrap call observed first-boot
@@ -3388,8 +3389,22 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     // drain runs AFTER axum finishes (or after axum's 25s fires), which
     // means no new requests can dispatch audit events after the drain
     // starts (axum has stopped accepting connections).
-    let drain_notify = Arc::new(tokio::sync::Notify::new());
-    let drain_notify_clone = Arc::clone(&drain_notify);
+    // Story 7.27 Round-3 review fix (R3-C3-P2): switched from
+    // `tokio::sync::Notify` + `notify_waiters()` to
+    // `tokio::sync::watch::<bool>` because `Notify` is edge-
+    // triggered — `notify_waiters()` only wakes ALREADY-registered
+    // waiters, and the drain-deadline futures (`graceful_fut_uds`,
+    // `drain_deadline_tcp`, `drain_deadline_uds`) only register
+    // their `.notified()` waiter lazily on first poll inside the
+    // `tokio::select!` / `tokio::join!`. If the shutdown signal
+    // raced ahead of `axum::serve`'s first poll on these futures,
+    // `notify_waiters()` would wake zero waiters and the drain
+    // deadlines would block forever. `watch::channel(false)` is
+    // level-triggered: subscribers added after `send(true)` still
+    // observe the true value via `changed()`/`borrow()`. Three
+    // independent `receiver.clone()`s feed the three waiters.
+    let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
+    let drain_tx_for_graceful = drain_tx.clone();
     let sweep_shutdown_for_graceful = Arc::clone(&sweep_shutdown);
     let graceful_fut = async move {
         shutdown_fut.await;
@@ -3397,19 +3412,10 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         // BEFORE notifying the axum drain, so the sweep loop can
         // exit cleanly while in-flight requests still complete.
         sweep_shutdown_for_graceful.notify_one();
-        // Story 7.27 Round-2 review fix (P0): `drain_notify` has
-        // THREE `.notified().await` waiters on the macOS split-
-        // listener path (`graceful_fut_uds`, `drain_deadline_tcp`,
-        // `drain_deadline_uds`) but `notify_one()` only wakes one of
-        // them — leaving the other two blocked forever and
-        // deadlocking `try_join!` until launchd SIGKILL. The pre-
-        // 7.27 single-waiter pattern was correct with `notify_one`;
-        // the split-listener change requires the broadcast form.
-        // `notify_waiters()` wakes ALL currently registered waiters
-        // exactly once (no permit stored for future waiters — which
-        // is fine here because all three waiters register before
-        // `axum::serve` starts).
-        drain_notify_clone.notify_waiters();
+        // Broadcast the drain signal. `watch::send` ignores errors
+        // when there are no receivers (all dropped before signal),
+        // which is fine for shutdown.
+        let _ = drain_tx_for_graceful.send(true);
     };
     // `into_make_service_with_connect_info::<SocketAddr>()` enables the
     // `ConnectInfo<SocketAddr>` extractor used by the control-plane handlers
@@ -3488,10 +3494,15 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
             let _ = stdout.flush();
         }
         // Per-listener graceful-shutdown trigger. The single
-        // `drain_notify` from above signals both axum serves.
-        let drain_notify_uds = Arc::clone(&drain_notify);
+        // `drain_tx` from above signals both axum serves via
+        // independent `watch::Receiver` clones.
+        let mut drain_rx_uds = drain_rx.clone();
         let graceful_fut_uds = async move {
-            drain_notify_uds.notified().await;
+            // `watch::Receiver::changed()` returns when the value
+            // changes from `false` to `true`. If the sender already
+            // moved to `true` before we polled, `changed()` still
+            // returns `Ok(())` immediately — level-triggered.
+            let _ = drain_rx_uds.changed().await;
         };
         axum::serve(
             uds_listener,
@@ -3513,9 +3524,9 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     // completed — silently dropping in-flight audit events on the
     // surviving listener during graceful shutdown.
     let drain_deadline_tcp = {
-        let dn = Arc::clone(&drain_notify);
+        let mut dn = drain_rx.clone();
         async move {
-            dn.notified().await;
+            let _ = dn.changed().await;
             tokio::time::sleep(AXUM_DRAIN_BUDGET).await;
             tracing::warn!(
                 "axum (TCP) shutdown drain budget exceeded ({}s), dropping remaining connections",
@@ -3535,9 +3546,9 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     #[cfg(target_os = "macos")]
     {
         let drain_deadline_uds = {
-            let dn = Arc::clone(&drain_notify);
+            let mut dn = drain_rx.clone();
             async move {
-                dn.notified().await;
+                let _ = dn.changed().await;
                 tokio::time::sleep(AXUM_DRAIN_BUDGET).await;
                 tracing::warn!(
                     "axum (UDS) shutdown drain budget exceeded ({}s), dropping remaining connections",
@@ -3563,6 +3574,18 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         // own selects honor the 25s drain deadline); we then
         // inspect both results and surface the first error.
         let (tcp_result, uds_result) = tokio::join!(tcp_task, uds_task);
+        // Round-3 review fix (R3-C3-P10): when both listeners fail
+        // with different errors, `tcp_result?` short-circuits and
+        // the UDS error is dropped on the floor. Log both results
+        // explicitly first so operators see the full picture even
+        // when only one becomes the process exit error.
+        if tcp_result.is_err() || uds_result.is_err() {
+            tracing::warn!(
+                tcp_result = ?tcp_result,
+                uds_result = ?uds_result,
+                "split-listener shutdown returned errors on one or both listeners"
+            );
+        }
         tcp_result?;
         uds_result?;
     }
@@ -4160,6 +4183,7 @@ mod tests {
         let keystore = FakeKeyStore::failing(KeyStoreError::MalformedMasterKey {
             expected_len: 32,
             actual_len: 16,
+            reason: permitlayer_keystore::MalformedReason::BadLength,
         });
         let result = bootstrap_from_keystore(&keystore).await;
         assert!(matches!(

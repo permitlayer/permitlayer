@@ -45,7 +45,7 @@ impl KeyStore for WindowsKeyStore {
         })
         .await
         .map_err(|e| shared::join_err(BACKEND, e))??;
-        Ok(crate::MasterKeyOutcome { key, first_boot: false })
+        Ok(crate::MasterKeyOutcome::new(key, false))
     }
 
     async fn set_master_key(&self, key: &[u8; MASTER_KEY_LEN]) -> Result<(), KeyStoreError> {

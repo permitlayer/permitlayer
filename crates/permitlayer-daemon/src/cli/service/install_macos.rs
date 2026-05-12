@@ -38,42 +38,70 @@ const CLIENTS_GROUP: &str = "permitlayer-clients";
 const PLIST_FILENAME_RC21: &str = "dev.agentsso.daemon.plist";
 
 /// Safely resolve `<home>/<rel_dir>/<leaf>` by walking the path
-/// component-by-component with `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`
-/// at each step. Returns the final fully-resolved PathBuf if every
-/// intermediate component is a non-symlink directory AND the leaf
-/// is a regular non-symlink file (verified via
-/// `fstatat(AT_SYMLINK_NOFOLLOW)`). Returns `None` if any component
-/// is a symlink, missing, wrong-type, or the chain fails to open.
+/// component-by-component with `openat(parent_fd, comp, O_DIRECTORY |
+/// O_NOFOLLOW | O_CLOEXEC)` at each step. Returns the final
+/// fully-resolved PathBuf if every intermediate component is a
+/// non-symlink directory AND the leaf is a regular non-symlink file
+/// (verified via `fstatat(AT_SYMLINK_NOFOLLOW)`). Returns `None` if
+/// any component is a symlink, missing, wrong-type, or the chain
+/// fails to open.
 ///
 /// Story 7.27 Round-2 review fix (P1): pre-fix, the rc.21 cleanup
 /// and the per-user bearer-token sweep walks did `<home>/Library/...`
 /// style `Path::join` then `remove_file(...)` — which follows
 /// intermediate symlinks. A non-root user could symlink-swap their
 /// own `Library` directory and root's `remove_file` would then
-/// attack the symlink target. This helper closes the vector by
-/// ensuring every path component is the inode we expect.
+/// attack the symlink target.
+///
+/// Round-3 review fix (R3-C4-P1): the Round-2 fix re-opened
+/// `cur_path` by full path at each step, leaving a TOCTOU window
+/// where an attacker who owns `<home>` could rename + symlink-swap
+/// intermediate components between our `fstatat` and our path-based
+/// re-open. Now we use `open_dir_nofollow_at(parent_fd, comp)` — a
+/// true `openat`-anchored walk — so each step resolves relative to
+/// the fd we already hold. Symlink defense is structural, not
+/// TOCTOU-windowed.
+///
+/// Round-3 review fix (R3-C4-P13): explicitly reject `.`, `..`, and
+/// NUL-containing components. Defense-in-depth: current callers
+/// pass `"Library/LaunchAgents"` literals so the helper accepts
+/// only safe components today, but the public API surface should
+/// refuse path-escape sequences up front.
 fn safe_resolve_rc21_plist(home: &Path, rel_dir: &str, leaf: &str) -> Option<PathBuf> {
     use std::os::fd::AsRawFd;
-    // Open home with O_NOFOLLOW; refuse if it's a symlink.
+    fn safe_component(c: &str) -> bool {
+        !c.is_empty() && c != "." && c != ".." && !c.contains('\0') && !c.contains('/')
+    }
+    if !safe_component(leaf) {
+        return None;
+    }
+    // Open home with O_NOFOLLOW; refuse if it's a symlink. `home` is
+    // resolved as a full path (the caller passes `User::from_uid(...)`
+    // result), so this initial open is the only path-based step; all
+    // subsequent walking is anchored on this fd.
     let mut dir_fd = permitlayer_platform_macos::open_dir_nofollow(home).ok()?;
-    // Walk each intermediate component (`Library`, `LaunchAgents`)
-    // via `openat`-equivalent: re-open from the current dir fd.
-    // `permitlayer-platform-macos` exposes only path-based
-    // `open_dir_nofollow`; for the chain walk we use `fstatat` on
-    // each subcomponent to verify non-symlink, then re-open the
-    // path. The window between fstat and open is tiny and the parent
-    // dir is operator-owned by convention; the strong primitive
-    // we need is "no symlink at this exact resolution point".
     let mut cur_path = home.to_path_buf();
     for component in rel_dir.split('/').filter(|c| !c.is_empty()) {
+        if !safe_component(component) {
+            return None;
+        }
+        // Verify the component is a non-symlink dir BEFORE opening.
+        // `open_dir_nofollow_at` would already refuse symlinks with
+        // ELOOP, but checking S_IFDIR explicitly also catches files +
+        // FIFOs the kernel might otherwise let through as ENOTDIR.
         let meta =
             permitlayer_platform_macos::fstatat_nofollow(dir_fd.as_raw_fd(), component).ok()?;
-        // Reject if not a regular dir (S_IFDIR).
         if (meta.st_mode & libc::S_IFMT) != libc::S_IFDIR {
             return None;
         }
+        // True openat-anchored open — the new fd resolves relative
+        // to `dir_fd`, NOT to CWD. Symlink-swap of `component` between
+        // the fstatat above and this open is no longer exploitable:
+        // the kernel performs both operations against the same parent
+        // inode without re-traversing the path.
+        dir_fd =
+            permitlayer_platform_macos::open_dir_nofollow_at(dir_fd.as_raw_fd(), component).ok()?;
         cur_path = cur_path.join(component);
-        dir_fd = permitlayer_platform_macos::open_dir_nofollow(&cur_path).ok()?;
     }
     // Verify the leaf is a regular non-symlink file.
     let leaf_meta = permitlayer_platform_macos::fstatat_nofollow(dir_fd.as_raw_fd(), leaf).ok()?;
@@ -266,7 +294,19 @@ fn resolve_operator() -> Result<(u32, String)> {
     // it to a shell or path construction without validation
     // becomes a vulnerability. macOS short-name convention is
     // `[A-Za-z0-9._-]+` (DSAttrTypeStandard:RecordName).
+    //
+    // Round-3 review fix (R3-C4-P4): also reject usernames that
+    // start with `-` or `.`. A leading `-` is interpreted as an
+    // option flag by `dseditgroup -a $user` (since `Command::args`
+    // doesn't shell-quote — `-rf` would be parsed as `-r -f` by
+    // dseditgroup). A leading `.` (`.`, `..`, `.hidden`) is
+    // semantically a path-traversal trap and also unusual for
+    // real macOS accounts. Require the first char to be
+    // `[A-Za-z0-9_]`.
+    let first_char_ok =
+        user.name.chars().next().is_some_and(|c| c.is_ascii_alphanumeric() || c == '_');
     if user.name.is_empty()
+        || !first_char_ok
         || !user.name.chars().all(|c| c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-')
     {
         eprint!(
@@ -298,58 +338,66 @@ fn resolve_operator() -> Result<(u32, String)> {
 /// `pub(super)` alias [`cleanup_rc21_launchagents_for_uninstall`]
 /// so the uninstall flow can reuse the same logic.
 async fn cleanup_rc21_launchagents() -> Vec<(PathBuf, u32)> {
-    let mut removed: Vec<(PathBuf, u32)> = Vec::new();
+    // Round-3 review fix (R3-C4-P3): two-phase to give the audit
+    // log a deterministic forensic trail. Pre-fix, `emit_rc21_cleanup_audit`
+    // ran AFTER the destructive `remove_file` — if the audit
+    // writer's init failed (disk full, scrub-engine OOM), the
+    // delete had already happened and was lost to the audit
+    // record. Now:
+    //   1. Resolve safe candidates (`safe_resolve_rc21_plist` —
+    //      symlink-defended, openat-anchored walk).
+    //   2. Emit an `intent` event for each (best-effort; if audit
+    //      fails the operator still sees stderr warnings).
+    //   3. Perform the destructive removals.
+    //   4. Emit `complete` events for the successful subset.
+    // The audit log now contains BOTH intents and outcomes, so a
+    // crash between phases is reconstructible.
 
-    // Per-user LaunchAgents under /Users/*.
+    // Phase 1: resolve candidates.
+    let mut candidates: Vec<(PathBuf, u32)> = Vec::new();
     if let Ok(entries) = std::fs::read_dir("/Users") {
         for entry in entries.flatten() {
             let meta = match entry.metadata() {
                 Ok(m) => m,
                 Err(_) => continue,
             };
-            // Skip non-directories + symlinks (defense against a
-            // hostile /Users symlink farm).
             if !meta.is_dir() || meta.file_type().is_symlink() {
                 continue;
             }
-            // Story 7.27 Round-2 review fix (P1): walk to the plist
-            // via `openat` chain so intermediate symlinks are
-            // rejected. Pre-fix, top-level `/Users/<name>` symlink-
-            // skip closed only one of three symlink-traversal vectors;
-            // a non-root user `ln -s /etc /Users/me/Library` would let
-            // root's `remove_file(plist)` attack `/etc/.../...`.
             use std::os::unix::fs::MetadataExt;
             let uid = meta.uid();
-            let plist = match safe_resolve_rc21_plist(
-                &entry.path(),
-                "Library/LaunchAgents",
-                PLIST_FILENAME_RC21,
-            ) {
-                Some(p) => p,
-                None => continue,
-            };
-            // Best-effort bootout for the user's gui/<uid> domain.
-            let _ = Command::new("/bin/launchctl")
-                .args(["bootout", &format!("gui/{uid}/dev.agentsso.daemon")])
-                .output();
-            if std::fs::remove_file(&plist).is_ok() {
-                removed.push((plist, uid));
+            if let Some(plist) =
+                safe_resolve_rc21_plist(&entry.path(), "Library/LaunchAgents", PLIST_FILENAME_RC21)
+            {
+                candidates.push((plist, uid));
             }
         }
     }
-
-    // System-wide LaunchAgents (vanishingly rare in rc.21 but
-    // possible if an operator hand-installed). `/Library/` is root-
-    // owned by macOS convention so the symlink-traversal threat is
-    // structurally absent — but we still use the safe-resolve
-    // helper for shape parity with the per-user walk above.
     if let Some(sys) =
         safe_resolve_rc21_plist(Path::new("/Library"), "LaunchAgents", PLIST_FILENAME_RC21)
     {
-        let _ =
-            Command::new("/bin/launchctl").args(["bootout", "system/dev.agentsso.daemon"]).output();
-        if std::fs::remove_file(&sys).is_ok() {
-            removed.push((sys, 0));
+        candidates.push((sys, 0));
+    }
+
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+
+    // Phase 2: emit intent events BEFORE any destructive action.
+    emit_rc21_cleanup_audit_intent(&candidates, operator_sudo_uid());
+
+    // Phase 3: perform the removals.
+    let mut removed: Vec<(PathBuf, u32)> = Vec::new();
+    for (plist, uid) in &candidates {
+        // Best-effort bootout — domain depends on uid (gui vs system).
+        let bootout_target = if *uid == 0 {
+            "system/dev.agentsso.daemon".to_string()
+        } else {
+            format!("gui/{uid}/dev.agentsso.daemon")
+        };
+        let _ = Command::new("/bin/launchctl").args(["bootout", &bootout_target]).output();
+        if std::fs::remove_file(plist).is_ok() {
+            removed.push((plist.clone(), *uid));
         }
     }
 
@@ -366,50 +414,97 @@ async fn cleanup_rc21_launchagents() -> Vec<(PathBuf, u32)> {
     removed
 }
 
-/// Best-effort: build a standalone AuditFsWriter and append one
-/// `service-install-rc21-cleanup` event per plist removed. Audit
-/// emission failures are logged but never block install — operator
-/// stdout output still surfaces the removals (see `install_macos`
-/// main flow).
-fn emit_rc21_cleanup_audit(removed: &[(PathBuf, u32)], operator_uid: Option<u32>) {
-    use permitlayer_core::audit::event::AuditEvent;
+/// Build a standalone `AuditFsWriter` for the install CLI's
+/// audit-emit sites. Returns `None` (with stderr warning) on any
+/// init failure; the install never blocks on audit problems.
+///
+/// Round-3 review fix (R3-C4-P6): immediately chmod 0o700 + chown
+/// 0:0 the parent dir after `create_dir_all`. `create_dir_all` uses
+/// the process umask (root default 0o022 → 0o755 world-readable)
+/// and `create_state_dirs()` doesn't run until later in the install
+/// flow, so audit events containing `operator_uid` /
+/// `operator_username` would otherwise be world-readable during the
+/// install window. The later state-dir setup re-asserts these
+/// properties idempotently.
+fn open_install_audit_writer(
+    context_label: &str,
+) -> Option<permitlayer_core::audit::writer::AuditFsWriter> {
     use permitlayer_core::audit::writer::AuditFsWriter;
     use permitlayer_core::scrub::{ScrubEngine, builtin_rules};
     use std::sync::Arc;
 
     let audit_dir = permitlayer_core::paths::audit_log_path(None);
-    // Story 7.27 Round-2 review fix (P1): ensure the audit log dir
-    // exists before `AuditFsWriter::new` opens its rotation file.
-    // Pre-fix, rc.21→rc.22 migration installs hit this path BEFORE
-    // `create_state_dirs()` had run, so the parent dir was missing
-    // and `AuditFsWriter::new` failed to open the file. Operator
-    // saw `warning: rc.21 cleanup audit skipped` and install
-    // proceeded with NO audit trail for the destructive cleanup —
-    // exactly the discipline the emitter was added to provide.
-    // The state-dirs creation step still runs later and reasserts
-    // ownership + mode; here we just ensure the parent exists.
-    if let Some(parent) = audit_dir.parent()
-        && let Err(e) = std::fs::create_dir_all(parent)
-    {
-        eprintln!(
-            "warning: rc.21 cleanup audit skipped — could not create parent dir {}: {e}",
-            parent.display()
+    if let Some(parent) = audit_dir.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            eprintln!(
+                "warning: {context_label} audit skipped — could not create parent dir {}: {e}",
+                parent.display()
+            );
+            return None;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700));
+        let _ = nix::unistd::chown(
+            parent,
+            Some(nix::unistd::Uid::from_raw(0)),
+            Some(nix::unistd::Gid::from_raw(0)),
         );
-        return;
     }
     let scrub_engine = match ScrubEngine::new(builtin_rules().to_vec()) {
         Ok(e) => Arc::new(e),
         Err(e) => {
-            eprintln!("warning: rc.21 cleanup audit skipped — scrub-engine init failed: {e}");
-            return;
+            eprintln!("warning: {context_label} audit skipped — scrub-engine init failed: {e}");
+            return None;
         }
     };
-    let mut writer = match AuditFsWriter::new(audit_dir, 100 * 1024 * 1024, scrub_engine) {
-        Ok(w) => w,
+    match AuditFsWriter::new(audit_dir, 100 * 1024 * 1024, scrub_engine) {
+        Ok(w) => Some(w),
         Err(e) => {
-            eprintln!("warning: rc.21 cleanup audit skipped — writer init failed: {e}");
-            return;
+            eprintln!("warning: {context_label} audit skipped — writer init failed: {e}");
+            None
         }
+    }
+}
+
+/// Round-3 review fix (R3-C4-P3): emit `intent` events for each
+/// candidate rc.21 plist BEFORE the destructive `remove_file` runs.
+/// Pre-fix, the audit emit ran AFTER removal — a failed writer init
+/// after removal meant the destructive action was lost to the
+/// forensic trail. Now intents are written first so a crash between
+/// intent and complete is still reconstructible.
+fn emit_rc21_cleanup_audit_intent(candidates: &[(PathBuf, u32)], operator_uid: Option<u32>) {
+    use permitlayer_core::audit::event::AuditEvent;
+    let Some(mut writer) = open_install_audit_writer("rc.21 cleanup intent") else {
+        return;
+    };
+    for (plist, uid) in candidates {
+        let mut event = AuditEvent::new(
+            "system".to_owned(),
+            "permitlayer".to_owned(),
+            "-".to_owned(),
+            "service-install".to_owned(),
+            "intent".to_owned(),
+            "service-install.rc21-launchagent-cleanup-intent".to_owned(),
+        );
+        event.extra = serde_json::json!({
+            "plist_path": plist.to_string_lossy(),
+            "launch_agent_uid": uid,
+            "operator_uid": operator_uid,
+        });
+        if let Err(e) = writer.append(&event) {
+            eprintln!("warning: rc.21 cleanup intent audit append failed: {e}");
+        }
+    }
+}
+
+/// Emit one `service-install.rc21-launchagent-cleanup` event per
+/// plist successfully removed. Pairs with
+/// `emit_rc21_cleanup_audit_intent` to give a complete forensic
+/// trail (intent → complete).
+fn emit_rc21_cleanup_audit(removed: &[(PathBuf, u32)], operator_uid: Option<u32>) {
+    use permitlayer_core::audit::event::AuditEvent;
+    let Some(mut writer) = open_install_audit_writer("rc.21 cleanup complete") else {
+        return;
     };
     for (plist, uid) in removed {
         let mut event = AuditEvent::new(
@@ -494,21 +589,39 @@ fn emit_install_complete_audit(
 /// Mutex against concurrent `agentsso service install` invocations.
 /// Uses `O_CREAT|O_EXCL` on a sentinel file; releases via `Drop`.
 /// Story 7.27 review fix.
+///
+/// Round-3 review fix (R3-C4-P2): wraps a `nix::fcntl::Flock<File>`
+/// so the kernel arbitrates ownership. The Round-2 implementation
+/// used `OpenOptions::create_new` + mtime-based stale detection,
+/// which had a race: two callers both stat stale, both `remove_file`
+/// (the second's removes the first's freshly-acquired lock), both
+/// `create_new` succeed — install-lock guarantee broken. `flock(2)`
+/// removes the race entirely; the lockfile inode persists across
+/// processes and the kernel arbitrates which holder is live.
 pub(super) struct InstallLock {
-    path: PathBuf,
-}
-
-impl Drop for InstallLock {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.path);
-    }
+    // Kept alive for the lifetime of the lock; dropping releases.
+    // `None` for the `--force` uninstall path (R3-C4-P9), which
+    // explicitly opts out of mutual exclusion to allow recovery
+    // from a recently-crashed install.
+    _flock: Option<nix::fcntl::Flock<std::fs::File>>,
 }
 
 /// Story 7.27 Round-2 review fix (P2): exposed via
 /// [`acquire_install_lock_pub`] so the uninstall flow can acquire
 /// the same lock and prevent concurrent install+uninstall races.
 pub(super) fn acquire_install_lock_pub() -> Result<InstallLock> {
-    acquire_install_lock()
+    acquire_install_lock_inner(false)
+}
+
+/// Round-3 review fix (R3-C4-P9): force variant for uninstall.
+/// A fresh crashed install (lock <10min old) would otherwise block
+/// the operator from running `service uninstall` to clean up —
+/// because the install-lock-not-stale check rejects (Round-2 mtime
+/// reclaim) or `flock(2)` returns EWOULDBLOCK (Round-3 R3-C4-P2).
+/// `--force` bypasses lock acquisition entirely; the caller is
+/// responsible for ensuring no other install is concurrently active.
+pub(super) fn acquire_install_lock_pub_force() -> InstallLock {
+    InstallLock { _flock: None }
 }
 
 /// Story 7.27 Round-2 review fix (P2): exposed for uninstall so it
@@ -518,20 +631,21 @@ pub(super) async fn cleanup_rc21_launchagents_for_uninstall() -> Vec<(PathBuf, u
 }
 
 fn acquire_install_lock() -> Result<InstallLock> {
+    acquire_install_lock_inner(false)
+}
+
+/// Round-3 review fix (R3-C4-P2): switched from mtime-based stale-
+/// reclaim to `flock(2)`. The lockfile inode persists indefinitely;
+/// the kernel-arbitrated advisory lock guarantees mutual exclusion
+/// without any mtime race. Stale-lock recovery is automatic — when
+/// the holder process exits (graceful or SIGKILL), the kernel
+/// releases the fd, which releases the flock. No reclaim heuristic
+/// needed.
+fn acquire_install_lock_inner(_force: bool) -> Result<InstallLock> {
     use std::os::unix::fs::OpenOptionsExt;
     // `/var/run/permitlayer/` may not exist on a fresh install. Try
     // there first (preferred — root-only-writable so the lock is
     // tamper-resistant); fall back to /tmp/.
-    //
-    // Story 7.27 Round-2 review fix (P2): pre-fix comment claimed
-    // `/var/run` is tmpfs on macOS — that's NOT true on modern
-    // macOS (it's a regular dir under the root volume). If `service
-    // install` is SIGKILLed mid-flow, the lock persists across
-    // reboots and blocks all subsequent installs. We now detect
-    // stale locks via mtime: any lock file older than 10 minutes
-    // (an install that takes >10 min is broken anyway) is treated
-    // as orphaned, reclaimed, and re-acquired.
-    const STALE_LOCK_AGE: Duration = Duration::from_secs(600);
     let primary = PathBuf::from("/var/run/permitlayer/.install.lock");
     let fallback = PathBuf::from("/tmp/.permitlayer-install.lock");
 
@@ -539,32 +653,25 @@ fn acquire_install_lock() -> Result<InstallLock> {
         let _ = std::fs::create_dir_all(parent);
     }
 
+    let mut last_open_err: Option<std::io::Error> = None;
     for candidate in [&primary, &fallback] {
-        match std::fs::OpenOptions::new().write(true).create_new(true).mode(0o600).open(candidate) {
-            Ok(_) => return Ok(InstallLock { path: candidate.clone() }),
-            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Story 7.27 Round-2 review fix (P2): mtime-based
-                // stale-lock detection. If the existing lock is older
-                // than `STALE_LOCK_AGE`, the prior install was killed
-                // or crashed without `Drop` running; reclaim it.
-                if let Ok(meta) = std::fs::metadata(candidate)
-                    && let Ok(modified) = meta.modified()
-                    && modified.elapsed().map(|e| e > STALE_LOCK_AGE).unwrap_or(false)
-                {
-                    eprintln!(
-                        "→ reclaiming stale install lock at {} (>10min old)",
-                        candidate.display()
-                    );
-                    if std::fs::remove_file(candidate).is_ok()
-                        && let Ok(_) = std::fs::OpenOptions::new()
-                            .write(true)
-                            .create_new(true)
-                            .mode(0o600)
-                            .open(candidate)
-                    {
-                        return Ok(InstallLock { path: candidate.clone() });
-                    }
-                }
+        let file = match std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(candidate)
+        {
+            Ok(f) => f,
+            Err(e) => {
+                last_open_err = Some(e);
+                continue;
+            }
+        };
+        match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+            Ok(flock) => return Ok(InstallLock { _flock: Some(flock) }),
+            Err((_returned_file, nix::errno::Errno::EWOULDBLOCK)) => {
                 eprint!(
                     "{}",
                     error_block(
@@ -573,22 +680,41 @@ fn acquire_install_lock() -> Result<InstallLock> {
                             "another `agentsso service install` is in progress (lock at {})",
                             candidate.display()
                         ),
-                        "wait for the other install to finish, or remove the lock file if no install is running",
+                        "wait for the other install to finish (the kernel releases the lock automatically when it exits)",
                         None,
                     )
                 );
                 return Err(silent_cli_error("concurrent install detected"));
             }
-            Err(_) => continue, // try next candidate
+            Err((_returned_file, errno)) => {
+                last_open_err = Some(std::io::Error::from_raw_os_error(errno as i32));
+                continue;
+            }
         }
     }
-    Err(anyhow::anyhow!("could not acquire install lock at any of /var/run/permitlayer/, /tmp/"))
+    Err(anyhow::anyhow!(
+        "could not acquire install lock at any of /var/run/permitlayer/, /tmp/: {}",
+        last_open_err.map(|e| e.to_string()).unwrap_or_else(|| "unknown".to_string())
+    ))
 }
 
 /// Escape `<`, `>`, `&`, `'`, `"` for safe interpolation into XML
 /// CharData / AttValue positions. Story 7.27 review fix: account
 /// names containing apostrophes or ampersands are legitimate on
 /// macOS and would otherwise produce a malformed plist.
+///
+/// Round-3 review note (R3-C4-P12): this helper does NOT escape
+/// control characters (U+0000–U+001F). Callers MUST validate that
+/// input contains no control chars before passing it here — XML 1.0
+/// rejects most control chars in CharData with no graceful
+/// recovery, and `launchctl bootstrap` returns an opaque
+/// "Bootstrap failed: 5: Input/output error" instead of a parse
+/// diagnostic. The only public consumer today is
+/// `operator_username`, which is now regex-validated against
+/// `[A-Za-z0-9._-]+` (first char `[A-Za-z0-9_]`); control chars
+/// are structurally impossible. If you add a new caller, validate
+/// input or extend this helper to numeric-escape (`&#xN;`) the
+/// control range.
 fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
@@ -895,7 +1021,7 @@ fn resolve_binary_source(args: &InstallArgs) -> Result<PathBuf> {
             // Refusing symlinks closes the swap window. Validating
             // executable-bit closes the "operator typo'd a path
             // to /etc/passwd" footgun.
-            use std::os::unix::fs::PermissionsExt;
+            use std::os::unix::fs::{MetadataExt, PermissionsExt};
             let meta = std::fs::symlink_metadata(p)
                 .with_context(|| format!("--from path {} not accessible", p.display()))?;
             if meta.file_type().is_symlink() {
@@ -911,6 +1037,27 @@ fn resolve_binary_source(args: &InstallArgs) -> Result<PathBuf> {
                     "--from path {} is not a regular file (type: {:?})",
                     p.display(),
                     meta.file_type()
+                );
+            }
+            // Round-3 review fix (R3-C4-P5): refuse hardlinks. The
+            // symlink check above doesn't catch hardlinks (they
+            // share an inode with a "primary" name and look like
+            // regular files to symlink_metadata). An attacker who
+            // can write to `/tmp/agentsso-malicious` can
+            // `ln /tmp/agentsso-malicious ~/Downloads/agentsso`,
+            // wait for the operator to run
+            // `sudo agentsso service install --from
+            // ~/Downloads/agentsso`, then race a content swap via
+            // the `/tmp/` path. nlink > 1 indicates the inode has
+            // another name elsewhere; refuse.
+            if meta.nlink() > 1 {
+                anyhow::bail!(
+                    "--from path {} has {} hardlinks; refusing because a second name \
+                     elsewhere could let an attacker swap the binary's contents while \
+                     the install runs. Copy the binary to a fresh path (e.g., \
+                     `/var/root/agentsso-staged`) and re-run with --from that path.",
+                    p.display(),
+                    meta.nlink()
                 );
             }
             if meta.permissions().mode() & 0o111 == 0 {
@@ -947,8 +1094,24 @@ fn copy_binary_to_helper_tools(from: &Path) -> Result<()> {
         .with_context(|| format!("chown root:wheel {}", tmp_path.display()))?;
     std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(0o755))
         .with_context(|| format!("chmod 0755 {}", tmp_path.display()))?;
+    // Round-3 review fix (R3-C4-P11): fsync the tmp file's data
+    // before the rename. Atomic-via-rename is only atomic w.r.t.
+    // crash if the tmp file's data is fsync'd first; otherwise a
+    // power loss between `rename` and writeback yields a zero-byte
+    // helper at `PRIVILEGED_HELPER_PATH` with a valid dirent —
+    // exactly the failure mode the rename pattern claims to prevent.
+    let tmp_file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&tmp_path)
+        .with_context(|| format!("open {} for fsync", tmp_path.display()))?;
+    tmp_file.sync_all().with_context(|| format!("fsync {}", tmp_path.display()))?;
+    drop(tmp_file);
     std::fs::rename(&tmp_path, PRIVILEGED_HELPER_PATH)
         .with_context(|| format!("rename {} → {}", tmp_path.display(), PRIVILEGED_HELPER_PATH))?;
+    // fsync the parent dir so the rename is durable.
+    if let Ok(dir) = std::fs::File::open(helper_dir) {
+        let _ = dir.sync_all();
+    }
     Ok(())
 }
 
@@ -1017,6 +1180,14 @@ fn bootstrap_daemon() -> Result<()> {
     if let Ok(out) = bootout {
         let stderr = String::from_utf8_lossy(&out.stderr);
         let code = out.status.code().unwrap_or(0);
+        // Round-3 review fix (R3-C4-P10) doc-only: the exit-code
+        // magic numbers `36` and `3` are best-effort across macOS
+        // versions — `launchctl bootout`'s exit code is the mach
+        // error number on modern macOS and the substring-match on
+        // stderr ("Could not find specified service" / "service
+        // not loaded") is the reliable signal. Keep the magic
+        // numbers as additional safety net but treat the
+        // substring as the source of truth.
         let not_loaded = !out.status.success()
             && (stderr.contains("Could not find specified service")
                 || stderr.contains("service not loaded")
@@ -1085,10 +1256,18 @@ fn verify_daemon_running(timeout: Duration) -> Result<u32> {
         if let Ok(o) = out {
             let stdout = String::from_utf8_lossy(&o.stdout);
             let stderr = String::from_utf8_lossy(&o.stderr);
-            let combined = format!("{stdout}{stderr}");
-            last_output = combined.clone();
-            let running = combined.lines().any(|l| l.trim_start().starts_with("state = running"));
-            let pid: Option<u32> = combined.lines().find_map(|l| {
+            // Round-3 review fix (R3-C4-P14): parse `state = running`
+            // from STDOUT only. `launchctl print` writes the
+            // human-readable state block to stdout when the service
+            // exists; stderr is reserved for error diagnostics. A
+            // future macOS that ships a localized help banner
+            // mentioning "running" in stderr could otherwise
+            // false-positive against the substring match.
+            // Combined buffer kept only for the failure-diagnostic
+            // `last_output` dump.
+            last_output = format!("--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
+            let running = stdout.lines().any(|l| l.trim_start().starts_with("state = running"));
+            let pid: Option<u32> = stdout.lines().find_map(|l| {
                 let trimmed = l.trim_start();
                 let rest = trimmed.strip_prefix("pid = ")?;
                 rest.trim().parse::<u32>().ok().filter(|&p| p != 0)
@@ -1101,7 +1280,17 @@ fn verify_daemon_running(timeout: Duration) -> Result<u32> {
             // PID. Result: install reported `✓ daemon running (pid N)`
             // for crashed daemons. PID is informational only —
             // state is authoritative.
-            if running {
+            //
+            // Round-3 review fix (R3-C4-P7): only return success if
+            // we have BOTH `state = running` AND a non-zero PID.
+            // Without the PID check, a transient launchctl race
+            // could return `state = running` before the daemon's
+            // pid field was populated (microseconds-wide window);
+            // caller would print "✓ daemon running (pid 0)" and the
+            // install-complete audit would record the kernel
+            // scheduler's PID, not the daemon's. Continue polling
+            // until both fields are present.
+            if running && pid.is_some() {
                 return Ok(pid.unwrap_or(0));
             }
         }

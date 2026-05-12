@@ -9,6 +9,28 @@
 //! chains or `#[from]`. `PlatformError::message` is the one exception and
 //! carries only backend diagnostic text (never the stored secret value).
 
+/// Reason a `MalformedMasterKey` error fired. Round-3 review fix
+/// disambiguates length-mismatch from bad-character so operator-
+/// facing error rendering can be specific.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum MalformedReason {
+    /// The decoded buffer was not `MASTER_KEY_LEN` bytes.
+    BadLength,
+    /// The buffer was the correct length but contained one or more
+    /// bytes outside `0-9a-fA-F` (hex backend).
+    BadCharacter,
+}
+
+impl std::fmt::Display for MalformedReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::BadLength => f.write_str("bad length"),
+            Self::BadCharacter => f.write_str("non-hex character"),
+        }
+    }
+}
+
 /// Errors returned by the keystore trait and its platform adapters.
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
@@ -66,11 +88,20 @@ pub enum KeyStoreError {
     #[error("this keystore adapter does not support replacing the master key")]
     PassphraseAdapterImmutable,
 
-    /// The OS keychain returned a secret of the wrong length. The master
-    /// key is always exactly 32 bytes; any deviation indicates corruption
-    /// or tampering.
-    #[error("master key has wrong length: expected {expected_len} bytes, got {actual_len}")]
-    MalformedMasterKey { expected_len: usize, actual_len: usize },
+    /// The OS keychain returned a secret of the wrong length or containing
+    /// invalid characters. The master key is always exactly 32 bytes
+    /// (64 hex chars on the macOS System.keychain backend); any deviation
+    /// indicates corruption or tampering.
+    ///
+    /// Round-3 review fix: the previous shape conflated bad-length and
+    /// bad-character failures (both reported `expected_len`/`actual_len`).
+    /// A bad-char input with the right length reported `expected=64,
+    /// actual=64`, which renders confusingly as "length matches but
+    /// malformed why?" in operator-facing error messages.
+    /// `reason: BadLength` / `reason: BadCharacter` discriminates the
+    /// two cases.
+    #[error("master key malformed: expected {expected_len} bytes, got {actual_len} ({reason})")]
+    MalformedMasterKey { expected_len: usize, actual_len: usize, reason: MalformedReason },
 
     /// The daemon needed to prompt for a passphrase (because the native
     /// keychain is unavailable and `FallbackMode::Auto` is engaged) but
@@ -163,8 +194,12 @@ impl KeyStoreError {
                 Self::PlatformError { backend, message: message.clone() }
             }
             Self::PassphraseAdapterImmutable => Self::PassphraseAdapterImmutable,
-            Self::MalformedMasterKey { expected_len, actual_len } => {
-                Self::MalformedMasterKey { expected_len: *expected_len, actual_len: *actual_len }
+            Self::MalformedMasterKey { expected_len, actual_len, reason } => {
+                Self::MalformedMasterKey {
+                    expected_len: *expected_len,
+                    actual_len: *actual_len,
+                    reason: *reason,
+                }
             }
             Self::PassphrasePromptUnavailable => Self::PassphrasePromptUnavailable,
             Self::RuntimeFallbackFailed { native, fallback } => Self::RuntimeFallbackFailed {

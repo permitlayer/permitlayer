@@ -79,6 +79,16 @@ const _: () = {
     let expected = 4 + 4 + 2 + 2 + 4 * NGROUPS;
     let actual = size_of::<Xucred>();
     assert!(actual == expected, "xucred struct size mismatch — check Darwin SDK header");
+
+    // Round-3 review fix: total-size match alone doesn't pin field
+    // offsets. A future SDK that inserts padding before `cr_groups`
+    // (e.g., 4-byte alignment quirk on an architecture variant) would
+    // pass the size assert but shift `cr_groups` so our reads land on
+    // the wrong bytes. Pin `cr_groups` at offset 12: 4 (cr_version) +
+    // 4 (cr_uid) + 2 (cr_ngroups) + 2 (padding). `offset_of!` is
+    // const-stable since Rust 1.77.
+    let offset = core::mem::offset_of!(Xucred, cr_groups);
+    assert!(offset == 12, "xucred cr_groups offset shifted — check Darwin SDK header");
 };
 
 /// Read the peer UID + effective GID of a raw socket fd. This is the
@@ -165,12 +175,24 @@ pub fn peer_uid_gid_from_raw_fd(fd: RawFd) -> io::Result<(u32, u32)> {
 
     // Round-2 review fix: `cr_ngroups` is `c_short` (signed); cast via
     // `usize` would turn negative values into `usize::MAX` and bypass
-    // the zero check. Treat anything outside `1..=NGROUPS` as "no
-    // primary GID reported" — defensive against future kernel ABI
-    // changes; today this branch is unreachable.
+    // the zero check.
+    //
+    // Round-3 review fix: out-of-range `cr_ngroups` now returns an
+    // explicit `InvalidData` error rather than silently substituting
+    // `gid = 0`. Returning root-equivalent group for "indeterminate
+    // peer cred" was a security smell: callers using the GID for audit
+    // logging or authorization could mis-classify the peer as
+    // root-grouped on a kernel-ABI violation. Today this branch is
+    // unreachable (the size + offset asserts above pin the struct
+    // layout), but defense-in-depth against future kernel changes.
     let ngroups = ucred.cr_ngroups;
     if ngroups <= 0 || (ngroups as usize) > NGROUPS {
-        return Ok((ucred.cr_uid, 0));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "LOCAL_PEERCRED: cr_ngroups out of range (got {ngroups}, expected 1..={NGROUPS})"
+            ),
+        ));
     }
 
     Ok((ucred.cr_uid, ucred.cr_groups[0]))

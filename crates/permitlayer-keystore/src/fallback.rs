@@ -401,10 +401,7 @@ mod fallback_tests {
     #[async_trait]
     impl KeyStore for SyntheticFallback {
         async fn master_key(&self) -> Result<crate::MasterKeyOutcome, KeyStoreError> {
-            Ok(crate::MasterKeyOutcome {
-                key: Zeroizing::new([0xAA; MASTER_KEY_LEN]),
-                first_boot: false,
-            })
+            Ok(crate::MasterKeyOutcome::new(Zeroizing::new([0xAA; MASTER_KEY_LEN]), false))
         }
         async fn set_master_key(&self, _: &[u8; MASTER_KEY_LEN]) -> Result<(), KeyStoreError> {
             Err(KeyStoreError::PassphraseAdapterImmutable)

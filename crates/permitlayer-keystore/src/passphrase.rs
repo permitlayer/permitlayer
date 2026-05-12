@@ -215,7 +215,7 @@ impl KeyStore for PassphraseKeyStore {
         // every process start from the same passphrase + salt).
         // Reporting `first_boot: false` unconditionally is correct
         // — there's no audit-significant "mint" event to fire.
-        Ok(crate::MasterKeyOutcome { key: Zeroizing::new(*self.derived_key), first_boot: false })
+        Ok(crate::MasterKeyOutcome::new(Zeroizing::new(*self.derived_key), false))
     }
 
     async fn set_master_key(&self, _key: &[u8; MASTER_KEY_LEN]) -> Result<(), KeyStoreError> {

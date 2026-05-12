@@ -78,6 +78,15 @@ where
             // declared in the span macro — pre-fix, the layer's
             // calls were silently dropping the kernel-attested
             // peer identity from the tracing surface.
+            //
+            // Round-3 review verification (R3-C5-P5): the recorder
+            // site is `permitlayer-daemon::server::control.rs:647`
+            // (`require_control_token`), called against the span
+            // created BY THIS MACRO. The daemon's control router
+            // applies `permitlayer_proxy::middleware::RequestTraceLayer::new()`
+            // (verified at `server/control.rs:2737`), so the
+            // recorder writes into the proxy-crate-defined span.
+            // Wiring is correct; the declaration belongs here.
             peer_uid = tracing::field::Empty,
             peer_gid = tracing::field::Empty,
         );

@@ -251,6 +251,17 @@ pub(crate) struct ConnectionsResponse {
 /// Story 7.27 Round-2 review fix (P2): centralizes the transport
 /// split so future rule changes don't need to be applied in two
 /// places.
+///
+/// Round-3 review note (R3-C5-P4): this is a transitional duplicate
+/// of `crate::cli::kill::resolve_control_endpoint(&DaemonConfig)` —
+/// they differ only in input type (SocketAddr vs DaemonConfig).
+/// Consolidating requires either threading `DaemonConfig` through
+/// the status-path callers OR teaching `kill::resolve_control_endpoint`
+/// to accept `Option<&DaemonConfig>` (or a `bind_addr: SocketAddr`
+/// directly). Both are larger refactors than fit in Round-3 scope.
+/// Track as a 7.28 cleanup item — the duplication is a drift hazard
+/// the moment Linux/Windows TCP migration happens, but in 7.27 the
+/// two helpers agree.
 fn resolve_control_endpoint_from_addr(addr: SocketAddr) -> crate::cli::kill::ControlEndpoint {
     #[cfg(target_os = "macos")]
     {

@@ -79,7 +79,7 @@ pub use codesign_macos::{
     CodesignError, capture_self_designated_requirement, read_trust_anchor, trust_anchor_path,
     verify_self_against, write_trust_anchor, write_trust_anchor_force,
 };
-pub use error::KeyStoreError;
+pub use error::{KeyStoreError, MalformedReason};
 #[cfg(feature = "test-seam")]
 pub use file_backed::FileBackedKeyStore;
 #[cfg(target_os = "linux")]
@@ -167,6 +167,51 @@ pub enum DeleteOutcome {
 /// All methods are async; platform FFI calls MUST be dispatched to a
 /// blocking worker via `tokio::task::spawn_blocking` inside the
 /// implementation (AC #3).
+/// Redacting newtype around the 32-byte master key. Deref-coerces to
+/// `Zeroizing<[u8; MASTER_KEY_LEN]>` so callers can keep using
+/// `outcome.key.as_slice()` / `&outcome.key`, but the hand-rolled
+/// `Debug` impl prints `<redacted>` instead of all 32 bytes.
+///
+/// **Round-3 review fix.** Round-2 added `#[non_exhaustive]` to
+/// `MasterKeyOutcome` claiming the attribute prevented external
+/// callers from destructuring the struct in a way that defeated the
+/// outer `Debug` redaction. That claim was overstated:
+/// `#[non_exhaustive]` only forces external callers to use the `..`
+/// rest pattern, and a `println!("{:?}", outcome.key)` still reaches
+/// the *derived* `Debug` on `Zeroizing<[u8; 32]>` which prints every
+/// byte. Wrapping `key` in this newtype with its own redacting
+/// `Debug` enforces the invariant at the type level — any path that
+/// reaches `Debug` on the `key` field now redacts.
+pub struct RedactedMasterKey(Zeroizing<[u8; MASTER_KEY_LEN]>);
+
+impl RedactedMasterKey {
+    /// Wrap a freshly-minted or freshly-read key.
+    pub fn new(key: Zeroizing<[u8; MASTER_KEY_LEN]>) -> Self {
+        Self(key)
+    }
+
+    /// Unwrap to the inner `Zeroizing<...>` — used by call sites that
+    /// genuinely need to consume the key (vault open/seal, rotate-key
+    /// rotation, the daemon's compile-time `if outcome.key.as_slice()
+    /// == [0u8; 32]` defensive check, etc.).
+    pub fn into_inner(self) -> Zeroizing<[u8; MASTER_KEY_LEN]> {
+        self.0
+    }
+}
+
+impl std::ops::Deref for RedactedMasterKey {
+    type Target = Zeroizing<[u8; MASTER_KEY_LEN]>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for RedactedMasterKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RedactedMasterKey(<redacted>)")
+    }
+}
+
 /// Outcome of [`KeyStore::master_key`].
 ///
 /// Story 7.27 AC #16: callers need to know whether the master key
@@ -176,25 +221,20 @@ pub enum DeleteOutcome {
 /// cut), but the daemon-level call site has the audit dispatcher in
 /// scope — it's the right layer to emit typed events from.
 ///
-/// **NOTE:** `Debug` is implemented by hand and redacts `key`.
-/// Deriving `Debug` here would leak the master key via any accidental
-/// `tracing::debug!(?outcome)`, `dbg!()`, or panic message that
-/// interpolated `{:?}`. Story 7.27 review fix.
+/// **Debug redaction.** Both the outer `MasterKeyOutcome` and the
+/// inner `RedactedMasterKey` print `<redacted>` for the key field.
+/// Round-3 review fix replaced the round-2 `#[non_exhaustive]`-only
+/// approach (which was documentation-grade, not type-enforced) with
+/// a redacting newtype on the field itself.
 ///
-/// **Round-2 review fix:** marked `#[non_exhaustive]` so external
-/// callers cannot pattern-destructure with explicit field bindings
-/// (`let MasterKeyOutcome { key, first_boot } = outcome;`) which
-/// would defeat the hand-rolled `Debug` redaction by pulling the
-/// inner `Zeroizing<[u8; 32]>` out where its derived-`Debug`-prints-
-/// all-bytes implementation can be reached. Callers must go through
-/// the public-but-unstable fields by name (`outcome.key`,
-/// `outcome.first_boot`) or use the dedicated accessors. The
-/// `non_exhaustive` attribute also future-proofs new fields (e.g.,
-/// a `key_id` for rotate-key v3) without breaking external matchers.
+/// `#[non_exhaustive]` is retained on the outer struct to future-
+/// proof new fields (e.g., a `key_id` for rotate-key v3) without
+/// breaking external matchers.
 #[non_exhaustive]
 pub struct MasterKeyOutcome {
-    /// The 32-byte master key, zeroized on drop via `Zeroizing`.
-    pub key: Zeroizing<[u8; MASTER_KEY_LEN]>,
+    /// The 32-byte master key, wrapped in a redacting newtype.
+    /// Deref-coerces to `Zeroizing<[u8; MASTER_KEY_LEN]>`.
+    pub key: RedactedMasterKey,
     /// `true` when this call minted a fresh key (first boot of the
     /// daemon against this keychain); `false` when an existing key
     /// was read back.
@@ -208,7 +248,7 @@ impl MasterKeyOutcome {
     /// literal `MasterKeyOutcome { key, first_boot }` form across
     /// crate boundaries.
     pub fn new(key: Zeroizing<[u8; MASTER_KEY_LEN]>, first_boot: bool) -> Self {
-        Self { key, first_boot }
+        Self { key: RedactedMasterKey::new(key), first_boot }
     }
 }
 

@@ -26,20 +26,12 @@ use tokio::net::UnixListener;
 
 /// Kernel-attested peer credentials for a UDS connection.
 ///
-/// Captured at `accept()` time via `LOCAL_PEERCRED` getsockopt —
-/// cannot be spoofed by user-space code on the other end of the
-/// socket. Exposed to handlers as `axum::Extension<PeerCredentials>`
-/// via [`record_peer_credentials_layer`].
-#[derive(Clone, Copy, Debug)]
-pub struct PeerCredentials {
-    /// Effective UID of the peer process at connect time.
-    pub uid: u32,
-    /// Primary GID (`cr_groups[0]`) of the peer process at connect
-    /// time. Used for audit logging; supplementary GID checks
-    /// (e.g., `permitlayer-clients` membership) are best left to
-    /// the kernel via the socket's 0660 mode + group ownership.
-    pub gid: u32,
-}
+/// Round-3 review fix (R3-C3-P1): the `PeerCredentials` struct lives
+/// in `super` (`server/mod.rs`) so non-macOS callers in
+/// `server/control.rs` can reference the type without `#[cfg]`
+/// clutter at every site. Re-export for source-compat with macOS-only
+/// callers that imported from this module.
+pub use super::PeerCredentials;
 
 /// Connect-info type for the UDS control listener.
 ///
@@ -225,7 +217,27 @@ pub fn bind_control_listener_no_perms(path: &Path) -> io::Result<UnixListener> {
                 format!("control-socket path is a symlink — refusing to bind: {}", path.display()),
             ));
         }
-        Ok(_) => {
+        Ok(meta) => {
+            // Round-3 review fix (R3-C3-P6): refuse non-socket file
+            // types up front. The Round-2 probe accepted ANY connect
+            // failure as "stale" → `remove_file`, which under
+            // `AGENTSSO_PATHS__HOME` override (operator-writable
+            // dir) lets an operator-equivalent process trick the
+            // daemon into deleting arbitrary files at the socket
+            // path (regular files, FIFOs, dangling-target sockets,
+            // etc.). The symlink check above catches symlinks; this
+            // check catches everything that isn't an AF_UNIX socket.
+            use std::os::unix::fs::FileTypeExt;
+            if !meta.file_type().is_socket() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "control-socket path exists but is not an AF_UNIX socket — \
+                         refusing to clobber: {}",
+                        path.display()
+                    ),
+                ));
+            }
             // Story 7.27 Round-2 review fix (P2): probe the
             // existing inode with a `connect(2)` before unlinking.
             // Under `AGENTSSO_PATHS__HOME` override (dev/test
@@ -325,12 +337,21 @@ mod tests {
     #[tokio::test]
     async fn bind_removes_stale_socket() {
         use std::os::unix::fs::FileTypeExt;
+        // Round-3 review fix (R3-C3-P6) tightened bind to refuse
+        // non-socket inodes at the path. Update this test to
+        // pre-create an actual AF_UNIX socket inode (bind + drop
+        // the listener) — that's the genuine "stale socket" case:
+        // a socket inode left behind by a prior daemon that
+        // exited without unlinking. Regular-file path is now
+        // covered by `bind_refuses_non_socket_inode` below.
         let dir = tempdir().unwrap();
         let sock_path = dir.path().join("control.sock");
-        // Pre-create a regular file at the path. Bind should remove
-        // it and create a fresh socket. Skip the chown step (root-
-        // required); we're only verifying the bind + cleanup logic.
-        std::fs::write(&sock_path, b"stale").unwrap();
+
+        // Create + drop a real AF_UNIX socket inode so the path
+        // becomes a stale socket (no live listener).
+        {
+            let _stale = UnixListener::bind(&sock_path).expect("create stale socket inode");
+        }
 
         let _listener =
             bind_control_listener_no_perms(&sock_path).expect("bind should remove stale + succeed");
@@ -342,6 +363,28 @@ mod tests {
             ft.is_socket(),
             ft.is_file()
         );
+    }
+
+    #[tokio::test]
+    async fn bind_refuses_non_socket_inode() {
+        // Round-3 review fix (R3-C3-P6): bind must refuse to
+        // clobber a non-socket inode at the configured path.
+        // Pre-fix, ANY connect-probe failure caused
+        // `remove_file(path)`, which under `AGENTSSO_PATHS__HOME`
+        // override let an operator-equivalent process trick the
+        // daemon into deleting arbitrary files (regular files,
+        // FIFOs, etc.). Now we refuse with `InvalidInput`.
+        let dir = tempdir().unwrap();
+        let sock_path = dir.path().join("control.sock");
+        std::fs::write(&sock_path, b"definitely-not-a-socket").expect("create regular file");
+
+        let err = bind_control_listener_no_perms(&sock_path)
+            .expect_err("bind must refuse non-socket inode");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        // File must still exist — we refused, we didn't delete.
+        assert!(sock_path.exists(), "refusal must not delete the file");
+        let contents = std::fs::read(&sock_path).unwrap();
+        assert_eq!(contents, b"definitely-not-a-socket");
     }
 
     #[test]

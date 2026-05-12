@@ -307,6 +307,7 @@ fn read_key_from_bytes(bytes: &[u8]) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, 
         return Err(KeyStoreError::MalformedMasterKey {
             expected_len: MASTER_KEY_LEN,
             actual_len: bytes.len(),
+            reason: crate::MalformedReason::BadLength,
         });
     }
     let mut key = Zeroizing::new([0u8; MASTER_KEY_LEN]);

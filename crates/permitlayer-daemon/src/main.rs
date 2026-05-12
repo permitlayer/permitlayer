@@ -143,6 +143,27 @@ async fn main() -> ExitCode {
     //     `agentsso service status` (eventually `--json` flag) or
     //     check exit code 2 (the `autostart.removed` interceptor's
     //     deliberate "loud failure" semantics).
+    // Round-3 review fix (R3-C5-P7) doc-only: this heuristic has
+    // known limitations the clap-driven full-fidelity parse would
+    // handle:
+    //   - `agentsso --help autostart` matches `autostart` here and
+    //     fires the interceptor BEFORE clap's `--help` rendering.
+    //     Operator wanted help; got the autostart-removed error
+    //     block. Acceptable: `--help` to find a removed command
+    //     should at least surface the removal note.
+    //   - `agentsso -- autostart` (conventional end-of-options
+    //     marker) matches `autostart` here too. clap would treat
+    //     `autostart` as a positional argument, not a subcommand,
+    //     so the interceptor's "you removed this subcommand"
+    //     message is slightly misleading — but operator intent was
+    //     still to invoke autostart, so the message is helpful.
+    //   - A future value-taking global flag (`--config /path`)
+    //     would cause `find` to return `/path` (no leading `-`),
+    //     which won't match `autostart`/`setup` so the interceptor
+    //     silently passes through to clap. Worth a clap
+    //     `try_get_matches_from` migration if such a flag is
+    //     added — but the parsing-cost objection is overblown
+    //     (clap parse is microsecond-scale).
     let first_subcommand_arg: Option<String> =
         std::env::args().skip(1).find(|a| !a.starts_with('-'));
 

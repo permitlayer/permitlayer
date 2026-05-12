@@ -555,7 +555,7 @@ async fn refresh_credentials(args: RefreshArgs) -> anyhow::Result<()> {
         }
     };
     let master_key = match keystore.master_key().await {
-        Ok(outcome) => outcome.key,
+        Ok(outcome) => outcome.key.into_inner(),
         Err(e) => {
             emit_cli_token_refresh_audit(
                 audit_store.as_ref(),

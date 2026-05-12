@@ -11,6 +11,7 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::io::{FromRawFd, OwnedFd, RawFd};
 use std::path::Path;
+use std::sync::Mutex;
 
 /// Open `path` as a directory with `O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC`.
 /// Symlinks at the final path component return `ELOOP` so callers can
@@ -51,9 +52,13 @@ pub fn open_dir_nofollow(path: &Path) -> io::Result<OwnedFd> {
 ///
 /// Refuses `u32::MAX` for either argument. Defense-in-depth: the
 /// `LOCAL_PEERCRED` failure path in [`crate::peer_cred`] produces
-/// `u32::MAX` as a sentinel; POSIX `fchown(fd, -1, -1)` is documented
-/// as a no-op (preserve ownership), so an accidental sentinel-flow
-/// would leave the dir root-owned silently. Reject loudly instead.
+/// `u32::MAX` as a sentinel; on Darwin `uid_t`/`gid_t` are `u32`, so
+/// `u32::MAX` bit-casts to `(uid_t)-1` — which Darwin's `fchown(2)`
+/// treats as the "preserve owner" sentinel (POSIX-defined). An
+/// accidental sentinel-flow would therefore leave the dir
+/// root-owned silently. Reject loudly instead. (`u32::MAX - 1` is
+/// syntactically valid; no real account uses it, so we don't reject
+/// — semantic identity validation is the caller's responsibility.)
 pub fn fchown_fd(fd: RawFd, uid: u32, gid: u32) -> io::Result<()> {
     if uid == u32::MAX || gid == u32::MAX {
         return Err(io::Error::new(
@@ -73,14 +78,17 @@ pub fn fchown_fd(fd: RawFd, uid: u32, gid: u32) -> io::Result<()> {
 /// `fchmod(fd, mode)` — chmod an open file/dir fd in-place.
 ///
 /// `mode` is `u32` for caller convenience (Rust permission literals
-/// `0o600` are `u32` by default), but on macOS `mode_t` is `u16`. A
-/// `debug_assert` guards against accidental bit-loss in the cast;
-/// production callers stay in the 12-bit permission range.
+/// `0o600` are `u32` by default), but on macOS `mode_t` is `u16`.
+/// Returns `Err(InvalidInput)` when `mode > mode_t::MAX` — refuses
+/// the silent-truncating cast that `debug_assert` alone would let
+/// through in release builds.
 pub fn fchmod_fd(fd: RawFd, mode: u32) -> io::Result<()> {
-    debug_assert!(
-        mode <= libc::mode_t::MAX as u32,
-        "fchmod_fd: mode 0o{mode:o} exceeds mode_t range",
-    );
+    if mode > libc::mode_t::MAX as u32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("fchmod_fd: mode 0o{mode:o} exceeds mode_t range"),
+        ));
+    }
     // SAFETY: same rationale as `fchown_fd`.
     let rc = unsafe { libc::fchmod(fd, mode as libc::mode_t) };
     if rc != 0 {
@@ -119,6 +127,81 @@ pub fn fstatat_nofollow(dir_fd: RawFd, name: &str) -> io::Result<libc::stat> {
     }
     // SAFETY: `fstatat` returned 0, so the kernel initialized `buf`.
     Ok(unsafe { buf.assume_init() })
+}
+
+/// `openat(parent_fd, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC)`
+/// — open `name` as a directory anchored on an already-open parent
+/// dir fd. Symlinks at the final component return `ELOOP`; non-
+/// directory leaves return `ENOTDIR`.
+///
+/// Round-3 review fix (R3-C4-P1): the path-based `open_dir_nofollow`
+/// only guards the FINAL component. Walking `<home>/Library/LaunchAgents`
+/// by repeatedly `open_dir_nofollow(cur_path)` re-traverses from CWD
+/// each step, leaving a TOCTOU window where an attacker who owns
+/// `<home>` can rename + symlink-swap intermediate components between
+/// our `fstatat` and our path-based re-open. This helper closes the
+/// window by anchoring each step on the parent dir fd we already hold.
+///
+/// Bounded EINTR retry (8 attempts) — same rationale as
+/// [`open_dir_nofollow`].
+pub fn open_dir_nofollow_at(parent_fd: RawFd, name: &str) -> io::Result<OwnedFd> {
+    let cstr = CString::new(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let mut attempts = 0;
+    let fd = loop {
+        // SAFETY: parent_fd is caller-supplied; if invalid the kernel
+        // returns EBADF and we propagate. `cstr` is a valid
+        // NUL-terminated string for the call.
+        let fd = unsafe {
+            libc::openat(
+                parent_fd,
+                cstr.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if fd >= 0 {
+            break fd;
+        }
+        let err = io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EINTR) && attempts < 8 {
+            attempts += 1;
+            continue;
+        }
+        return Err(err);
+    };
+    // SAFETY: openat returned a valid fd we now own.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+}
+
+/// `openat(dir_fd, name, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, mode)`
+/// — open or create a regular file anchored on an open dir fd.
+///
+/// Round-3 review fix (R3-C3-P7): the daemon's `agent_token.rs`
+/// per-peer-UID flock previously opened the lockfile by path
+/// (`OpenOptions::open(&lock_path)`); under `AGENTSSO_PATHS__HOME`
+/// override the parent chain is operator-writable, so a hostile
+/// sibling could swap a parent component to a symlink between the
+/// earlier `open_dir_nofollow` and the path-based open. Anchoring
+/// the open on the dir fd closes that window without putting an
+/// `unsafe` block in the daemon (which is `#![forbid(unsafe_code)]`).
+pub fn openat_rw_create_nofollow(dir_fd: RawFd, name: &str, mode: u32) -> io::Result<OwnedFd> {
+    let cstr = CString::new(name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: dir_fd is caller-supplied; if invalid the kernel
+    // returns EBADF and we propagate. `cstr` is a valid
+    // NUL-terminated string for the call. The kernel returns either
+    // a valid fd we now own, or -1 with errno set.
+    let fd = unsafe {
+        libc::openat(
+            dir_fd,
+            cstr.as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::c_uint::from(mode as u16),
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: openat returned a valid fd we now own.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) })
 }
 
 /// `unlinkat(dir_fd, name, 0)` — remove a name relative to an open
@@ -166,25 +249,56 @@ impl Drop for UmaskGuard {
     }
 }
 
+/// Process-wide serialization for `with_umask` invocations. `umask(2)`
+/// is process-global; concurrent callers would otherwise interleave
+/// set/restore and leak a wrong mask to whichever thread races in
+/// between. We hold this `Mutex` for the lifetime of the closure so
+/// two callers serialize cleanly even if both run on tokio workers.
+///
+/// Round-3 review fix: the doc-comment used to merely warn against
+/// concurrent invocation; the daemon's `bind_control_listener` call-
+/// site runs inside multi-threaded tokio, so the warning was not an
+/// invariant. The `Mutex` promotes it to one. Poisoning is benign:
+/// a panic inside `f` already unwinds through `UmaskGuard::drop`,
+/// which restores the prior mask before the mutex is released. We
+/// recover from poisoning by reading the inner `PoisonError::into_inner`
+/// so subsequent callers aren't permanently blocked by a prior panic.
+///
+/// **Scope of protection (Round-3 review note R3-C3-P9).** This lock
+/// only serializes `with_umask`-vs-`with_umask`. Concurrent file
+/// creation on OTHER tokio workers during the bind window (e.g.,
+/// `std::fs::File::create`, `OpenOptions::open(mode = …)`) will
+/// still observe the tight 0o177 mask and inherit unintended-tight
+/// perms. The bind window is microsecond-scale in practice
+/// (`UnixListener::bind` is one syscall), so the blast radius is
+/// small — but callers SHOULD NOT add file-creation work to the
+/// closure passed to `with_umask`, and unrelated subsystems should
+/// not rely on `with_umask` to gate them against bind-time umask
+/// changes. If a future caller needs broader serialization, the
+/// proper fix is to refactor the bind to a pre-listen `socket()` +
+/// `fchmod()` + `bind()` sequence on a manually-obtained fd, which
+/// avoids the process-wide umask change entirely.
+static UMASK_LOCK: Mutex<()> = Mutex::new(());
+
 /// Run `f` with the process umask temporarily set to `tight`. Restores
 /// the previous umask before returning AND on panic (RAII via
 /// [`UmaskGuard`]).
 ///
-/// The mask change is **process-global** and **not thread-safe**.
-/// Callers MUST:
-/// - Keep `f` short — a long-running closure holds the tighter mask
-///   across unrelated thread allocations, silently affecting other
-///   threads' file modes.
-/// - Avoid concurrent invocation — two threads calling `with_umask`
-///   simultaneously can interleave their set/restore calls and leak a
-///   wrong mask. The intended discipline is single-call-at-startup
-///   (e.g., the `bind_control_listener_no_perms` path on daemon boot).
+/// The mask change is **process-global**. This wrapper serializes
+/// callers via [`UMASK_LOCK`] so two threads cannot interleave their
+/// set/restore windows. Callers should still keep `f` short — the
+/// process-wide umask is held for the duration of the closure, which
+/// affects unrelated file-creation on other threads.
 ///
 /// Story 7.27 P0 review fix: used to wrap `UnixListener::bind` so the
 /// socket inode is created mode 0600 from the moment it exists,
 /// closing the window between `bind` and the post-bind chgrp+chmod
-/// 0660 where any local process could `connect(2)` to it.
+/// 0660 where any local process could `connect(2)` to it. Round-3
+/// review fix: added [`UMASK_LOCK`] so the multi-threaded tokio
+/// runtime can't race another file-creating worker against the
+/// tight-umask window.
 pub fn with_umask<R>(tight: u32, f: impl FnOnce() -> R) -> R {
+    let _serialized = UMASK_LOCK.lock().unwrap_or_else(|p| p.into_inner());
     let _guard = UmaskGuard::set(tight as libc::mode_t);
     f()
 }
@@ -201,8 +315,10 @@ mod tests {
     fn open_dir_nofollow_succeeds_on_real_dir() {
         let dir = tempdir().unwrap();
         let fd = open_dir_nofollow(dir.path()).expect("open should succeed");
-        // Verify fd is usable.
-        assert!(fd.as_raw_fd() > 0);
+        // Verify fd is usable. `>= 0` (not `> 0`) — fd 0 is a valid
+        // value if the test runner has closed stdin before invoking us
+        // (some CI sandboxes do this).
+        assert!(fd.as_raw_fd() >= 0);
     }
 
     #[test]

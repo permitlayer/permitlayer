@@ -461,7 +461,7 @@ pub(crate) fn enrich_audit_extra_with_peer(
     extra: &mut serde_json::Value,
     extensions: &axum::http::Extensions,
 ) {
-    let Some(creds) = extensions.get::<crate::server::control_listener::PeerCredentials>() else {
+    let Some(creds) = extensions.get::<crate::server::PeerCredentials>() else {
         return;
     };
     enrich_audit_extra_with_peer_creds(extra, Some(*creds));
@@ -473,7 +473,7 @@ pub(crate) fn enrich_audit_extra_with_peer(
 /// top of the handler, then call this helper at each emit site.
 pub(crate) fn enrich_audit_extra_with_peer_creds(
     extra: &mut serde_json::Value,
-    creds: Option<crate::server::control_listener::PeerCredentials>,
+    creds: Option<crate::server::PeerCredentials>,
 ) {
     let Some(creds) = creds else { return };
     if creds.uid == u32::MAX {
@@ -505,8 +505,14 @@ pub(crate) fn enrich_audit_extra_with_peer_creds(
         );
         return;
     };
-    obj.insert("peer_uid".to_owned(), serde_json::json!(creds.uid));
-    obj.insert("peer_gid".to_owned(), serde_json::json!(creds.gid));
+    // Round-3 review fix (R3-C3-P4): `entry(...).or_insert(...)` instead
+    // of `insert(...)` so the helper is additive-only. Several handlers
+    // (register, remove, rebind) already set `peer_uid`/`peer_gid`
+    // explicitly in their `event.extra = serde_json::json!({...})` AND
+    // call this helper afterward. The previous `insert` form clobbered
+    // the explicit values silently; `or_insert` preserves them.
+    obj.entry("peer_uid".to_owned()).or_insert_with(|| serde_json::json!(creds.uid));
+    obj.entry("peer_gid".to_owned()).or_insert_with(|| serde_json::json!(creds.gid));
 }
 
 /// Header name carried by the CLI to authenticate against
@@ -637,14 +643,11 @@ pub(crate) async fn require_control_token(
     // and by declaring `peer_uid` / `peer_gid` as `Empty` fields
     // in the request-span macro, the values now reach the
     // tracing surface for grep-correlation.
-    if let Some(creds) =
-        req.extensions().get::<crate::server::control_listener::PeerCredentials>().copied()
-    {
+    if let Some(creds) = req.extensions().get::<crate::server::PeerCredentials>().copied() {
         tracing::Span::current().record("peer_uid", creds.uid);
         tracing::Span::current().record("peer_gid", creds.gid);
     }
-    if let Some(creds) =
-        req.extensions().get::<crate::server::control_listener::PeerCredentials>().copied()
+    if let Some(creds) = req.extensions().get::<crate::server::PeerCredentials>().copied()
         && let Some(expected_uid) = operator_uid()
         && creds.uid != u32::MAX
         && creds.uid != expected_uid
@@ -693,9 +696,23 @@ pub(crate) async fn require_control_token(
     // rebind) get this as a request-level breadcrumb plus the
     // domain event with the same request_id — the two correlate
     // via the request_id field.
+    //
+    // Round-3 review fix (R3-C3-P3): `tokio::spawn` the audit-append
+    // so the handler does NOT block on the audit store. The Round-2
+    // patch wrapped the append in `tokio::time::timeout(5s, …)`
+    // inline before `next.run(req).await`, which meant a slow store
+    // serialized every authenticated request behind one append. The
+    // spawned task holds an `Arc` clone of the audit store, runs the
+    // same 5s-timeout discipline, and logs `WARN` on failure or
+    // timeout — best-effort semantics preserved; latency restored.
+    //
+    // Round-3 review fix (R3-C3-P5): outcome field is
+    // `"authenticated"` (not `"ok"`) because this emit fires BEFORE
+    // the handler runs. `"ok"` would silently contradict downstream
+    // 4xx/5xx / rate-limit responses; `"authenticated"` is neutral
+    // and accurate (bearer-token + peer-cred check passed).
     if let Some(store) = &state.audit_store {
-        let creds =
-            req.extensions().get::<crate::server::control_listener::PeerCredentials>().copied();
+        let creds = req.extensions().get::<crate::server::PeerCredentials>().copied();
         let request_id = req
             .extensions()
             .get::<permitlayer_proxy::error::RequestId>()
@@ -703,24 +720,13 @@ pub(crate) async fn require_control_token(
             .unwrap_or_else(|| ulid::Ulid::new().to_string());
         let path = req.uri().path().to_owned();
         let method = req.method().to_string();
-        // Story 7.27 Round-2 review fix (P2): event_type is
-        // `control-request-authenticated` (not `control-request`)
-        // because this emit fires BEFORE the handler runs. It only
-        // attests that the bearer-token + peer-cred check passed,
-        // not that the handler succeeded. Renaming the event_type
-        // makes the contract explicit so downstream audit-log
-        // analyzers don't misread the `outcome: ok` as "request
-        // succeeded" when the handler may have returned a 4xx/5xx
-        // afterward. Handlers emit their own domain-specific event
-        // (kill, register, remove, etc.) with the same
-        // request_id; the two correlate via that field.
         let mut event = AuditEvent::with_request_id(
             request_id,
             "system".to_owned(),
             "permitlayer".to_owned(),
             "-".to_owned(),
             "control-plane".to_owned(),
-            "ok".to_owned(),
+            "authenticated".to_owned(),
             "control-request-authenticated".to_owned(),
         );
         let mut extra = serde_json::json!({ "method": method, "path": path });
@@ -732,35 +738,27 @@ pub(crate) async fn require_control_token(
             obj.insert("peer_gid".to_owned(), serde_json::json!(c.gid));
         }
         event.extra = extra;
-        // Story 7.27 Round-2 review fix (P1): wrap the per-request
-        // audit-append in a 5s timeout so a stuck audit store
-        // (slow disk, NFS hang, sealed-file rotation contention)
-        // does not block the control-plane indefinitely. On
-        // timeout, drop the event with a `WARN` — best-effort
-        // semantics match the existing `identity_mismatch` write
-        // discipline above. Full migration to `audit_dispatcher`
-        // (non-blocking with backpressure) is the long-term fix
-        // but requires threading the dispatcher through
-        // `ControlState` — out of scope for the Round-2 review
-        // patch landing window.
-        const AUDIT_APPEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
-        match tokio::time::timeout(AUDIT_APPEND_TIMEOUT, store.append(event)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                tracing::warn!(
-                    target: "control",
-                    error = %e,
-                    "control-request audit write failed (best-effort)",
-                );
+        let store = std::sync::Arc::clone(store);
+        tokio::spawn(async move {
+            const AUDIT_APPEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+            match tokio::time::timeout(AUDIT_APPEND_TIMEOUT, store.append(event)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        target: "control",
+                        error = %e,
+                        "control-request audit write failed (best-effort)",
+                    );
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        target: "control",
+                        "control-request audit write timed out after 5s; \
+                         event dropped (best-effort)",
+                    );
+                }
             }
-            Err(_elapsed) => {
-                tracing::warn!(
-                    target: "control",
-                    "control-request audit write timed out after 5s; \
-                     event dropped (best-effort)",
-                );
-            }
-        }
+        });
     }
 
     next.run(req).await
@@ -1500,10 +1498,10 @@ pub(crate) async fn register_agent_handler(
     // dereference + copy out immediately, releasing the borrow on
     // `req.extensions()` before the body-consumption step.
     #[cfg(target_os = "macos")]
-    let _peer_creds_for_register: Option<crate::server::control_listener::PeerCredentials> =
-        req.extensions().get::<crate::server::control_listener::PeerCredentials>().copied();
+    let _peer_creds_for_register: Option<crate::server::PeerCredentials> =
+        req.extensions().get::<crate::server::PeerCredentials>().copied();
     // Audit-emit peer creds snapshot (cross-platform, always None on TCP).
-    let _peer_creds_for_audit: Option<crate::server::control_listener::PeerCredentials> = {
+    let _peer_creds_for_audit: Option<crate::server::PeerCredentials> = {
         #[cfg(target_os = "macos")]
         {
             _peer_creds_for_register
@@ -1979,8 +1977,8 @@ pub(crate) async fn remove_agent_handler(
 
     // Snapshot peer creds before `req.into_parts()` consumes the
     // request body. Story 7.27 AC #1 (review fix).
-    let peer_creds_for_audit: Option<crate::server::control_listener::PeerCredentials> =
-        req.extensions().get::<crate::server::control_listener::PeerCredentials>().copied();
+    let peer_creds_for_audit: Option<crate::server::PeerCredentials> =
+        req.extensions().get::<crate::server::PeerCredentials>().copied();
 
     // Rate-limit concurrent agent CRUD (see register_agent_handler
     // for the rationale).
@@ -2184,8 +2182,8 @@ pub(crate) async fn rebind_agent_handler(
 
     // Snapshot peer creds before `req.into_parts()` consumes it.
     // Story 7.27 AC #1 (review fix).
-    let peer_creds_for_audit: Option<crate::server::control_listener::PeerCredentials> =
-        req.extensions().get::<crate::server::control_listener::PeerCredentials>().copied();
+    let peer_creds_for_audit: Option<crate::server::PeerCredentials> =
+        req.extensions().get::<crate::server::PeerCredentials>().copied();
 
     // Rate-limit concurrent agent CRUD (same shape as register/remove).
     let _permit = match state.agent_crud_semaphore.clone().try_acquire_owned() {

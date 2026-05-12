@@ -62,8 +62,16 @@ pub struct InstallArgs {
 
 #[derive(Args, Debug)]
 pub struct UninstallArgs {
-    // Reserved for future flags (e.g., `--keep-vault`); empty for
-    // rc.22 "burn the boats" — uninstall removes everything.
+    /// Bypass the install-lock acquisition. Use when a previous
+    /// `service install` crashed leaving the lock held and you
+    /// need to clean up. Round-3 review fix (R3-C4-P9): without
+    /// `--force`, a fresh crashed install (lock held by a dead
+    /// process for less than the kernel's grace) blocks recovery
+    /// — uninstall waits forever for a lock that may never
+    /// release. With `--force`, uninstall proceeds without
+    /// mutual-exclusion guarantees.
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[cfg(target_os = "macos")]

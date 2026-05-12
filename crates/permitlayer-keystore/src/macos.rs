@@ -263,7 +263,7 @@ fn read_or_mint_master_key(account: &str) -> Result<crate::MasterKeyOutcome, Key
             service_id = MASTER_KEY_SERVICE,
             "loaded existing master key from System.keychain"
         );
-        return Ok(crate::MasterKeyOutcome { key, first_boot: false });
+        return Ok(crate::MasterKeyOutcome::new(key, false));
     }
 
     // Story 7.27 Round-2 review fix: surface a clear "must run as
@@ -319,7 +319,7 @@ fn read_or_mint_master_key(account: &str) -> Result<crate::MasterKeyOutcome, Key
                 service_id = MASTER_KEY_SERVICE,
                 "minted fresh master key in System.keychain"
             );
-            Ok(crate::MasterKeyOutcome { key: new_key, first_boot: true })
+            Ok(crate::MasterKeyOutcome::new(new_key, true))
         }
         // P8 (Story 7.26 code review): concurrent first-boot self-heal.
         // If the read-back returns *different* bytes, another daemon
@@ -347,7 +347,7 @@ fn read_or_mint_master_key(account: &str) -> Result<crate::MasterKeyOutcome, Key
                     service_id = MASTER_KEY_SERVICE,
                     "first-boot race detected; adopted the surviving key from System.keychain"
                 );
-                Ok(crate::MasterKeyOutcome { key: canonical, first_boot: false })
+                Ok(crate::MasterKeyOutcome::new(canonical, false))
             }
             None => Err(KeyStoreError::PlatformError {
                 backend: BACKEND,
@@ -378,10 +378,37 @@ fn read_or_mint_master_key(account: &str) -> Result<crate::MasterKeyOutcome, Key
 /// unit tests that exercise the mint path don't require root-owned
 /// state dirs.
 ///
-/// Acquisition uses `LOCK_EX` (blocking exclusive); the returned
-/// `Flock<File>` releases the lock on Drop (RAII).
-fn acquire_mint_lock() -> Result<nix::fcntl::Flock<std::fs::File>, KeyStoreError> {
-    let lock_path = mint_lock_path();
+/// Round-3 review fix: acquisition uses bounded-retry non-blocking
+/// `LockExclusiveNonblock` (10 × 100ms) instead of indefinite
+/// `LockExclusive`. A stuck previous mint holder would otherwise
+/// hang every subsequent daemon startup forever with no actionable
+/// error; the bounded retry surfaces `MintLockTimeout` after one
+/// second so operators see the lock path and the EWOULDBLOCK errno.
+///
+/// **NFS / SMB caveat (Round-3 review note).** `nix::fcntl::Flock`
+/// uses BSD `flock(2)` on macOS, which silently degrades to a no-op
+/// on remote filesystems. The state dir
+/// (`/Library/Application Support/permitlayer/`) is created on local
+/// APFS by `agentsso service install` and should never be
+/// bind-mounted to a remote FS. Operators who do so are off-spec —
+/// the lock would silently not protect mint serialization.
+///
+/// The returned `Flock<File>` releases the lock on Drop (RAII).
+///
+/// **Defense-in-depth `fstat`-after-open (Round-3 review fix).** The
+/// `O_NOFOLLOW` flag refuses to traverse a symlink at the FINAL
+/// component, but the parent dir is reached via standard path
+/// resolution (`create_dir_all` follows symlinks). An attacker who
+/// can pre-create the lockfile path as a regular file with
+/// permissive perms can win on the second invocation. We `fstat` the
+/// opened fd and refuse if `st_uid` is neither geteuid() nor root,
+/// or if `st_mode & 0o077 != 0`. Mode-0o600 is set on creation but
+/// `O_CREAT` is a no-op if the file already exists — the existing
+/// file's perms survive.
+fn acquire_mint_lock_at(
+    state_dir: &std::path::Path,
+) -> Result<nix::fcntl::Flock<std::fs::File>, KeyStoreError> {
+    let lock_path = state_dir.join(".master-key-mint.lock");
     // Ensure the parent directory exists. In production this is the
     // root-owned `paths::daemon_state_dir(None)`; in tests it's a
     // tempdir we control.
@@ -393,6 +420,7 @@ fn acquire_mint_lock() -> Result<nix::fcntl::Flock<std::fs::File>, KeyStoreError
     }
     use std::os::unix::fs::OpenOptionsExt;
     let lock_file = std::fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .create(true)
         .truncate(false)
@@ -403,31 +431,113 @@ fn acquire_mint_lock() -> Result<nix::fcntl::Flock<std::fs::File>, KeyStoreError
             backend: BACKEND,
             message: format!("failed to open mint-lock {}: {e}", lock_path.display()),
         })?;
-    nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusive).map_err(
-        |(_file, errno)| KeyStoreError::PlatformError {
-            backend: BACKEND,
-            message: format!("failed to acquire mint-lock {}: errno={errno}", lock_path.display()),
-        },
-    )
+
+    // Round-3 review fix: post-open `fstat` to refuse hostile
+    // pre-created lockfiles. A local attacker with write into the
+    // state-dir's parent could plant the lockfile with mode 0o666
+    // before the daemon ever runs; `O_CREAT` is a no-op when the
+    // file exists, so our 0o600 mode argument never takes effect.
+    {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: we own the fd; libc::fstat reads into a fresh
+        // `libc::stat` buffer.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        // Wrapped in unsafe block — single libc call, fd is borrowed
+        // for the duration. Acceptable here because this crate is
+        // already a documented unsafe-isolation seam below
+        // `#![forbid(unsafe_code)]` on the daemon.
+        let rc = unsafe { libc::fstat(lock_file.as_raw_fd(), &mut st) };
+        if rc != 0 {
+            return Err(KeyStoreError::PlatformError {
+                backend: BACKEND,
+                message: format!(
+                    "fstat({}) failed: {}",
+                    lock_path.display(),
+                    std::io::Error::last_os_error()
+                ),
+            });
+        }
+        // SAFETY: `geteuid` is async-signal-safe and always returns.
+        let euid = unsafe { libc::geteuid() };
+        let owner_ok = st.st_uid == euid || st.st_uid == 0;
+        let mode_bits = u32::from(st.st_mode) & 0o777;
+        if !owner_ok || (mode_bits & 0o077) != 0 {
+            return Err(KeyStoreError::PlatformError {
+                backend: BACKEND,
+                message: format!(
+                    "mint-lock {} has unsafe ownership/mode (uid={}, mode=0o{mode_bits:o}); \
+                     refusing to use. Remove the file and re-run after the daemon's state dir \
+                     is locked down.",
+                    lock_path.display(),
+                    st.st_uid,
+                ),
+            });
+        }
+    }
+
+    // Round-3 review fix: bounded retry of `LockExclusiveNonblock`
+    // instead of indefinite `LockExclusive`. Surfaces a clear error
+    // after ~1 second if a previous mint holder is wedged.
+    const MAX_RETRIES: u32 = 10;
+    const RETRY_SLEEP: std::time::Duration = std::time::Duration::from_millis(100);
+    let mut file = lock_file;
+    for attempt in 0..MAX_RETRIES {
+        match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+            Ok(flock) => return Ok(flock),
+            Err((returned_file, nix::errno::Errno::EWOULDBLOCK)) => {
+                file = returned_file;
+                if attempt + 1 < MAX_RETRIES {
+                    std::thread::sleep(RETRY_SLEEP);
+                }
+            }
+            Err((_returned_file, errno)) => {
+                return Err(KeyStoreError::PlatformError {
+                    backend: BACKEND,
+                    message: format!(
+                        "failed to acquire mint-lock {}: errno={errno}",
+                        lock_path.display()
+                    ),
+                });
+            }
+        }
+    }
+    Err(KeyStoreError::PlatformError {
+        backend: BACKEND,
+        message: format!(
+            "mint-lock {} held by another process for >{}ms — a previous mint may be wedged. \
+             Check for stuck `agentsso start` processes; remove the stale lockfile only if no \
+             daemon is running.",
+            lock_path.display(),
+            (MAX_RETRIES as u128) * RETRY_SLEEP.as_millis(),
+        ),
+    })
 }
 
-/// Resolve the mint-lock path. Production: under the daemon state
-/// dir; tests/dev: under `env::temp_dir()` so non-root contexts work.
-fn mint_lock_path() -> std::path::PathBuf {
-    // The production state-dir is owned by `permitlayer-core::paths`,
-    // which this crate cannot depend on (would create a cycle). Check
-    // for the canonical macOS daemon state dir; fall back to temp
-    // otherwise. The fallback is fine because:
-    //   - In production, the daemon runs as root and the canonical
-    //     dir always exists (created by `service install`).
-    //   - In tests/dev, two test processes racing the keystore mint
-    //     path are a contrived scenario and the temp-dir lockfile
-    //     still serializes them correctly.
+/// Production entry point: resolves the lock dir from the canonical
+/// macOS state path (or `$TMPDIR` fallback for non-root dev/test) and
+/// delegates to [`acquire_mint_lock_at`]. Round-3 review fix split
+/// the resolution out so tests can supply an explicit path and so
+/// the `is_dir()` TOCTOU probe is no longer load-bearing.
+fn acquire_mint_lock() -> Result<nix::fcntl::Flock<std::fs::File>, KeyStoreError> {
+    acquire_mint_lock_at(&resolve_mint_state_dir())
+}
+
+/// Resolve the mint-lock state dir. Production: the canonical macOS
+/// daemon state dir; tests/dev: `$TMPDIR`.
+///
+/// The production state-dir is owned by `permitlayer-core::paths`,
+/// which this crate cannot depend on (would create a cycle). The
+/// fallback is acceptable because in production the daemon runs as
+/// root with the canonical dir already created by `service install`;
+/// in tests, the per-uid `$TMPDIR` serializes same-uid races (it
+/// does NOT serialize root vs user, but tests don't span that
+/// boundary).
+fn resolve_mint_state_dir() -> std::path::PathBuf {
     let prod = std::path::PathBuf::from("/Library/Application Support/permitlayer");
     if prod.is_dir() {
-        return prod.join(".master-key-mint.lock");
+        return prod;
     }
-    std::env::temp_dir().join("permitlayer-master-key-mint.lock")
+    std::env::temp_dir()
 }
 
 /// Constant-time byte comparison for read-back equality. Mirrors
@@ -482,6 +592,13 @@ fn clear_account(account: &str) -> Result<(), KeyStoreError> {
 fn delete_account(account: &str) -> Result<DeleteOutcome, KeyStoreError> {
     let output = Command::new("/usr/bin/security")
         .stdin(std::process::Stdio::null())
+        // Round-3 review fix: pin locale to C so stderr-string
+        // matching (`"could not be found"`,
+        // `"SecKeychainSearchCopyNext"`) works on non-English macOS.
+        // Without this, the AlreadyAbsent classification falls
+        // through to PlatformError on locale-translated stderr.
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
         .args([
             "delete-generic-password",
             "-s",
@@ -606,6 +723,12 @@ fn write_master_key_via_security_a(
         // daemon never blocks if `security` decides to prompt
         // (e.g., locked-keychain unlock prompt).
         .stdin(std::process::Stdio::null())
+        // Round-3 review fix: pin locale to C so the locked-keychain
+        // classifier's stderr substring matches (User interaction is
+        // not allowed / errSecInteractionRequired) work on
+        // non-English macOS.
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
         .args([
             "add-generic-password",
             "-s",
@@ -681,6 +804,7 @@ fn decode_hex_master_key(
         return Err(KeyStoreError::MalformedMasterKey {
             expected_len: MASTER_KEY_LEN * 2,
             actual_len: hex_bytes.len(),
+            reason: crate::MalformedReason::BadLength,
         });
     }
     let mut key = Zeroizing::new([0u8; MASTER_KEY_LEN]);
@@ -695,6 +819,7 @@ fn decode_hex_master_key(
         return Err(KeyStoreError::MalformedMasterKey {
             expected_len: MASTER_KEY_LEN * 2,
             actual_len: hex_bytes.len(),
+            reason: crate::MalformedReason::BadCharacter,
         });
     }
     Ok(key)
@@ -715,6 +840,14 @@ fn decode_hex_nibble_ct(c: u8) -> (u8, u8) {
     // them with the in-range predicate; OR together. Any byte
     // outside `0-9a-fA-F` leaves all three branches zero and trips
     // the `bad` flag.
+    //
+    // Round-3 review note: `&` (bitwise AND on booleans) is
+    // load-bearing for constant-time codegen — `&&` is short-circuit
+    // and produces a branch that LLVM may keep, leaking position via
+    // timing. Do NOT "simplify" `(c >= b'0') & (c <= b'9')` to
+    // `(c >= b'0') && (c <= b'9')`. Rust permits `bool & bool` and
+    // returns `bool` (since 1.27); the `as u8 * 0xFF` then yields a
+    // branchless 0-or-0xFF mask.
     let in_09 = ((c >= b'0') & (c <= b'9')) as u8 * 0xFF;
     let in_af = ((c >= b'a') & (c <= b'f')) as u8 * 0xFF;
     let in_uf = ((c >= b'A') & (c <= b'F')) as u8 * 0xFF;
@@ -737,13 +870,31 @@ fn decode_hex_nibble_ct(c: u8) -> (u8, u8) {
 /// with HMAC-SHA256 keyed by the fixed domain-separator constant
 /// [`FINGERPRINT_DOMAIN_SEP`]. The change preserves cross-boot
 /// correlation (the load-bearing property — operators grep both
-/// logs by fingerprint to confirm same key across daemon restarts)
-/// while removing the trivial-candidate-verification oracle. An
-/// attacker who steals a candidate master-key file from a backup
-/// can no longer confirm-by-recomputing-`SHA-256`; they need to
-/// know the domain-separator AND use HMAC, which documents intent
-/// and protects against code-drift where someone might log
-/// `SHA-256(key)` of a longer prefix.
+/// logs by fingerprint to confirm same key across daemon restarts).
+///
+/// **Threat model clarification (Round-3 review).** The domain-
+/// separator is a compile-time public constant. An attacker with
+/// the binary (every operator) can read it and recompute the HMAC
+/// of a candidate key — computationally identical to using a public
+/// salt with raw SHA-256. So this fix protects against:
+///   - **code-drift**: someone refactoring the fingerprint to use
+///     `SHA-256(key)` of a longer prefix in another module won't
+///     match this output. The HMAC + domain separator documents the
+///     intent and pins the contract.
+///   - **mistaken-oracle implementations**: a future caller hashing
+///     the raw key directly for logging would diverge from this
+///     output, surfacing the bug in cross-correlation rather than
+///     silently leaking a different oracle.
+///
+/// It does NOT protect against:
+///   - **backup-theft attackers**: anyone with the binary can
+///     replicate the HMAC; the oracle reduction is unchanged from a
+///     public-salt scheme.
+///   - **brute-force candidate verification**: same as above.
+///
+/// True "no oracle" requires a per-install random salt persisted
+/// alongside the master key. That's a fingerprint-redesign story,
+/// not a round-3 patch.
 ///
 /// Output is 8 hex chars (4 bytes of HMAC truncation), matching the
 /// pre-fix wire format; daemon-side `master_key_fingerprint_first8`
@@ -785,9 +936,12 @@ mod tests {
     fn decode_hex_rejects_short_input() {
         let err = decode_hex_master_key(b"deadbeef").unwrap_err();
         match err {
-            KeyStoreError::MalformedMasterKey { expected_len, actual_len } => {
+            KeyStoreError::MalformedMasterKey { expected_len, actual_len, reason } => {
                 assert_eq!(expected_len, 64);
                 assert_eq!(actual_len, 8);
+                // Round-3 review fix: bad-length path must report
+                // `BadLength`, distinguishing from bad-character.
+                assert_eq!(reason, crate::MalformedReason::BadLength);
             }
             other => panic!("expected MalformedMasterKey, got {other:?}"),
         }
@@ -802,10 +956,17 @@ mod tests {
         // as MalformedMasterKey (was PlatformError) so the daemon's
         // existing matcher routes to the consistent remediation
         // banner for "corrupted keychain entry" failures.
-        assert!(
-            matches!(err, KeyStoreError::MalformedMasterKey { .. }),
-            "non-hex char must classify as MalformedMasterKey, got {err:?}"
-        );
+        // Round-3 review fix: must report `BadCharacter`, NOT
+        // `BadLength`, so operator-facing renderer can say "non-hex
+        // character" vs "wrong length".
+        match err {
+            KeyStoreError::MalformedMasterKey { expected_len, actual_len, reason } => {
+                assert_eq!(expected_len, 64);
+                assert_eq!(actual_len, 64, "input was the right length, just bad char");
+                assert_eq!(reason, crate::MalformedReason::BadCharacter);
+            }
+            other => panic!("expected MalformedMasterKey, got {other:?}"),
+        }
     }
 
     #[test]
@@ -862,6 +1023,28 @@ mod tests {
         // = 0x66687aad, which a bug regressing to raw SHA-256 would
         // produce.
         assert_ne!(fingerprint(&[0u8; 32]), "66687aad");
+
+        // Round-3 review fix: a buggy HMAC impl returning `key[..4]`
+        // (or `domain_sep[..4]`, or `key XOR domain_sep[..4]`) could
+        // also "differ from raw SHA-256 of all-zeros" without being a
+        // correct HMAC. Add a second test vector with a non-trivial
+        // key so a wrong-but-different impl gets caught.
+        let nontrivial = [0x42u8; 32];
+        let mut nontrivial_mac =
+            <Hmac<Sha256> as Mac>::new_from_slice(FINGERPRINT_DOMAIN_SEP).unwrap();
+        nontrivial_mac.update(&nontrivial);
+        let nontrivial_tag = nontrivial_mac.finalize().into_bytes();
+        let nontrivial_hex = format!(
+            "{:02x}{:02x}{:02x}{:02x}",
+            nontrivial_tag[0], nontrivial_tag[1], nontrivial_tag[2], nontrivial_tag[3],
+        );
+        assert_eq!(fingerprint(&nontrivial), nontrivial_hex);
+        // Sanity: the two test vectors must produce different
+        // fingerprints (HMAC is a function of input).
+        assert_ne!(fingerprint(&[0u8; 32]), fingerprint(&nontrivial));
+        // A `key[..4]` buggy impl would have returned "42424242" for
+        // the non-trivial key — sanity check we're not that.
+        assert_ne!(nontrivial_hex, "42424242");
     }
 
     /// Round-trip the master key through `write_master_key_via_security_a`
