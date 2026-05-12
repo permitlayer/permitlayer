@@ -192,6 +192,22 @@ pub(crate) struct ControlState {
     /// Story 8.7 AC #4: vault directory path to consult when the
     /// stub-active flag fires. Typically `{config.paths.home}/vault`.
     pub vault_dir: PathBuf,
+    /// Story 7.30 AC #11: vault used by the credentials-seal /
+    /// credentials-verify handlers. Constructed at boot from the
+    /// eagerly-bootstrapped master key (see `cli/start.rs`). Shared
+    /// via `Arc` with the proxy service so both sides see the same
+    /// `active_key_id` and refresh-rotation seals stay consistent.
+    /// `#[allow(dead_code)]` covers the post-Task-1 / pre-Task-4 gap;
+    /// the credentials-seal handler lands in Task 4 and consumes
+    /// both this field and `credentials_seal_lock`.
+    #[allow(dead_code)]
+    pub vault: Arc<permitlayer_vault::Vault>,
+    /// Story 7.30 AC #11: serializes concurrent seal-credential
+    /// operations. Held across `vault.seal` + `store.put` +
+    /// `write_metadata_atomic` so a concurrent seal of the same
+    /// service can't interleave.
+    #[allow(dead_code)]
+    pub credentials_seal_lock: Arc<tokio::sync::Mutex<()>>,
     /// Operator authentication token for `/v1/control/*` endpoints.
     /// The middleware layer at the router level (`require_control_token`)
     /// reads `X-Agentsso-Control` from each inbound request and
@@ -2689,6 +2705,7 @@ pub(crate) fn router(
     cli_overrides: Arc<crate::config::CliOverrides>,
     proxy_stub_branch_active: Arc<AtomicBool>,
     vault_dir: PathBuf,
+    vault: Arc<permitlayer_vault::Vault>,
     control_token: Arc<crate::lifecycle::control_token::ControlToken>,
 ) -> Router {
     // The caller owns the `Arc<Zeroizing<_>>` and shares the same
@@ -2715,6 +2732,8 @@ pub(crate) fn router(
         cli_overrides,
         proxy_stub_branch_active,
         vault_dir,
+        vault,
+        credentials_seal_lock: Arc::new(tokio::sync::Mutex::new(())),
         control_token,
     };
     Router::new()
@@ -2813,6 +2832,15 @@ mod tests {
         )
     }
 
+    /// Story 7.30: throw-away `Arc<Vault>` for tests that don't
+    /// exercise credentials-seal / credentials-verify. The vault holds
+    /// a deterministic 32-byte key + `key_id = 0`; `Vault::new` is
+    /// a pure constructor so no I/O happens here.
+    fn test_vault() -> Arc<permitlayer_vault::Vault> {
+        let key = zeroize::Zeroizing::new([0x55u8; permitlayer_keystore::MASTER_KEY_LEN]);
+        Arc::new(permitlayer_vault::Vault::new(key, 0))
+    }
+
     /// Construct a ControlToken with deterministic bytes so test
     /// helpers can produce request headers that match. Production
     /// callers must always go through `ControlToken::read_or_mint`.
@@ -2841,7 +2869,7 @@ mod tests {
         // exercise the agent control endpoints construct their own
         // registry; everything else is fine with the default empty.
         let agent_registry = Arc::new(AgentRegistry::new(vec![]));
-        let (ato, cs, co, stub, vault) = test_reload_wiring();
+        let (ato, cs, co, stub, vault_dir) = test_reload_wiring();
         router(
             kill_switch,
             None,
@@ -2863,7 +2891,8 @@ mod tests {
             cs,
             co,
             stub,
-            vault,
+            vault_dir,
+            test_vault(),
             test_control_token(),
         )
     }
@@ -2878,7 +2907,7 @@ mod tests {
         let policies_dir = tempfile::tempdir().unwrap().keep();
         let reload_mutex = Arc::new(std::sync::Mutex::new(()));
         let agent_registry = Arc::new(AgentRegistry::new(vec![]));
-        let (ato, cs, co, stub, vault) = test_reload_wiring();
+        let (ato, cs, co, stub, vault_dir) = test_reload_wiring();
         router(
             kill_switch,
             Some(audit_store),
@@ -2900,7 +2929,8 @@ mod tests {
             cs,
             co,
             stub,
-            vault,
+            vault_dir,
+            test_vault(),
             test_control_token(),
         )
     }
@@ -2918,7 +2948,7 @@ mod tests {
         let policies_dir = tempfile::tempdir().unwrap().keep();
         let reload_mutex = Arc::new(std::sync::Mutex::new(()));
         let agent_registry = Arc::new(AgentRegistry::new(vec![]));
-        let (ato, cs, co, stub, vault) = test_reload_wiring();
+        let (ato, cs, co, stub, vault_dir) = test_reload_wiring();
         router(
             kill_switch,
             None,
@@ -2935,7 +2965,8 @@ mod tests {
             cs,
             co,
             stub,
-            vault,
+            vault_dir,
+            test_vault(),
             test_control_token(),
         )
     }
@@ -3118,7 +3149,7 @@ mod tests {
         let policies_dir = tempfile::tempdir().unwrap().keep();
         let reload_mutex = Arc::new(std::sync::Mutex::new(()));
         let agent_registry = Arc::new(AgentRegistry::new(vec![]));
-        let (ato, cs, co, stub, vault) = test_reload_wiring();
+        let (ato, cs, co, stub, vault_dir) = test_reload_wiring();
         router(
             kill_switch,
             None,
@@ -3135,7 +3166,8 @@ mod tests {
             cs,
             co,
             stub,
-            vault,
+            vault_dir,
+            test_vault(),
             test_control_token(),
         )
     }

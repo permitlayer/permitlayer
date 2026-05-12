@@ -50,7 +50,7 @@ permitlayer-connectors = { path = "crates/permitlayer-connectors", version = "0.
 permitlayer-platform-macos = { path = "crates/permitlayer-platform-macos", version = "0.3.0-rc.22" }
 
 # Credential type discipline
-zeroize = { version = "1.8", features = ["zeroize_derive"] }
+zeroize = { version = "1.8", features = ["zeroize_derive", "serde"] }
 thiserror = "2.0"
 static_assertions = "1.1"
 serde = "1.0"                     # dev-only in credential crate: assert_not_impl_any! needs the trait path

@@ -642,13 +642,12 @@ async fn try_build_proxy_service(
     scrub_engine: Option<&Arc<permitlayer_core::scrub::ScrubEngine>>,
     audit_store: Option<&Arc<dyn permitlayer_core::store::AuditStore>>,
     master_key: &zeroize::Zeroizing<[u8; permitlayer_keystore::MASTER_KEY_LEN]>,
-    active_key_id: u8,
+    vault: Arc<permitlayer_vault::Vault>,
 ) -> Option<Arc<permitlayer_proxy::ProxyService>> {
     use hkdf::Hkdf;
     use permitlayer_core::store::fs::CredentialFsStore;
     use permitlayer_proxy::token::ScopedTokenIssuer;
     use permitlayer_proxy::upstream::UpstreamClient;
-    use permitlayer_vault::Vault;
     use sha2::Sha256;
     use zeroize::Zeroizing;
 
@@ -727,20 +726,10 @@ async fn try_build_proxy_service(
         }
     };
 
-    // `Vault::new` consumes the master key by value, so we clone the
-    // bytes into a fresh `Zeroizing` buffer. This is the one place
-    // where the key bytes exist in two buffers simultaneously (the
-    // caller's bootstrap buffer + the vault's internal buffer); both
-    // are zeroized on drop.
-    let mut vault_key = Zeroizing::new([0u8; permitlayer_keystore::MASTER_KEY_LEN]);
-    vault_key.copy_from_slice(master_key.as_slice());
-    // Story 7.6a AC #12: `key_id` for the live proxy Vault is the
-    // active key_id walked from the vault on boot
-    // (`max(envelope.key_id)`, defaulting to 0 on empty vault). Every
-    // refresh-rotation seal stamps this value on the new envelope.
-    // Story 7.6b will increment per rotation; for 7.6a it's `0` until
-    // a rotation event happens.
-    let vault = Arc::new(Vault::new(vault_key, active_key_id));
+    // Story 7.30 Task 1: `Vault` is now constructed unconditionally at
+    // boot (see `run()` around the `compute_active_key_id` site) and
+    // shared via `Arc` between the proxy service and the control-plane
+    // `ControlState.vault` field. Both sides see the same active_key_id.
     let token_issuer = Arc::new(ScopedTokenIssuer::new(signing_key));
 
     let upstream_client = match UpstreamClient::new() {
@@ -2596,6 +2585,20 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     let active_key_id = compute_active_key_id(&config.paths.home.join("vault"));
     tracing::info!(active_key_id, "vault bootstrap: discovered active key_id");
 
+    // Story 7.30 Task 1 (AC #10/#11): construct the `Arc<Vault>` here,
+    // unconditionally, AFTER `compute_active_key_id` so the key_id is
+    // correct, and BEFORE `try_build_proxy_service` so both the proxy
+    // (refresh path) and `ControlState` (new credentials-seal /
+    // credentials-verify handlers) share the same `Arc`. `Vault::new`
+    // is a pure constructor (no I/O) and `compute_active_key_id`
+    // returns `0` on an empty vault, so this is safe even on a fresh
+    // install with no sealed credentials yet.
+    let vault = {
+        let mut vault_key = zeroize::Zeroizing::new([0u8; permitlayer_keystore::MASTER_KEY_LEN]);
+        vault_key.copy_from_slice(master_key.as_slice());
+        Arc::new(permitlayer_vault::Vault::new(vault_key, active_key_id))
+    };
+
     // 7b'. Build the agent identity store + registry + HMAC lookup
     // subkey (Story 4.4). Always gets a real master-key-derived
     // subkey now that Story 1.15 has provisioned the master key
@@ -2657,7 +2660,7 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         scrub_engine.as_ref(),
         audit_store.as_ref(),
         &master_key,
-        active_key_id,
+        Arc::clone(&vault),
     )
     .await;
     let proxy_stub_branch_active =
@@ -2966,6 +2969,7 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         Arc::clone(&cli_overrides),
         Arc::clone(&proxy_stub_branch_active),
         vault_dir_for_reload,
+        Arc::clone(&vault),
         Arc::clone(&control_token),
     );
     // `agent_lookup_key` (the local binding) is moved into control::router
