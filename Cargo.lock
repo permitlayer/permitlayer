@@ -2275,6 +2275,7 @@ version = "0.3.0-rc.22"
 dependencies = [
  "axum",
  "mockito",
+ "nix",
  "oauth2",
  "open",
  "permitlayer-credential",

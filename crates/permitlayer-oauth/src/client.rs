@@ -175,25 +175,49 @@ impl OAuthClient {
 
         let (auth_url, _csrf_token) = auth_request.url();
 
-        // Open browser. open::that() is blocking on some platforms,
-        // so we use spawn_blocking to avoid stalling the async
-        // executor.
+        // Story 7.30 AC #9: detect SSH / sudo / no-Aqua contexts and
+        // skip `open::that()` entirely. Per Apple DTS Quinn (thread
+        // 756081) and TN2083, `/usr/bin/open` is AppKit-linked and
+        // "isn't rated for use in a non-GUI context" — it silently
+        // fails with `LSOpenURLsWithRole() failed with error -54` on
+        // SSH-only sessions. Surface a copy-paste URL block + suggest
+        // `--headless` / `--device-flow` instead.
         let url_string = auth_url.to_string();
-        let url_for_open = url_string.clone();
-        let open_result = tokio::task::spawn_blocking(move || open::that(&url_for_open)).await;
-        match open_result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                // Auto-fallback: if open::that() can't reach a usable
-                // browser (no DISPLAY, headless SSH, `su` without GUI
-                // context, etc.), print the URL so the user can
-                // complete the flow manually instead of dead-ending.
-                print_browser_fallback_message(&url_string, &e);
-            }
-            Err(e) => {
-                return Err(OAuthError::BrowserOpenFailed {
-                    source: std::io::Error::other(e.to_string()),
-                });
+        if should_skip_browser_open() {
+            tracing::info!("skipping browser open: detected non-GUI / cross-session context",);
+            print_non_gui_consent_block(&url_string);
+        } else {
+            // Wrap `open::that()` in a 5-second timeout so a hung
+            // `LSOpenURLsWithRole` call can't stall the runtime. The
+            // bound is loose enough that a normal browser launch
+            // completes well within it; a timeout indicates the call
+            // is wedged or about to fail silently.
+            let url_for_open = url_string.clone();
+            let timeout_result = tokio::time::timeout(
+                Duration::from_secs(5),
+                tokio::task::spawn_blocking(move || open::that(&url_for_open)),
+            )
+            .await;
+            match timeout_result {
+                Ok(Ok(Ok(()))) => {}
+                Ok(Ok(Err(e))) => {
+                    print_browser_fallback_message(&url_string, &e);
+                }
+                Ok(Err(e)) => {
+                    return Err(OAuthError::BrowserOpenFailed {
+                        source: std::io::Error::other(e.to_string()),
+                    });
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        "browser-open call did not return within 5s; falling back to manual copy",
+                    );
+                    let io_err = std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "open::that() did not return within 5s",
+                    );
+                    print_browser_fallback_message(&url_string, &io_err);
+                }
             }
         }
 
@@ -414,6 +438,98 @@ fn print_browser_fallback_message(url: &str, err: &std::io::Error) {
     let _ = render_browser_fallback_message(&mut stderr, url, err);
 }
 
+/// Story 7.30 AC #9: detect non-GUI / cross-session contexts where
+/// `/usr/bin/open` (and `xdg-open` / `start`) are likely to fail
+/// silently — SSH sessions without a local browser, `sudo` from SSH,
+/// and processes running under a different user's GUI session on
+/// macOS.
+///
+/// Heuristics are best-effort. `SSH_CONNECTION` is unset under
+/// `sudo -i` from SSH, and the macOS `console`-owner check is racy
+/// with fast user-switching. When in doubt, prefer surfacing the URL
+/// over silent `open::that()` failure.
+///
+/// **Test seam:** `AGENTSSO_FORCE_BROWSER_FALLBACK=1` forces the
+/// non-GUI branch unconditionally (used by the unit test below).
+pub(crate) fn should_skip_browser_open() -> bool {
+    if std::env::var_os("AGENTSSO_FORCE_BROWSER_FALLBACK").is_some() {
+        return true;
+    }
+    if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
+        return true;
+    }
+    // `sudo -i` from SSH masks `SSH_CONNECTION` but preserves
+    // `SUDO_USER`. If we're running as root via sudo AND there's no
+    // DISPLAY (Linux) / no console-owner match (macOS), assume
+    // non-GUI.
+    #[cfg(unix)]
+    {
+        let is_sudo_root =
+            std::env::var_os("SUDO_USER").is_some() && nix::unistd::Uid::current().is_root();
+        if is_sudo_root {
+            #[cfg(target_os = "linux")]
+            {
+                if std::env::var_os("DISPLAY").is_none()
+                    && std::env::var_os("WAYLAND_DISPLAY").is_none()
+                {
+                    return true;
+                }
+            }
+            #[cfg(target_os = "macos")]
+            {
+                // On macOS, check whether the running user matches the
+                // console owner via `stat -f %Su /dev/console`. A
+                // mismatch (e.g. `_root` while `alice` holds the GUI
+                // session) means `open::that()` would attempt to talk
+                // to a session this process can't reach.
+                if let Ok(out) = std::process::Command::new("/usr/bin/stat")
+                    .args(["-f", "%Su", "/dev/console"])
+                    .output()
+                {
+                    if out.status.success() {
+                        let console_owner = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+                        let sudo_user = std::env::var("SUDO_USER").unwrap_or_default();
+                        if console_owner != sudo_user {
+                            return true;
+                        }
+                    }
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Print the non-GUI consent block: prominent copy-paste markers
+/// around the OAuth URL plus a suggestion to re-run with
+/// `--headless` or `--device-flow` so the redirect can be captured
+/// without a local browser.
+fn print_non_gui_consent_block(url: &str) {
+    let mut stderr = std::io::stderr();
+    let _ = render_non_gui_consent_block(&mut stderr, url);
+}
+
+fn render_non_gui_consent_block<W: std::io::Write>(w: &mut W, url: &str) -> std::io::Result<()> {
+    writeln!(w)?;
+    writeln!(w, "  detected non-GUI / cross-session context — skipping browser-open.")?;
+    writeln!(w)?;
+    writeln!(w, "  ── copy this URL into a browser on any device ──────────────")?;
+    writeln!(w)?;
+    writeln!(w, "    {url}")?;
+    writeln!(w)?;
+    writeln!(w, "  ─────────────────────────────────────────────────────────────")?;
+    writeln!(w)?;
+    writeln!(w, "  this OAuth flow needs to receive the redirect URL too. Re-run")?;
+    writeln!(w, "  with one of:")?;
+    writeln!(w)?;
+    writeln!(w, "    --headless        — paste the post-consent URL back via stdin")?;
+    writeln!(w, "                        (best for SSH from a machine with a browser)")?;
+    writeln!(w, "    --device-flow     — Google OAuth 2.0 device flow (RFC 8628;")?;
+    writeln!(w, "                        best for truly browser-less hosts)")?;
+    writeln!(w)?;
+    Ok(())
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -442,6 +558,23 @@ mod tests {
             "expires_in": 3600,
             "scope": "https://www.googleapis.com/auth/gmail.readonly"
         }))
+    }
+
+    // ── Story 7.30 Task 11: browser-launch fallback ──────────────────
+
+    /// Verify that the rendered non-GUI consent block carries the
+    /// load-bearing operator hints (URL, --headless, --device-flow).
+    /// Output shape is deliberately pinned because operator
+    /// documentation in `docs/user-guide/install.md` references it.
+    #[test]
+    fn non_gui_consent_block_renders_url_and_remediation_hints() {
+        let mut buf: Vec<u8> = Vec::new();
+        render_non_gui_consent_block(&mut buf, "https://accounts.google.com/test-url").unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("https://accounts.google.com/test-url"));
+        assert!(text.contains("--headless"));
+        assert!(text.contains("--device-flow"));
+        assert!(text.contains("non-GUI"));
     }
 
     #[test]
