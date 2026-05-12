@@ -9,6 +9,7 @@ This directory holds the load-bearing design decisions for permitlayer. Each ADR
 | [0003](0003-agent-identity-token-lookup.md) | Agent-identity token lookup | Accepted | 2026-04-12 | 4.4 |
 | [0004](0004-multiple-versions-policy.md) | `cargo deny check bans` — `multiple-versions = "warn"` policy | Accepted | 2026-04-19 | 8.0 |
 | [0005](0005-release-automation-identity.md) | Release automation identity — `HOMEBREW_TAP_TOKEN` PAT ownership | Accepted | 2026-04-22 | 7.1 |
+| [0006](0006-macos-launchdaemon-system-service.md) | macOS: LaunchDaemon system-service over per-user LaunchAgent | Accepted | 2026-05-12 | 7.25–7.29 |
 
 ## Conventions
 

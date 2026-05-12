@@ -117,26 +117,26 @@ if ! diff -q "$ACTUAL" "$REPATCHED" >/dev/null; then
 fi
 
 # Structural sanity: patched output must contain the caveats block AND
-# Story 7.16 invariants. Story 7.16 dropped the `service do` block (the
-# `brew services start agentsso` path was structurally broken over SSH
-# on modern macOS — gui-domain bootstrap returns exit 125 — so we
-# recommend `agentsso autostart enable` instead, which targets the
-# user-domain via launchctl directly per Story 7.3 + 7.16).
+# Story 7.29 (rc.22) invariants. rc.22 ships the daemon as a root
+# LaunchDaemon installed via `sudo agentsso service install`; the
+# per-user `agentsso autostart enable` flow is gone, as is the
+# `brew services start agentsso` path that Story 7.16 already dropped.
 #
 # Positive markers (must be present):
-for marker in 'def caveats' 'agentsso connect' 'agentsso autostart enable'; do
+for marker in 'def caveats' 'agentsso connect' 'sudo agentsso service install' 'agentsso agent register'; do
     if ! grep -q "$marker" "$ACTUAL"; then
         echo "FAIL: patched output missing expected marker: $marker" >&2
         exit 1
     fi
 done
 
-# Negative markers (must NOT be present — Story 7.16 invariants):
-for negative in '^[[:space:]]+service do$' 'brew services start agentsso' '\bagentsso setup\b'; do
+# Negative markers (must NOT be present — Story 7.16 + 7.29 invariants):
+for negative in '^[[:space:]]+service do$' 'brew services start agentsso' '\bagentsso setup\b' 'agentsso autostart enable'; do
     if grep -Eq "$negative" "$ACTUAL"; then
-        echo "FAIL: patched output contains banned marker (Story 7.16 regression): $negative" >&2
-        echo "      The brew formula no longer ships a service-do block (SSH-broken)" >&2
-        echo "      and no longer references the deleted 'agentsso setup' verb." >&2
+        echo "FAIL: patched output contains banned marker: $negative" >&2
+        echo "      rc.22 brew formula ships no service-do block, no" >&2
+        echo "      'agentsso setup' verb, and no 'agentsso autostart enable'" >&2
+        echo "      (replaced by 'sudo agentsso service install')." >&2
         exit 1
     fi
 done
