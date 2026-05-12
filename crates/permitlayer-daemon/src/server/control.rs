@@ -2054,6 +2054,102 @@ pub(crate) async fn agent_policy_name_handler(
     }
 }
 
+/// Service set the credential endpoints accept (Story 7.30 AC #2
+/// + #3). Mirrors `crates/permitlayer-daemon/src/cli/connect.rs::SUPPORTED_SERVICES`;
+/// kept private until Task 12 deduplicates the constant.
+pub(crate) const CREDENTIAL_SUPPORTED_SERVICES: &[&str] = &["gmail", "calendar", "drive"];
+
+fn credential_service_supported(service: &str) -> bool {
+    CREDENTIAL_SUPPORTED_SERVICES.contains(&service)
+}
+
+/// Response body for `GET /v1/control/credentials/{service}/meta`
+/// (Story 7.30 AC #2).
+///
+/// Both branches (existing / not-existing) return HTTP 200 with a
+/// boolean discriminator. This is deliberate: the CLI's idempotent
+/// re-run branch is a single JSON-parse path, no special-casing 404.
+#[derive(Debug, Serialize)]
+pub(crate) struct CredentialMetaResponse {
+    pub exists: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meta: Option<permitlayer_oauth::metadata::CredentialMeta>,
+}
+
+/// `GET /v1/control/credentials/{service}/meta` — return the
+/// `CredentialMeta` for a sealed credential, or `{ "exists": false }`
+/// when none exists (Story 7.30 AC #2).
+///
+/// Reads `{state.vault_dir}/{service}-meta.json` via blocking-pool
+/// tokio. No audit event — read-only, frequently polled during the
+/// CLI's idempotent re-run check. Operator-callable.
+pub(crate) async fn credentials_meta_handler(
+    State(state): State<ControlState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(service): Path<String>,
+    req: axum::extract::Request,
+) -> Response {
+    if let Err(e) = require_loopback(peer) {
+        return e.into_response();
+    }
+
+    let request_id = read_request_id(&req);
+
+    if !credential_service_supported(&service) {
+        return agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "credentials.unknown_service",
+            format!(
+                "service {:?} is not supported; allowed: {}",
+                service,
+                CREDENTIAL_SUPPORTED_SERVICES.join(", ")
+            ),
+            Some(request_id),
+        );
+    }
+
+    let meta_path = state.vault_dir.join(format!("{service}-meta.json"));
+    let read_result =
+        tokio::task::spawn_blocking(move || std::fs::read_to_string(&meta_path)).await;
+
+    let raw = match read_result {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (StatusCode::OK, Json(CredentialMetaResponse { exists: false, meta: None }))
+                .into_response();
+        }
+        Ok(Err(e)) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credentials.meta_io_failed",
+                format!("could not read {service} meta file: {e}"),
+                Some(request_id),
+            );
+        }
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credentials.meta_join_failed",
+                format!("blocking task join failed: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+
+    match serde_json::from_str::<permitlayer_oauth::metadata::CredentialMeta>(&raw) {
+        Ok(meta) => {
+            (StatusCode::OK, Json(CredentialMetaResponse { exists: true, meta: Some(meta) }))
+                .into_response()
+        }
+        Err(e) => agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "credentials.meta_parse_failed",
+            format!("could not parse {service} meta file: {e}"),
+            Some(request_id),
+        ),
+    }
+}
+
 /// `POST /v1/control/agent/remove` — delete an agent file and swap
 /// the registry. Returns `removed: false` for a not-found name.
 pub(crate) async fn remove_agent_handler(
@@ -2820,6 +2916,7 @@ pub(crate) fn router(
         .route("/v1/control/agent/register", post(register_agent_handler))
         .route("/v1/control/agent/list", get(list_agents_handler))
         .route("/v1/control/agent/{name}/policy_name", get(agent_policy_name_handler))
+        .route("/v1/control/credentials/{service}/meta", get(credentials_meta_handler))
         .route("/v1/control/agent/remove", post(remove_agent_handler))
         .route("/v1/control/agent/rebind", post(rebind_agent_handler))
         .route("/v1/control/connections", get(connections_handler))
@@ -4467,5 +4564,123 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let json = body_json(resp).await;
         assert_eq!(json["code"], "agent.invalid_name");
+    }
+
+    // ── Story 7.30 Task 3: GET /v1/control/credentials/{service}/meta ──
+
+    /// Build a router with `state.vault_dir` pinned to a caller-supplied
+    /// path. Used by Story 7.30 credentials-meta tests that need to
+    /// stage a meta JSON fixture on disk.
+    fn build_with_vault_dir(kill_switch: Arc<KillSwitch>, vault_dir: std::path::PathBuf) -> Router {
+        let policy_set = Arc::new(ArcSwap::from_pointee(PolicySet::empty()));
+        let policies_dir = tempfile::tempdir().unwrap().keep();
+        let reload_mutex = Arc::new(std::sync::Mutex::new(()));
+        let agent_registry = Arc::new(AgentRegistry::new(vec![]));
+        let (ato, cs, co, stub, _placeholder_vault_dir) = test_reload_wiring();
+        router(
+            kill_switch,
+            None,
+            policy_set,
+            policies_dir,
+            reload_mutex,
+            agent_registry,
+            None,
+            Arc::new(zeroize::Zeroizing::new([0x42u8; LOOKUP_KEY_BYTES])),
+            test_approval_service(),
+            test_conn_tracker(),
+            test_plugin_registry(),
+            ato,
+            cs,
+            co,
+            stub,
+            vault_dir,
+            test_vault(),
+            test_control_token(),
+        )
+    }
+
+    #[tokio::test]
+    async fn credentials_meta_handler_returns_exists_true_with_meta_for_present_credential() {
+        let switch = Arc::new(KillSwitch::new());
+        let vault_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vault_dir.path().join("gmail-meta.json"),
+            r#"{"client_type":"byo","client_source":"/abs/cs.json","connected_at":"2026-05-12T12:00:00Z","scopes":["https://mail.google.com/"]}"#,
+        )
+        .unwrap();
+        let app = build_with_vault_dir(Arc::clone(&switch), vault_dir.path().to_path_buf());
+
+        let resp = app
+            .oneshot(req_with_peer(
+                Method::GET,
+                "/v1/control/credentials/gmail/meta",
+                loopback_v4(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["exists"], true);
+        assert_eq!(json["meta"]["client_type"], "byo");
+        assert_eq!(json["meta"]["scopes"][0], "https://mail.google.com/");
+    }
+
+    #[tokio::test]
+    async fn credentials_meta_handler_returns_exists_false_when_meta_missing() {
+        let switch = Arc::new(KillSwitch::new());
+        let vault_dir = tempfile::tempdir().unwrap();
+        let app = build_with_vault_dir(Arc::clone(&switch), vault_dir.path().to_path_buf());
+
+        let resp = app
+            .oneshot(req_with_peer(
+                Method::GET,
+                "/v1/control/credentials/gmail/meta",
+                loopback_v4(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["exists"], false);
+        assert!(json.get("meta").map_or(true, serde_json::Value::is_null));
+    }
+
+    #[tokio::test]
+    async fn credentials_meta_handler_rejects_unknown_service() {
+        let switch = Arc::new(KillSwitch::new());
+        let vault_dir = tempfile::tempdir().unwrap();
+        let app = build_with_vault_dir(Arc::clone(&switch), vault_dir.path().to_path_buf());
+
+        let resp = app
+            .oneshot(req_with_peer(
+                Method::GET,
+                "/v1/control/credentials/slack/meta",
+                loopback_v4(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "credentials.unknown_service");
+    }
+
+    #[tokio::test]
+    async fn credentials_meta_handler_returns_500_on_parse_failure() {
+        let switch = Arc::new(KillSwitch::new());
+        let vault_dir = tempfile::tempdir().unwrap();
+        std::fs::write(vault_dir.path().join("gmail-meta.json"), b"this is not json").unwrap();
+        let app = build_with_vault_dir(Arc::clone(&switch), vault_dir.path().to_path_buf());
+
+        let resp = app
+            .oneshot(req_with_peer(
+                Method::GET,
+                "/v1/control/credentials/gmail/meta",
+                loopback_v4(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "credentials.meta_parse_failed");
     }
 }
