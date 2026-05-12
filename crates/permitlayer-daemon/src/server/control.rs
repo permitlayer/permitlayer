@@ -61,7 +61,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use arc_swap::ArcSwap;
 use axum::Json;
 use axum::Router;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -1978,6 +1978,82 @@ pub(crate) async fn list_agents_handler(
     (StatusCode::OK, Json(ListAgentsResponse { status: "ok", agents })).into_response()
 }
 
+/// Response body for `GET /v1/control/agent/{name}/policy_name`
+/// (Story 7.30 AC #1).
+#[derive(Debug, Serialize)]
+pub(crate) struct AgentPolicyNameResponse {
+    pub name: String,
+    pub policy_name: String,
+}
+
+/// `GET /v1/control/agent/{name}/policy_name` — return the policy
+/// binding for a single agent (Story 7.30 AC #1).
+///
+/// The CLI's `agentsso connect` flow needs to resolve an agent's
+/// policy name early so it can update the policy's scope set later in
+/// the same flow. Before Story 7.30 the CLI opened the agent store
+/// directly; now the daemon owns every fs touch, so this read-only
+/// lookup moves daemon-side.
+///
+/// No audit event — read-only lookup matches the `list_agents_handler`
+/// precedent. Operator-callable.
+pub(crate) async fn agent_policy_name_handler(
+    State(state): State<ControlState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(name): Path<String>,
+    req: axum::extract::Request,
+) -> Response {
+    if let Err(e) = require_loopback(peer) {
+        return e.into_response();
+    }
+
+    let request_id = read_request_id(&req);
+
+    if let Err(e) = validate_agent_name(&name) {
+        return agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "agent.invalid_name",
+            format!("{e}"),
+            Some(request_id),
+        );
+    }
+
+    let Some(store) = state.agent_store.clone() else {
+        return agent_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "agent.store_unavailable",
+            "agent identity store is unavailable; check the daemon startup logs \
+             for 'agent registry unavailable' — the registry may have failed to \
+             load."
+                .to_owned(),
+            Some(request_id),
+        );
+    };
+
+    match store.get(&name).await {
+        Ok(Some(identity)) => (
+            StatusCode::OK,
+            Json(AgentPolicyNameResponse {
+                name: identity.name().to_owned(),
+                policy_name: identity.policy_name.clone(),
+            }),
+        )
+            .into_response(),
+        Ok(None) => agent_error_response(
+            StatusCode::NOT_FOUND,
+            "agent.not_found",
+            format!("no agent with name {name:?}"),
+            Some(request_id),
+        ),
+        Err(e) => agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "agent.store_io_failed",
+            format!("agent store read failed: {e}"),
+            Some(request_id),
+        ),
+    }
+}
+
 /// `POST /v1/control/agent/remove` — delete an agent file and swap
 /// the registry. Returns `removed: false` for a not-found name.
 pub(crate) async fn remove_agent_handler(
@@ -2743,6 +2819,7 @@ pub(crate) fn router(
         .route("/v1/control/reload", post(reload_handler))
         .route("/v1/control/agent/register", post(register_agent_handler))
         .route("/v1/control/agent/list", get(list_agents_handler))
+        .route("/v1/control/agent/{name}/policy_name", get(agent_policy_name_handler))
         .route("/v1/control/agent/remove", post(remove_agent_handler))
         .route("/v1/control/agent/rebind", post(rebind_agent_handler))
         .route("/v1/control/connections", get(connections_handler))
@@ -4199,5 +4276,196 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let json = body_json(resp).await;
         assert_eq!(json["error"]["code"], "forbidden_not_loopback");
+    }
+
+    // ── Story 7.30 Task 2: GET /v1/control/agent/{name}/policy_name ──
+
+    /// In-memory `AgentIdentityStore` for the agent-policy-name handler
+    /// tests. Holds a fixed map of agent records; only `get`/`list` are
+    /// meaningful — other trait methods are no-ops (the read-only
+    /// handler under test never calls them).
+    #[derive(Clone, Default)]
+    struct InMemoryAgentStore {
+        agents: std::collections::HashMap<String, permitlayer_core::agent::AgentIdentity>,
+    }
+
+    impl InMemoryAgentStore {
+        fn with_agent(name: &str, policy_name: &str) -> Self {
+            let identity = permitlayer_core::agent::AgentIdentity::new(
+                name.to_owned(),
+                policy_name.to_owned(),
+                "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".to_owned(),
+                "0".repeat(64),
+                chrono::Utc::now(),
+                None,
+            )
+            .unwrap();
+            let mut agents = std::collections::HashMap::new();
+            agents.insert(name.to_owned(), identity);
+            Self { agents }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl permitlayer_core::store::AgentIdentityStore for InMemoryAgentStore {
+        async fn put(
+            &self,
+            _identity: permitlayer_core::agent::AgentIdentity,
+        ) -> Result<(), permitlayer_core::store::StoreError> {
+            Ok(())
+        }
+        async fn get(
+            &self,
+            name: &str,
+        ) -> Result<
+            Option<permitlayer_core::agent::AgentIdentity>,
+            permitlayer_core::store::StoreError,
+        > {
+            Ok(self.agents.get(name).cloned())
+        }
+        async fn list(
+            &self,
+        ) -> Result<Vec<permitlayer_core::agent::AgentIdentity>, permitlayer_core::store::StoreError>
+        {
+            Ok(self.agents.values().cloned().collect())
+        }
+        async fn remove(&self, _name: &str) -> Result<bool, permitlayer_core::store::StoreError> {
+            Ok(false)
+        }
+        async fn touch_last_seen(
+            &self,
+            _identity: permitlayer_core::agent::AgentIdentity,
+        ) -> Result<(), permitlayer_core::store::StoreError> {
+            Ok(())
+        }
+        async fn update_lookup_key_and_token(
+            &self,
+            _name: &str,
+            _new_lookup_key_hex: String,
+            _new_token_hash: String,
+        ) -> Result<bool, permitlayer_core::store::StoreError> {
+            Ok(false)
+        }
+        async fn update_policy(
+            &self,
+            _name: &str,
+            _new_policy_name: String,
+        ) -> Result<bool, permitlayer_core::store::StoreError> {
+            Ok(false)
+        }
+    }
+
+    /// Build a router wired with a caller-supplied `Option<Arc<dyn
+    /// AgentIdentityStore>>`. Used by Story 7.30 endpoint tests; `None`
+    /// exercises the `agent.store_unavailable` 503 branch.
+    fn build_with_agent_store(
+        kill_switch: Arc<KillSwitch>,
+        agent_store: Option<Arc<dyn permitlayer_core::store::AgentIdentityStore>>,
+    ) -> Router {
+        let policy_set = Arc::new(ArcSwap::from_pointee(PolicySet::empty()));
+        let policies_dir = tempfile::tempdir().unwrap().keep();
+        let reload_mutex = Arc::new(std::sync::Mutex::new(()));
+        let agent_registry = Arc::new(AgentRegistry::new(vec![]));
+        let (ato, cs, co, stub, vault_dir) = test_reload_wiring();
+        router(
+            kill_switch,
+            None,
+            policy_set,
+            policies_dir,
+            reload_mutex,
+            agent_registry,
+            agent_store,
+            Arc::new(zeroize::Zeroizing::new([0x42u8; LOOKUP_KEY_BYTES])),
+            test_approval_service(),
+            test_conn_tracker(),
+            test_plugin_registry(),
+            ato,
+            cs,
+            co,
+            stub,
+            vault_dir,
+            test_vault(),
+            test_control_token(),
+        )
+    }
+
+    #[tokio::test]
+    async fn agent_policy_name_handler_returns_policy_for_existing_agent() {
+        let switch = Arc::new(KillSwitch::new());
+        let store: Arc<dyn permitlayer_core::store::AgentIdentityStore> =
+            Arc::new(InMemoryAgentStore::with_agent("claude-desktop", "gmail-read-only"));
+        let app = build_with_agent_store(Arc::clone(&switch), Some(store));
+
+        let resp = app
+            .oneshot(req_with_peer(
+                Method::GET,
+                "/v1/control/agent/claude-desktop/policy_name",
+                loopback_v4(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["name"], "claude-desktop");
+        assert_eq!(json["policy_name"], "gmail-read-only");
+    }
+
+    #[tokio::test]
+    async fn agent_policy_name_handler_returns_404_for_missing_agent() {
+        let switch = Arc::new(KillSwitch::new());
+        let store: Arc<dyn permitlayer_core::store::AgentIdentityStore> =
+            Arc::new(InMemoryAgentStore::with_agent("claude-desktop", "gmail-read-only"));
+        let app = build_with_agent_store(Arc::clone(&switch), Some(store));
+
+        let resp = app
+            .oneshot(req_with_peer(
+                Method::GET,
+                "/v1/control/agent/openclaw-test/policy_name",
+                loopback_v4(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "agent.not_found");
+    }
+
+    #[tokio::test]
+    async fn agent_policy_name_handler_returns_503_when_store_unavailable() {
+        let switch = Arc::new(KillSwitch::new());
+        let app = build_with_agent_store(Arc::clone(&switch), None);
+
+        let resp = app
+            .oneshot(req_with_peer(
+                Method::GET,
+                "/v1/control/agent/claude-desktop/policy_name",
+                loopback_v4(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "agent.store_unavailable");
+    }
+
+    #[tokio::test]
+    async fn agent_policy_name_handler_rejects_invalid_name() {
+        let switch = Arc::new(KillSwitch::new());
+        let store: Arc<dyn permitlayer_core::store::AgentIdentityStore> =
+            Arc::new(InMemoryAgentStore::default());
+        let app = build_with_agent_store(Arc::clone(&switch), Some(store));
+
+        // `..` is not a valid agent name (path traversal guard).
+        let resp = app
+            .oneshot(req_with_peer(
+                Method::GET,
+                "/v1/control/agent/..%2Fetc/policy_name",
+                loopback_v4(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "agent.invalid_name");
     }
 }
