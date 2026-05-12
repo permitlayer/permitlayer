@@ -171,8 +171,7 @@ fn control_command_works_cross_home_via_env_var() {
     assert!(wait_for_health(daemon.port), "daemon should boot");
     let bind_addr = format!("127.0.0.1:{}", daemon.port);
 
-    // Read the daemon-owner's token (the operator would do this via
-    // `sudo cat /home/<svc-user>/.agentsso/control.token`).
+    // Read the daemon-owner's token.
     let token = read_test_control_token(home_daemon.path());
 
     let home_caller = tempfile::tempdir().unwrap();

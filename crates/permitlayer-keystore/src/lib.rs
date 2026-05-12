@@ -371,7 +371,9 @@ pub struct KeystoreConfig {
     /// Fallback behavior when the native backend is unavailable.
     pub fallback: FallbackMode,
     /// Home directory for keystore on-disk state (salt + verifier).
-    /// Typically `~/.agentsso`.
+    /// Resolved via `permitlayer_core::paths::daemon_state_dir(None)` —
+    /// `/Library/Application Support/permitlayer/` on macOS, `~/.agentsso/`
+    /// on Linux + Windows.
     pub home: PathBuf,
 }
 

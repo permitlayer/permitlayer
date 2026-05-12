@@ -41,7 +41,7 @@ fn run_uninstall(home: &Path, args: &[&str]) -> std::process::Output {
 
 /// AC #1 + AC #6 — happy path: full uninstall on a tempdir-home.
 /// Asserts: data dir is gone, exit code is 0 (success-with-or-without
-/// warnings), AND the autostart artifact for `dev.agentsso.daemon`
+/// warnings), AND the autostart artifact for `dev.permitlayer.daemon`
 /// is not registered after the run.
 ///
 /// P5 (review): adds the autostart-artifact-gone assertion the spec
@@ -51,7 +51,7 @@ fn run_uninstall(home: &Path, args: &[&str]) -> std::process::Output {
 fn uninstall_yes_wipes_data_dir_and_exits_zero() {
     let tmp = tempfile::TempDir::new().unwrap();
     let home = tmp.path().to_path_buf();
-    // Build a minimal ~/.agentsso/ tree.
+    // Build a minimal state-dir tree.
     std::fs::create_dir_all(home.join("vault")).unwrap();
     std::fs::create_dir_all(home.join("audit")).unwrap();
     std::fs::create_dir_all(home.join("policies")).unwrap();
@@ -75,9 +75,9 @@ fn uninstall_yes_wipes_data_dir_and_exits_zero() {
         home.display()
     );
 
-    // P5 (review): on macOS, also verify no `dev.agentsso.daemon.plist`
+    // P5 (review): on macOS, also verify no `dev.permitlayer.daemon.plist`
     // artifact got created in the test home (the test home is NOT
-    // the user's real `~/Library/LaunchAgents/`, but the autostart
+    // the user's real `/Library/LaunchDaemons/`, but the autostart
     // step would warn-and-continue in subprocess-isolated mode, so
     // we just assert the orchestrator didn't crash and didn't leave
     // an orphan plist where it tried to operate). On Linux/Windows

@@ -8,7 +8,7 @@
 //! pre/post rebind.
 //!
 //! Daemon stays LIVE throughout — rebind does not touch the vault,
-//! only rewrites the plain TOML at `~/.agentsso/agents/<name>.toml`.
+//! only rewrites the plain TOML at `<state-dir>/agents/<name>.toml`.
 //! No `agentsso stop` precondition.
 
 use std::time::Duration;

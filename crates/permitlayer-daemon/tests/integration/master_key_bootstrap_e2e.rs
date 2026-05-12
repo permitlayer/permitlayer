@@ -45,7 +45,7 @@ use crate::common::{DaemonTestConfig, free_port, start_daemon, wait_for_health};
 /// `StartError` → `main()` → `ExitCode::from(2)` plumbing end-to-end.
 ///
 /// Also verifies the Drop-safety of the refactor: the PID file at
-/// `~/.agentsso/pid` is removed on exit (no `std::process::exit`
+/// `<state-dir>/pid` is removed on exit (no `std::process::exit`
 /// leak) because `run()` now returns `Err` via `?` and Rust stack
 /// unwinding fires `PidFile::Drop`.
 ///
@@ -155,7 +155,7 @@ fn real_keystore_bootstrap_happy_path_persists_and_reuses_master_key() {
     // First daemon instance: fresh install. PassphraseKeyStore
     // generates a 16-byte salt, derives the key via Argon2id, and
     // persists both the salt and an HMAC verifier to
-    // ~/.agentsso/keystore/passphrase.state.
+    // <state-dir>/keystore/passphrase.state.
     let mut daemon_1 = start_daemon(DaemonTestConfig {
         port: 0,
         home: home.path().to_path_buf(),

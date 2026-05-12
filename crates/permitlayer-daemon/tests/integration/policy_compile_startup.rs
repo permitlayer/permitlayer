@@ -42,10 +42,7 @@ fn happy_path_seeds_default_toml_and_boots() {
 
     // First-run seeded the default policy file.
     let seeded = home.path().join("policies").join("default.toml");
-    assert!(
-        seeded.exists(),
-        "daemon should have seeded ~/.agentsso/policies/default.toml on first boot"
-    );
+    assert!(seeded.exists(), "daemon should have seeded the default policies file on first boot");
     let contents = std::fs::read_to_string(&seeded).unwrap();
     assert!(contents.contains("gmail-read-only"));
     assert!(contents.contains("approval-mode"));
