@@ -261,6 +261,38 @@ sudo dseditgroup -o edit -a $(whoami) -t user permitlayer-clients
 
 Log out and back in so the new group membership takes effect.
 
+### `agentsso connect` says `connect.daemon_must_run`
+
+`agentsso connect` writes credentials through the daemon (the daemon
+owns the master key and the vault directory). It refuses to run if
+the daemon isn't reachable. The structured remediation block branches
+on the detected failure:
+
+- **Helper binary not installed** (no `/var/run/permitlayer/control.sock`):
+  run `sudo agentsso service install`.
+- **Helper installed but the LaunchDaemon isn't running**:
+  `sudo launchctl kickstart -k system/dev.permitlayer.daemon`.
+- **Socket connect with EACCES** (you're not in the group):
+  see the permission-error troubleshooting above.
+
+### `agentsso connect` hangs on "waiting for browser consent" over SSH
+
+`/usr/bin/open` can't reach a usable browser from an SSH session or
+from a process whose owning user doesn't hold the Aqua session.
+The CLI detects most of these cases automatically and prints a
+copy-paste URL block with `--headless` / `--device-flow` suggestions.
+
+If detection doesn't trip (e.g. you're under `sudo -i` from SSH which
+masks `SSH_CONNECTION`) and `agentsso connect` appears to hang,
+press Ctrl-C and re-run with one of:
+
+- `--headless` — print the OAuth URL, accept the pasted redirect URL
+  via stdin. Best for SSH from a machine that has a browser.
+- `--device-flow` — Google OAuth 2.0 device flow (RFC 8628). Best for
+  truly browser-less hosts (CI runners, cloud-init). Requires an
+  OAuth client of type **TV and Limited Input Device** (separate
+  Google client type from the Desktop app type).
+
 ### MCP client can't connect to `127.0.0.1:3820`
 
 Verify the daemon is bound:

@@ -1,20 +1,40 @@
 //! `agentsso connect <service>` — one-verb orchestration of the
-//! agent-onboarding journey (Story 7.13).
+//! agent-onboarding journey (Story 7.13, daemon-mediated since 7.30).
 //!
-//! Composes existing primitives into an idempotent state machine:
+//! Composes the operator-interactive OAuth dance with a sequence of
+//! UDS calls into the daemon control plane. The daemon owns every
+//! credential write, every vault touch, every master-key read, and
+//! every policy-file edit. The CLI is now a thin orchestrator over:
+//!
+//! - `GET /v1/control/agent/{name}/policy_name` (agent lookup)
+//! - `GET /v1/control/credentials/{service}/meta` (idempotent re-run)
+//! - `POST /v1/control/credentials/seal` (token seal + meta write)
+//! - `POST /v1/control/credentials/{service}/verify` (Google probe)
+//! - `POST /v1/control/policy/{policy_name}/scopes` (merge + reload)
+//! - `POST /v1/control/agent/rebind` (existing surface)
+//!
+//! See `cli/connect_uds.rs` for the typed UDS clients.
+//!
+//! ## Flow
 //!
 //! 1. **Pre-flight** — agent exists, service is supported, flags are coherent.
-//! 2. **OAuth + seal** — sealed credential present? skip. Else: refuse if
-//!    daemon up; run inner OAuth flow (browser or rc.13 paste); seal into vault.
-//! 3. **Verify (with retry loop)** — `verify::verify_connection` with up to
-//!    5 retries; renders `OAuthError::remediation_owned()` between attempts so
-//!    Story 7.12's actionable URLs surface.
-//! 4. **Policy edit** — `policy::edit::add_scopes_to_policy` merges granted
-//!    scopes into the agent's policy file. No-op when scopes are already
-//!    present (idempotent).
-//! 5. **Reload** — `POST /v1/control/reload` so the rebind sees the new scopes.
-//!    Skipped when Step 4 was a no-op.
-//! 6. **Rebind** — `POST /v1/control/agent/rebind` (Story 7.11). Same-policy
+//! 2. **Daemon-must-be-running gate** (Story 7.30 AC #7) — `agentsso connect`
+//!    now requires the daemon up because it owns the vault. Three
+//!    remediation branches for the failure modes: helper not installed
+//!    (`sudo agentsso service install`), helper present but launchd
+//!    not-running (`sudo launchctl kickstart`), socket EACCES
+//!    (`sudo dseditgroup` group-membership fix).
+//! 3. **OAuth + seal** — sealed credential present with covering
+//!    scopes? skip. Else: drive the OAuth dance (browser via
+//!    Story 7.30 AC #9 fallback / `--headless` paste / `--device-flow`),
+//!    then POST plaintext tokens to the daemon's seal endpoint.
+//! 4. **Verify (with retry loop)** — POST to the verify endpoint up
+//!    to 5 times in interactive mode; render structured Google
+//!    failures and daemon-side errors via
+//!    `render_verify_error_from_daemon`.
+//! 5. **Policy scopes merge** — single POST that returns the diff
+//!    AND the `reloaded: bool` discriminator. No separate reload call.
+//! 6. **Rebind** — POST `/v1/control/agent/rebind` (Story 7.11). Same-policy
 //!    rebind is a server-side no-op; CLI logs it as such.
 //! 7. **OpenClaw snippet emission** — prints the JSON snippet to stdout
 //!    (with copy-paste delimiter block); optionally writes to
@@ -24,22 +44,31 @@
 //! 8. **Summary** — one block listing each step's outcome.
 //!
 //! Re-running `connect` with identical args after a successful run is a
-//! guaranteed end-to-end no-op: each step detects "already done" and
-//! returns "no change". Bearer tokens are NOT rotated (Story 7.11
-//! invariant). Policy files are NOT re-written when scopes are already
-//! present. The integration tests assert byte-equality of every state-
-//! holding file across re-runs.
+//! guaranteed end-to-end no-op: each daemon endpoint detects "already
+//! done" and returns "no change". Bearer tokens are NOT rotated
+//! (Story 7.11 invariant). Policy files are NOT re-written when scopes
+//! are already present.
 //!
-//! # Replaces `agentsso setup`
+//! ## Story 7.30 deviations vs Story 7.13
 //!
-//! Story 7.13 deletes `cli/setup.rs` entirely. This file consumes the
-//! per-service OAuth-and-seal flow that lived inside `setup.rs::run`
-//! (lines 351-619 in the rc.14 archive) and layers Steps 4-7 on top.
-//! The `--non-interactive` orchestrator path from setup is dropped:
-//! `agentsso connect` always requires an explicit service arg.
-//! Operators invoking the legacy `agentsso setup` see a
-//! `setup.removed` remediation block from `main.rs`'s top-level
-//! interceptor (Task 4 of Story 7.13).
+//! - **Daemon-running gate inverted.** Pre-7.30 connect refused when
+//!   the daemon was UP (to prevent seal-races with the refresh path);
+//!   post-7.30 it refuses when the daemon is DOWN. The error code is
+//!   `connect.daemon_must_run`, replacing the deleted
+//!   `connect.daemon_must_stop`. Same exit-2 (operator-correctable).
+//! - **Vault-dir writability checks gone from CLI.** The daemon owns
+//!   `0700 root:wheel` `/Library/Application Support/permitlayer/vault/`
+//!   and surfaces fs failures through `credentials.store_io_failed`.
+//!   `connect.vault_dir_symlink` / `_unwritable` error codes deleted.
+//! - **Plaintext tokens cross the UDS boundary.** Documented in
+//!   ADR-0007: `Zeroizing<String>` on both sides means the heap is
+//!   scrubbed on drop; the axum body buffer (`Bytes`) is the
+//!   non-zeroizing window during request parse.
+//!
+//! ## Replaces `agentsso setup`
+//!
+//! Story 7.13 deleted `cli/setup.rs` entirely. The legacy verb
+//! intercepts to `setup.removed` via `main.rs`'s top-level handler.
 
 use std::path::{Path, PathBuf};
 
@@ -1386,8 +1415,8 @@ fn render_verify_error_from_daemon(
 
 /// POST `/v1/control/agent/rebind` against the running daemon.
 ///
-/// Story 7.27 Round-2 review fix (P0): same UDS-on-macOS migration
-/// as `post_reload` above.
+/// Story 7.27 Round-2 review fix (P0): dispatches over UDS on macOS
+/// via `resolve_control_endpoint(&config)` + `http_post_json_via`.
 async fn post_rebind(home: &Path, agent: &str, policy: &str) -> anyhow::Result<()> {
     let config = crate::cli::kill::load_daemon_config_or_default_with_warn("connect rebind");
     let endpoint = crate::cli::kill::resolve_control_endpoint(&config);
@@ -1403,9 +1432,11 @@ async fn post_rebind(home: &Path, agent: &str, policy: &str) -> anyhow::Result<(
     {
         Ok(r) => r,
         Err(e) => {
-            // Round-3 review fix (R3-C5-P3): see `post_reload` —
-            // same structured endpoint-aware error-block discipline
-            // for transport failures.
+            // Round-3 review fix (R3-C5-P3): structured endpoint-aware
+            // error-block discipline for transport failures (matches
+            // the pattern in kill.rs / agent.rs / etc.). Classifies
+            // ENOENT/EACCES/ECONNREFUSED so the operator gets a
+            // targeted remediation instead of one-size-fits-all.
             tracing::debug!(error = %e, endpoint = %endpoint, "agent rebind transport failure");
             eprint!(
                 "{}",
