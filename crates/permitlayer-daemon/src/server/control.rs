@@ -2807,6 +2807,277 @@ fn verify_reason_remediation_url(
     }
 }
 
+/// Request body for `POST /v1/control/policy/{policy_name}/scopes`
+/// (Story 7.30 AC #5).
+#[derive(Debug, Deserialize)]
+pub(crate) struct PolicyScopesAddRequest {
+    /// Short scope names to merge into the policy's allow-list
+    /// (e.g. `["gmail.readonly", "gmail.modify"]`). NOT full Google
+    /// scope URIs — the CLI maps URIs to shorts before sending.
+    pub short_names: Vec<String>,
+}
+
+/// Response body for `POST /v1/control/policy/{policy_name}/scopes`.
+#[derive(Debug, Serialize)]
+pub(crate) struct PolicyScopesAddResponse {
+    pub policy_name: String,
+    pub before: Vec<String>,
+    pub added: Vec<String>,
+    pub after: Vec<String>,
+    pub reloaded: bool,
+}
+
+/// `POST /v1/control/policy/{policy_name}/scopes` — merge new scopes
+/// into a policy file and reload the active policy set (Story 7.30
+/// AC #5).
+///
+/// Idempotent: when the requested `short_names` are already present,
+/// the helper returns a no-op diff and the daemon skips the reload
+/// + skips the audit event (matches the CLI's existing
+/// `policy_was_modified` gating).
+///
+/// On a real merge, runs the same reload sequence as
+/// `reload_handler`: clear approval caches, swap the `ArcSwap`
+/// policy set via `reload_policies_with_diff_locked`, and emit a
+/// reload audit event via `write_reload_audit_event`.
+///
+/// Audit event: `policy-scopes-added` with `policy_name`, `before`,
+/// `added`, `after`. Plus the standard reload audit event when the
+/// merge produced a real diff.
+pub(crate) async fn policy_scopes_handler(
+    State(state): State<ControlState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(policy_name): Path<String>,
+    req: axum::extract::Request,
+) -> Response {
+    if let Err(e) = require_loopback(peer) {
+        return e.into_response();
+    }
+
+    let request_id = read_request_id(&req);
+    let peer_creds_for_audit: Option<crate::server::PeerCredentials> =
+        req.extensions().get::<crate::server::PeerCredentials>().copied();
+
+    // Defense-in-depth: reject path-traversal and obviously-invalid
+    // policy names before `add_scopes_to_policy` joins them into a
+    // filesystem path. `add_scopes_to_policy` itself will surface a
+    // not-found, but a 400 here gives the caller a clearer typed
+    // error code without ever doing fs I/O on a bad name.
+    if policy_name.is_empty()
+        || policy_name.contains('/')
+        || policy_name.contains('\\')
+        || policy_name.contains("..")
+        || policy_name.starts_with('.')
+    {
+        return agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "policy.invalid_name",
+            format!("policy name {policy_name:?} contains illegal characters"),
+            Some(request_id),
+        );
+    }
+
+    let (_parts, body) = req.into_parts();
+    let bytes = match axum::body::to_bytes(body, 16 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::BAD_REQUEST,
+                "policy.bad_request",
+                format!("failed to read request body: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+    let payload: PolicyScopesAddRequest = match serde_json::from_slice(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::BAD_REQUEST,
+                "policy.bad_request",
+                format!("invalid JSON body: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+
+    let policies_dir = state.policies_dir.clone();
+    let policy_name_for_blocking = policy_name.clone();
+    let short_names_for_blocking: Vec<String> = payload.short_names.clone();
+    let edit_result = tokio::task::spawn_blocking(move || {
+        let short_name_refs: Vec<&str> =
+            short_names_for_blocking.iter().map(String::as_str).collect();
+        permitlayer_core::policy::edit::add_scopes_to_policy(
+            &policies_dir,
+            &policy_name_for_blocking,
+            &short_name_refs,
+        )
+    })
+    .await;
+
+    let diff = match edit_result {
+        Ok(Ok(d)) => d,
+        Ok(Err(e)) => {
+            return policy_edit_error_response(e, &request_id);
+        }
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "policy.io_failed",
+                format!("policy edit task join failed: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+
+    let reloaded = if diff.is_no_op() {
+        false
+    } else {
+        // Mirror reload_handler's pre-swap discipline: clear approval
+        // caches before swapping the ArcSwap.
+        state.approval_service.clear_caches();
+        tracing::info!("approval service caches cleared on policy-scopes reload (pre-swap)");
+
+        let ps = Arc::clone(&state.policy_set);
+        let dir = state.policies_dir.clone();
+        let mtx = Arc::clone(&state.reload_mutex);
+        let result = tokio::task::spawn_blocking(move || {
+            super::sighup::reload_policies_with_diff_locked(&ps, &dir, &mtx)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(reload_diff)) => {
+                tracing::info!(
+                    policies_loaded = reload_diff.policies_loaded,
+                    added = reload_diff.added.len(),
+                    modified = reload_diff.modified.len(),
+                    removed = reload_diff.removed.len(),
+                    "policies reloaded via policy-scopes endpoint",
+                );
+                super::sighup::write_reload_audit_event(state.audit_store.as_ref(), &reload_diff)
+                    .await;
+                true
+            }
+            Ok(Err(e)) => {
+                return agent_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "policy.reload_failed",
+                    format!("post-edit policy reload failed: {e}"),
+                    Some(request_id),
+                );
+            }
+            Err(e) => {
+                return agent_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "policy.reload_failed",
+                    format!("post-edit policy reload task panicked: {e}"),
+                    Some(request_id),
+                );
+            }
+        }
+    };
+
+    // policy-scopes-added audit event (only when a real merge happened,
+    // matching the CLI's existing `policy_was_modified` gating).
+    if !diff.is_no_op() {
+        if let Some(audit) = &state.audit_store {
+            let mut event = AuditEvent::with_request_id(
+                request_id.clone(),
+                "operator".to_owned(),
+                "permitlayer".to_owned(),
+                "-".to_owned(),
+                "policy-scopes-add".to_owned(),
+                "ok".to_owned(),
+                "policy-scopes-added".to_owned(),
+            );
+            event.extra = serde_json::json!({
+                "policy_name": diff.policy_name,
+                "before": diff.before,
+                "added": diff.added,
+                "after": diff.after,
+            });
+            enrich_audit_extra_with_peer_creds(&mut event.extra, peer_creds_for_audit);
+            if let Err(e) = audit.append(event).await {
+                tracing::warn!(error = %e, "policy-scopes-added audit write failed (best-effort)");
+            }
+        }
+    }
+
+    tracing::info!(
+        target: "control",
+        request_id = %request_id,
+        policy_name = %policy_name,
+        added_count = diff.added.len(),
+        reloaded,
+        "policy scope merge complete",
+    );
+
+    (
+        StatusCode::OK,
+        Json(PolicyScopesAddResponse {
+            policy_name,
+            before: diff.before,
+            added: diff.added,
+            after: diff.after,
+            reloaded,
+        }),
+    )
+        .into_response()
+}
+
+/// Map `PolicyEditError` variants to HTTP responses (Story 7.30 AC #5).
+fn policy_edit_error_response(
+    err: permitlayer_core::policy::edit::PolicyEditError,
+    request_id: &str,
+) -> Response {
+    use permitlayer_core::policy::edit::PolicyEditError;
+    match err {
+        PolicyEditError::PolicyFileNotFound { path } => agent_error_response(
+            StatusCode::NOT_FOUND,
+            "policy.not_found",
+            format!("policy file not found: {}", path.display()),
+            Some(request_id.to_owned()),
+        ),
+        PolicyEditError::PolicyFileIsSymlink { path } => agent_error_response(
+            StatusCode::CONFLICT,
+            "policy.is_symlink",
+            format!("policy file is a symlink (refusing to follow): {}", path.display()),
+            Some(request_id.to_owned()),
+        ),
+        PolicyEditError::PolicyNotInFile { name, path } => agent_error_response(
+            StatusCode::NOT_FOUND,
+            "policy.not_found",
+            format!("policy {name:?} not found in file {}", path.display()),
+            Some(request_id.to_owned()),
+        ),
+        PolicyEditError::ParseFailed { source } => agent_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "policy.parse_failed",
+            format!("policy file parse failed: {source}"),
+            Some(request_id.to_owned()),
+        ),
+        PolicyEditError::CompileFailedAfterEdit { source } => agent_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "policy.compile_failed_after_edit",
+            format!("post-edit policy compile failed (file unchanged): {source}"),
+            Some(request_id.to_owned()),
+        ),
+        PolicyEditError::Io { source } => agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "policy.io_failed",
+            format!("policy file IO failed: {source}"),
+            Some(request_id.to_owned()),
+        ),
+        PolicyEditError::SerializeFailed { source } => agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "policy.serialize_failed",
+            format!("policy TOML serialize failed: {source}"),
+            Some(request_id.to_owned()),
+        ),
+    }
+}
+
 /// `POST /v1/control/agent/remove` — delete an agent file and swap
 /// the registry. Returns `removed: false` for a not-found name.
 pub(crate) async fn remove_agent_handler(
@@ -3576,6 +3847,7 @@ pub(crate) fn router(
         .route("/v1/control/credentials/{service}/meta", get(credentials_meta_handler))
         .route("/v1/control/credentials/seal", post(credentials_seal_handler))
         .route("/v1/control/credentials/{service}/verify", post(credentials_verify_handler))
+        .route("/v1/control/policy/{policy_name}/scopes", post(policy_scopes_handler))
         .route("/v1/control/agent/remove", post(remove_agent_handler))
         .route("/v1/control/agent/rebind", post(rebind_agent_handler))
         .route("/v1/control/connections", get(connections_handler))
@@ -5762,5 +6034,173 @@ mod tests {
             })
             .is_none()
         );
+    }
+
+    // ── Story 7.30 Task 6: POST /v1/control/policy/{name}/scopes ─────
+
+    /// Build a router with `state.policies_dir` pinned to a caller-
+    /// supplied path, plus an optional audit store. Used by the
+    /// policy-scopes-endpoint tests which need to stage a policy file
+    /// on disk and (in the audit-shape test) observe the
+    /// `policy-scopes-added` event.
+    fn build_with_policies_dir(
+        policies_dir: std::path::PathBuf,
+        audit_store: Option<Arc<dyn permitlayer_core::store::AuditStore>>,
+    ) -> Router {
+        let switch = Arc::new(KillSwitch::new());
+        let policy_set = Arc::new(ArcSwap::from_pointee(PolicySet::empty()));
+        let reload_mutex = Arc::new(std::sync::Mutex::new(()));
+        let agent_registry = Arc::new(AgentRegistry::new(vec![]));
+        let (ato, cs, co, stub, vault_dir) = test_reload_wiring();
+        router(
+            switch,
+            audit_store,
+            policy_set,
+            policies_dir,
+            reload_mutex,
+            agent_registry,
+            None,
+            Arc::new(zeroize::Zeroizing::new([0x42u8; LOOKUP_KEY_BYTES])),
+            test_approval_service(),
+            test_conn_tracker(),
+            test_plugin_registry(),
+            ato,
+            cs,
+            co,
+            stub,
+            vault_dir,
+            test_vault(),
+            test_control_token(),
+        )
+    }
+
+    fn stage_minimal_policy(policies_dir: &std::path::Path, name: &str, scopes: &[&str]) {
+        let scopes_toml: String =
+            scopes.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(", ");
+        let body = format!(
+            "[[policies]]\nname = \"{name}\"\nscopes = [{scopes_toml}]\nresources = [\"*\"]\napproval-mode = \"auto\"\nauto-approve-reads = true\n"
+        );
+        std::fs::write(policies_dir.join(format!("{name}.toml")), body).unwrap();
+    }
+
+    fn post_policy_scopes(policy_name: &str, short_names: &[&str]) -> Request<Body> {
+        let body = serde_json::json!({ "short_names": short_names });
+        let mut r = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/v1/control/policy/{policy_name}/scopes"))
+            .header("content-type", "application/json")
+            .header("x-agentsso-control", test_control_token_header())
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        r.extensions_mut().insert(ConnectInfo(loopback_v4()));
+        r
+    }
+
+    #[tokio::test]
+    async fn policy_scopes_handler_merges_new_scopes() {
+        let policies_dir = tempfile::tempdir().unwrap();
+        stage_minimal_policy(policies_dir.path(), "gmail-read-only", &["gmail.readonly"]);
+
+        let app = build_with_policies_dir(policies_dir.path().to_path_buf(), None);
+        let resp =
+            app.oneshot(post_policy_scopes("gmail-read-only", &["gmail.metadata"])).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["policy_name"], "gmail-read-only");
+        assert_eq!(json["before"][0], "gmail.readonly");
+        assert_eq!(json["added"][0], "gmail.metadata");
+        assert_eq!(json["after"].as_array().unwrap().len(), 2);
+        assert_eq!(json["reloaded"], true);
+    }
+
+    #[tokio::test]
+    async fn policy_scopes_handler_no_op_when_scopes_already_present() {
+        let policies_dir = tempfile::tempdir().unwrap();
+        stage_minimal_policy(
+            policies_dir.path(),
+            "gmail-read-only",
+            &["gmail.readonly", "gmail.metadata"],
+        );
+
+        let app = build_with_policies_dir(policies_dir.path().to_path_buf(), None);
+        let resp =
+            app.oneshot(post_policy_scopes("gmail-read-only", &["gmail.metadata"])).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["added"].as_array().unwrap().len(), 0);
+        assert_eq!(json["reloaded"], false);
+    }
+
+    #[tokio::test]
+    async fn policy_scopes_handler_returns_404_when_policy_file_missing() {
+        let policies_dir = tempfile::tempdir().unwrap();
+        let app = build_with_policies_dir(policies_dir.path().to_path_buf(), None);
+        let resp =
+            app.oneshot(post_policy_scopes("does-not-exist", &["gmail.metadata"])).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "policy.not_found");
+    }
+
+    #[tokio::test]
+    async fn policy_scopes_handler_rejects_invalid_policy_name() {
+        let policies_dir = tempfile::tempdir().unwrap();
+        let app = build_with_policies_dir(policies_dir.path().to_path_buf(), None);
+        // `..` path traversal: server-side check rejects before fs touch.
+        let resp = app.oneshot(post_policy_scopes("..%2Fetc", &["gmail.metadata"])).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "policy.invalid_name");
+    }
+
+    #[tokio::test]
+    async fn policy_scopes_handler_emits_audit_event_on_merge() {
+        let home_tmp = tempfile::tempdir().unwrap();
+        let store = build_audit_store(home_tmp.path());
+
+        let policies_dir = tempfile::tempdir().unwrap();
+        stage_minimal_policy(policies_dir.path(), "gmail-read-only", &["gmail.readonly"]);
+
+        let app =
+            build_with_policies_dir(policies_dir.path().to_path_buf(), Some(Arc::clone(&store)));
+        let resp =
+            app.oneshot(post_policy_scopes("gmail-read-only", &["gmail.metadata"])).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let events = read_audit_events(home_tmp.path());
+        let scope_events: Vec<_> =
+            events.iter().filter(|e| e.event_type == "policy-scopes-added").collect();
+        assert_eq!(scope_events.len(), 1);
+        let event = scope_events[0];
+        assert_eq!(event.outcome, "ok");
+        assert_eq!(event.extra["policy_name"], "gmail-read-only");
+        assert_eq!(event.extra["before"][0], "gmail.readonly");
+        assert_eq!(event.extra["added"][0], "gmail.metadata");
+        let after = event.extra["after"].as_array().unwrap();
+        assert_eq!(after.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn policy_scopes_handler_no_op_skips_audit_event() {
+        let home_tmp = tempfile::tempdir().unwrap();
+        let store = build_audit_store(home_tmp.path());
+
+        let policies_dir = tempfile::tempdir().unwrap();
+        stage_minimal_policy(
+            policies_dir.path(),
+            "gmail-read-only",
+            &["gmail.readonly", "gmail.metadata"],
+        );
+
+        let app =
+            build_with_policies_dir(policies_dir.path().to_path_buf(), Some(Arc::clone(&store)));
+        let resp =
+            app.oneshot(post_policy_scopes("gmail-read-only", &["gmail.metadata"])).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let events = read_audit_events(home_tmp.path());
+        let scope_events: Vec<_> =
+            events.iter().filter(|e| e.event_type == "policy-scopes-added").collect();
+        assert_eq!(scope_events.len(), 0, "no-op merge must not emit audit event");
     }
 }
