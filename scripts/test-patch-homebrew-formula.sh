@@ -131,7 +131,7 @@ for marker in 'def caveats' 'agentsso connect' 'sudo agentsso service install' '
 done
 
 # Negative markers (must NOT be present — Story 7.16 + 7.29 invariants):
-for negative in '^[[:space:]]+service do$' 'brew services start agentsso' '\bagentsso setup\b' 'agentsso autostart enable'; do
+for negative in '^[[:space:]]+service do$' 'brew services start agentsso' '\bagentsso setup\b' 'agentsso autostart enable' 'agent register --name'; do
     if grep -Eq "$negative" "$ACTUAL"; then
         echo "FAIL: patched output contains banned marker: $negative" >&2
         echo "      rc.22 brew formula ships no service-do block, no" >&2

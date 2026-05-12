@@ -10,7 +10,7 @@
 #     cop that `brew style --fix` enforces but cannot autocorrect.
 #   - `caveats` — users need post-install instructions pointing at
 #     `sudo agentsso service install` (the rc.22 system-service install
-#     path) + `agentsso agent register --name <name>` (mints the bearer
+#     path) + `agentsso agent register <name> --policy <policy>` (mints
 #     token consumed by MCP clients) + `agentsso connect <service>`
 #     (Story 7.13 verb rename).
 #

@@ -69,7 +69,7 @@ class Agentsso < Formula
       2. From your end-user account, register an agent and mint a
          bearer token:
 
-             agentsso agent register --name <name>
+             agentsso agent register <name> --policy <policy-name>
 
          The token is written to ~/.agentsso/agent-bearer.token and is
          the credential your MCP client (OpenClaw / Claude Desktop /

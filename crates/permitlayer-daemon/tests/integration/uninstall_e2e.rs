@@ -41,12 +41,11 @@ fn run_uninstall(home: &Path, args: &[&str]) -> std::process::Output {
 
 /// AC #1 + AC #6 — happy path: full uninstall on a tempdir-home.
 /// Asserts: data dir is gone, exit code is 0 (success-with-or-without
-/// warnings), AND the autostart artifact for `dev.permitlayer.daemon`
-/// is not registered after the run.
-///
-/// P5 (review): adds the autostart-artifact-gone assertion the spec
-/// (Story 7.4 Task 7 / `tests/integration/uninstall_e2e.rs:179`)
-/// required.
+/// warnings). The autostart-artifact-not-registered check below is
+/// a structural comment (the orchestrator runs in subprocess-isolated
+/// mode against the tempdir home, so there's no real LaunchDaemon to
+/// observe); we only assert the orchestrator didn't crash and didn't
+/// leave an orphan plist where it tried to operate.
 #[test]
 fn uninstall_yes_wipes_data_dir_and_exits_zero() {
     let tmp = tempfile::TempDir::new().unwrap();

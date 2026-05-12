@@ -238,7 +238,7 @@ pub async fn run(args: InstallArgs) -> Result<()> {
         println!();
     }
     println!("End-users on this Mac register their agent with:");
-    println!("  agentsso agent register --name <name>");
+    println!("  agentsso agent register <name> --policy <policy-name>");
     println!("──────────────────────────────────────────────────────────────");
     Ok(())
 }

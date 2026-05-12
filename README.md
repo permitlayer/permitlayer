@@ -32,7 +32,10 @@ normal OAuth client. The tokens never touch the agent.
 brew tap permitlayer/tap
 brew install permitlayer/tap/agentsso
 sudo agentsso service install                       # one-time, per machine
-agentsso agent register --name <name>               # from your end-user account
+# Log out + back in (or open a new login shell) — the install adds
+# you to permitlayer-clients; group membership doesn't take effect in
+# your current shell. Then, from your end-user account:
+agentsso agent register <name> --policy gmail-read-only
 agentsso connect gmail --oauth-client ./client_secret.json --agent <name>
 ```
 
@@ -42,13 +45,20 @@ agentsso connect gmail --oauth-client ./client_secret.json --agent <name>
 `permitlayer-clients` macOS group, and starts the daemon. macOS will
 display a "Background item added" notification — if the daemon doesn't
 appear running, check **System Settings → General → Login Items →
-Allow in the Background**.
+Allow in the Background**. If `agentsso agent register` returns a
+permission error, your `permitlayer-clients` group membership hasn't
+taken effect yet — log out and back in.
 
-`agentsso agent register --name <name>` mints a per-user bearer token
-at `~/.agentsso/agent-bearer.token` (mode 0600). MCP clients
-(OpenClaw / Claude Desktop / Cursor) read that token and connect to
-the daemon at `http://127.0.0.1:3820/mcp` with transport
+`agentsso agent register <name> --policy <policy-name>` mints a
+per-user bearer token at `~/.agentsso/agent-bearer.token` (mode 0600).
+MCP clients (OpenClaw / Claude Desktop / Cursor) read that token and
+connect to the daemon at `http://127.0.0.1:3820/mcp` with transport
 `streamable-http`.
+
+Running the daemon and end-user under different OS accounts? See
+[Running the daemon and the agent under different OS users](#running-the-daemon-and-the-agent-under-different-os-users)
+below — additional operators need to be added to the
+`permitlayer-clients` group explicitly.
 
 See [docs/user-guide/install.md](docs/user-guide/install.md) for the
 full lifecycle (`brew upgrade`, `brew uninstall`, `service status`,
@@ -91,11 +101,21 @@ keeps tokens scoped to your Google account, not a shared app.
    agentsso service status        # confirm daemon is running
    ```
 
+   After this completes, log out and back in (or open a new login
+   shell) so your new `permitlayer-clients` group membership takes
+   effect. Steps 2-6 below run from your end-user account, NOT under
+   `sudo`.
+
 2. **Register an agent** (from your end-user account, once per MCP client):
 
    ```sh
-   agentsso agent register --name <name>
+   agentsso agent register <name> --policy gmail-read-only
    ```
+
+   `--policy` is required and must name a policy that already exists
+   under `/Library/Application Support/permitlayer/policies/`. The
+   seeded `gmail-read-only` policy is a safe starting point. Add
+   `--json` for a `jq`-parseable envelope (scripted installs).
 
    Mints a bearer token at `~/.agentsso/agent-bearer.token` (mode 0600,
    owned by you). MCP clients read this file.
@@ -145,11 +165,14 @@ polling completes without operator interaction at the target machine:
 ```sh
 # Scripted-install scenario (CI, Ansible, cloud-init):
 # OAuth client must be type "TV and Limited Input Device" (NOT "Desktop app").
-# See docs/user-guide/install.md → "Device-flow OAuth client setup".
+# See the "Fully-headless / scripted installs" section in
+# docs/user-guide/install.md for the OAuth client setup details.
 sudo agentsso service install
+# Mint a bearer token first — `connect` requires the agent to be
+# pre-registered. `--json` parses cleanly through jq for scripted use.
+AGENTSSO_BEARER_TOKEN=$(agentsso agent register ci-bot --policy gmail-read-only --json | jq -r .bearer_token)
 agentsso connect gmail --oauth-client ./client_secret_device.json --agent ci-bot \
   --device-flow --device-flow-timeout 300 --non-interactive
-AGENTSSO_BEARER_TOKEN=$(agentsso agent register ci-bot --policy default --json | jq -r .bearer_token)
 ```
 
 `--device-flow` is mutually exclusive with `--headless` (the paste-
@@ -193,20 +216,39 @@ authenticate to it on two separate channels:
   caller's UID via `LOCAL_PEERCRED` and audit-logs it alongside any
   bearer-token claim. `sudo agentsso service install` adds the
   invoking operator to that group; add additional operators with
-  `sudo dseditgroup -o edit -a <user> -t user permitlayer-clients`.
+  `sudo dseditgroup -o edit -a <user> -t user permitlayer-clients`,
+  then have the user log out and back in for the group membership to
+  take effect.
 
 - **MCP data plane** (`/mcp/*`) lives on TCP loopback at
   `127.0.0.1:3820`. MCP clients (OpenClaw, Claude Desktop, Cursor)
   speak HTTP-over-streamable-http, which is TCP-only; we keep this
   channel on loopback specifically for compatibility. The daemon
   authenticates MCP clients via per-user bearer tokens minted by
-  `agentsso agent register --name <name>` and written to
-  `~/.agentsso/agent-bearer.token` (mode `0600`, owned by the
-  invoking user).
+  `agentsso agent register <name> --policy <policy-name>` and written
+  to `~/.agentsso/agent-bearer.token` (mode `0600`, owned by the
+  invoking user). MCP clients read the token **value** from that file
+  (not the path — e.g., Claude Desktop's `env` block needs the bearer
+  string itself, not a `~/.agentsso/...` path expression).
+
+  If the operator who ran `sudo agentsso service install` is a
+  different OS account than the end-user who'll run
+  `agentsso agent register`, that end-user must be added to the
+  `permitlayer-clients` group too — `sudo dseditgroup -o edit -a
+  <end-user> -t user permitlayer-clients` then log them out and back
+  in.
 
 The split is deliberate. The control plane gets kernel-attested peer
 identity from UDS; the MCP plane gets backward-compatibility with
 existing HTTP-only MCP clients.
+
+The MCP plane's TCP bind address is configurable via the
+`AGENTSSO_HTTP__BIND_ADDR` env var (figment env-layering applies via
+`Env::prefixed("AGENTSSO_").split("__")`, so `AGENTSSO_HTTP__BIND_ADDR=
+127.0.0.1:3920` overrides the default `127.0.0.1:3820`). Set it in
+the LaunchDaemon plist's `EnvironmentVariables` if you need a
+non-default port — `sudo agentsso service install` regenerates the
+plist, so this is a one-time edit per machine.
 
 ## What's in the box
 

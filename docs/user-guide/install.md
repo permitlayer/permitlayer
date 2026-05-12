@@ -77,18 +77,24 @@ sudo dseditgroup -o edit -a <username> -t user permitlayer-clients
 ## Register an agent
 
 From your **end-user** account (not from `sudo`), mint a per-user
-bearer token:
+bearer token. The agent name is positional; `--policy` is required
+and must reference a policy that already exists under
+`/Library/Application Support/permitlayer/policies/`. The seeded
+`gmail-read-only` policy is a safe starting point:
 
 ```sh
-agentsso agent register --name <name>
+agentsso agent register <name> --policy gmail-read-only
 ```
 
 The token is written to `~/.agentsso/agent-bearer.token` (mode 0600,
-owned by you). Each MCP client (OpenClaw, Claude Desktop, Cursor)
-that should talk to the daemon needs to be pointed at this token.
+owned by you), and is also echoed once to stdout for piping into MCP
+client configs. Add `--json` to get a single-line JSON envelope
+(`{"status":"ok","name":"...","policy_name":"...","bearer_token":"..."}`)
+suitable for `jq` parsing in scripted installs.
 
 The token survives daemon restarts. If you need to rotate it, delete
-the file and re-run `agentsso agent register --name <name>`.
+the file and re-run `agentsso agent register <name> --policy
+<policy-name>`.
 
 ## Creating an OAuth client
 
@@ -152,12 +158,15 @@ operator action on the target machine.
 ## Verify
 
 ```sh
-agentsso service status   # daemon process state + bind addresses
-agentsso health           # round-trip a request through the control plane
+agentsso service status                      # daemon process state + bind addresses
+curl http://127.0.0.1:3820/health            # round-trip a request through the MCP plane
 ```
 
-Both should return cleanly. If either fails, see
-[Troubleshooting](#troubleshooting).
+`agentsso service status` checks that `launchd` thinks the daemon
+should be running and the bearer-token-bearing socket is bound.
+The `curl` against `/health` round-trips an actual HTTP request and
+returns a JSON envelope when the daemon is serving. If either fails,
+see [Troubleshooting](#troubleshooting).
 
 ## Point your MCP client at agentsso
 
@@ -190,30 +199,17 @@ deletes the master key from System.keychain, removes
 `permitlayer-clients` group. It does not touch the `agentsso` binary
 itself — that's `brew uninstall`'s job.
 
-Per-user state at `~/.agentsso/` (the bearer token, in particular)
-is left in place by `service uninstall`. Remove it manually if you
-want to fully clean up:
+Per-user state at `~/.agentsso/` (the bearer token in particular)
+is left in place by `service uninstall`. The bearer token will no
+longer authenticate to anything once the daemon is gone, so clear it
+explicitly to avoid leaving an orphan credential file on disk:
 
 ```sh
 rm -rf ~/.agentsso/
 ```
 
-## Upgrade
-
-```sh
-brew upgrade agentsso
-sudo agentsso service install   # idempotent — refreshes the privileged binary copy
-```
-
-The master key in System.keychain is preserved across upgrades (the
-`-A` ACL is independent of the binary's codesign hash), so existing
-sealed credentials continue to work.
-
-If `brew upgrade` runs while the daemon is active, the new binary is
-delivered but the running daemon doesn't know about it. Re-running
-`sudo agentsso service install` re-copies the binary into
-`/Library/PrivilegedHelperTools/` and kicks the LaunchDaemon to
-pick up the new image.
+Each end-user with a registered agent should do this on their own
+account.
 
 ## Troubleshooting
 
@@ -240,7 +236,19 @@ daemon should be running and why it isn't. Common failures:
 - **Master-key item missing or unreadable**: typically only happens
   if someone manually removed the System.keychain entry. Run
   `sudo agentsso service uninstall && sudo agentsso service install`
-  to mint a fresh one (this discards any sealed credentials).
+  to mint a fresh one — this discards any sealed credentials, so each
+  end-user with a registered agent will need to re-run
+  `agentsso agent register <name> --policy <policy-name>` and re-run
+  `agentsso connect <service> --agent <name>` for any services they
+  had connected.
+- **Stale binary after `brew upgrade agentsso`**: the privileged
+  helper copy at `/Library/PrivilegedHelperTools/agentsso` is what
+  the LaunchDaemon executes; `brew upgrade` only refreshes
+  `/opt/homebrew/bin/agentsso`. Re-run `sudo agentsso service
+  install` after every `brew upgrade` to copy the new binary into
+  place and kick the LaunchDaemon. The master key in System.keychain
+  is preserved (`-A` ACL is independent of the binary's codesign
+  hash), so sealed credentials survive the upgrade.
 
 ### `agentsso connect` returns a permission error
 
@@ -273,3 +281,19 @@ sudo launchctl kickstart -k system/dev.permitlayer.daemon
 
 Revert with `sudo launchctl unsetenv AGENTSSO_LOG__LEVEL` and
 another `kickstart`. The daemon does not honor `RUST_LOG`.
+
+### Running the daemon in the foreground (dev)
+
+For local development, the LaunchDaemon-installed daemon can be
+stopped and the binary invoked directly:
+
+```sh
+sudo launchctl bootout system/dev.permitlayer.daemon
+sudo /Library/PrivilegedHelperTools/agentsso start
+```
+
+`agentsso start` runs in the foreground with logs on stdout/stderr.
+Stop with Ctrl-C; restart the LaunchDaemon with
+`sudo launchctl bootstrap system /Library/LaunchDaemons/dev.permitlayer.daemon.plist`
+when you're done. This mode is not intended for production — it
+bypasses the LaunchDaemon's auto-restart behavior.
