@@ -192,6 +192,26 @@ fn read_account(account: &str) -> Result<Option<Zeroizing<[u8; MASTER_KEY_LEN]>>
     let entry = entry_for_system_keychain(account)?;
     match entry.get_secret() {
         Ok(mut bytes) => {
+            // Story 7.27 Round-2 review fix: treat empty (0-byte) entries
+            // as `NoEntry` so the mint path engages and replaces the
+            // useless inode via `-U` upsert. This handles the
+            // pathological "operator manually inserted `security
+            // add-generic-password ... -w \"\"`" case and the
+            // partially-written-entry-from-killed-`security` case.
+            // Wrong-length-but-non-empty entries still surface as
+            // `MalformedMasterKey` (distinct from corruption — operator
+            // needs to know to investigate).
+            if bytes.is_empty() {
+                tracing::warn!(
+                    event = "master_key.boot.empty_entry_replaced",
+                    keychain_target = KEYCHAIN_TARGET,
+                    service_id = MASTER_KEY_SERVICE,
+                    "found empty System.keychain entry at {MASTER_KEY_SERVICE}; treating as \
+                     NoEntry so the mint path overwrites it"
+                );
+                bytes.zeroize();
+                return Ok(None);
+            }
             let result = decode_hex_master_key(&bytes);
             bytes.zeroize();
             result.map(Some)
@@ -222,6 +242,19 @@ fn read_account(account: &str) -> Result<Option<Zeroizing<[u8; MASTER_KEY_LEN]>>
 /// plus a fingerprint that the daemon-side caller correlates into an
 /// audit record.
 fn read_or_mint_master_key(account: &str) -> Result<crate::MasterKeyOutcome, KeyStoreError> {
+    // Story 7.27 Round-2 review fix: serialize the read+mint+write+
+    // verify sequence across processes via `flock` on a sibling
+    // lockfile. The LaunchDaemon singleton model normally prevents
+    // two daemons racing here, but an operator running `agentsso
+    // start` standalone while the LaunchDaemon is booting (or two
+    // concurrent `service install` invocations) would otherwise
+    // produce dual `first_boot=true` audit emissions for one
+    // keychain entry, or a silent-clobber where one daemon overwrites
+    // another's freshly-minted key. The lock is dropped at end of
+    // function via `Flock<File>` RAII; lockfile persists for next
+    // invocation.
+    let _mint_lock = acquire_mint_lock()?;
+
     if let Some(key) = read_account(account)? {
         tracing::info!(
             event = "master_key.boot.existing",
@@ -231,6 +264,27 @@ fn read_or_mint_master_key(account: &str) -> Result<crate::MasterKeyOutcome, Key
             "loaded existing master key from System.keychain"
         );
         return Ok(crate::MasterKeyOutcome { key, first_boot: false });
+    }
+
+    // Story 7.27 Round-2 review fix: surface a clear "must run as
+    // root" error BEFORE attempting `security add-generic-password`
+    // against System.keychain. Reads succeed for any caller (`-A`
+    // ACL); writes require root. Without this check, non-root
+    // callers got a generic `PlatformError { exit=1 stderr=… }`
+    // with no remediation pointer. The probe path in
+    // `MacKeyStore::new` stays caller-agnostic so unprivileged
+    // tooling (e.g., `agentsso status` querying daemon state) can
+    // still instantiate the keystore without minting.
+    if !nix::unistd::geteuid().is_root() {
+        return Err(KeyStoreError::PlatformError {
+            backend: BACKEND,
+            message: "minting the master key in /Library/Keychains/System.keychain requires \
+                      root. The LaunchDaemon installed by `sudo agentsso service install` \
+                      runs the daemon as root automatically; manual `agentsso start` from a \
+                      user shell will fail here. Re-run via `sudo agentsso service install` \
+                      (or `sudo agentsso start` for ad-hoc dev use)."
+                .into(),
+        });
     }
 
     // Fresh install: mint + write + verify.
@@ -312,6 +366,70 @@ fn read_or_mint_master_key(account: &str) -> Result<crate::MasterKeyOutcome, Key
     }
 }
 
+/// Inter-process mint serialization lock. Acquired by
+/// [`read_or_mint_master_key`] around the read+mint+write+verify
+/// sequence so two concurrent daemons cannot both observe `NoEntry`
+/// and race to mint distinct master keys.
+///
+/// Lockfile lives at `/Library/Application Support/permitlayer/
+/// .master-key-mint.lock` in production (root-only-writable; matches
+/// `paths::daemon_state_dir(None)` resolution). In test contexts
+/// without that directory, falls back to `std::env::temp_dir()` so
+/// unit tests that exercise the mint path don't require root-owned
+/// state dirs.
+///
+/// Acquisition uses `LOCK_EX` (blocking exclusive); the returned
+/// `Flock<File>` releases the lock on Drop (RAII).
+fn acquire_mint_lock() -> Result<nix::fcntl::Flock<std::fs::File>, KeyStoreError> {
+    let lock_path = mint_lock_path();
+    // Ensure the parent directory exists. In production this is the
+    // root-owned `paths::daemon_state_dir(None)`; in tests it's a
+    // tempdir we control.
+    if let Some(parent) = lock_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| KeyStoreError::PlatformError {
+            backend: BACKEND,
+            message: format!("failed to create lock-dir {}: {e}", parent.display()),
+        })?;
+    }
+    use std::os::unix::fs::OpenOptionsExt;
+    let lock_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .mode(0o600)
+        .open(&lock_path)
+        .map_err(|e| KeyStoreError::PlatformError {
+            backend: BACKEND,
+            message: format!("failed to open mint-lock {}: {e}", lock_path.display()),
+        })?;
+    nix::fcntl::Flock::lock(lock_file, nix::fcntl::FlockArg::LockExclusive).map_err(
+        |(_file, errno)| KeyStoreError::PlatformError {
+            backend: BACKEND,
+            message: format!("failed to acquire mint-lock {}: errno={errno}", lock_path.display()),
+        },
+    )
+}
+
+/// Resolve the mint-lock path. Production: under the daemon state
+/// dir; tests/dev: under `env::temp_dir()` so non-root contexts work.
+fn mint_lock_path() -> std::path::PathBuf {
+    // The production state-dir is owned by `permitlayer-core::paths`,
+    // which this crate cannot depend on (would create a cycle). Check
+    // for the canonical macOS daemon state dir; fall back to temp
+    // otherwise. The fallback is fine because:
+    //   - In production, the daemon runs as root and the canonical
+    //     dir always exists (created by `service install`).
+    //   - In tests/dev, two test processes racing the keystore mint
+    //     path are a contrived scenario and the temp-dir lockfile
+    //     still serializes them correctly.
+    let prod = std::path::PathBuf::from("/Library/Application Support/permitlayer");
+    if prod.is_dir() {
+        return prod.join(".master-key-mint.lock");
+    }
+    std::env::temp_dir().join("permitlayer-master-key-mint.lock")
+}
+
 /// Constant-time byte comparison for read-back equality. Mirrors
 /// [`keyring_shared::constant_time_eq`] (which is Linux/Windows-only
 /// on rc.22+ and therefore not reachable from this module).
@@ -351,13 +469,48 @@ fn clear_account(account: &str) -> Result<(), KeyStoreError> {
 /// Distinguishing delete: `Removed` vs `AlreadyAbsent`. Used by
 /// `delete_master_key()` so the operator-facing audit log can
 /// surface which case fired during `agentsso uninstall`.
+///
+/// Story 7.27 Round-2 review fix: write path uses
+/// `/usr/bin/security add-generic-password -A` (no DR-bound ACL).
+/// Delete now goes through the same `/usr/bin/security delete-
+/// generic-password` CLI for symmetric write/delete semantics —
+/// avoids the asymmetry where `keyring::Entry::delete_credential()`
+/// applied a different ACL discipline than the `-A`-written entry
+/// expected. Reads still go through the `keyring` crate (which works
+/// fine for `-A` entries since `allowAllForm` permits any root
+/// caller).
 fn delete_account(account: &str) -> Result<DeleteOutcome, KeyStoreError> {
-    let entry = entry_for_system_keychain(account)?;
-    match entry.delete_credential() {
-        Ok(()) => Ok(DeleteOutcome::Removed),
-        Err(keyring::Error::NoEntry) => Ok(DeleteOutcome::AlreadyAbsent),
-        Err(e) => Err(shared::map_err(BACKEND, e)),
+    let output = Command::new("/usr/bin/security")
+        .stdin(std::process::Stdio::null())
+        .args([
+            "delete-generic-password",
+            "-s",
+            MASTER_KEY_SERVICE,
+            "-a",
+            account,
+            SYSTEM_KEYCHAIN_PATH,
+        ])
+        .output()
+        .map_err(|e| KeyStoreError::BackendUnavailable { backend: BACKEND, source: Box::new(e) })?;
+    if output.status.success() {
+        return Ok(DeleteOutcome::Removed);
     }
+    // `security delete-generic-password` returns exit 44 (also
+    // exit 1 in some Darwin releases) for "item not found";
+    // stderr contains `SecKeychainSearchCopyNext`/`The specified
+    // item could not be found in the keychain`.
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("could not be found") || stderr.contains("SecKeychainSearchCopyNext") {
+        return Ok(DeleteOutcome::AlreadyAbsent);
+    }
+    let exit = output.status.code().map_or_else(|| "signal".to_string(), |c| c.to_string());
+    Err(KeyStoreError::PlatformError {
+        backend: BACKEND,
+        message: format!(
+            "/usr/bin/security delete-generic-password exit={exit}: {}",
+            stderr.trim()
+        ),
+    })
 }
 
 /// WRITE the master key (or any key-shaped account) to
@@ -378,8 +531,33 @@ fn delete_account(account: &str) -> Result<DeleteOutcome, KeyStoreError> {
 /// Argv exposure: per `security(1)` man page + Apple
 /// `SecurityTool/macOS/keychain_add.c`, `-w` has no stdin form. The
 /// secret is in argv for the duration of the `security`
-/// invocation (~milliseconds). See module-level doc-comment for the
-/// tradeoff rationale and the FFI escape hatch.
+/// invocation (~milliseconds; under syspolicyd queue pressure can
+/// stretch to seconds per `project_slow_nextest_on_macos.md`).
+///
+/// **Threat model (Round-2 review):** an attacker observing argv via
+/// `ps auxe` during this window can recover the hex-encoded master
+/// key. Practical exploitation requires (a) shell access on the box
+/// during the milliseconds-to-seconds-wide write window, AND (b)
+/// timing precision to catch the invocation. Mitigations:
+///   - `Stdio::null()` on stdin prevents `security` from prompting
+///     (which would extend the window indefinitely).
+///   - System.keychain reads gate on the kernel-process layer
+///     anyway — a non-root attacker who captured the hex argv can
+///     decode it but cannot read the on-disk entry.
+///   - The LaunchDaemon model means writes happen at most once per
+///     fresh-install boot; the surface area is a brief one-time
+///     window, not a recurring exposure.
+///
+/// Alternatives considered + rejected:
+///   - stdin-via-pipe: `/usr/bin/security`'s `-w` flag has no stdin
+///     form per the man page; Apple's source confirms.
+///   - Native FFI via `SecKeychainAddGenericPassword` directly:
+///     bypasses argv but couples to security-framework's C ABI for
+///     a one-shot mint operation; not worth the maintenance burden.
+///   - Base64 / raw-bytes encoding: doesn't change the argv-exposed
+///     surface, just changes representation.
+///
+/// See module-level doc-comment for the FFI escape hatch.
 fn write_master_key_via_security_a(
     account: &str,
     key: &[u8; MASTER_KEY_LEN],
@@ -394,21 +572,35 @@ fn write_master_key_via_security_a(
     // zeroizes on Drop so EVERY exit path scrubs it — the prior
     // `?` on `Command::output()` skipped the explicit zeroize when
     // the spawn itself failed.
+    // Story 7.27 Round-2 review fix: use `Zeroizing<String>` directly
+    // instead of a hand-rolled `ZeroizingHex` newtype. The zeroize
+    // crate already provides `Zeroize` for `String` (zeroizes the
+    // buffer in place) so `Zeroizing<String>` gives the same
+    // single-buffer single-zeroize semantics as the local newtype
+    // without the maintenance burden.
     use std::fmt::Write;
-    struct ZeroizingHex(String);
-    impl Drop for ZeroizingHex {
-        fn drop(&mut self) {
-            self.0.zeroize();
-        }
-    }
-    let mut secret_hex = ZeroizingHex(String::with_capacity(MASTER_KEY_LEN * 2));
+    let mut secret_hex: Zeroizing<String> =
+        Zeroizing::new(String::with_capacity(MASTER_KEY_LEN * 2));
     for b in key.iter() {
         // `write!` into a `String` is infallible (the impl of
         // `fmt::Write` for `String` never returns an error), so the
         // `Result` here can be safely discarded.
-        let _ = write!(&mut secret_hex.0, "{:02x}", b);
+        let _ = write!(&mut *secret_hex, "{:02x}", b);
     }
 
+    // Story 7.27 Round-2 review note: `Command::output()` has no
+    // timeout. A hung `/usr/bin/security` (keychain corruption,
+    // syspolicyd deadlock, XPC stall) would block the
+    // `spawn_blocking` worker indefinitely. Mitigations in place:
+    //   - `Stdio::null()` on stdin prevents the prompt-hang case.
+    //   - LaunchDaemon's `KeepAlive` + macOS launchd watchdog
+    //     restart the daemon if it stops responding to launchd
+    //     queries. A hung `security` will eventually surface as a
+    //     watchdog kill + restart cycle.
+    //   - Adding a thread-based timeout (e.g., `wait-timeout` crate)
+    //     would add a new dep for a recovery scenario the LaunchDaemon
+    //     watchdog already covers. Defer until ops experience shows
+    //     this is a real problem.
     let output = Command::new("/usr/bin/security")
         // P6 (Story 7.26 code review): explicitly null stdin so the
         // daemon never blocks if `security` decides to prompt
@@ -423,7 +615,7 @@ fn write_master_key_via_security_a(
             "-A", // no DR-bound ACL (load-bearing — produces allowAllForm)
             "-U", // upsert OK; read-before-write gate is the source of truth for "first boot"
             "-w",
-            secret_hex.0.as_str(),
+            secret_hex.as_str(),
             SYSTEM_KEYCHAIN_PATH,
         ])
         .output()
@@ -434,6 +626,32 @@ fn write_master_key_via_security_a(
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         let exit = output.status.code().map_or_else(|| "signal".to_string(), |c| c.to_string());
+        // Story 7.27 Round-2 review fix: classify the locked-keychain
+        // post-sleep error so operators get a clear remediation
+        // pointer. `/usr/bin/security` returns generic exit=1 with
+        // "User interaction is not allowed" when System.keychain is
+        // locked AND `-i` (interactive prompt) cannot be used because
+        // we're running headless via LaunchDaemon. The install path
+        // runs `security set-keychain-settings -u` to disable
+        // auto-lock; this classifier handles the regression case
+        // where someone re-locked it (e.g., `security lock-keychain`
+        // run by an admin script) or where install's
+        // `set-keychain-settings` was skipped (MDM-restricted box).
+        if stderr.contains("User interaction is not allowed")
+            || stderr.contains("errSecInteractionRequired")
+        {
+            return Err(KeyStoreError::PlatformError {
+                backend: BACKEND,
+                message: format!(
+                    "/Library/Keychains/System.keychain is locked and `security` cannot \
+                     prompt (headless context). Remediation: re-run `sudo security \
+                     set-keychain-settings -u /Library/Keychains/System.keychain` to \
+                     disable auto-lock so the daemon can read across sleep/wake cycles. \
+                     Original error: exit={exit}: {}",
+                    stderr.trim()
+                ),
+            });
+        }
         return Err(KeyStoreError::PlatformError {
             backend: BACKEND,
             message: format!(
@@ -449,6 +667,13 @@ fn write_master_key_via_security_a(
 /// Surfaces `MalformedMasterKey` on length or character errors so
 /// the daemon's existing `StartError::MasterKeyCall` rendering
 /// kicks in.
+///
+/// Story 7.27 Round-2 review fix: non-hex characters now surface as
+/// `MalformedMasterKey` (was `PlatformError`), and the per-nibble
+/// loop runs to completion without early-exit so the position of a
+/// malformed byte is not leakable via timing. Both changes bring the
+/// classifier in line with the discipline already enforced by
+/// `decode_hex_master_key`'s length check.
 fn decode_hex_master_key(
     hex_bytes: &[u8],
 ) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyStoreError> {
@@ -459,34 +684,88 @@ fn decode_hex_master_key(
         });
     }
     let mut key = Zeroizing::new([0u8; MASTER_KEY_LEN]);
+    let mut any_bad: u8 = 0;
     for (i, chunk) in hex_bytes.chunks(2).enumerate() {
-        let hi = decode_hex_nibble(chunk[0])?;
-        let lo = decode_hex_nibble(chunk[1])?;
+        let (hi, hi_bad) = decode_hex_nibble_ct(chunk[0]);
+        let (lo, lo_bad) = decode_hex_nibble_ct(chunk[1]);
+        any_bad |= hi_bad | lo_bad;
         key[i] = (hi << 4) | lo;
+    }
+    if any_bad != 0 {
+        return Err(KeyStoreError::MalformedMasterKey {
+            expected_len: MASTER_KEY_LEN * 2,
+            actual_len: hex_bytes.len(),
+        });
     }
     Ok(key)
 }
 
-fn decode_hex_nibble(c: u8) -> Result<u8, KeyStoreError> {
-    match c {
-        b'0'..=b'9' => Ok(c - b'0'),
-        b'a'..=b'f' => Ok(10 + c - b'a'),
-        b'A'..=b'F' => Ok(10 + c - b'A'),
-        _ => Err(KeyStoreError::PlatformError {
-            backend: BACKEND,
-            message: format!("non-hex character 0x{c:02x} in System.keychain master-key bytes"),
-        }),
-    }
+/// Constant-time hex-nibble decode. Returns `(value, bad_mask)`
+/// where `bad_mask == 0xFF` for invalid chars, `0x00` for valid. The
+/// value field is zero on invalid chars; callers OR together
+/// `bad_mask`s across the whole input and check once at the end.
+///
+/// `#[allow(clippy::manual_range_contains)]` because this is the
+/// deliberate constant-time form — `RangeInclusive::contains` is
+/// `match`-based and may branch differently across the three valid
+/// ranges, which would leak position via timing.
+#[allow(clippy::manual_range_contains)]
+fn decode_hex_nibble_ct(c: u8) -> (u8, u8) {
+    // Compute the three valid-range decodes unconditionally; mask
+    // them with the in-range predicate; OR together. Any byte
+    // outside `0-9a-fA-F` leaves all three branches zero and trips
+    // the `bad` flag.
+    let in_09 = ((c >= b'0') & (c <= b'9')) as u8 * 0xFF;
+    let in_af = ((c >= b'a') & (c <= b'f')) as u8 * 0xFF;
+    let in_uf = ((c >= b'A') & (c <= b'F')) as u8 * 0xFF;
+    // Suppress underflow for branches that don't fire: subtract only
+    // under the matching mask.
+    let v_09 = c.wrapping_sub(b'0') & in_09;
+    let v_af = c.wrapping_sub(b'a').wrapping_add(10) & in_af;
+    let v_uf = c.wrapping_sub(b'A').wrapping_add(10) & in_uf;
+    let value = v_09 | v_af | v_uf;
+    let any = in_09 | in_af | in_uf; // 0xFF if valid, 0 if invalid
+    let bad = !any;
+    (value, bad)
 }
 
-/// 8-hex-char SHA-256 prefix of `bytes` for audit-log fingerprinting.
-/// Exposed via `tracing` field from
-/// [`read_or_mint_master_key`]; the daemon-side caller correlates it
-/// into the `MasterKeyFirstBoot` audit-event payload.
+/// Domain-separated 8-hex-char fingerprint of `bytes` for audit-log
+/// correlation between the keystore-side `tracing::info!` ops events
+/// and the daemon-side `master-key-first-boot` audit event.
+///
+/// Story 7.27 Round-2 review fix: replaced raw `SHA-256(bytes)[..4]`
+/// with HMAC-SHA256 keyed by the fixed domain-separator constant
+/// [`FINGERPRINT_DOMAIN_SEP`]. The change preserves cross-boot
+/// correlation (the load-bearing property — operators grep both
+/// logs by fingerprint to confirm same key across daemon restarts)
+/// while removing the trivial-candidate-verification oracle. An
+/// attacker who steals a candidate master-key file from a backup
+/// can no longer confirm-by-recomputing-`SHA-256`; they need to
+/// know the domain-separator AND use HMAC, which documents intent
+/// and protects against code-drift where someone might log
+/// `SHA-256(key)` of a longer prefix.
+///
+/// Output is 8 hex chars (4 bytes of HMAC truncation), matching the
+/// pre-fix wire format; daemon-side `master_key_fingerprint_first8`
+/// in `crates/permitlayer-daemon/src/cli/start.rs` MUST use the same
+/// construction or correlation breaks.
+pub const FINGERPRINT_DOMAIN_SEP: &[u8] = b"permitlayer-master-key-fingerprint";
+
 fn fingerprint(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(bytes);
-    format!("{:02x}{:02x}{:02x}{:02x}", digest[0], digest[1], digest[2], digest[3])
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+    // `Hmac::<Sha256>::new_from_slice` only returns `Err` for invalid
+    // key length, but `Hmac` accepts arbitrary key sizes — there is
+    // no failure mode for our fixed-constant `FINGERPRINT_DOMAIN_SEP`
+    // input. `unwrap_or_else` over `expect()` keeps clippy's
+    // expect_used lint quiet while preserving the structural
+    // unreachability.
+    let Ok(mut mac) = <Hmac<Sha256> as Mac>::new_from_slice(FINGERPRINT_DOMAIN_SEP) else {
+        unreachable!("HMAC-SHA256 accepts arbitrary key length");
+    };
+    mac.update(bytes);
+    let tag = mac.finalize().into_bytes();
+    format!("{:02x}{:02x}{:02x}{:02x}", tag[0], tag[1], tag[2], tag[3])
 }
 
 #[cfg(test)]
@@ -519,7 +798,39 @@ mod tests {
         let mut bytes = vec![b'a'; 64];
         bytes[5] = b'g'; // not a hex char
         let err = decode_hex_master_key(&bytes).unwrap_err();
-        assert!(matches!(err, KeyStoreError::PlatformError { .. }));
+        // Story 7.27 Round-2 review fix: non-hex chars now classify
+        // as MalformedMasterKey (was PlatformError) so the daemon's
+        // existing matcher routes to the consistent remediation
+        // banner for "corrupted keychain entry" failures.
+        assert!(
+            matches!(err, KeyStoreError::MalformedMasterKey { .. }),
+            "non-hex char must classify as MalformedMasterKey, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn decode_hex_nibble_ct_classifies_correctly() {
+        // Verify the constant-time decoder produces correct values
+        // for valid chars and bad-flag for invalid.
+        for c in b'0'..=b'9' {
+            let (v, bad) = decode_hex_nibble_ct(c);
+            assert_eq!(v, c - b'0', "digit {c:#x}");
+            assert_eq!(bad, 0, "digit {c:#x} flagged bad");
+        }
+        for c in b'a'..=b'f' {
+            let (v, bad) = decode_hex_nibble_ct(c);
+            assert_eq!(v, 10 + (c - b'a'), "lower {c:#x}");
+            assert_eq!(bad, 0, "lower {c:#x} flagged bad");
+        }
+        for c in b'A'..=b'F' {
+            let (v, bad) = decode_hex_nibble_ct(c);
+            assert_eq!(v, 10 + (c - b'A'), "upper {c:#x}");
+            assert_eq!(bad, 0, "upper {c:#x} flagged bad");
+        }
+        for c in [b'g', b'/', b' ', 0u8, b'@', b'G', 0xFFu8] {
+            let (_v, bad) = decode_hex_nibble_ct(c);
+            assert_eq!(bad, 0xFF, "invalid char {c:#x} must flag bad");
+        }
     }
 
     #[test]
@@ -527,6 +838,30 @@ mod tests {
         let f = fingerprint(&[0u8; 32]);
         assert_eq!(f.len(), 8);
         assert!(f.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn fingerprint_is_hmac_not_raw_sha256() {
+        // Story 7.27 Round-2 review fix: verify the fingerprint
+        // genuinely uses HMAC-SHA256 with the documented domain
+        // separator, NOT raw SHA-256. A regression that reverts to
+        // `Sha256::digest(bytes)` would produce a different value
+        // for the all-zero key; this test pins the contract.
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        let mut expected = <Hmac<Sha256> as Mac>::new_from_slice(FINGERPRINT_DOMAIN_SEP).unwrap();
+        expected.update(&[0u8; 32]);
+        let expected_tag = expected.finalize().into_bytes();
+        let expected_hex = format!(
+            "{:02x}{:02x}{:02x}{:02x}",
+            expected_tag[0], expected_tag[1], expected_tag[2], expected_tag[3],
+        );
+        assert_eq!(fingerprint(&[0u8; 32]), expected_hex);
+
+        // Also assert the value is NOT the raw `SHA-256(zeros)[..4]`
+        // = 0x66687aad, which a bug regressing to raw SHA-256 would
+        // produce.
+        assert_ne!(fingerprint(&[0u8; 32]), "66687aad");
     }
 
     /// Round-trip the master key through `write_master_key_via_security_a`

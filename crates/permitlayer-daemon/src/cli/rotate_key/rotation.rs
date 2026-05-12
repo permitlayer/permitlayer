@@ -1756,10 +1756,9 @@ mod tests {
             &self,
         ) -> Result<permitlayer_keystore::MasterKeyOutcome, KeyStoreError> {
             match *self.primary.lock().unwrap() {
-                Some(k) => Ok(permitlayer_keystore::MasterKeyOutcome {
-                    key: Zeroizing::new(k),
-                    first_boot: false,
-                }),
+                Some(k) => {
+                    Ok(permitlayer_keystore::MasterKeyOutcome::new(Zeroizing::new(k), false))
+                }
                 None => Err(KeyStoreError::PlatformError {
                     backend: "mock",
                     message: "no primary".into(),

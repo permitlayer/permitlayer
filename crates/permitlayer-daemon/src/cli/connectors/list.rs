@@ -14,7 +14,7 @@ use anyhow::Result;
 use clap::Args;
 
 use crate::cli::kill::{
-    error_block_daemon_unreachable, error_block_protocol_error, http_get_via,
+    error_block_daemon_unreachable_endpoint, error_block_protocol_error, http_get_via,
     load_daemon_config_or_default_with_warn, resolve_control_endpoint,
 };
 use crate::design::render::{TableCell, empty_state, error_block, table, truncate_field};
@@ -38,13 +38,12 @@ pub async fn list_connectors(args: ListArgs) -> Result<()> {
     // `/v1/control/*` is the canonical gate.
 
     let endpoint = resolve_control_endpoint(&config);
-    let bind_addr = config.http.bind_addr;
     let token = crate::cli::kill::read_control_token(&home);
     let response = match http_get_via(&endpoint, "/v1/control/connectors", token.as_deref()).await {
         Ok(b) => b,
         Err(e) => {
             tracing::debug!(error = %e, endpoint = %endpoint, "connectors list request failed");
-            eprint!("{}", error_block_daemon_unreachable("connectors list", bind_addr));
+            eprint!("{}", error_block_daemon_unreachable_endpoint("connectors list", &endpoint));
             std::process::exit(3);
         }
     };

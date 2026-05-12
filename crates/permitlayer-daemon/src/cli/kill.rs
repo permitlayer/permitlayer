@@ -65,14 +65,13 @@ pub async fn run(_args: KillArgs) -> Result<()> {
     // `/var/run/permitlayer/control.sock`; Linux + Windows stay on
     // the rc.21 loopback TCP path (their redesigns are 7.18/7.19).
     let endpoint = resolve_control_endpoint(&config);
-    let bind_addr = config.http.bind_addr;
     let token = read_control_token(&home);
     let response_body =
         match http_post_empty_json_via(&endpoint, "/v1/control/kill", token.as_deref()).await {
             Ok(body) => body,
             Err(e) => {
                 tracing::debug!(error = %e, endpoint = %endpoint, "kill request failed");
-                eprint!("{}", error_block_daemon_unreachable("kill", bind_addr));
+                eprint!("{}", error_block_daemon_unreachable_endpoint("kill", &endpoint));
                 std::process::exit(3);
             }
         };
@@ -187,17 +186,21 @@ pub(crate) fn error_block_daemon_not_running(verb: &str) -> String {
 /// `tracing::debug!` at the call site so operators with `--log-level debug`
 /// can diagnose further. The user-facing block stays structured and
 /// consistent regardless of the real error.
-pub(crate) fn error_block_daemon_unreachable(verb: &str, addr: SocketAddr) -> String {
-    // Remediation must be cross-user-safe. `agentsso status` is itself
-    // PID-gated against the calling user's home, so a cross-user caller
-    // (e.g., `angie` talking to a daemon running as `austinlowry`)
-    // would see "daemon not running" from `status` even though the
-    // daemon is up. Point at `start` (the genuine no-daemon fix) AND
-    // the bind-addr override (the cross-user fix).
+/// Story 7.27 Round-2 review fix (P2): endpoint-aware variant.
+/// Pre-fix, `error_block_daemon_unreachable` took only a
+/// `SocketAddr` and hardcoded `unix:/var/run/permitlayer/control.sock`
+/// in the macOS hint — wrong under `AGENTSSO_PATHS__HOME=<tmpdir>`
+/// (test/dev mode) AND misleading on macOS where the request never
+/// touched TCP. This variant uses the actual resolved
+/// `ControlEndpoint::Display` impl so the message reflects reality.
+pub(crate) fn error_block_daemon_unreachable_endpoint(
+    verb: &str,
+    endpoint: &ControlEndpoint,
+) -> String {
     error_block(
         "daemon_unreachable",
-        &format!("cannot reach daemon on {addr} (during {verb})"),
-        "agentsso start  (or, if the daemon is running under a different user, set AGENTSSO_HTTP__BIND_ADDR=<addr> to match)",
+        &format!("cannot reach daemon at {endpoint} (during {verb})"),
+        "agentsso start  (or, if the daemon is running under a different user, set AGENTSSO_HTTP__BIND_ADDR=<addr> to match; on macOS the UDS path is fixed)",
         None,
     )
 }
@@ -271,8 +274,7 @@ pub(crate) fn resolve_control_endpoint(config: &DaemonConfig) -> ControlEndpoint
     #[cfg(target_os = "macos")]
     {
         let _ = config;
-        let home_override =
-            std::env::var("AGENTSSO_PATHS__HOME").ok().map(std::path::PathBuf::from);
+        let home_override = permitlayer_core::paths::home_override();
         let sock = permitlayer_core::paths::control_socket_path(home_override.as_deref());
         ControlEndpoint::Uds(sock)
     }
@@ -666,9 +668,10 @@ mod tests {
     }
 
     #[test]
-    fn error_block_daemon_unreachable_shape() {
+    fn error_block_daemon_unreachable_endpoint_tcp_shape() {
         let addr: SocketAddr = "127.0.0.1:3820".parse().unwrap();
-        let out = error_block_daemon_unreachable("kill", addr);
+        let endpoint = ControlEndpoint::Tcp(addr);
+        let out = error_block_daemon_unreachable_endpoint("kill", &endpoint);
         assert!(out.contains("daemon_unreachable"), "out: {out}");
         assert!(out.contains("127.0.0.1:3820"), "out: {out}");
         assert!(out.contains("during kill"), "out: {out}");
@@ -676,6 +679,23 @@ mod tests {
         // Cross-user remediation hint must be present so a caller talking
         // to a daemon owned by a different user has a path forward.
         assert!(out.contains("AGENTSSO_HTTP__BIND_ADDR"), "out: {out}");
+    }
+
+    #[test]
+    fn error_block_daemon_unreachable_endpoint_uds_shape() {
+        // Story 7.27 Round-2 review fix (P2): UDS endpoint Display
+        // is now reflected in the user-facing message, replacing
+        // the pre-fix hardcoded `unix:/var/run/permitlayer/
+        // control.sock` literal that ignored `AGENTSSO_PATHS__HOME`.
+        let endpoint = ControlEndpoint::Uds("/tmp/test/control.sock".into());
+        let out = error_block_daemon_unreachable_endpoint("kill", &endpoint);
+        assert!(out.contains("daemon_unreachable"), "out: {out}");
+        assert!(
+            out.contains("/tmp/test/control.sock"),
+            "UDS path must appear in operator-facing message; out: {out}"
+        );
+        assert!(out.contains("during kill"), "out: {out}");
+        assert!(out.contains("agentsso start"), "out: {out}");
     }
 
     #[test]

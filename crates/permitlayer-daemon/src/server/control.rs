@@ -444,6 +444,71 @@ fn require_loopback(peer: SocketAddr) -> Result<(), ControlError> {
     }
 }
 
+/// Story 7.27 AC #1 (review fix): enrich an `AuditEvent.extra` JSON
+/// object with the kernel-attested peer UID + GID from the request's
+/// `Extension<PeerCredentials>`. No-op when the request has no
+/// `PeerCredentials` extension (TCP control routes in dev/test mode,
+/// non-macOS platforms) — those audit events stay schema-compatible
+/// with rc.21.
+///
+/// Callers pass `req.extensions()`; the helper looks up
+/// `PeerCredentials` and, when present, inserts `peer_uid` +
+/// `peer_gid` keys into the JSON object. The `extra` value MUST be a
+/// JSON object (`serde_json::Value::Object`) — every existing audit
+/// emit site in this file uses `serde_json::json!({ ... })` which
+/// produces an object, so this contract is upheld in practice.
+pub(crate) fn enrich_audit_extra_with_peer(
+    extra: &mut serde_json::Value,
+    extensions: &axum::http::Extensions,
+) {
+    let Some(creds) = extensions.get::<crate::server::control_listener::PeerCredentials>() else {
+        return;
+    };
+    enrich_audit_extra_with_peer_creds(extra, Some(*creds));
+}
+
+/// Variant of [`enrich_audit_extra_with_peer`] that takes the
+/// captured creds directly. Use in handlers that consume `req` via
+/// `into_parts()` before the audit emit — snapshot the creds at the
+/// top of the handler, then call this helper at each emit site.
+pub(crate) fn enrich_audit_extra_with_peer_creds(
+    extra: &mut serde_json::Value,
+    creds: Option<crate::server::control_listener::PeerCredentials>,
+) {
+    let Some(creds) = creds else { return };
+    if creds.uid == u32::MAX {
+        return;
+    }
+    // Story 7.27 Round-2 review fix (P2): upgrade `Value::Null`
+    // to an empty object so freshly-constructed `AuditEvent::new(...)`
+    // events (whose `extra` defaults to `Value::Null`) still
+    // receive peer-cred enrichment. Pre-fix, the helper silently
+    // returned for non-Object values — a future contributor
+    // forgetting to set `event.extra = serde_json::json!({...})`
+    // before calling this would lose peer attribution without any
+    // warning. `debug_assert!` catches non-object non-null values
+    // in test builds; release builds log via tracing::warn so
+    // operators see the contract violation in the field.
+    if extra.is_null() {
+        *extra = serde_json::json!({});
+    }
+    let Some(obj) = extra.as_object_mut() else {
+        debug_assert!(
+            false,
+            "enrich_audit_extra_with_peer_creds called with non-object `extra`: {extra:?}"
+        );
+        tracing::warn!(
+            target: "control",
+            extra = %extra,
+            "enrich_audit_extra_with_peer_creds called with non-object `extra`; \
+             peer-cred attribution dropped — fix the caller to pass a JSON object"
+        );
+        return;
+    };
+    obj.insert("peer_uid".to_owned(), serde_json::json!(creds.uid));
+    obj.insert("peer_gid".to_owned(), serde_json::json!(creds.gid));
+}
+
 /// Header name carried by the CLI to authenticate against
 /// `/v1/control/*`. Distinct from `Authorization: Bearer <agt_v2_*>`
 /// (the agent-identity tokens used by /mcp/* and /v1/tools/*) so the
@@ -466,6 +531,54 @@ const CONTROL_TOKEN_HEADER: &str = "x-agentsso-control";
 /// defense in depth (`subtle::ConstantTimeEq`); the primary security
 /// boundary is the `0o600` mode on `<home>/control.token`. See the
 /// module-level doc on `ControlToken` for the full threat model.
+/// Resolve `PERMITLAYER_OPERATOR_UID` once at first use; return `None`
+/// if unset or malformed.
+///
+/// Story 7.27 Round-2 review fix (P1): pre-fix, `require_control_token`
+/// called `std::env::var("PERMITLAYER_OPERATOR_UID")` on every
+/// authenticated request — which (a) serializes through the global
+/// env mutex on every request and (b) silently disables the
+/// identity-mismatch check when an admin `setenv`s the variable
+/// away. Reading once into a `OnceLock` at first-touch:
+///   - amortizes the env-var lookup
+///   - documents intent (env-var is a boot-time invariant, not a
+///     runtime knob)
+///   - emits a structured `WARN` audit-event surface at first-touch
+///     if the env-var is missing or malformed, so operators know
+///     the supplementary check is degraded.
+fn operator_uid() -> Option<u32> {
+    use std::sync::OnceLock;
+    static OPERATOR_UID: OnceLock<Option<u32>> = OnceLock::new();
+    *OPERATOR_UID.get_or_init(|| {
+        let raw = std::env::var("PERMITLAYER_OPERATOR_UID").ok();
+        match raw.as_deref().map(str::trim) {
+            None => {
+                tracing::warn!(
+                    event = "control.operator_uid_missing",
+                    "PERMITLAYER_OPERATOR_UID is not set; the supplementary \
+                     kernel-attested-UID match against the operator-secret \
+                     bearer-token is disabled. Set this in the LaunchDaemon \
+                     plist (`<key>EnvironmentVariables</key>`) to enable it."
+                );
+                None
+            }
+            Some(s) => match s.parse::<u32>() {
+                Ok(uid) => Some(uid),
+                Err(e) => {
+                    tracing::warn!(
+                        event = "control.operator_uid_malformed",
+                        raw = %s,
+                        error = %e,
+                        "PERMITLAYER_OPERATOR_UID is set but not a valid u32; \
+                         the supplementary UID-match check is disabled."
+                    );
+                    None
+                }
+            },
+        }
+    })
+}
+
 pub(crate) async fn require_control_token(
     State(state): State<ControlState>,
     req: axum::extract::Request,
@@ -501,6 +614,155 @@ pub(crate) async fn require_control_token(
         );
         return ControlError::ForbiddenInvalidControlToken.into_response();
     }
+
+    // Story 7.27 AC #15 (review fix): identity-mismatch detection.
+    // The bearer-token (X-Agentsso-Control) is an operator-shared
+    // secret. The kernel-attested peer UID identifies WHO is calling.
+    // When PERMITLAYER_OPERATOR_UID is set (installed-as-LaunchDaemon
+    // mode) AND the peer UID disagrees, log a WARN audit event but
+    // DO NOT reject — the operator-secret IS the auth credential in
+    // rc.22; the UID check is a supplementary forensics signal that
+    // catches the case where a non-operator user on the Mac has
+    // gained access to the operator-secret.
+    //
+    // Story 7.27 Round-2 review fix (P1): also enrich the
+    // current tracing span with `peer_uid`/`peer_gid` here. The
+    // outer `record_peer_credentials_layer` runs ABOVE the
+    // `RequestTraceLayer` (axum layer order is outer-runs-first),
+    // so its `Span::current().record(...)` calls hit the ambient
+    // daemon span — which doesn't declare `peer_uid`/`peer_gid`
+    // as fields, making the record a documented no-op. By moving
+    // the recording here (inside `require_control_token`, which
+    // runs INSIDE `RequestTraceLayer`'s `info_span!("request")`),
+    // and by declaring `peer_uid` / `peer_gid` as `Empty` fields
+    // in the request-span macro, the values now reach the
+    // tracing surface for grep-correlation.
+    if let Some(creds) =
+        req.extensions().get::<crate::server::control_listener::PeerCredentials>().copied()
+    {
+        tracing::Span::current().record("peer_uid", creds.uid);
+        tracing::Span::current().record("peer_gid", creds.gid);
+    }
+    if let Some(creds) =
+        req.extensions().get::<crate::server::control_listener::PeerCredentials>().copied()
+        && let Some(expected_uid) = operator_uid()
+        && creds.uid != u32::MAX
+        && creds.uid != expected_uid
+    {
+        let path = req.uri().path().to_owned();
+        tracing::warn!(
+            target: "control",
+            path = %path,
+            peer_uid = creds.uid,
+            peer_gid = creds.gid,
+            operator_uid = expected_uid,
+            "control.identity_mismatch: peer UID differs from operator UID",
+        );
+        if let Some(store) = &state.audit_store {
+            let mut event = AuditEvent::new(
+                "system".to_owned(),
+                "permitlayer".to_owned(),
+                "-".to_owned(),
+                "control-plane".to_owned(),
+                "warn".to_owned(),
+                "control.identity_mismatch".to_owned(),
+            );
+            event.extra = serde_json::json!({
+                "peer_uid": creds.uid,
+                "peer_gid": creds.gid,
+                "operator_uid": expected_uid,
+                "route": path,
+            });
+            if let Err(e) = store.append(event).await {
+                tracing::warn!(
+                    target: "control",
+                    error = %e,
+                    "control.identity_mismatch audit write failed",
+                );
+            }
+        }
+    }
+
+    // Story 7.27 AC #1 (review fix): emit a per-request audit event
+    // for every authenticated /v1/control/* request, carrying the
+    // kernel-attested peer_uid + peer_gid. This gives universal
+    // audit coverage for inspection handlers (whoami, list-agents,
+    // state, connections, connectors, reload) that don't emit
+    // domain-specific events of their own. Handlers that DO emit
+    // their own domain event (kill, resume, register, remove,
+    // rebind) get this as a request-level breadcrumb plus the
+    // domain event with the same request_id — the two correlate
+    // via the request_id field.
+    if let Some(store) = &state.audit_store {
+        let creds =
+            req.extensions().get::<crate::server::control_listener::PeerCredentials>().copied();
+        let request_id = req
+            .extensions()
+            .get::<permitlayer_proxy::error::RequestId>()
+            .map(|r| r.0.clone())
+            .unwrap_or_else(|| ulid::Ulid::new().to_string());
+        let path = req.uri().path().to_owned();
+        let method = req.method().to_string();
+        // Story 7.27 Round-2 review fix (P2): event_type is
+        // `control-request-authenticated` (not `control-request`)
+        // because this emit fires BEFORE the handler runs. It only
+        // attests that the bearer-token + peer-cred check passed,
+        // not that the handler succeeded. Renaming the event_type
+        // makes the contract explicit so downstream audit-log
+        // analyzers don't misread the `outcome: ok` as "request
+        // succeeded" when the handler may have returned a 4xx/5xx
+        // afterward. Handlers emit their own domain-specific event
+        // (kill, register, remove, etc.) with the same
+        // request_id; the two correlate via that field.
+        let mut event = AuditEvent::with_request_id(
+            request_id,
+            "system".to_owned(),
+            "permitlayer".to_owned(),
+            "-".to_owned(),
+            "control-plane".to_owned(),
+            "ok".to_owned(),
+            "control-request-authenticated".to_owned(),
+        );
+        let mut extra = serde_json::json!({ "method": method, "path": path });
+        if let Some(c) = creds
+            && c.uid != u32::MAX
+            && let Some(obj) = extra.as_object_mut()
+        {
+            obj.insert("peer_uid".to_owned(), serde_json::json!(c.uid));
+            obj.insert("peer_gid".to_owned(), serde_json::json!(c.gid));
+        }
+        event.extra = extra;
+        // Story 7.27 Round-2 review fix (P1): wrap the per-request
+        // audit-append in a 5s timeout so a stuck audit store
+        // (slow disk, NFS hang, sealed-file rotation contention)
+        // does not block the control-plane indefinitely. On
+        // timeout, drop the event with a `WARN` — best-effort
+        // semantics match the existing `identity_mismatch` write
+        // discipline above. Full migration to `audit_dispatcher`
+        // (non-blocking with backpressure) is the long-term fix
+        // but requires threading the dispatcher through
+        // `ControlState` — out of scope for the Round-2 review
+        // patch landing window.
+        const AUDIT_APPEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+        match tokio::time::timeout(AUDIT_APPEND_TIMEOUT, store.append(event)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    target: "control",
+                    error = %e,
+                    "control-request audit write failed (best-effort)",
+                );
+            }
+            Err(_elapsed) => {
+                tracing::warn!(
+                    target: "control",
+                    "control-request audit write timed out after 5s; \
+                     event dropped (best-effort)",
+                );
+            }
+        }
+    }
+
     next.run(req).await
 }
 
@@ -573,6 +835,7 @@ pub(crate) async fn kill_handler(
             "in_flight_cancelled": 0,
             "was_already_active": summary.was_already_active,
         });
+        enrich_audit_extra_with_peer(&mut event.extra, req.extensions());
         if let Err(e) = store.append(event).await {
             tracing::warn!(
                 target: "control",
@@ -670,6 +933,7 @@ pub(crate) async fn resume_handler(
             "duration_killed_seconds": duration_killed_seconds,
             "was_already_inactive": summary.was_already_inactive,
         });
+        enrich_audit_extra_with_peer(&mut event.extra, req.extensions());
         if let Err(e) = store.append(event).await {
             tracing::warn!(
                 target: "control",
@@ -1238,6 +1502,17 @@ pub(crate) async fn register_agent_handler(
     #[cfg(target_os = "macos")]
     let _peer_creds_for_register: Option<crate::server::control_listener::PeerCredentials> =
         req.extensions().get::<crate::server::control_listener::PeerCredentials>().copied();
+    // Audit-emit peer creds snapshot (cross-platform, always None on TCP).
+    let _peer_creds_for_audit: Option<crate::server::control_listener::PeerCredentials> = {
+        #[cfg(target_os = "macos")]
+        {
+            _peer_creds_for_register
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    };
 
     // Rate-limit concurrent agent CRUD. `try_acquire_owned` returns
     // immediately with an error when the semaphore is exhausted rather
@@ -1489,6 +1764,7 @@ pub(crate) async fn register_agent_handler(
             "policy_name": payload.policy_name,
             "created_at": format_audit_timestamp(created_at),
         });
+        enrich_audit_extra_with_peer_creds(&mut event.extra, _peer_creds_for_audit);
         if let Err(e) = audit.append(event).await {
             tracing::warn!(error = %e, "agent-registered audit write failed (best-effort)");
         }
@@ -1519,9 +1795,17 @@ pub(crate) async fn register_agent_handler(
     #[cfg(target_os = "macos")]
     let bearer_token_file: Option<BearerTokenFileWriteResult> = {
         if let Some(creds) = _peer_creds_for_register {
-            let token_bytes = bearer_token.clone().into_bytes();
+            // Story 7.27 Round-2 review fix (P2): wrap the
+            // bearer-token byte buffer in `Zeroizing` so the
+            // plaintext is scrubbed when this scope exits, mirroring
+            // the discipline used elsewhere in the daemon for
+            // master-key bytes. Pre-fix, the `Vec<u8>` would survive
+            // until allocator reuse, leaving plaintext token
+            // fragments on the heap.
+            let token_bytes: zeroize::Zeroizing<Vec<u8>> =
+                zeroize::Zeroizing::new(bearer_token.clone().into_bytes());
             let state_dir = permitlayer_core::paths::daemon_state_dir(
-                std::env::var("AGENTSSO_PATHS__HOME").ok().map(std::path::PathBuf::from).as_deref(),
+                permitlayer_core::paths::home_override().as_deref(),
             );
             match crate::server::agent_token::write_bearer_token_to_user_home(
                 &token_bytes,
@@ -1557,6 +1841,7 @@ pub(crate) async fn register_agent_handler(
                         );
                         event.extra = serde_json::json!({
                             "peer_uid": creds.uid,
+                            "peer_gid": creds.gid,
                             "target_path": outcome.target_path.to_string_lossy(),
                             "replace_existing": outcome.replace_existing,
                         });
@@ -1599,6 +1884,7 @@ pub(crate) async fn register_agent_handler(
                         );
                         event.extra = serde_json::json!({
                             "peer_uid": creds.uid,
+                            "peer_gid": creds.gid,
                             "error": e.to_string(),
                         });
                         if let Err(audit_err) = audit.append(event).await {
@@ -1690,6 +1976,11 @@ pub(crate) async fn remove_agent_handler(
     }
 
     let request_id = read_request_id(&req);
+
+    // Snapshot peer creds before `req.into_parts()` consumes the
+    // request body. Story 7.27 AC #1 (review fix).
+    let peer_creds_for_audit: Option<crate::server::control_listener::PeerCredentials> =
+        req.extensions().get::<crate::server::control_listener::PeerCredentials>().copied();
 
     // Rate-limit concurrent agent CRUD (see register_agent_handler
     // for the rationale).
@@ -1841,6 +2132,7 @@ pub(crate) async fn remove_agent_handler(
         event.extra = serde_json::json!({
             "had_last_seen": had_last_seen,
         });
+        enrich_audit_extra_with_peer_creds(&mut event.extra, peer_creds_for_audit);
         if let Err(e) = audit.append(event).await {
             tracing::warn!(error = %e, "agent-removed audit write failed (best-effort)");
         }
@@ -1889,6 +2181,11 @@ pub(crate) async fn rebind_agent_handler(
     }
 
     let request_id = read_request_id(&req);
+
+    // Snapshot peer creds before `req.into_parts()` consumes it.
+    // Story 7.27 AC #1 (review fix).
+    let peer_creds_for_audit: Option<crate::server::control_listener::PeerCredentials> =
+        req.extensions().get::<crate::server::control_listener::PeerCredentials>().copied();
 
     // Rate-limit concurrent agent CRUD (same shape as register/remove).
     let _permit = match state.agent_crud_semaphore.clone().try_acquire_owned() {
@@ -2154,6 +2451,7 @@ pub(crate) async fn rebind_agent_handler(
             "old_policy_name": old_policy_name,
             "new_policy_name": payload.policy_name,
         });
+        enrich_audit_extra_with_peer_creds(&mut event.extra, peer_creds_for_audit);
         if let Err(e) = audit.append(event).await {
             tracing::warn!(error = %e, "agent-rebound audit write failed (best-effort)");
         }

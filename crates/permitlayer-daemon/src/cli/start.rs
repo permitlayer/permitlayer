@@ -2316,18 +2316,61 @@ pub(crate) async fn bootstrap_from_keystore(
 pub(crate) static FIRST_BOOT_OBSERVED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// Reset the `FIRST_BOOT_OBSERVED` flag — for unit tests that need a
+/// clean baseline across `bootstrap_from_keystore` invocations in
+/// the same process. Tests that exercise the boot path inline
+/// observe pollution from prior tests; calling this in `#[test]`
+/// setup gives a deterministic starting state.
+///
+/// Story 7.27 Round-2 review fix: closes a latent test-flakiness
+/// vector. Not exposed outside the crate.
+#[cfg(test)]
+#[allow(dead_code)] // Test seam: callers will be added when boot-path tests are stabilized.
+pub(crate) fn reset_first_boot_observed() {
+    FIRST_BOOT_OBSERVED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
 /// Compute the first 8 hex characters of `SHA-256(master_key)` for
 /// audit-event fingerprinting. Matches the macOS keystore's
 /// `tracing::info!` fingerprint format so operators can grep-
 /// correlate the operations log with the audit log. Never emits the
 /// master-key bytes themselves.
+///
+/// Story 7.27 Round-2 review fix: domain-separated HMAC-SHA256 keyed
+/// by `permitlayer_keystore::FINGERPRINT_DOMAIN_SEP` (only on
+/// macOS where the keystore-side counterpart lives — Linux/Windows
+/// fall back to the original raw `SHA-256(key)[..4]` until those
+/// platforms get their own fingerprint contract in 7.18/7.19). The
+/// HMAC variant removes the trivial-candidate-verification oracle
+/// while preserving cross-boot correlation (operators grep both
+/// logs by fingerprint to confirm the same key across daemon
+/// restarts).
 pub(crate) fn master_key_fingerprint_first8(
     key: &zeroize::Zeroizing<[u8; permitlayer_keystore::MASTER_KEY_LEN]>,
 ) -> String {
-    use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(key.as_slice());
-    let hex: String = digest.iter().take(4).map(|b| format!("{b:02x}")).collect();
-    hex
+    #[cfg(target_os = "macos")]
+    {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        // HMAC accepts arbitrary key length; the `Err` arm is
+        // structurally unreachable for our fixed-constant domain
+        // separator. `let-else + unreachable!` keeps clippy's
+        // `expect_used` lint quiet without `expect("…")`.
+        let Ok(mut mac) =
+            <Hmac<Sha256> as Mac>::new_from_slice(permitlayer_keystore::FINGERPRINT_DOMAIN_SEP)
+        else {
+            unreachable!("HMAC-SHA256 accepts arbitrary key length");
+        };
+        mac.update(key.as_slice());
+        let tag = mac.finalize().into_bytes();
+        format!("{:02x}{:02x}{:02x}{:02x}", tag[0], tag[1], tag[2], tag[3])
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(key.as_slice());
+        digest.iter().take(4).map(|b| format!("{b:02x}")).collect()
+    }
 }
 
 /// Parse `AGENTSSO_TEST_MASTER_KEY_HEX` into a 32-byte master key if
@@ -2731,6 +2774,14 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     // see one extra info line; production scripts ignore unknown
     // stdout. Flush is explicit because Windows pipes are line-buffered
     // and the test harness blocks on this line before continuing.
+    //
+    // **PROTOCOL CHANNEL** (Story 7.27 review fix annotation): this
+    // writeln is NOT a tracing log; it is a deliberate stdout-protocol
+    // sync channel between the daemon and integration test fixtures.
+    // The matching `AGENTSSO_CONTROL_SOCK=...` line at the UDS bind
+    // site (below) follows the same contract. DO NOT replace either
+    // with `tracing::info!` without coordinating a workspace-wide
+    // fixture migration first.
     let bound_addr = listener.local_addr().map_err(|source| {
         tracing::error!(addr = %bind_addr, "failed to read local_addr after bind: {source}");
         StartError::BindFailed { addr: bind_addr, source }
@@ -2865,7 +2916,20 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     // is for the tamper-evident compliance log.
     if FIRST_BOOT_OBSERVED.load(std::sync::atomic::Ordering::SeqCst) {
         let fingerprint = master_key_fingerprint_first8(&master_key);
-        let keychain_target = if cfg!(target_os = "macos") { "System" } else { "default" };
+        // Story 7.27 Round-2 review fix: surface a per-platform
+        // backend name in the audit payload. Linux: secret-service
+        // (libsecret over D-Bus); Windows: cred-man (Credential
+        // Manager). The pre-fix "default" was operationally
+        // meaningless on non-macOS hosts.
+        let keychain_target = if cfg!(target_os = "macos") {
+            "System"
+        } else if cfg!(target_os = "linux") {
+            "secret-service"
+        } else if cfg!(target_os = "windows") {
+            "cred-man"
+        } else {
+            "unknown"
+        };
         let service_id = permitlayer_keystore::MASTER_KEY_SERVICE;
         let mut event = permitlayer_core::audit::event::AuditEvent::new(
             "daemon".to_owned(),
@@ -3333,7 +3397,19 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         // BEFORE notifying the axum drain, so the sweep loop can
         // exit cleanly while in-flight requests still complete.
         sweep_shutdown_for_graceful.notify_one();
-        drain_notify_clone.notify_one();
+        // Story 7.27 Round-2 review fix (P0): `drain_notify` has
+        // THREE `.notified().await` waiters on the macOS split-
+        // listener path (`graceful_fut_uds`, `drain_deadline_tcp`,
+        // `drain_deadline_uds`) but `notify_one()` only wakes one of
+        // them — leaving the other two blocked forever and
+        // deadlocking `try_join!` until launchd SIGKILL. The pre-
+        // 7.27 single-waiter pattern was correct with `notify_one`;
+        // the split-listener change requires the broadcast form.
+        // `notify_waiters()` wakes ALL currently registered waiters
+        // exactly once (no permit stored for future waiters — which
+        // is fine here because all three waiters register before
+        // `axum::serve` starts).
+        drain_notify_clone.notify_waiters();
     };
     // `into_make_service_with_connect_info::<SocketAddr>()` enables the
     // `ConnectInfo<SocketAddr>` extractor used by the control-plane handlers
@@ -3346,13 +3422,28 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     // `paths::control_socket_path()` and serves `control_router_for_uds`
     // with `ConnectInfo<PeerCredentials>` so handlers (or future
     // middleware) can attest the caller's kernel UID. Both serve
-    // futures run concurrently via `tokio::join!`; either failing
-    // is fatal.
+    // futures run concurrently via `tokio::try_join!`; either failing
+    // is fatal, but neither's *completion* cancels the other's drain
+    // (the prior `tokio::select!` impl silently dropped in-flight
+    // audit events on the surviving listener — see review fix in
+    // shutdown sequence at section 11).
     #[cfg(target_os = "macos")]
     let control_serve_fut = {
         use crate::server::control_listener::{
             UdsConnectInfo, bind_control_listener, bind_control_listener_no_perms,
         };
+        // Invariant: PidFile MUST be acquired before this UDS bind
+        // sequence. Two concurrent `agentsso start` invocations
+        // would otherwise both reach the bind step (their PidFile
+        // races would be moot since AF_UNIX bind is atomic on
+        // EADDRINUSE — but the loser would have already chowned
+        // the winner's socket via `apply_control_socket_perms`).
+        // PidFile acquisition (`PidFile::acquire`) at ~line 2481
+        // is the global lock; the closure-borrow below keeps the
+        // `pid_file` binding live across this scope so the
+        // ordering is visually + compiler-enforced.
+        // Story 7.27 review fix.
+        let _ = &pid_file;
         // Honor the `AGENTSSO_PATHS__HOME` test override (same
         // discipline as `agentsso_home()` in cli/mod.rs). Under
         // override, `control.sock` lives at
@@ -3360,8 +3451,7 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         // chown step (tests don't run as root + the
         // `permitlayer-clients` group doesn't exist on dev boxes
         // that haven't run `service install`).
-        let home_override =
-            std::env::var("AGENTSSO_PATHS__HOME").ok().map(std::path::PathBuf::from);
+        let home_override = permitlayer_core::paths::home_override();
         let sock_path = permitlayer_core::paths::control_socket_path(home_override.as_deref());
         // Best-effort: ensure the runtime parent dir exists. `service
         // install` creates `/var/run/permitlayer/` as root:wheel
@@ -3415,28 +3505,70 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     // 5 seconds are reserved for the audit dispatcher drain below.
     const AXUM_DRAIN_BUDGET: Duration = Duration::from_secs(25);
     const AUDIT_DRAIN_BUDGET: Duration = Duration::from_secs(5);
-    let drain_deadline = async {
-        drain_notify.notified().await;
-        tokio::time::sleep(AXUM_DRAIN_BUDGET).await;
-        tracing::warn!(
-            "axum shutdown drain budget exceeded ({}s), dropping remaining connections",
-            AXUM_DRAIN_BUDGET.as_secs()
-        );
+    // Story 7.27 review fix: each listener honors the SHARED 25s
+    // shutdown budget via its own per-listener select, then we
+    // try_join both. Prior implementation used a single
+    // `tokio::select!` over BOTH serve futures + drain_deadline,
+    // which cancelled the other listener mid-flight when ANY arm
+    // completed — silently dropping in-flight audit events on the
+    // surviving listener during graceful shutdown.
+    let drain_deadline_tcp = {
+        let dn = Arc::clone(&drain_notify);
+        async move {
+            dn.notified().await;
+            tokio::time::sleep(AXUM_DRAIN_BUDGET).await;
+            tracing::warn!(
+                "axum (TCP) shutdown drain budget exceeded ({}s), dropping remaining connections",
+                AXUM_DRAIN_BUDGET.as_secs()
+            );
+        }
     };
+    let tcp_task: std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), StartError>> + Send>,
+    > = Box::pin(async move {
+        tokio::select! {
+            result = serve_fut => result.map_err(|source| StartError::ServeFailed { source }),
+            () = drain_deadline_tcp => Ok(()),
+        }
+    });
+
     #[cfg(target_os = "macos")]
     {
-        tokio::select! {
-            result = serve_fut => { result.map_err(|source| StartError::ServeFailed { source })?; }
-            result = control_serve_fut => { result.map_err(|source| StartError::ServeFailed { source })?; }
-            () = drain_deadline => {}
-        }
+        let drain_deadline_uds = {
+            let dn = Arc::clone(&drain_notify);
+            async move {
+                dn.notified().await;
+                tokio::time::sleep(AXUM_DRAIN_BUDGET).await;
+                tracing::warn!(
+                    "axum (UDS) shutdown drain budget exceeded ({}s), dropping remaining connections",
+                    AXUM_DRAIN_BUDGET.as_secs()
+                );
+            }
+        };
+        let uds_task: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), StartError>> + Send>,
+        > = Box::pin(async move {
+            tokio::select! {
+                result = control_serve_fut => result.map_err(|source| StartError::ServeFailed { source }),
+                () = drain_deadline_uds => Ok(()),
+            }
+        });
+        // Story 7.27 Round-2 review fix (P1): use `tokio::join!`
+        // (not `try_join!`) so an error in one listener does NOT
+        // cancel the other mid-drain. `try_join!` documented
+        // contract is "drops the other future on Err" — which
+        // re-introduces exactly the in-flight-cancellation bug
+        // the per-listener-select shape was designed to avoid.
+        // With `join!`, both listeners run to completion (their
+        // own selects honor the 25s drain deadline); we then
+        // inspect both results and surface the first error.
+        let (tcp_result, uds_result) = tokio::join!(tcp_task, uds_task);
+        tcp_result?;
+        uds_result?;
     }
     #[cfg(not(target_os = "macos"))]
     {
-        tokio::select! {
-            result = serve_fut => { result.map_err(|source| StartError::ServeFailed { source })?; }
-            () = drain_deadline => {}
-        }
+        tcp_task.await?;
     }
 
     // 11. Shutdown sequence.
@@ -3905,7 +4037,7 @@ mod tests {
             let mut slot = self.stored.lock().unwrap();
             let first_boot = slot.is_none();
             let key = slot.get_or_insert([0x42u8; MASTER_KEY_LEN]);
-            Ok(permitlayer_keystore::MasterKeyOutcome { key: Zeroizing::new(*key), first_boot })
+            Ok(permitlayer_keystore::MasterKeyOutcome::new(Zeroizing::new(*key), first_boot))
         }
 
         async fn set_master_key(&self, key: &[u8; MASTER_KEY_LEN]) -> Result<(), KeyStoreError> {

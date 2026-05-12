@@ -49,11 +49,13 @@ pub enum ServiceCommand {
 
 #[derive(Args, Debug)]
 pub struct InstallArgs {
-    /// Override the source binary path (dev-only). The default
-    /// resolves `std::env::current_exe()` and refuses unsafe source
-    /// locations (anything outside `/usr/local/bin/agentsso`,
-    /// `/opt/homebrew/bin/agentsso`, or the privileged-helper path
-    /// itself). Use this flag for `cargo build --release` testing.
+    /// Override the source binary path. The default resolves
+    /// `std::env::current_exe()` and canonicalizes it. No allowlist
+    /// of "safe" source locations is enforced — the operator owns the
+    /// outcome (Tailscale precedent; previous brew-prefix allowlist
+    /// produced wrong remediations on Macs with custom
+    /// `HOMEBREW_PREFIX`). Use this flag for `cargo build --release`
+    /// testing.
     #[arg(long)]
     pub from: Option<PathBuf>,
 }

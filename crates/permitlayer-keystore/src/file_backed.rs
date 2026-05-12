@@ -266,3 +266,45 @@ fn subtle_eq(a: &[u8; MASTER_KEY_LEN], b: &[u8; MASTER_KEY_LEN]) -> bool {
     use subtle::ConstantTimeEq;
     a.ct_eq(b).into()
 }
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    /// Story 7.27 Round-2 review fix: prior to this test, no
+    /// automated coverage exercised the `MasterKeyOutcome.first_boot`
+    /// round-trip. The destructive macOS test is `#[ignore]` so CI
+    /// never runs it; this `FileBackedKeyStore` test gives us
+    /// fast-path coverage of the "first call mints, sets first_boot=
+    /// true; subsequent call reads, sets first_boot=false" contract.
+    #[tokio::test]
+    async fn master_key_first_boot_then_existing_round_trip() {
+        let dir = TempDir::new().expect("tempdir");
+        let store = FileBackedKeyStore::new(dir.path()).expect("create store");
+
+        let first = store.master_key().await.expect("first master_key call");
+        assert!(first.first_boot, "first master_key call must report first_boot=true");
+        assert_eq!(first.key.len(), MASTER_KEY_LEN);
+
+        let second = store.master_key().await.expect("second master_key call");
+        assert!(!second.first_boot, "second master_key call must report first_boot=false");
+        assert!(subtle_eq(&first.key, &second.key), "key bytes must persist across calls");
+    }
+
+    #[tokio::test]
+    async fn master_key_idempotent_on_existing_file() {
+        // Pre-existing key file (operator-restored from backup, or
+        // an upgrade-from-older-format scenario). First call should
+        // report `first_boot=false` because the file is already there.
+        let dir = TempDir::new().expect("tempdir");
+        let store = FileBackedKeyStore::new(dir.path()).expect("create store");
+        let preset = [0x42u8; MASTER_KEY_LEN];
+        write_key_file(&store.primary_path(), &Zeroizing::new(preset)).expect("preset write");
+
+        let outcome = store.master_key().await.expect("master_key call");
+        assert!(!outcome.first_boot, "existing-file master_key must report first_boot=false");
+        assert!(subtle_eq(&outcome.key, &Zeroizing::new(preset)));
+    }
+}

@@ -114,6 +114,38 @@ enum Commands {
 /// `ExitCode::FAILURE` (1) on error, matching the pre-1.15 behavior.
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Story 7.27 review fix: locate the first non-flag arg so the
+    // interceptors fire even when global flags (`--verbose`, `--log`,
+    // etc.) precede the subcommand. Previous `args().nth(1)` matched
+    // only the literal second token, so `agentsso --verbose autostart`
+    // bypassed the interceptor and hit clap's "unrecognized" error.
+    //
+    // Story 7.27 Round-2 review note: this heuristic is correct for
+    // the current `Cli` struct because no global flag takes a bare
+    // separate-token value (all `Cli` options use either bool flags
+    // or `--flag=value` form). If a future flag is added with the
+    // shape `--log <value>` (separate-token form), `find` would
+    // match the value instead of the subcommand. Switching to
+    // `clap::Command::try_get_matches_from_mut` would be more robust
+    // but adds parsing cost on every CLI invocation. Re-evaluate if
+    // a value-taking global flag is added.
+    //
+    // Known edge cases (all acceptable as documented):
+    //   - `agentsso help autostart` falls through to clap's own
+    //     "unrecognized subcommand" rendering (autostart was
+    //     removed from `Commands` enum). Operators see clap's
+    //     standard error, not the structured migration block —
+    //     but the binary's `--help` output also no longer lists
+    //     `autostart` so the discovery path is consistent.
+    //   - `agentsso autostart status --json`: the interceptor emits
+    //     a non-JSON `error_block` on stderr. Legacy script users
+    //     of the `autostart status --json` form must migrate to
+    //     `agentsso service status` (eventually `--json` flag) or
+    //     check exit code 2 (the `autostart.removed` interceptor's
+    //     deliberate "loud failure" semantics).
+    let first_subcommand_arg: Option<String> =
+        std::env::args().skip(1).find(|a| !a.starts_with('-'));
+
     // Story 7.13 AC #7 — legacy `agentsso setup` interceptor.
     //
     // The `setup` subcommand was removed in favor of the
@@ -122,7 +154,7 @@ async fn main() -> ExitCode {
     // remediation block instead of clap's terse "unrecognized
     // subcommand" error. Runs BEFORE clap parsing so it short-circuits
     // even when later args would themselves fail clap.
-    if std::env::args().nth(1).as_deref() == Some("setup") {
+    if first_subcommand_arg.as_deref() == Some("setup") {
         eprint!(
             "{}",
             crate::design::render::error_block(
@@ -144,7 +176,7 @@ async fn main() -> ExitCode {
     // Operators (or scripts) still typing `agentsso autostart enable`
     // get a structured remediation block instead of clap's terse
     // "unrecognized subcommand" error.
-    if std::env::args().nth(1).as_deref() == Some("autostart") {
+    if first_subcommand_arg.as_deref() == Some("autostart") {
         eprint!(
             "{}",
             crate::design::render::error_block(

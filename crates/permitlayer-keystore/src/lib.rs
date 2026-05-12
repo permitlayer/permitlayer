@@ -85,6 +85,8 @@ pub use file_backed::FileBackedKeyStore;
 #[cfg(target_os = "linux")]
 pub use linux::LinuxKeyStore;
 #[cfg(target_os = "macos")]
+pub use macos::FINGERPRINT_DOMAIN_SEP;
+#[cfg(target_os = "macos")]
 pub use macos::MacKeyStore;
 pub use passphrase::PassphraseKeyStore;
 #[cfg(target_os = "windows")]
@@ -173,14 +175,50 @@ pub enum DeleteOutcome {
 /// emitted a `tracing::info!` event internally (Story 7.26 first
 /// cut), but the daemon-level call site has the audit dispatcher in
 /// scope — it's the right layer to emit typed events from.
-#[derive(Debug)]
+///
+/// **NOTE:** `Debug` is implemented by hand and redacts `key`.
+/// Deriving `Debug` here would leak the master key via any accidental
+/// `tracing::debug!(?outcome)`, `dbg!()`, or panic message that
+/// interpolated `{:?}`. Story 7.27 review fix.
+///
+/// **Round-2 review fix:** marked `#[non_exhaustive]` so external
+/// callers cannot pattern-destructure with explicit field bindings
+/// (`let MasterKeyOutcome { key, first_boot } = outcome;`) which
+/// would defeat the hand-rolled `Debug` redaction by pulling the
+/// inner `Zeroizing<[u8; 32]>` out where its derived-`Debug`-prints-
+/// all-bytes implementation can be reached. Callers must go through
+/// the public-but-unstable fields by name (`outcome.key`,
+/// `outcome.first_boot`) or use the dedicated accessors. The
+/// `non_exhaustive` attribute also future-proofs new fields (e.g.,
+/// a `key_id` for rotate-key v3) without breaking external matchers.
+#[non_exhaustive]
 pub struct MasterKeyOutcome {
-    /// The 32-byte master key, zeroized on drop.
+    /// The 32-byte master key, zeroized on drop via `Zeroizing`.
     pub key: Zeroizing<[u8; MASTER_KEY_LEN]>,
     /// `true` when this call minted a fresh key (first boot of the
     /// daemon against this keychain); `false` when an existing key
     /// was read back.
     pub first_boot: bool,
+}
+
+impl MasterKeyOutcome {
+    /// Construct a new `MasterKeyOutcome`. Required because the
+    /// struct is `#[non_exhaustive]` — external callers (e.g., test
+    /// doubles in `permitlayer-daemon`) cannot use the struct
+    /// literal `MasterKeyOutcome { key, first_boot }` form across
+    /// crate boundaries.
+    pub fn new(key: Zeroizing<[u8; MASTER_KEY_LEN]>, first_boot: bool) -> Self {
+        Self { key, first_boot }
+    }
+}
+
+impl std::fmt::Debug for MasterKeyOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MasterKeyOutcome")
+            .field("key", &"<redacted>")
+            .field("first_boot", &self.first_boot)
+            .finish()
+    }
 }
 
 #[async_trait::async_trait]
@@ -608,5 +646,20 @@ mod factory_tests {
         #[cfg(not(target_os = "macos"))]
         assert_eq!(MASTER_KEY_SERVICE, "io.permitlayer.master-key");
         assert_eq!(MASTER_KEY_ACCOUNT, "master");
+    }
+
+    /// Story 7.27 Round-2 review fix: negative assertion to catch a
+    /// regression where someone accidentally reverts the macOS
+    /// MASTER_KEY_SERVICE rename. Pre-rc.22 used the legacy id; the
+    /// rename is what isolates new System.keychain entries from
+    /// orphaned user-login-keychain entries left behind by rc.21
+    /// installs.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_master_key_service_is_not_legacy() {
+        assert_ne!(
+            MASTER_KEY_SERVICE, "io.permitlayer.master-key",
+            "macOS MASTER_KEY_SERVICE must NOT regress to the rc.21 legacy id"
+        );
     }
 }

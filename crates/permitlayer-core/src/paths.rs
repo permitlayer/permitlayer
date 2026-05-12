@@ -57,6 +57,29 @@ use std::path::{Path, PathBuf};
 /// dedicated redesigns in future stories).
 ///
 /// When `home_override = Some(path)`, returns `path` directly.
+/// Convenience helper that reads `AGENTSSO_PATHS__HOME` once and
+/// returns it as a `PathBuf`. Centralized so all consumers
+/// (`start.rs`, `kill.rs`, `status.rs`, `control.rs`, ...) use the
+/// same parsing semantics — if the env-var name or normalization
+/// rules ever change, this is the single edit site.
+///
+/// Returns `None` for: unset env var, empty string, whitespace-only
+/// string. Story 7.27 Round-2 review fix (P1): pre-fix
+/// `std::env::var(...).ok().map(PathBuf::from)` returned
+/// `Some(PathBuf::from(""))` on `AGENTSSO_PATHS__HOME=` (operator/
+/// script clearing the override, common in CI). That produced
+/// relative paths everywhere downstream: `control_socket_path()`
+/// became `"run/control.sock"`, `vault_dir()` became `"vault"`,
+/// daemon bound in CWD, CLI connected from a different CWD, fail.
+/// Treating empty/whitespace as `None` falls back to the platform-
+/// default system path layout.
+pub fn home_override() -> Option<PathBuf> {
+    std::env::var("AGENTSSO_PATHS__HOME").ok().and_then(|s| {
+        let trimmed = s.trim();
+        if trimmed.is_empty() { None } else { Some(PathBuf::from(trimmed)) }
+    })
+}
+
 pub fn daemon_state_dir(home_override: Option<&Path>) -> PathBuf {
     if let Some(p) = home_override {
         return p.to_path_buf();

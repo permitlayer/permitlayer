@@ -23,11 +23,15 @@
 
 #![cfg(target_os = "macos")]
 
+pub mod fs_safe;
 pub mod peer_cred;
 pub mod rename_excl;
 
+pub use fs_safe::{
+    fchmod_fd, fchown_fd, fstatat_nofollow, open_dir_nofollow, unlinkat_dir_fd, with_umask,
+};
 pub use peer_cred::{
     peer_uid_from_raw_fd, peer_uid_from_unix_stream, peer_uid_gid_from_raw_fd,
     peer_uid_gid_from_unix_stream,
 };
-pub use rename_excl::rename_excl;
+pub use rename_excl::{rename_at, rename_excl, rename_excl_at};

@@ -48,8 +48,13 @@ pub mod update;
 /// returned `None` AND no env override is set — vanishingly rare,
 /// but the `?` callers depend on the fallible signature).
 pub(crate) fn agentsso_home() -> anyhow::Result<PathBuf> {
-    if let Ok(override_path) = std::env::var("AGENTSSO_PATHS__HOME") {
-        return Ok(PathBuf::from(override_path));
+    // Story 7.27 Round-2 review fix (P3): consolidate the env-var
+    // lookup through `permitlayer_core::paths::home_override()` so
+    // empty-string + whitespace normalization (P1 fix) applies here
+    // too. Pre-fix, this fifth inline-`std::env::var` site was
+    // missed in the Round-1 consolidation pass (story line 773).
+    if let Some(override_path) = permitlayer_core::paths::home_override() {
+        return Ok(override_path);
     }
     Ok(permitlayer_core::paths::daemon_state_dir(None))
 }

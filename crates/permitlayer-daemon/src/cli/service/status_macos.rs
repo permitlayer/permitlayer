@@ -36,7 +36,17 @@ pub async fn run() -> Result<()> {
     println!("  control sock: {sock_status}");
     println!("  log:          /Library/Logs/permitlayer/daemon.log");
     println!("──────────────────────────────────────────────────────────────");
-    Ok(())
+    // Story 7.27 Round-2 review fix (P2): exit non-zero when the
+    // daemon is not running. Pre-fix, `agentsso service status`
+    // always exited 0 — scripts piping it could not detect failure
+    // via exit code. Now: exit 0 for `running`, exit 1 for any
+    // non-running state. Operators relying on the always-zero
+    // behavior can pipe `|| true`.
+    if state == "running" {
+        Ok(())
+    } else {
+        Err(crate::cli::silent_cli_error(format!("daemon not running (state: {state})")))
+    }
 }
 
 fn read_launchctl_state() -> (&'static str, Option<u32>) {

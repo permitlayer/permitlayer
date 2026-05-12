@@ -31,7 +31,28 @@
 use std::ffi::CString;
 use std::io;
 use std::os::raw::{c_char, c_int, c_uint};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::io::RawFd;
 use std::path::Path;
+
+/// Reject path-component names that contain `/` or `..`. The dir-fd-
+/// anchored security model assumes `from_name`/`to_name` are single
+/// path components; a `/` in the name would resolve relative to the
+/// dir fd but traverse upward/inward, defeating the anchoring. A `..`
+/// component would let a caller escape the dir entirely.
+///
+/// Current call-sites pass fixed literals so this is defense-in-depth
+/// only — but the public API surface accepts arbitrary `&str` and a
+/// future caller could pass attacker-controlled input.
+fn validate_single_component(name: &str) -> io::Result<()> {
+    if name.is_empty() || name == "." || name == ".." || name.contains('/') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("not a single path component: {name:?}"),
+        ));
+    }
+    Ok(())
+}
 
 /// `AT_FDCWD` sentinel (`-2` on Darwin); means "the path is resolved
 /// relative to the current working directory."
@@ -72,9 +93,9 @@ unsafe extern "C" {
 /// function alone is NOT sufficient defense against a symlinked
 /// parent dir.
 pub fn rename_excl(src: &Path, dst: &Path) -> io::Result<()> {
-    let src_c = CString::new(src.as_os_str().as_encoded_bytes())
+    let src_c = CString::new(src.as_os_str().as_bytes())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-    let dst_c = CString::new(dst.as_os_str().as_encoded_bytes())
+    let dst_c = CString::new(dst.as_os_str().as_bytes())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
 
     // SAFETY: `src_c` and `dst_c` are valid NUL-terminated C strings
@@ -89,12 +110,71 @@ pub fn rename_excl(src: &Path, dst: &Path) -> io::Result<()> {
     if rc == -1 { Err(io::Error::last_os_error()) } else { Ok(()) }
 }
 
+/// `renameatx_np` variant relative to an open directory file
+/// descriptor on both sides. Caller is responsible for opening
+/// `dir_fd` with `O_NOFOLLOW | O_DIRECTORY` if symlink defense on
+/// the parent path is required (Story 7.27 token-write path).
+///
+/// Errors mirror [`rename_excl`]: `AlreadyExists` on `EEXIST`,
+/// `last_os_error()` otherwise.
+///
+/// Story 7.27 review fix: the original `rename_excl` resolved
+/// `tmp_path` and `target` via `AT_FDCWD`, which follows symlinks on
+/// every intermediate path component. Holding the parent dir fd open
+/// across the bind sequence ensures the rename targets the inode the
+/// daemon validated, not whatever path resolution finds at rename
+/// time.
+pub fn rename_excl_at(
+    from_dirfd: RawFd,
+    from_name: &str,
+    to_dirfd: RawFd,
+    to_name: &str,
+) -> io::Result<()> {
+    validate_single_component(from_name)?;
+    validate_single_component(to_name)?;
+    let from_c =
+        CString::new(from_name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let to_c = CString::new(to_name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+    // SAFETY: `from_c` and `to_c` are valid NUL-terminated C strings
+    // for the duration of the call. The dir fds are caller-supplied;
+    // if either is invalid the kernel returns EBADF and we propagate
+    // it as io::Error.
+    let rc =
+        unsafe { renameatx_np(from_dirfd, from_c.as_ptr(), to_dirfd, to_c.as_ptr(), RENAME_EXCL) };
+
+    if rc == -1 { Err(io::Error::last_os_error()) } else { Ok(()) }
+}
+
+/// `renameat(from_dir_fd, from_name, to_dir_fd, to_name)` — plain
+/// POSIX rename relative to dir fds, no `RENAME_EXCL`. Used by the
+/// token-rotation fallback after the EEXIST audit event is emitted.
+pub fn rename_at(
+    from_dirfd: RawFd,
+    from_name: &str,
+    to_dirfd: RawFd,
+    to_name: &str,
+) -> io::Result<()> {
+    validate_single_component(from_name)?;
+    validate_single_component(to_name)?;
+    let from_c =
+        CString::new(from_name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let to_c = CString::new(to_name).map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+
+    // SAFETY: same rationale as `rename_excl_at`. Uses the libc
+    // binding for `renameat(2)` so the ABI source is the standard
+    // libc crate, not a one-off extern block in this file.
+    let rc = unsafe { libc::renameat(from_dirfd, from_c.as_ptr(), to_dirfd, to_c.as_ptr()) };
+    if rc == -1 { Err(io::Error::last_os_error()) } else { Ok(()) }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
     use std::fs;
     use std::io::Write;
+    use std::os::unix::io::AsRawFd;
     use tempfile::tempdir;
 
     #[test]
@@ -147,6 +227,34 @@ mod tests {
         let dst = Path::new("/tmp/ignore");
         let err = rename_excl(bad_src, dst).expect_err("nul byte must be rejected");
         assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        // Tighten coverage: the cause must be a NUL byte (downcast to
+        // CString's NulError). This decouples the test from the
+        // io::ErrorKind classification, which could shift to e.g.
+        // NotFound if CString::new were ever bypassed and we delegated
+        // to the kernel.
+        let inner = err.into_inner().expect("io::Error must carry an inner cause");
+        assert!(
+            inner.downcast::<std::ffi::NulError>().is_ok(),
+            "inner cause must be CString NulError"
+        );
+    }
+
+    #[test]
+    fn rename_excl_at_rejects_path_separator_in_name() {
+        // Defense-in-depth: dir-fd-anchored renames must reject names
+        // containing `/` or `..` so a caller cannot escape the
+        // anchoring.
+        let dir = tempdir().unwrap();
+        let dir_fd = crate::open_dir_nofollow(dir.path()).expect("open_dir_nofollow");
+        let raw = dir_fd.as_raw_fd();
+        for bad in ["with/slash", "..", "./inner", "", "..\0nul"] {
+            let err = rename_excl_at(raw, bad, raw, "ok")
+                .expect_err(&format!("rename_excl_at must reject {bad:?}"));
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+            let err = rename_at(raw, "ok", raw, bad)
+                .expect_err(&format!("rename_at must reject {bad:?}"));
+            assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        }
     }
 
     #[test]

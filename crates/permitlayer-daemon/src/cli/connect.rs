@@ -1366,14 +1366,27 @@ async fn read_access_token(
 }
 
 /// POST `/v1/control/reload` against the running daemon.
+///
+/// Story 7.27 Round-2 review fix (P0): dispatches over UDS on macOS
+/// via `resolve_control_endpoint(&config)` + `http_post_json_via`.
+/// Pre-fix, this site (and `post_rebind` below) was missed in the
+/// AC #9 sweep — the daemon does NOT listen for `/v1/control/*`
+/// over TCP on macOS rc.22, so the call would fail with
+/// connection-refused at `127.0.0.1:3820`. Linux/Windows preserve
+/// the TCP transport via the same helper (Story 7.18/7.19 will
+/// migrate them later).
 async fn post_reload(home: &Path) -> anyhow::Result<()> {
     let config = crate::cli::kill::load_daemon_config_or_default_with_warn("connect reload");
-    let bind_addr = config.http.bind_addr;
+    let endpoint = crate::cli::kill::resolve_control_endpoint(&config);
     let token = crate::cli::kill::read_control_token(home);
-    let response =
-        crate::cli::kill::http_post_json(bind_addr, "/v1/control/reload", "{}", token.as_deref())
-            .await
-            .map_err(|e| anyhow::anyhow!("daemon reload request failed: {e}"))?;
+    let response = crate::cli::kill::http_post_json_via(
+        &endpoint,
+        "/v1/control/reload",
+        "{}",
+        token.as_deref(),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("daemon reload request failed: {e}"))?;
     let parsed: serde_json::Value = serde_json::from_str(&response)
         .map_err(|e| anyhow::anyhow!("malformed reload response: {e} (body: {response})"))?;
     if parsed["status"].as_str() == Some("ok") {
@@ -1385,13 +1398,16 @@ async fn post_reload(home: &Path) -> anyhow::Result<()> {
 }
 
 /// POST `/v1/control/agent/rebind` against the running daemon.
+///
+/// Story 7.27 Round-2 review fix (P0): same UDS-on-macOS migration
+/// as `post_reload` above.
 async fn post_rebind(home: &Path, agent: &str, policy: &str) -> anyhow::Result<()> {
     let config = crate::cli::kill::load_daemon_config_or_default_with_warn("connect rebind");
-    let bind_addr = config.http.bind_addr;
+    let endpoint = crate::cli::kill::resolve_control_endpoint(&config);
     let token = crate::cli::kill::read_control_token(home);
     let body = serde_json::json!({"name": agent, "policy_name": policy}).to_string();
-    let response = crate::cli::kill::http_post_json(
-        bind_addr,
+    let response = crate::cli::kill::http_post_json_via(
+        &endpoint,
         "/v1/control/agent/rebind",
         &body,
         token.as_deref(),

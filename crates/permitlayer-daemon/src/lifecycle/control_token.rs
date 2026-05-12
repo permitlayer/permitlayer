@@ -246,30 +246,115 @@ impl ControlToken {
         // it can't read a root-owned 0600 file. Re-chmod to 0640 +
         // chgrp `permitlayer-clients` so operators in that group
         // (added by `service install`) can read the secret without
-        // gaining write/delete access. The kernel-attested peer UID
-        // from `LOCAL_PEERCRED` on the UDS connection remains the
-        // primary identity attestation (per AC #15); this just
-        // makes the supplementary token-check work cross-user.
+        // gaining write/delete access.
         //
-        // If the group doesn't resolve (operator never ran `service
-        // install`, or running outside the rc.22 model), fall back
-        // to leaving the file 0600 owned by the writer — same
-        // behavior as Linux + Windows.
+        // # Threat model
+        //
+        // **Why is group-readable safe?** The bearer-token check is
+        // a SUPPLEMENTARY signal; the kernel-attested peer UID from
+        // `LOCAL_PEERCRED` on the UDS connection is the PRIMARY
+        // identity gate. Even if a malicious `permitlayer-clients`
+        // member reads `control.token` from disk, they cannot
+        // impersonate the operator over UDS because:
+        //
+        //   1. UDS peer-cred capture (`record_peer_credentials_layer`
+        //      in `server/control_listener.rs`) records the
+        //      kernel-attested peer UID/GID at accept time. The
+        //      attacker connects as themselves; the daemon sees
+        //      THEIR UID, not the operator's.
+        //   2. AC #11 `control.identity_mismatch` detection at
+        //      `server/control.rs::require_control_token` fires a
+        //      WARN audit event when the peer UID ≠
+        //      `PERMITLAYER_OPERATOR_UID` (the operator's UID
+        //      captured at `service install` time and persisted in
+        //      the LaunchDaemon plist `EnvironmentVariables`).
+        //      Audit-log readers can trace the impersonation
+        //      attempt.
+        //   3. UDS connect itself is gated on `permitlayer-clients`
+        //      group membership at the kernel layer (socket mode
+        //      0660 root:permitlayer-clients per AC #5). A non-
+        //      member cannot even open the connection.
+        //
+        // So the operator-CLI cross-user-auth model assumes a
+        // trusted `permitlayer-clients` membership (curated via
+        // `dseditgroup`), where every member is permitted to
+        // operate as themselves — never as anyone else.
+        //
+        // # Fallback behavior
+        //
+        // If `permitlayer-clients` is absent (operator never ran
+        // `service install`), `Group::from_name` returns `Ok(None)`.
+        // Pre-Round-2, this branch silently no-op'd, leaving the
+        // file 0600 root-only — operator-CLI then fails with
+        // `forbidden_missing_control_token` and no log indicating
+        // WHY. Round-2 fix: emit `tracing::warn!` on every fallback
+        // branch so operators can grep `control_token.permitlayer_
+        // clients_group_missing` and follow the remediation. Also
+        // capture chown/chmod errors instead of `let _ =` so
+        // partial-success doesn't masquerade as full success.
         #[cfg(target_os = "macos")]
         if nix::unistd::getuid().is_root() {
             use std::os::unix::fs::PermissionsExt;
-            if let Ok(Some(group)) = nix::unistd::Group::from_name("permitlayer-clients") {
-                let _ = nix::unistd::chown(
-                    path,
-                    Some(nix::unistd::Uid::from_raw(0)),
-                    Some(nix::unistd::Gid::from_raw(group.gid.as_raw())),
-                );
-                let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640));
-                tracing::info!(
-                    target: "control_token",
-                    path = %path.display(),
-                    "control.token chgrp'd to permitlayer-clients mode 0640 for cross-user CLI access"
-                );
+            match nix::unistd::Group::from_name("permitlayer-clients") {
+                Ok(Some(group)) => {
+                    let chown_result = nix::unistd::chown(
+                        path,
+                        Some(nix::unistd::Uid::from_raw(0)),
+                        Some(nix::unistd::Gid::from_raw(group.gid.as_raw())),
+                    );
+                    if let Err(e) = chown_result {
+                        tracing::warn!(
+                            target: "control_token",
+                            event = "control_token.chgrp_failed",
+                            path = %path.display(),
+                            error = %e,
+                            "failed to chgrp control.token to permitlayer-clients; \
+                             file stays at the prior owner — operator-CLI cross-user auth \
+                             may not work"
+                        );
+                    } else if let Err(e) =
+                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640))
+                    {
+                        tracing::warn!(
+                            target: "control_token",
+                            event = "control_token.chmod_failed",
+                            path = %path.display(),
+                            error = %e,
+                            "chgrp'd control.token to permitlayer-clients but chmod 0640 \
+                             failed; file stays at the prior mode — operator-CLI may not \
+                             be able to read it"
+                        );
+                    } else {
+                        tracing::info!(
+                            target: "control_token",
+                            event = "control_token.chgrp_complete",
+                            path = %path.display(),
+                            "control.token chgrp'd to permitlayer-clients mode 0640 for \
+                             cross-user CLI access"
+                        );
+                    }
+                }
+                Ok(None) => {
+                    tracing::warn!(
+                        target: "control_token",
+                        event = "control_token.permitlayer_clients_group_missing",
+                        path = %path.display(),
+                        "permitlayer-clients group not found — control.token stays 0600 \
+                         root-only. Operator-CLI cross-user auth will fail with \
+                         `forbidden_missing_control_token`. Run `sudo agentsso service \
+                         install` to create the group and grant operator access."
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "control_token",
+                        event = "control_token.permitlayer_clients_lookup_failed",
+                        path = %path.display(),
+                        error = %e,
+                        "nss lookup for permitlayer-clients group failed — control.token \
+                         stays 0600 root-only; operator-CLI cross-user auth may not work"
+                    );
+                }
             }
         }
 

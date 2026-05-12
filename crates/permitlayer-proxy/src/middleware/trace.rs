@@ -69,6 +69,17 @@ where
             scope = "unknown",
             method = %req.method(),
             path = %req.uri().path(),
+            // Story 7.27 Round-2 review fix (P1): declare
+            // `peer_uid` / `peer_gid` as `Empty` so the
+            // UDS-side `record_peer_credentials_layer` (in
+            // `permitlayer-daemon::server::control_listener`)
+            // can populate them via `Span::current().record(...)`.
+            // `record()` is a documented no-op for fields not
+            // declared in the span macro — pre-fix, the layer's
+            // calls were silently dropping the kernel-attested
+            // peer identity from the tracing surface.
+            peer_uid = tracing::field::Empty,
+            peer_gid = tracing::field::Empty,
         );
 
         // Swap self.inner with a clone so the polled-ready instance is the

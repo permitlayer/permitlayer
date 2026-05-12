@@ -49,6 +49,10 @@ security-framework = "3"
 security-framework-sys = "2.17"
 core-foundation = "0.10"
 core-foundation-sys = "0.8"
+# Story 7.27 Round-2 review fix: `nix::fcntl::Flock` for the
+# inter-process master-key mint serialization lock in
+# `macos::acquire_mint_lock`.
+nix = { version = "0.29", features = ["fs", "user"] }
 
 # Unix-only: errno constants used by `passphrase::is_no_tty_error` to
 # detect rpassword's no-controlling-terminal failure shape (ENXIO /

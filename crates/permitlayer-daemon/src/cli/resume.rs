@@ -17,7 +17,7 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::cli::kill::{
-    error_block_daemon_unreachable, error_block_protocol_error, http_get_via,
+    error_block_daemon_unreachable_endpoint, error_block_protocol_error, http_get_via,
     http_post_empty_json_via, load_daemon_config_or_default_with_warn, resolve_control_endpoint,
 };
 use crate::design::kill_banner::{
@@ -41,7 +41,6 @@ pub async fn run(_args: ResumeArgs) -> Result<()> {
     // case below.
 
     let endpoint = resolve_control_endpoint(&config);
-    let bind_addr = config.http.bind_addr;
     let token = crate::cli::kill::read_control_token(&home);
 
     // 1. GET /v1/control/state to capture `activated_at` (for
@@ -51,7 +50,7 @@ pub async fn run(_args: ResumeArgs) -> Result<()> {
         Ok(b) => b,
         Err(e) => {
             tracing::debug!(error = %e, endpoint = %endpoint, "state probe failed during resume");
-            eprint!("{}", error_block_daemon_unreachable("resume", bind_addr));
+            eprint!("{}", error_block_daemon_unreachable_endpoint("resume", &endpoint));
             std::process::exit(3);
         }
     };
@@ -80,7 +79,7 @@ pub async fn run(_args: ResumeArgs) -> Result<()> {
             Ok(b) => b,
             Err(e) => {
                 tracing::debug!(error = %e, endpoint = %endpoint, "resume request failed");
-                eprint!("{}", error_block_daemon_unreachable("resume", bind_addr));
+                eprint!("{}", error_block_daemon_unreachable_endpoint("resume", &endpoint));
                 std::process::exit(3);
             }
         };
