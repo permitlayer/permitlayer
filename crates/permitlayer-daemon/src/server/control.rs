@@ -2490,6 +2490,323 @@ pub(crate) async fn credentials_seal_handler(
         .into_response()
 }
 
+/// Request body for `POST /v1/control/credentials/{service}/verify`
+/// (Story 7.30 AC #4).
+#[derive(Debug, Deserialize)]
+pub(crate) struct CredentialsVerifyRequest {
+    pub agent: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+}
+
+/// `POST /v1/control/credentials/{service}/verify` — read the sealed
+/// credential, unseal via `state.vault`, and run the Google verify
+/// probe daemon-side (Story 7.30 AC #4).
+///
+/// The CLI's `agentsso connect` flow drove the verify probe locally
+/// pre-7.30 — which required CLI-side vault unseal access, which
+/// requires the master key, which only the daemon should hold. This
+/// handler keeps verify daemon-side while the CLI retains the
+/// operator-interactive retry loop ("Press Enter to retry").
+///
+/// Audit event: `credentials-verified` with outcome `"ok"` or
+/// `"error"`. `peer_uid` + `peer_gid` enriched via the standard
+/// peer-creds helper.
+pub(crate) async fn credentials_verify_handler(
+    State(state): State<ControlState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(service): Path<String>,
+    req: axum::extract::Request,
+) -> Response {
+    if let Err(e) = require_loopback(peer) {
+        return e.into_response();
+    }
+
+    let request_id = read_request_id(&req);
+    let peer_creds_for_audit: Option<crate::server::PeerCredentials> =
+        req.extensions().get::<crate::server::PeerCredentials>().copied();
+
+    if !credential_service_supported(&service) {
+        return agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "credentials.unknown_service",
+            format!(
+                "service {:?} is not supported; allowed: {}",
+                service,
+                CREDENTIAL_SUPPORTED_SERVICES.join(", ")
+            ),
+            Some(request_id),
+        );
+    }
+
+    let (_parts, body) = req.into_parts();
+    let bytes = match axum::body::to_bytes(body, 16 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::BAD_REQUEST,
+                "credentials.bad_request",
+                format!("failed to read request body: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+    let payload: CredentialsVerifyRequest = match serde_json::from_slice(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::BAD_REQUEST,
+                "credentials.bad_request",
+                format!("invalid JSON body: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+
+    let Some(home) = state.vault_dir.parent().map(std::path::Path::to_path_buf) else {
+        return agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "credentials.vault_layout_invalid",
+            format!(
+                "vault_dir {:?} has no parent — cannot derive credential store home",
+                state.vault_dir
+            ),
+            Some(request_id),
+        );
+    };
+
+    let store = match permitlayer_core::store::fs::CredentialFsStore::new(home) {
+        Ok(s) => s,
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credentials.store_init_failed",
+                format!("credential store init failed: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+
+    let sealed = match store.get(&service).await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            return agent_error_response(
+                StatusCode::NOT_FOUND,
+                "credentials.not_found",
+                format!("no sealed credential for service {service:?}"),
+                Some(request_id),
+            );
+        }
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credentials.store_io_failed",
+                format!("credential store read failed: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+
+    let access_token = match state.vault.unseal(&service, &sealed) {
+        Ok(t) => t,
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credentials.unseal_failed",
+                format!("vault unseal failed: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+
+    let verify_result = permitlayer_oauth::google::verify::verify_connection(
+        &service,
+        access_token.reveal(),
+        payload.project_id.as_deref(),
+    )
+    .await;
+
+    // Audit-emit helper used by both ok and error paths.
+    let emit_audit = |outcome: &'static str, extra: serde_json::Value| {
+        let audit_store = state.audit_store.clone();
+        let request_id = request_id.clone();
+        let agent_name = payload.agent.clone();
+        let service_for_audit = service.clone();
+        let peer_creds = peer_creds_for_audit;
+        let event_extra = extra;
+        async move {
+            if let Some(audit) = audit_store {
+                let mut event = AuditEvent::with_request_id(
+                    request_id,
+                    agent_name,
+                    "permitlayer".to_owned(),
+                    service_for_audit,
+                    "credentials-verify".to_owned(),
+                    outcome.to_owned(),
+                    "credentials-verified".to_owned(),
+                );
+                event.extra = event_extra;
+                enrich_audit_extra_with_peer_creds(&mut event.extra, peer_creds);
+                if let Err(e) = audit.append(event).await {
+                    tracing::warn!(error = %e, "credentials-verified audit write failed (best-effort)");
+                }
+            }
+        }
+    };
+
+    match verify_result {
+        Ok(result) => {
+            emit_audit(
+                "ok",
+                serde_json::json!({
+                    "service": service,
+                    "agent": payload.agent,
+                }),
+            )
+            .await;
+            tracing::info!(
+                target: "control",
+                request_id = %request_id,
+                service = %service,
+                agent = %payload.agent,
+                "credential verified via control endpoint",
+            );
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "summary": result.summary,
+                    "email": result.email,
+                })),
+            )
+                .into_response()
+        }
+        Err(permitlayer_oauth::OAuthError::VerificationFailed {
+            reason,
+            status_code,
+            verify_reason,
+            ..
+        }) => {
+            let verify_reason_kebab = verify_reason.as_ref().map(verify_reason_kebab_label);
+            let remediation_url = verify_reason.as_ref().and_then(verify_reason_remediation_url);
+            match status_code {
+                Some(_) => {
+                    emit_audit(
+                        "error",
+                        serde_json::json!({
+                            "service": service,
+                            "agent": payload.agent,
+                            "status_code": status_code,
+                            "verify_reason": verify_reason_kebab,
+                        }),
+                    )
+                    .await;
+                    (
+                        StatusCode::OK,
+                        Json(serde_json::json!({
+                            "ok": false,
+                            "status_code": status_code,
+                            "verify_reason": verify_reason_kebab,
+                            "remediation_url": remediation_url,
+                            "reason_text": reason,
+                        })),
+                    )
+                        .into_response()
+                }
+                None => {
+                    emit_audit(
+                        "error",
+                        serde_json::json!({
+                            "service": service,
+                            "agent": payload.agent,
+                            "verify_reason": verify_reason_kebab,
+                            "transport_failure": true,
+                        }),
+                    )
+                    .await;
+                    (
+                        StatusCode::BAD_GATEWAY,
+                        Json(serde_json::json!({
+                            "status": "error",
+                            "code": "credentials.transport_failed",
+                            "message": reason,
+                            "request_id": request_id,
+                        })),
+                    )
+                        .into_response()
+                }
+            }
+        }
+        Err(e) => {
+            emit_audit(
+                "error",
+                serde_json::json!({
+                    "service": service,
+                    "agent": payload.agent,
+                    "verify_reason": serde_json::Value::Null,
+                    "transport_failure": true,
+                }),
+            )
+            .await;
+            agent_error_response(
+                StatusCode::BAD_GATEWAY,
+                "credentials.transport_failed",
+                format!("verify call returned non-VerificationFailed error: {e}"),
+                Some(request_id),
+            )
+        }
+    }
+}
+
+/// Map a `VerifyReason` enum variant to a kebab-case wire label
+/// (Story 7.30 AC #4). Mirrors the existing `kill_reason_wire_label`
+/// pattern.
+fn verify_reason_kebab_label(reason: &permitlayer_oauth::error::VerifyReason) -> &'static str {
+    use permitlayer_oauth::error::VerifyReason;
+    match reason {
+        VerifyReason::ServiceDisabled { .. } => "service-disabled",
+        VerifyReason::BillingDisabled { .. } => "billing-disabled",
+        VerifyReason::ScopeInsufficient { .. } => "scope-insufficient",
+        VerifyReason::Other => "other",
+        // VerifyReason is `#[non_exhaustive]`; future variants surface as
+        // "other" until a wire label is assigned.
+        _ => "other",
+    }
+}
+
+/// Map a `VerifyReason` to an operator-facing remediation URL when
+/// one is available. `None` if no canonical URL applies (e.g.
+/// `Other`, or `ScopeInsufficient` which the operator must resolve
+/// via re-consent rather than a URL).
+fn verify_reason_remediation_url(
+    reason: &permitlayer_oauth::error::VerifyReason,
+) -> Option<String> {
+    use permitlayer_oauth::error::VerifyReason;
+    match reason {
+        VerifyReason::ServiceDisabled { service, project, .. } => {
+            // `service` is the canonical Google API name (e.g.
+            // `"calendar.googleapis.com"`). Operators arrive at the
+            // API-library page; the `?project=<id>` query pre-fills the
+            // project switcher when present.
+            let base = format!("https://console.cloud.google.com/apis/library/{service}");
+            Some(match project {
+                Some(p) => format!("{base}?project={p}"),
+                None => base,
+            })
+        }
+        VerifyReason::BillingDisabled { project } => {
+            let base = "https://console.cloud.google.com/billing".to_owned();
+            Some(match project {
+                Some(p) => format!("{base}/linkedaccount?project={p}"),
+                None => base,
+            })
+        }
+        VerifyReason::ScopeInsufficient { .. } | VerifyReason::Other => None,
+        // VerifyReason is `#[non_exhaustive]`; future variants surface no URL.
+        _ => None,
+    }
+}
+
 /// `POST /v1/control/agent/remove` — delete an agent file and swap
 /// the registry. Returns `removed: false` for a not-found name.
 pub(crate) async fn remove_agent_handler(
@@ -3258,6 +3575,7 @@ pub(crate) fn router(
         .route("/v1/control/agent/{name}/policy_name", get(agent_policy_name_handler))
         .route("/v1/control/credentials/{service}/meta", get(credentials_meta_handler))
         .route("/v1/control/credentials/seal", post(credentials_seal_handler))
+        .route("/v1/control/credentials/{service}/verify", post(credentials_verify_handler))
         .route("/v1/control/agent/remove", post(remove_agent_handler))
         .route("/v1/control/agent/rebind", post(rebind_agent_handler))
         .route("/v1/control/connections", get(connections_handler))
@@ -5318,5 +5636,131 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let json = body_json(resp).await;
         assert_eq!(json["code"], "credentials.bad_request");
+    }
+
+    // ── Story 7.30 Task 5: POST /v1/control/credentials/{service}/verify
+
+    fn post_verify_request(service: &str, agent: &str) -> Request<Body> {
+        let body = serde_json::json!({ "agent": agent });
+        let mut r = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/v1/control/credentials/{service}/verify"))
+            .header("content-type", "application/json")
+            .header("x-agentsso-control", test_control_token_header())
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        r.extensions_mut().insert(ConnectInfo(loopback_v4()));
+        r
+    }
+
+    #[tokio::test]
+    async fn credentials_verify_handler_returns_404_when_credential_missing() {
+        let (app, _home_tmp, _) = build_with_seal_wiring("test-agent", None);
+        let resp = app.oneshot(post_verify_request("gmail", "test-agent")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "credentials.not_found");
+    }
+
+    #[tokio::test]
+    async fn credentials_verify_handler_rejects_unknown_service() {
+        let (app, _home_tmp, _) = build_with_seal_wiring("test-agent", None);
+        let resp = app.oneshot(post_verify_request("slack", "test-agent")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "credentials.unknown_service");
+    }
+
+    #[tokio::test]
+    async fn credentials_verify_handler_rejects_bad_json() {
+        let (app, _home_tmp, _) = build_with_seal_wiring("test-agent", None);
+        let mut r = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/control/credentials/gmail/verify")
+            .header("content-type", "application/json")
+            .header("x-agentsso-control", test_control_token_header())
+            .body(Body::from(b"not json".to_vec()))
+            .unwrap();
+        r.extensions_mut().insert(ConnectInfo(loopback_v4()));
+        let resp = app.oneshot(r).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "credentials.bad_request");
+    }
+
+    #[tokio::test]
+    async fn credentials_verify_handler_returns_500_on_unseal_failure() {
+        let home_tmp = tempfile::tempdir().unwrap();
+        let vault_dir = home_tmp.path().join("vault");
+        std::fs::create_dir_all(&vault_dir).unwrap();
+        // Stage a bogus sealed file. `CredentialFsStore::get` will
+        // surface this as `StoreError::CorruptEnvelope` before the
+        // vault gets a chance to unseal.
+        std::fs::write(vault_dir.join("gmail.sealed"), b"not-a-real-sealed-envelope").unwrap();
+
+        let app = build_with_seal_wiring_with_existing_home(
+            "test-agent",
+            home_tmp.path().to_path_buf(),
+            None,
+        );
+        let resp = app.oneshot(post_verify_request("gmail", "test-agent")).await.unwrap();
+        // Path returns 500 via either store_io_failed or unseal_failed.
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json = body_json(resp).await;
+        let code = json["code"].as_str().unwrap_or_default();
+        assert!(
+            matches!(code, "credentials.store_io_failed" | "credentials.unseal_failed"),
+            "unexpected error code {code}",
+        );
+    }
+
+    #[test]
+    fn verify_reason_kebab_label_covers_known_variants() {
+        use permitlayer_oauth::error::VerifyReason;
+        assert_eq!(
+            verify_reason_kebab_label(&VerifyReason::ServiceDisabled {
+                service: "calendar.googleapis.com".to_owned(),
+                project: None,
+                also_billing_disabled: false,
+            }),
+            "service-disabled"
+        );
+        assert_eq!(
+            verify_reason_kebab_label(&VerifyReason::BillingDisabled { project: None }),
+            "billing-disabled"
+        );
+        assert_eq!(
+            verify_reason_kebab_label(&VerifyReason::ScopeInsufficient {
+                missing_scopes: vec![],
+                also_service_disabled: None,
+                also_billing_disabled: false,
+            }),
+            "scope-insufficient"
+        );
+        assert_eq!(verify_reason_kebab_label(&VerifyReason::Other), "other");
+    }
+
+    #[test]
+    fn verify_reason_remediation_url_renders_console_url_for_service_disabled() {
+        use permitlayer_oauth::error::VerifyReason;
+        let url = verify_reason_remediation_url(&VerifyReason::ServiceDisabled {
+            service: "calendar.googleapis.com".to_owned(),
+            project: Some("my-project".to_owned()),
+            also_billing_disabled: false,
+        })
+        .unwrap();
+        assert_eq!(
+            url,
+            "https://console.cloud.google.com/apis/library/calendar.googleapis.com?project=my-project"
+        );
+        // None for `ScopeInsufficient` (operator must re-consent, no URL applies).
+        assert!(
+            verify_reason_remediation_url(&VerifyReason::ScopeInsufficient {
+                missing_scopes: vec![],
+                also_service_disabled: None,
+                also_billing_disabled: false,
+            })
+            .is_none()
+        );
     }
 }
