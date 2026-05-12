@@ -65,7 +65,7 @@ use axum::extract::{ConnectInfo, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use permitlayer_core::agent::{
     AgentIdentity, AgentRegistry, BEARER_TOKEN_PREFIX, LOOKUP_KEY_BYTES, compute_lookup_key,
@@ -76,7 +76,7 @@ use permitlayer_core::killswitch::{
     ActivationSummary, DeactivationSummary, KillReason, KillSwitch,
 };
 use permitlayer_core::policy::PolicySet;
-use permitlayer_core::store::AgentIdentityStore;
+use permitlayer_core::store::{AgentIdentityStore, CredentialStore};
 
 /// Lightweight state for the control router.
 ///
@@ -2150,6 +2150,346 @@ pub(crate) async fn credentials_meta_handler(
     }
 }
 
+/// Policy for the seal endpoint's `if_exists` field (Story 7.30 AC #3).
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SealIfExists {
+    /// Replace the existing credential atomically. Default.
+    #[default]
+    Replace,
+    /// Skip writing if a credential already exists for this service.
+    Skip,
+    /// Return 409 if a credential already exists.
+    Error,
+}
+
+/// Request body for `POST /v1/control/credentials/seal` (Story 7.30 AC #3).
+///
+/// Token fields use `Zeroizing<String>` (zeroize 1.8 `serde` feature
+/// added in Task 1, sourced from RustCrypto/utils
+/// `zeroize/src/lib.rs:568-580`'s `Deserialize for Zeroizing<T>`
+/// impl). When the handler scope exits, `Zeroizing`'s `Drop` calls
+/// `String::zeroize` which writes zeros over the full `Vec<u8>`
+/// capacity backing the String before the allocator frees it
+/// (`zeroize/src/lib.rs:524-528`). The plaintext window per request
+/// is documented in ADR-0007 (authored in Task 13).
+#[derive(Debug, Deserialize)]
+pub(crate) struct CredentialsSealRequest {
+    pub service: String,
+    pub agent: String,
+    pub access_token: zeroize::Zeroizing<String>,
+    #[serde(default)]
+    pub refresh_token: Option<zeroize::Zeroizing<String>>,
+    pub granted_scopes: Vec<String>,
+    pub client_type: String,
+    pub client_source: String,
+    #[serde(default)]
+    pub expires_in_secs: Option<u64>,
+    #[serde(default)]
+    pub if_exists: SealIfExists,
+}
+
+/// Response body for `POST /v1/control/credentials/seal`.
+#[derive(Debug, Serialize)]
+pub(crate) struct CredentialsSealResponse {
+    pub sealed: bool,
+    pub replaced_previous: bool,
+    pub meta: permitlayer_oauth::metadata::CredentialMeta,
+}
+
+/// `POST /v1/control/credentials/seal` — atomically seal OAuth tokens
+/// into the daemon's vault, write the provenance meta JSON, and emit
+/// an audit event (Story 7.30 AC #3).
+///
+/// The CLI's `agentsso connect` flow drives the operator-interactive
+/// OAuth dance, then POSTs the resulting tokens to this endpoint. The
+/// daemon owns every fs touch + every vault-key access; the CLI never
+/// reads the master key, never touches `vault/`, never writes
+/// `*-meta.json`.
+///
+/// Concurrency: acquires `state.credentials_seal_lock` for the
+/// duration of `vault.seal` + `store.put` + `write_metadata_atomic` so
+/// two concurrent seals of the same service can't interleave.
+///
+/// Audit event: `credentials-sealed` with `service`, `agent`,
+/// `scopes`, `client_type`, `client_source`, `replaced_previous`,
+/// `had_refresh_token`, plus `peer_uid` + `peer_gid` via
+/// `enrich_audit_extra_with_peer_creds`.
+///
+/// **ENOTSUP deviation from spec.** The story spec called for an
+/// `ENOTSUP` classification branch returning
+/// `credentials.unsupported_volume`. Pre-implementation research
+/// confirmed the spec is wrong about which syscall surfaces ENOTSUP:
+/// `write_metadata_atomic` goes through `tempfile::persist` →
+/// `rustix::fs::rename` (no flags) and `CredentialFsStore::put` uses
+/// `std::fs::rename` — both are plain POSIX `rename(2)`, which on
+/// macOS does NOT return ENOTSUP (`man 2 rename` scopes ENOTSUP to
+/// flag-bearing `renamex_np`/`renameatx_np` only, neither of which
+/// is called from these paths). Branch dropped as dead code; non-APFS
+/// failures surface as `EROFS`/`EIO`/`EXDEV`/`EACCES` via the generic
+/// `credentials.store_io_failed` or `credentials.meta_write_failed`
+/// arms. See ADR-0007 (Task 13) for the threat-model writeup.
+pub(crate) async fn credentials_seal_handler(
+    State(state): State<ControlState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: axum::extract::Request,
+) -> Response {
+    if let Err(e) = require_loopback(peer) {
+        return e.into_response();
+    }
+
+    let request_id = read_request_id(&req);
+
+    let peer_creds_for_audit: Option<crate::server::PeerCredentials> =
+        req.extensions().get::<crate::server::PeerCredentials>().copied();
+
+    let (_parts, body) = req.into_parts();
+    let bytes = match axum::body::to_bytes(body, 64 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::BAD_REQUEST,
+                "credentials.bad_request",
+                format!("failed to read request body: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+    let payload: CredentialsSealRequest = match serde_json::from_slice(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::BAD_REQUEST,
+                "credentials.bad_request",
+                format!("invalid JSON body: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+
+    if !credential_service_supported(&payload.service) {
+        return agent_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "credentials.unknown_service",
+            format!(
+                "service {:?} is not supported; allowed: {}",
+                payload.service,
+                CREDENTIAL_SUPPORTED_SERVICES.join(", ")
+            ),
+            Some(request_id),
+        );
+    }
+
+    if let Err(e) = validate_agent_name(&payload.agent) {
+        return agent_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "credentials.invalid_agent_name",
+            format!("{e}"),
+            Some(request_id),
+        );
+    }
+
+    {
+        let snapshot = state.agent_registry.snapshot();
+        if snapshot.get_by_name(&payload.agent).is_none() {
+            return agent_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "credentials.unknown_agent",
+                format!("no agent named {:?} is registered", payload.agent),
+                Some(request_id),
+            );
+        }
+    }
+
+    let _seal_guard = state.credentials_seal_lock.lock().await;
+
+    let Some(home) = state.vault_dir.parent().map(std::path::Path::to_path_buf) else {
+        return agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "credentials.vault_layout_invalid",
+            format!(
+                "vault_dir {:?} has no parent — cannot derive credential store home",
+                state.vault_dir
+            ),
+            Some(request_id),
+        );
+    };
+    let meta_path = state.vault_dir.join(format!("{}-meta.json", payload.service));
+    let credential_exists = meta_path.exists();
+
+    match (payload.if_exists, credential_exists) {
+        (SealIfExists::Error, true) => {
+            return agent_error_response(
+                StatusCode::CONFLICT,
+                "credentials.already_exists",
+                format!(
+                    "credential for service {:?} already exists; pass \
+                     `if_exists: \"replace\"` to overwrite",
+                    payload.service
+                ),
+                Some(request_id),
+            );
+        }
+        (SealIfExists::Skip, true) => {
+            let meta_raw = match std::fs::read_to_string(&meta_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    return agent_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "credentials.meta_io_failed",
+                        format!("could not read existing meta file: {e}"),
+                        Some(request_id),
+                    );
+                }
+            };
+            let meta: permitlayer_oauth::metadata::CredentialMeta =
+                match serde_json::from_str(&meta_raw) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        return agent_error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "credentials.meta_parse_failed",
+                            format!("could not parse existing meta file: {e}"),
+                            Some(request_id),
+                        );
+                    }
+                };
+            return (
+                StatusCode::OK,
+                Json(CredentialsSealResponse { sealed: false, replaced_previous: false, meta }),
+            )
+                .into_response();
+        }
+        _ => {} // Replace branch (default) or no existing credential — proceed.
+    }
+
+    let replaced_previous = credential_exists;
+
+    let access_token = permitlayer_credential::OAuthToken::from_trusted_bytes(
+        payload.access_token.as_bytes().to_vec(),
+    );
+    let sealed_access = match state.vault.seal(&payload.service, &access_token) {
+        Ok(s) => s,
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credentials.seal_failed",
+                format!("vault seal failed for access token: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+
+    let sealed_refresh = match payload.refresh_token.as_ref() {
+        Some(refresh) => {
+            let refresh_token = permitlayer_credential::OAuthRefreshToken::from_trusted_bytes(
+                refresh.as_bytes().to_vec(),
+            );
+            let refresh_service = format!("{}-refresh", payload.service);
+            match state.vault.seal_refresh(&refresh_service, &refresh_token) {
+                Ok(s) => Some((refresh_service, s)),
+                Err(e) => {
+                    return agent_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "credentials.seal_failed",
+                        format!("vault seal failed for refresh token: {e}"),
+                        Some(request_id),
+                    );
+                }
+            }
+        }
+        None => None,
+    };
+
+    let had_refresh_token = sealed_refresh.is_some();
+
+    let store = match permitlayer_core::store::fs::CredentialFsStore::new(home.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credentials.store_init_failed",
+                format!("credential store init failed: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+
+    if let Err(e) = store.put(&payload.service, sealed_access).await {
+        return agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "credentials.store_io_failed",
+            format!("credential store write failed for sealed access token: {e}"),
+            Some(request_id),
+        );
+    }
+    if let Some((refresh_service, sealed)) = sealed_refresh {
+        if let Err(e) = store.put(&refresh_service, sealed).await {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credentials.store_io_failed",
+                format!("credential store write failed for sealed refresh token: {e}"),
+                Some(request_id),
+            );
+        }
+    }
+
+    let meta = permitlayer_oauth::metadata::CredentialMeta {
+        client_type: payload.client_type.clone(),
+        client_source: Some(payload.client_source.clone()),
+        connected_at: chrono::Utc::now().to_rfc3339(),
+        last_refreshed_at: None,
+        scopes: payload.granted_scopes.clone(),
+        expires_in_secs: payload.expires_in_secs,
+    };
+    if let Err(e) = permitlayer_oauth::metadata::write_metadata_atomic(&meta_path, &meta) {
+        return agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "credentials.meta_write_failed",
+            format!("meta JSON write failed: {e}"),
+            Some(request_id),
+        );
+    }
+
+    if let Some(audit) = &state.audit_store {
+        let mut event = AuditEvent::with_request_id(
+            request_id.clone(),
+            payload.agent.clone(),
+            "permitlayer".to_owned(),
+            payload.service.clone(),
+            "credentials-seal".to_owned(),
+            "ok".to_owned(),
+            "credentials-sealed".to_owned(),
+        );
+        event.extra = serde_json::json!({
+            "service": payload.service,
+            "agent": payload.agent,
+            "scopes": payload.granted_scopes,
+            "client_type": payload.client_type,
+            "client_source": payload.client_source,
+            "replaced_previous": replaced_previous,
+            "had_refresh_token": had_refresh_token,
+        });
+        enrich_audit_extra_with_peer_creds(&mut event.extra, peer_creds_for_audit);
+        if let Err(e) = audit.append(event).await {
+            tracing::warn!(error = %e, "credentials-sealed audit write failed (best-effort)");
+        }
+    }
+
+    tracing::info!(
+        target: "control",
+        request_id = %request_id,
+        service = %payload.service,
+        agent = %payload.agent,
+        replaced_previous,
+        had_refresh_token,
+        "credential sealed via control endpoint"
+    );
+
+    (StatusCode::OK, Json(CredentialsSealResponse { sealed: true, replaced_previous, meta }))
+        .into_response()
+}
+
 /// `POST /v1/control/agent/remove` — delete an agent file and swap
 /// the registry. Returns `removed: false` for a not-found name.
 pub(crate) async fn remove_agent_handler(
@@ -2917,6 +3257,7 @@ pub(crate) fn router(
         .route("/v1/control/agent/list", get(list_agents_handler))
         .route("/v1/control/agent/{name}/policy_name", get(agent_policy_name_handler))
         .route("/v1/control/credentials/{service}/meta", get(credentials_meta_handler))
+        .route("/v1/control/credentials/seal", post(credentials_seal_handler))
         .route("/v1/control/agent/remove", post(remove_agent_handler))
         .route("/v1/control/agent/rebind", post(rebind_agent_handler))
         .route("/v1/control/connections", get(connections_handler))
@@ -4682,5 +5023,300 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
         let json = body_json(resp).await;
         assert_eq!(json["code"], "credentials.meta_parse_failed");
+    }
+
+    // ── Story 7.30 Task 4: POST /v1/control/credentials/seal ─────────
+
+    /// Wiring for seal-handler tests: builds a router with a fixed
+    /// agent registry (single agent `"test-agent"` → policy `"test-policy"`),
+    /// a real `tempdir/vault` directory for `state.vault_dir`, an
+    /// optional audit store, and a real `Arc<Vault>` (so seal() can
+    /// produce envelope bytes). Returns the router + the `home` tempdir
+    /// (so tests can read the resulting on-disk files), keeping the
+    /// tempdir alive for the test scope.
+    fn build_with_seal_wiring(
+        agent_name: &str,
+        audit_store: Option<Arc<dyn permitlayer_core::store::AuditStore>>,
+    ) -> (Router, tempfile::TempDir, Arc<KillSwitch>) {
+        let switch = Arc::new(KillSwitch::new());
+        let home_tmp = tempfile::tempdir().unwrap();
+        let home = home_tmp.path();
+        let vault_dir_path = home.join("vault");
+        std::fs::create_dir_all(&vault_dir_path).unwrap();
+
+        let identity = permitlayer_core::agent::AgentIdentity::new(
+            agent_name.to_owned(),
+            "test-policy".to_owned(),
+            "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".to_owned(),
+            "0".repeat(64),
+            chrono::Utc::now(),
+            None,
+        )
+        .unwrap();
+        let agent_registry = Arc::new(AgentRegistry::new(vec![identity]));
+
+        let policy_set = Arc::new(ArcSwap::from_pointee(PolicySet::empty()));
+        let policies_dir = tempfile::tempdir().unwrap().keep();
+        let reload_mutex = Arc::new(std::sync::Mutex::new(()));
+        let (ato, cs, co, stub, _placeholder_vault_dir) = test_reload_wiring();
+
+        let router = router(
+            Arc::clone(&switch),
+            audit_store,
+            policy_set,
+            policies_dir,
+            reload_mutex,
+            agent_registry,
+            None,
+            Arc::new(zeroize::Zeroizing::new([0x42u8; LOOKUP_KEY_BYTES])),
+            test_approval_service(),
+            test_conn_tracker(),
+            test_plugin_registry(),
+            ato,
+            cs,
+            co,
+            stub,
+            vault_dir_path,
+            test_vault(),
+            test_control_token(),
+        );
+        (router, home_tmp, switch)
+    }
+
+    /// Build a seal-handler request with the canonical valid body. Override
+    /// individual fields via closure mutation before serialization.
+    fn seal_request_body(
+        service: &str,
+        agent: &str,
+        if_exists: &str,
+        with_refresh: bool,
+    ) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "service": service,
+            "agent": agent,
+            "access_token": "ya29.test-access-token-bytes",
+            "granted_scopes": ["https://mail.google.com/"],
+            "client_type": "byo",
+            "client_source": "/abs/cs.json",
+            "expires_in_secs": 3599,
+            "if_exists": if_exists,
+        });
+        if with_refresh {
+            body["refresh_token"] = serde_json::json!("1//test-refresh-token-bytes");
+        }
+        body
+    }
+
+    fn post_seal_request(body: serde_json::Value) -> Request<Body> {
+        let mut r = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/control/credentials/seal")
+            .header("content-type", "application/json")
+            .header("x-agentsso-control", test_control_token_header())
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        r.extensions_mut().insert(ConnectInfo(loopback_v4()));
+        r
+    }
+
+    #[tokio::test]
+    async fn credentials_seal_handler_seals_fresh_credential() {
+        let (app, home_tmp, _) = build_with_seal_wiring("test-agent", None);
+        let body = seal_request_body("gmail", "test-agent", "replace", true);
+        let resp = app.oneshot(post_seal_request(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["sealed"], true);
+        assert_eq!(json["replaced_previous"], false);
+        assert_eq!(json["meta"]["client_type"], "byo");
+
+        // On-disk artifacts.
+        let vault_dir = home_tmp.path().join("vault");
+        assert!(vault_dir.join("gmail.sealed").is_file());
+        assert!(vault_dir.join("gmail-refresh.sealed").is_file());
+        assert!(vault_dir.join("gmail-meta.json").is_file());
+    }
+
+    #[tokio::test]
+    async fn credentials_seal_handler_replaces_previous_on_replace() {
+        let (app, home_tmp, switch) = build_with_seal_wiring("test-agent", None);
+        // First seal.
+        let body = seal_request_body("gmail", "test-agent", "replace", false);
+        let resp = app.oneshot(post_seal_request(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Second seal (replace).
+        let (app2, _home2, _) = (
+            build_with_seal_wiring_with_existing_home(
+                "test-agent",
+                home_tmp.path().to_path_buf(),
+                None,
+            ),
+            home_tmp,
+            switch,
+        );
+        let body = seal_request_body("gmail", "test-agent", "replace", false);
+        let resp = app2.oneshot(post_seal_request(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["sealed"], true);
+        assert_eq!(json["replaced_previous"], true);
+    }
+
+    /// Variant of `build_with_seal_wiring` that reuses an existing
+    /// `home` directory. Used by the `replace` test which needs to
+    /// observe state across two sequential handler invocations.
+    fn build_with_seal_wiring_with_existing_home(
+        agent_name: &str,
+        home: std::path::PathBuf,
+        audit_store: Option<Arc<dyn permitlayer_core::store::AuditStore>>,
+    ) -> Router {
+        let switch = Arc::new(KillSwitch::new());
+        let vault_dir_path = home.join("vault");
+        std::fs::create_dir_all(&vault_dir_path).unwrap();
+
+        let identity = permitlayer_core::agent::AgentIdentity::new(
+            agent_name.to_owned(),
+            "test-policy".to_owned(),
+            "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".to_owned(),
+            "0".repeat(64),
+            chrono::Utc::now(),
+            None,
+        )
+        .unwrap();
+        let agent_registry = Arc::new(AgentRegistry::new(vec![identity]));
+
+        let policy_set = Arc::new(ArcSwap::from_pointee(PolicySet::empty()));
+        let policies_dir = tempfile::tempdir().unwrap().keep();
+        let reload_mutex = Arc::new(std::sync::Mutex::new(()));
+        let (ato, cs, co, stub, _placeholder_vault_dir) = test_reload_wiring();
+
+        router(
+            Arc::clone(&switch),
+            audit_store,
+            policy_set,
+            policies_dir,
+            reload_mutex,
+            agent_registry,
+            None,
+            Arc::new(zeroize::Zeroizing::new([0x42u8; LOOKUP_KEY_BYTES])),
+            test_approval_service(),
+            test_conn_tracker(),
+            test_plugin_registry(),
+            ato,
+            cs,
+            co,
+            stub,
+            vault_dir_path,
+            test_vault(),
+            test_control_token(),
+        )
+    }
+
+    #[tokio::test]
+    async fn credentials_seal_handler_skips_when_if_exists_skip_and_present() {
+        let (app, home_tmp, _) = build_with_seal_wiring("test-agent", None);
+        // First seal establishes the credential.
+        let body = seal_request_body("gmail", "test-agent", "replace", false);
+        let resp = app.oneshot(post_seal_request(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Second seal with if_exists=skip.
+        let app2 = build_with_seal_wiring_with_existing_home(
+            "test-agent",
+            home_tmp.path().to_path_buf(),
+            None,
+        );
+        let body = seal_request_body("gmail", "test-agent", "skip", false);
+        let resp = app2.oneshot(post_seal_request(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["sealed"], false);
+        assert_eq!(json["replaced_previous"], false);
+    }
+
+    #[tokio::test]
+    async fn credentials_seal_handler_returns_409_when_if_exists_error_and_present() {
+        let (app, home_tmp, _) = build_with_seal_wiring("test-agent", None);
+        let body = seal_request_body("gmail", "test-agent", "replace", false);
+        let resp = app.oneshot(post_seal_request(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let app2 = build_with_seal_wiring_with_existing_home(
+            "test-agent",
+            home_tmp.path().to_path_buf(),
+            None,
+        );
+        let body = seal_request_body("gmail", "test-agent", "error", false);
+        let resp = app2.oneshot(post_seal_request(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "credentials.already_exists");
+    }
+
+    #[tokio::test]
+    async fn credentials_seal_handler_returns_422_for_unknown_agent() {
+        let (app, _home_tmp, _) = build_with_seal_wiring("test-agent", None);
+        let body = seal_request_body("gmail", "no-such-agent", "replace", false);
+        let resp = app.oneshot(post_seal_request(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "credentials.unknown_agent");
+    }
+
+    #[tokio::test]
+    async fn credentials_seal_handler_returns_422_for_unknown_service() {
+        let (app, _home_tmp, _) = build_with_seal_wiring("test-agent", None);
+        let body = seal_request_body("slack", "test-agent", "replace", false);
+        let resp = app.oneshot(post_seal_request(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "credentials.unknown_service");
+    }
+
+    #[tokio::test]
+    async fn credentials_seal_handler_emits_audit_event_with_expected_shape() {
+        let home_tmp = tempfile::tempdir().unwrap();
+        let store = build_audit_store(home_tmp.path());
+
+        let app = build_with_seal_wiring_with_existing_home(
+            "test-agent",
+            home_tmp.path().to_path_buf(),
+            Some(Arc::clone(&store)),
+        );
+        let body = seal_request_body("gmail", "test-agent", "replace", true);
+        let resp = app.oneshot(post_seal_request(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let events = read_audit_events(home_tmp.path());
+        let seal_events: Vec<_> =
+            events.iter().filter(|e| e.event_type == "credentials-sealed").collect();
+        assert_eq!(seal_events.len(), 1);
+        let event = seal_events[0];
+        assert_eq!(event.outcome, "ok");
+        assert_eq!(event.extra["service"], "gmail");
+        assert_eq!(event.extra["agent"], "test-agent");
+        assert_eq!(event.extra["client_type"], "byo");
+        assert_eq!(event.extra["client_source"], "/abs/cs.json");
+        assert_eq!(event.extra["replaced_previous"], false);
+        assert_eq!(event.extra["had_refresh_token"], true);
+        assert_eq!(event.extra["scopes"][0], "https://mail.google.com/");
+    }
+
+    #[tokio::test]
+    async fn credentials_seal_handler_rejects_bad_json() {
+        let (app, _home_tmp, _) = build_with_seal_wiring("test-agent", None);
+        let mut r = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/control/credentials/seal")
+            .header("content-type", "application/json")
+            .header("x-agentsso-control", test_control_token_header())
+            .body(Body::from(b"not json".to_vec()))
+            .unwrap();
+        r.extensions_mut().insert(ConnectInfo(loopback_v4()));
+        let resp = app.oneshot(r).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "credentials.bad_request");
     }
 }
