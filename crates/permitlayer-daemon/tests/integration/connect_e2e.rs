@@ -215,6 +215,28 @@ fn connect_daemon_up_unknown_agent_emits_agent_not_found() {
     drop(daemon);
 }
 
+// Story 7.30: the "daemon up + agent registered + connect reaches
+// oauth-client step" happy-path lights up two UDS hops
+// (agent_policy_name + credentials_meta). It can't run in the
+// current integration test harness because the helper that
+// registers the test agent uses TCP POST against
+// `/v1/control/agent/register`, which post-Story-7.27 lives on the
+// UDS listener on macOS — not on the TCP loopback used here. The
+// same harness limitation affects half the daemon's integration
+// tests (`agent_rebind_e2e`, `agent_registry_e2e`,
+// `kill_resume_e2e::connect_blocked_when_killed`, …); fixing it is
+// out of scope for Story 7.30. The CLI's UDS hops are still covered
+// by:
+//   - 28 unit tests on the daemon-side handlers (control.rs) — full
+//     happy path including audit-event shape verification.
+//   - 2 unit tests on the CLI-side URL encoder (connect_uds.rs).
+//   - The two integration tests above
+//     (`connect_without_daemon_exits_2_with_must_run_block` and
+//     `connect_daemon_up_unknown_agent_emits_agent_not_found`) for
+//     the exit-code surface.
+//   - Manual macOS shakedown on Angie's box per the rc.22 ship
+//     procedure (Story 7.29 Task 6 + 7.30 AC #18-25).
+
 // --------------------------------------------------------------------------
 // AC #2 / Step 7 — snippet emission paths exercised at the unit level.
 // (We can't run the full happy path without OAuth, but snippet emission
