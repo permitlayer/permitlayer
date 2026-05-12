@@ -44,14 +44,8 @@
 use std::path::{Path, PathBuf};
 
 use clap::Args;
-use permitlayer_core::store::CredentialStore;
-use permitlayer_core::store::fs::CredentialFsStore;
-use permitlayer_keystore::{FallbackMode, KeystoreConfig, default_keystore};
 use permitlayer_oauth::google::consent::GoogleOAuthConfig;
 use permitlayer_oauth::google::scopes;
-use permitlayer_oauth::google::verify;
-use permitlayer_oauth::metadata::{CredentialMeta, write_metadata_atomic};
-use permitlayer_vault::Vault;
 
 use crate::design::render;
 use crate::design::terminal::{ColorSupport, styled};
@@ -61,8 +55,7 @@ use crate::design::theme::Theme;
 // this file into `cli::oauth_render`. See module-level docs there.
 use super::oauth_render::{
     HEADLESS_PASTE_TIMEOUT_SECS, OAuthErrorSeverity, SpinnerGuard, build_teal_theme,
-    check_vault_dir_writable, print_headless_consent_block, read_pasted_redirect_url,
-    render_oauth_error,
+    print_headless_consent_block, read_pasted_redirect_url, render_oauth_error,
 };
 
 // ──────────────────────────────────────────────────────────────────
@@ -115,25 +108,29 @@ pub(crate) fn exit3() -> anyhow::Error {
 ///
 /// - **2 (operator-correctable)**: connect.agent_not_found,
 ///   connect.unknown_service, connect.invalid_oauth_client,
-///   connect.daemon_must_stop, connect.vault_dir_*, connect.non_interactive_required.
-/// - **3 (system / retry)**: connect.oauth_failed, connect.verify_failed,
-///   connect.policy_edit_failed, connect.reload_failed, connect.rebind_failed,
-///   connect.openclaw_failed.
+///   connect.daemon_must_run, connect.non_interactive_required.
+/// - **3 (system / retry)**: connect.oauth_failed, connect.seal_failed,
+///   connect.verify_failed, connect.policy_edit_failed,
+///   connect.reload_failed, connect.rebind_failed, connect.openclaw_failed,
+///   connect.agent_lookup_failed, connect.meta_lookup_failed.
 ///
 /// Used both by the unit tests (mapping table) and by [`silent_err_for_code`]
 /// (which produces the right typed marker for `connect_to_exit_code` to
 /// downcast). Story 7.13 round-1 P1 wired this in: previously many failure
 /// paths used bare `silent_cli_error` which produced exit 1; the spec table
 /// in Dev Notes promised 2/3 per code.
+///
+/// Story 7.30 deviation: `connect.daemon_must_stop` (exit 2) is replaced
+/// by `connect.daemon_must_run` (exit 2) because the daemon now owns
+/// every credential write. `connect.vault_dir_symlink` / `_unwritable`
+/// are gone: the daemon owns the vault dir.
 pub(crate) fn connect_exit_code(code: &str) -> i32 {
     match code {
         "connect.agent_not_found"
         | "connect.unknown_service"
         | "connect.invalid_oauth_client"
-        | "connect.daemon_must_stop"
+        | "connect.daemon_must_run"
         | "connect.non_interactive_required"
-        | "connect.vault_dir_symlink"
-        | "connect.vault_dir_unwritable"
         | "setup.removed" => 2,
         _ => 3,
     }
@@ -457,31 +454,70 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
         "starting connect flow"
     );
 
-    // ── Step 1b — agent existence pre-check (AC #5) ────────────────
+    // ── Step 1b — daemon-running gate + agent existence pre-check ──
     //
-    // Read the agent file directly via the FS store rather than
-    // contacting the daemon. The control plane has no
-    // GET /v1/control/agent/<name> endpoint, only `list`, and the
-    // agent file is the source of truth anyway. Failing this step
-    // produces an operator-actionable error BEFORE any vault touch.
-    let agent_policy_name = match resolve_agent_policy_name(&home, &args.agent).await? {
-        Some(p) => p,
-        None => {
+    // Story 7.30: the connect flow now writes every credential through
+    // the daemon control plane (the daemon owns the master key + the
+    // `0700 root:wheel` state directory). Require the daemon to be
+    // running before going further; if it isn't, render a structured
+    // remediation block pointing at the install/start/group steps.
+    let control_handle = super::connect_uds::require_daemon_running(&home).await?;
+
+    let agent_policy_name = match super::connect_uds::get_agent_policy_name(
+        &control_handle,
+        &args.agent,
+    )
+    .await
+    {
+        Ok(super::connect_uds::ControlOutcome::Ok(resp)) => resp.policy_name,
+        Ok(super::connect_uds::ControlOutcome::Err { status_code, body }) => {
+            // 404 → operator-correctable agent-not-found.
+            if body.code == "agent.not_found" {
+                eprint!(
+                    "{}",
+                    render::error_block(
+                        "connect.agent_not_found",
+                        &format!("agent '{}' not found", args.agent),
+                        &format!(
+                            "agentsso agent register {} --policy <policy-name>\n\n  \
+                             then re-run this command:\n  \
+                             agentsso connect {service} --agent {}",
+                            args.agent, args.agent
+                        ),
+                        None,
+                    )
+                );
+                return Err(exit2());
+            }
+            // Any other daemon-side error → exit 3.
             eprint!(
                 "{}",
                 render::error_block(
-                    "connect.agent_not_found",
-                    &format!("agent '{}' not found", args.agent),
+                    "connect.agent_lookup_failed",
                     &format!(
-                        "agentsso agent register {} --policy <policy-name>\n\n  \
-                         then re-run this command:\n  \
-                         agentsso connect {service} --agent {}",
-                        args.agent, args.agent
+                        "agent lookup failed (HTTP {status_code}, daemon code {}): {}",
+                        body.code, body.message
                     ),
+                    "check the daemon's tracing log and the audit log for the matching request_id",
                     None,
                 )
             );
-            return Err(exit2());
+            return Err(silent_err_for_code("connect.agent_lookup_failed", "agent lookup failed"));
+        }
+        Err(transport_err) => {
+            eprint!(
+                "{}",
+                render::error_block(
+                    "connect.agent_lookup_failed",
+                    &format!("agent lookup transport error: {transport_err}"),
+                    "verify the daemon is healthy: agentsso status",
+                    None,
+                )
+            );
+            return Err(silent_err_for_code(
+                "connect.agent_lookup_failed",
+                "agent lookup transport failure",
+            ));
         }
     };
 
@@ -494,50 +530,69 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
         println!();
     }
 
-    // ── Step 2 — OAuth + seal (vault-touching phase) ───────────────
+    // ── Step 2 — OAuth + seal (daemon-mediated phase) ──────────────
     //
-    // Round-1 P15 ordering fix: detect credential coverage AND gate
-    // daemon-running BEFORE resolving the OAuth client. The previous
-    // ordering forced operators who hit the daemon-running gate to
-    // first navigate the missing-OAuth-client error — but `agentsso
-    // stop` is the actual blocker, so it should be the first thing
-    // they see. Resolving the OAuth client is also expensive
-    // (interactive prompt) and unnecessary on the credential-skip path.
-    let vault_dir = home.join("vault");
-    let meta_path = vault_dir.join(format!("{service}-meta.json"));
-    let credential_already_present = !args.force && credential_covers_target(&meta_path, &service);
-
-    // Need to seal a new credential? Gate on daemon-running BEFORE
-    // any OAuth-client work.
-    if !credential_already_present {
-        // Round-1 P8: typed daemon-running state distinguishes "known
-        // PID" from "running but PID-file unreadable" so the rendered
-        // error message no longer says misleading "PID 0".
-        let pid_hint = match daemon_running_state(&home) {
-            DaemonRunningState::NotRunning => None,
-            DaemonRunningState::Running(pid) => Some(format!(" (PID {pid})")),
-            DaemonRunningState::RunningUnknownPid => Some(String::new()),
-        };
-        if let Some(hint) = pid_hint {
+    // Story 7.30: the daemon owns the vault, the master key, and every
+    // `*.sealed` / `*-meta.json` file. The CLI's job here is:
+    //   1. Check whether a credential already exists with covering
+    //      scopes (idempotent re-run path) — via UDS.
+    //   2. If not, drive the operator-interactive OAuth dance.
+    //   3. POST the resulting tokens to the daemon, which seals them
+    //      into its vault and writes the meta JSON.
+    //
+    // The daemon-must-be-running gate already fired in Step 1b above.
+    let existing_meta = match super::connect_uds::get_credentials_meta(&control_handle, &service)
+        .await
+    {
+        Ok(super::connect_uds::ControlOutcome::Ok(resp)) => resp,
+        Ok(super::connect_uds::ControlOutcome::Err { status_code, body }) => {
             eprint!(
                 "{}",
                 render::error_block(
-                    "connect.daemon_must_stop",
+                    "connect.meta_lookup_failed",
                     &format!(
-                        "agentsso daemon is running{hint}; connecting a service \
-                         requires sealing a new credential and must not race against a \
-                         live daemon."
+                        "credential meta lookup failed (HTTP {status_code}, daemon code {}): {}",
+                        body.code, body.message
                     ),
-                    &format!(
-                        "agentsso stop && agentsso connect {service} --agent {} --oauth-client <path>",
-                        args.agent
-                    ),
+                    "check the daemon's tracing log for the matching request_id",
                     None,
                 )
             );
-            return Err(exit3());
+            return Err(silent_err_for_code(
+                "connect.meta_lookup_failed",
+                "credential meta lookup failed",
+            ));
         }
-    }
+        Err(transport_err) => {
+            eprint!(
+                "{}",
+                render::error_block(
+                    "connect.meta_lookup_failed",
+                    &format!("credential meta transport error: {transport_err}"),
+                    "verify the daemon is healthy: agentsso status",
+                    None,
+                )
+            );
+            return Err(silent_err_for_code(
+                "connect.meta_lookup_failed",
+                "credential meta transport failure",
+            ));
+        }
+    };
+
+    let credential_already_present = !args.force
+        && existing_meta.exists
+        && existing_meta
+            .meta
+            .as_ref()
+            .map(|m| {
+                let needed: std::collections::HashSet<&str> =
+                    scopes::default_scopes_for_service(&service).into_iter().collect();
+                let have: std::collections::HashSet<&str> =
+                    m.scopes.iter().map(String::as_str).collect();
+                needed.is_subset(&have)
+            })
+            .unwrap_or(false);
 
     // `oauth_config` is needed only on the seal path AND for verify's
     // project_id rendering. On the credential-skip path it's None
@@ -555,26 +610,9 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
             tracing::info!(service = %service, "oauth + seal skipped: credential present");
         }
         // Capture scopes from existing meta for downstream policy merge.
-        match std::fs::read_to_string(&meta_path) {
-            Ok(text) => match serde_json::from_str::<CredentialMeta>(&text) {
-                Ok(m) => m.scopes,
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        path = %meta_path.display(),
-                        "credential meta failed to parse; using default scopes for service"
-                    );
-                    scopes::default_scopes_for_service(&service)
-                        .into_iter()
-                        .map(str::to_owned)
-                        .collect()
-                }
-            },
-            Err(_) => scopes::default_scopes_for_service(&service)
-                .into_iter()
-                .map(str::to_owned)
-                .collect(),
-        }
+        existing_meta.meta.as_ref().map(|m| m.scopes.clone()).unwrap_or_else(|| {
+            scopes::default_scopes_for_service(&service).into_iter().map(str::to_owned).collect()
+        })
     } else {
         // Resolve the OAuth client now that the daemon-running gate
         // passed. Same shape as setup.rs had (interactive prompt fallback
@@ -586,36 +624,17 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
         // verify + summary code outside the if/else can read it.
         let oauth_config = resolve_oauth_client(&args, &service, &theme, interactive).await?;
 
-        // Phase 0: vault dir writability.
-        if let Err(e) = check_vault_dir_writable(&vault_dir) {
-            let (code, remediation) = if e.kind() == std::io::ErrorKind::InvalidInput {
-                (
-                    "connect.vault_dir_symlink",
-                    "rm ~/.agentsso/vault && mkdir -p -m 0700 ~/.agentsso/vault",
-                )
-            } else {
-                (
-                    "connect.vault_dir_unwritable",
-                    "chmod 0700 ~/.agentsso/vault || mkdir -p -m 0700 ~/.agentsso/vault",
-                )
-            };
-            eprint!(
-                "{}",
-                render::error_block(
-                    code,
-                    &format!("{}: {e}", vault_dir.display()),
-                    remediation,
-                    None
-                )
-            );
-            return Err(silent_err_for_code(code, "vault dir unwritable"));
-        }
+        // Story 7.30: vault-dir writability checks moved daemon-side. The
+        // daemon owns `0700 root:wheel` `/Library/Application Support/permitlayer/vault/`
+        // and surfaces fs failures through `credentials.store_io_failed`
+        // on the seal POST. Operator never touches that path directly
+        // anymore.
 
         // Phase 1: scope preview (interactive only).
         let teal_theme = std::sync::Arc::new(build_teal_theme(&theme));
 
         if interactive {
-            if meta_path.exists() && !args.force {
+            if existing_meta.exists && !args.force {
                 let styled_service = styled(&service, theme.tokens().accent, color_support);
                 println!(
                     "  {styled_service} is already connected \u{00b7} re-running will replace existing credentials"
@@ -663,11 +682,11 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
         }
 
         // Phase 3: browser + spinner / headless paste.
-        let keystore_config = KeystoreConfig { fallback: FallbackMode::Auto, home: home.clone() };
-        let keystore = default_keystore(&keystore_config)?;
-        let master_key = keystore.master_key().await?.key.into_inner();
-        let active_key_id = super::start::compute_active_key_id(&home.join("vault"));
-        let vault = Vault::new(master_key, active_key_id);
+        //
+        // Story 7.30: the CLI no longer constructs a `Vault` — the
+        // daemon owns the master key and the vault. The OAuth dance
+        // here only produces plaintext tokens; the seal POST below
+        // hands them to the daemon's `credentials_seal_handler`.
         let client = permitlayer_oauth::OAuthClient::new(
             oauth_config.client_id().to_owned(),
             oauth_config.client_secret().map(str::to_owned),
@@ -792,48 +811,95 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
             }
         };
 
-        // Phase 4: seal + store.
-        let store = CredentialFsStore::new(home.clone())?;
-        let sealed_access = vault
-            .seal(&service, &result.access_token)
-            .map_err(|e| anyhow::anyhow!("failed to seal access token: {e}"))?;
-        store
-            .put(&service, sealed_access)
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to store access token: {e}"))?;
-        if let Some(ref refresh_token) = result.refresh_token {
-            let refresh_service = format!("{service}-refresh");
-            let sealed_refresh = vault
-                .seal_refresh(&refresh_service, refresh_token)
-                .map_err(|e| anyhow::anyhow!("failed to seal refresh token: {e}"))?;
-            store
-                .put(&refresh_service, sealed_refresh)
-                .await
-                .map_err(|e| anyhow::anyhow!("failed to store refresh token: {e}"))?;
-        }
+        // Phase 4: seal via daemon (Story 7.30 AC #3).
+        //
+        // The CLI hands plaintext tokens to the daemon's
+        // `credentials_seal_handler` over UDS. The daemon owns the seal
+        // crypto (vault.seal), the disk write (CredentialFsStore::put),
+        // and the meta JSON (write_metadata_atomic). The `if_exists`
+        // semantics map: `--force` → replace; otherwise → replace too
+        // (this branch only fires when the idempotent re-run check
+        // above already concluded "we need to seal").
+        let granted_scopes_for_seal: Vec<String> =
+            if result.scopes.is_empty() { scopes_owned.clone() } else { result.scopes.clone() };
 
-        let granted = if result.scopes.is_empty() { scopes_owned } else { result.scopes.clone() };
-        let meta = CredentialMeta {
-            client_type: "byo".to_owned(),
-            client_source: Some(oauth_config.source_path().display().to_string()),
-            connected_at: chrono::Utc::now().to_rfc3339(),
-            last_refreshed_at: None,
-            scopes: granted.clone(),
-            expires_in_secs: result.expires_in.map(|d| d.as_secs()),
+        // `access_token` and `refresh_token` are `OAuthToken` /
+        // `OAuthRefreshToken` — non-Display, non-Debug. Convert the raw
+        // bytes to UTF-8 strings via `reveal()` for the JSON wire body;
+        // the seal handler deserializes them into `Zeroizing<String>`.
+        let access_token_str = std::str::from_utf8(result.access_token.reveal())
+            .map_err(|e| anyhow::anyhow!("access token is not valid UTF-8: {e}"))?
+            .to_owned();
+        let refresh_token_str: Option<String> = match result.refresh_token.as_ref() {
+            Some(t) => Some(
+                std::str::from_utf8(t.reveal())
+                    .map_err(|e| anyhow::anyhow!("refresh token is not valid UTF-8: {e}"))?
+                    .to_owned(),
+            ),
+            None => None,
         };
-        write_metadata_atomic(&meta_path, &meta)
-            .map_err(|e| anyhow::anyhow!("failed to write credential metadata: {e}"))?;
-        if interactive {
-            let check = styled("\u{2713}", theme.tokens().accent, color_support);
-            println!("  {check} tokens sealed");
-        } else {
-            tracing::info!(service = %service, "access token sealed and stored");
+        let client_source_str = oauth_config.source_path().display().to_string();
+        let seal_req = super::connect_uds::CredentialsSealRequest {
+            service: &service,
+            agent: &args.agent,
+            access_token: &access_token_str,
+            refresh_token: refresh_token_str.as_deref(),
+            granted_scopes: &granted_scopes_for_seal,
+            client_type: "byo",
+            client_source: &client_source_str,
+            expires_in_secs: result.expires_in.map(|d| d.as_secs()),
+            if_exists: "replace",
+        };
+        match super::connect_uds::post_credentials_seal(&control_handle, &seal_req).await {
+            Ok(super::connect_uds::ControlOutcome::Ok(resp)) => {
+                if interactive {
+                    let check = styled("\u{2713}", theme.tokens().accent, color_support);
+                    if resp.replaced_previous {
+                        println!("  {check} tokens sealed (replaced previous)");
+                    } else {
+                        println!("  {check} tokens sealed");
+                    }
+                } else {
+                    tracing::info!(
+                        service = %service,
+                        replaced_previous = resp.replaced_previous,
+                        "access token sealed via daemon"
+                    );
+                }
+            }
+            Ok(super::connect_uds::ControlOutcome::Err { status_code, body }) => {
+                eprint!(
+                    "{}",
+                    render::error_block(
+                        "connect.seal_failed",
+                        &format!(
+                            "credentials seal failed (HTTP {status_code}, daemon code {}): {}",
+                            body.code, body.message
+                        ),
+                        "check the daemon's tracing log for the matching request_id, then retry",
+                        None,
+                    )
+                );
+                return Err(silent_err_for_code("connect.seal_failed", "seal failed"));
+            }
+            Err(transport_err) => {
+                eprint!(
+                    "{}",
+                    render::error_block(
+                        "connect.seal_failed",
+                        &format!("credentials seal transport error: {transport_err}"),
+                        "verify the daemon is healthy: agentsso status",
+                        None,
+                    )
+                );
+                return Err(silent_err_for_code("connect.seal_failed", "seal transport failure"));
+            }
         }
 
         // Move oauth_config out so the post-block verify + summary code
         // can read its project_id / provenance_tag.
         oauth_config_opt = Some(oauth_config);
-        granted
+        granted_scopes_for_seal
     };
 
     // ── Step 3 — verify (with retry loop, AC #4) ────────────────────
@@ -844,7 +910,7 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
     // URL/gcloud command. Up to 5 attempts in interactive mode;
     // first failure exits in --non-interactive mode.
     let project_id_for_verify = oauth_config_opt.as_ref().and_then(|c| c.project_id());
-    verify_with_retry(&home, &service, project_id_for_verify, interactive, &args).await?;
+    verify_with_retry(&control_handle, &service, project_id_for_verify, interactive, &args).await?;
 
     if interactive {
         let check = styled("\u{2713}", theme.tokens().accent, color_support);
@@ -895,24 +961,28 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
         }
     }
 
-    let policies_dir = home.join("policies");
-    let policy_diff = match permitlayer_core::policy::edit::add_scopes_to_policy(
-        &policies_dir,
-        &agent_policy_name,
-        &short_names,
-    ) {
-        Ok(d) => d,
-        Err(e) => {
+    // Story 7.30 (Task 10): policy edit + reload move daemon-side. The
+    // CLI POSTs the short-name diff to `/v1/control/policy/{name}/scopes`
+    // and the daemon owns the file-write + ArcSwap reload. No-op merges
+    // surface as `reloaded: false` in the response.
+    let scopes_req = super::connect_uds::PolicyScopesRequest { short_names: &short_names };
+    let policy_outcome =
+        super::connect_uds::post_policy_scopes(&control_handle, &agent_policy_name, &scopes_req)
+            .await;
+    let policy_resp = match policy_outcome {
+        Ok(super::connect_uds::ControlOutcome::Ok(resp)) => resp,
+        Ok(super::connect_uds::ControlOutcome::Err { status_code, body }) => {
             eprint!(
                 "{}",
                 render::error_block(
                     "connect.policy_edit_failed",
                     &format!(
-                        "failed to merge granted scopes into policy '{agent_policy_name}': {e}"
+                        "policy scope merge failed (HTTP {status_code}, daemon code {}): {}",
+                        body.code, body.message
                     ),
                     &format!(
-                        "inspect ~/.agentsso/policies/{agent_policy_name}.toml and re-run \
-                         (or manually add the scopes: {})",
+                        "inspect the policy file (server-side) and re-run, \
+                         or manually add the scopes: {}",
                         short_names.join(", ")
                     ),
                     None,
@@ -920,54 +990,47 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
             );
             return Err(silent_err_for_code("connect.policy_edit_failed", "policy edit failed"));
         }
+        Err(transport_err) => {
+            eprint!(
+                "{}",
+                render::error_block(
+                    "connect.policy_edit_failed",
+                    &format!("policy scope merge transport error: {transport_err}"),
+                    "verify the daemon is healthy: agentsso status",
+                    None,
+                )
+            );
+            return Err(silent_err_for_code(
+                "connect.policy_edit_failed",
+                "policy edit transport failure",
+            ));
+        }
     };
-    let policy_was_modified = !policy_diff.is_no_op();
+    let policy_was_modified = !policy_resp.added.is_empty();
     if interactive {
         if policy_was_modified {
-            let added = policy_diff.added.join(", ");
+            let added = policy_resp.added.join(", ");
             let check = styled("\u{2713}", theme.tokens().accent, color_support);
             println!("  {check} policy '{agent_policy_name}' updated \u{00b7} added: {added}");
+            if policy_resp.reloaded {
+                let check = styled("\u{2713}", theme.tokens().accent, color_support);
+                println!("  {check} daemon reloaded");
+            }
         } else {
             let check = styled("\u{2713}", theme.tokens().accent, color_support);
             println!(
                 "  {check} policy '{agent_policy_name}' \u{00b7} skipped (scopes already present)"
             );
+            let check = styled("\u{2713}", theme.tokens().accent, color_support);
+            println!("  {check} reload \u{00b7} skipped (policy unchanged)");
         }
     } else {
         tracing::info!(
             policy = %agent_policy_name,
-            added = ?policy_diff.added,
+            added = ?policy_resp.added,
+            reloaded = policy_resp.reloaded,
             "policy edit complete"
         );
-    }
-
-    // ── Step 5 — reload (only if policy was modified) ──────────────
-    if policy_was_modified {
-        match post_reload(&home).await {
-            Ok(()) => {
-                if interactive {
-                    let check = styled("\u{2713}", theme.tokens().accent, color_support);
-                    println!("  {check} daemon reloaded");
-                } else {
-                    tracing::info!("daemon reloaded");
-                }
-            }
-            Err(e) => {
-                eprint!(
-                    "{}",
-                    render::error_block(
-                        "connect.reload_failed",
-                        &format!("failed to reload daemon after policy edit: {e}"),
-                        "agentsso reload   # then re-run agentsso connect",
-                        None,
-                    )
-                );
-                return Err(silent_err_for_code("connect.reload_failed", "reload failed"));
-            }
-        }
-    } else if interactive {
-        let check = styled("\u{2713}", theme.tokens().accent, color_support);
-        println!("  {check} reload \u{00b7} skipped (policy unchanged)");
     }
 
     // ── Step 6 — rebind ────────────────────────────────────────────
@@ -1059,49 +1122,6 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
 // Step helpers
 // ──────────────────────────────────────────────────────────────────
 
-/// Read the agent file directly via `AgentIdentityFsStore` and return
-/// its `policy_name`. Returns `None` if the agent doesn't exist.
-async fn resolve_agent_policy_name(home: &Path, name: &str) -> anyhow::Result<Option<String>> {
-    use permitlayer_core::store::AgentIdentityStore;
-
-    let store = permitlayer_core::store::fs::AgentIdentityFsStore::new(home.to_path_buf())
-        .map_err(|e| anyhow::anyhow!("failed to open agent store: {e}"))?;
-    let agent =
-        store.get(name).await.map_err(|e| anyhow::anyhow!("failed to read agent '{name}': {e}"))?;
-    Ok(agent.map(|a| a.policy_name))
-}
-
-/// Result of probing whether a daemon is currently running.
-///
-/// Round-1 P8: replaces `Option<u32>` where a "running but unknown PID"
-/// state was conflated with `Some(0)` and rendered as the misleading
-/// "PID 0" in operator-facing messages.
-enum DaemonRunningState {
-    /// No daemon process is alive (no PID file, or PID file points at
-    /// a dead PID).
-    NotRunning,
-    /// Daemon is running and we read a real PID from the PID file.
-    Running(u32),
-    /// Daemon is running but the PID file is unreadable / missing /
-    /// corrupt — the liveness probe itself reported `true` but we
-    /// can't tell the operator which process to act on.
-    RunningUnknownPid,
-}
-
-/// Probe daemon-running state. Honors the PID file for both liveness
-/// (via `is_daemon_running`, which checks process existence) and for
-/// the PID hint we render to the operator.
-fn daemon_running_state(home: &Path) -> DaemonRunningState {
-    if matches!(crate::lifecycle::pid::PidFile::is_daemon_running(home), Ok(true)) {
-        match crate::lifecycle::pid::PidFile::read(home) {
-            Ok(Some(pid)) => DaemonRunningState::Running(pid),
-            _ => DaemonRunningState::RunningUnknownPid,
-        }
-    } else {
-        DaemonRunningState::NotRunning
-    }
-}
-
 /// Resolve the OAuth client config — same prompt-fallback shape as
 /// the legacy `setup.rs` had.
 async fn resolve_oauth_client(
@@ -1149,28 +1169,12 @@ async fn resolve_oauth_client(
     }
 }
 
-/// Returns true when an existing credential meta file already covers
-/// the service's default scope set — so connect can skip the OAuth
-/// flow entirely (idempotent re-run path, AC #2).
-fn credential_covers_target(meta_path: &Path, service: &str) -> bool {
-    let Ok(text) = std::fs::read_to_string(meta_path) else {
-        return false;
-    };
-    let Ok(meta) = serde_json::from_str::<CredentialMeta>(&text) else {
-        return false;
-    };
-    let needed: std::collections::HashSet<&str> =
-        scopes::default_scopes_for_service(service).into_iter().collect();
-    let have: std::collections::HashSet<&str> = meta.scopes.iter().map(String::as_str).collect();
-    needed.is_subset(&have)
-}
-
 /// Run the verify probe with up to 5 retries (interactive) or 1
 /// attempt (non-interactive). Renders structured errors on each
 /// failure via `OAuthError::remediation_owned()` so Story 7.12's
 /// actionable text surfaces.
 async fn verify_with_retry(
-    home: &Path,
+    control_handle: &super::connect_uds::ConnectControlHandle,
     service: &str,
     project_id: Option<&str>,
     interactive: bool,
@@ -1182,227 +1186,202 @@ async fn verify_with_retry(
     let max = if interactive { MAX_ATTEMPTS } else { 1 };
 
     for attempt in 1..=max {
-        // Read the access token from the sealed credential each
-        // attempt — a long retry loop could outlive a token refresh,
-        // and we want the freshest bytes.
-        let token = match read_access_token(home, service).await {
-            Ok(b) => b,
+        // Story 7.30: verify probe now lives daemon-side. POST to
+        // `/v1/control/credentials/{service}/verify` — the daemon
+        // unseals the sealed credential and runs the Google probe.
+        // The CLI retains the operator-interactive retry-loop UX
+        // ("Press Enter to retry") but no longer touches the vault.
+        let verify_req =
+            super::connect_uds::CredentialsVerifyRequest { agent: &args.agent, project_id };
+        let verify_outcome =
+            super::connect_uds::post_credentials_verify(control_handle, service, &verify_req).await;
+        let (status_code, body) = match verify_outcome {
+            Ok(pair) => pair,
             Err(e) => {
                 eprint!(
                     "{}",
                     render::error_block(
                         "connect.verify_failed",
-                        &format!("failed to read sealed credential for {service}: {e}"),
-                        &format!(
-                            "agentsso credentials list   # confirm credential exists\n  \
-                             agentsso connect {service} --agent {}   # or re-run to re-seal",
-                            args.agent
-                        ),
+                        &format!("verify transport error: {e}"),
+                        "verify the daemon is healthy: agentsso status",
                         None,
                     )
                 );
                 return Err(silent_err_for_code(
                     "connect.verify_failed",
-                    "verify failed reading credential",
+                    "verify transport failure",
                 ));
             }
         };
 
-        match verify::verify_connection(service, token.reveal(), project_id).await {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                let last_attempt = attempt == max;
-                let severity = if last_attempt {
-                    OAuthErrorSeverity::Fatal
-                } else {
-                    OAuthErrorSeverity::NonFatal
-                };
-                render_oauth_error(&e, service, interactive, severity, "verification failed");
+        // Daemon contract:
+        //   - 200 with `ok: true`  → verify succeeded.
+        //   - 200 with `ok: false` → structured Google failure
+        //     (verify_reason / remediation_url surfaced for retry).
+        //   - 4xx/5xx → daemon-side failure (credential missing,
+        //     unseal failed, transport to Google failed, etc.).
+        if (200..300).contains(&status_code)
+            && body.get("ok").and_then(|v| v.as_bool()) == Some(true)
+        {
+            return Ok(());
+        }
 
-                // Round-1 D2 (re-audit): if the failure is a 401 and we
-                // exhausted retries, hint that the access token may
-                // have expired during the retry loop. Connect doesn't
-                // refresh tokens itself (the daemon is stopped during
-                // seal/verify; refresh lives in the daemon's runtime
-                // path). The operator's recourse is to re-run connect
-                // — Step 2 will skip the OAuth flow because the
-                // credential is sealed, AND a fresh access-token
-                // exchange happens on re-run.
-                if last_attempt && is_unauthorized_after_long_run(&e) && interactive {
-                    eprintln!();
-                    eprintln!(
-                        "  hint: 401 after multiple retries can mean the access token expired"
-                    );
-                    eprintln!(
-                        "        mid-loop. Re-run `agentsso connect {service} --agent {}`;",
-                        args.agent
-                    );
-                    eprintln!("        Step 2 will skip OAuth (credential is sealed) and the next");
-                    eprintln!("        verify gets a fresh handshake.");
-                    eprintln!();
-                }
+        // Build a synthetic verify-error message for render_verify_error.
+        let last_attempt = attempt == max;
+        let severity =
+            if last_attempt { OAuthErrorSeverity::Fatal } else { OAuthErrorSeverity::NonFatal };
+        render_verify_error_from_daemon(&body, status_code, service, interactive, severity);
 
-                if last_attempt {
-                    return Err(silent_err_for_code(
-                        "connect.verify_failed",
-                        "verify failed after retries",
-                    ));
-                }
+        let status_code_401 = body.get("status_code").and_then(|v| v.as_u64()) == Some(401);
+        if last_attempt && status_code_401 && interactive {
+            eprintln!();
+            eprintln!("  hint: 401 after multiple retries can mean the access token expired");
+            eprintln!(
+                "        mid-loop. Re-run `agentsso connect {service} --agent {}`;",
+                args.agent
+            );
+            eprintln!("        Step 2 will skip OAuth (credential is sealed) and the next");
+            eprintln!("        verify gets a fresh handshake.");
+            eprintln!();
+        }
 
-                if !interactive {
-                    return Err(silent_err_for_code(
-                        "connect.verify_failed",
-                        "verify failed (non-interactive)",
-                    ));
-                }
+        if last_attempt {
+            return Err(silent_err_for_code(
+                "connect.verify_failed",
+                "verify failed after retries",
+            ));
+        }
 
-                // Interactive: prompt to retry. A blank line / Enter
-                // means "retry"; Ctrl-D / EOF aborts.
-                eprint!(
-                    "  Press Enter to retry (attempt {}/{}), Ctrl-D to abort: ",
-                    attempt + 1,
-                    max
+        if !interactive {
+            return Err(silent_err_for_code(
+                "connect.verify_failed",
+                "verify failed (non-interactive)",
+            ));
+        }
+
+        // Interactive: prompt to retry. A blank line / Enter
+        // means "retry"; Ctrl-D / EOF aborts.
+        eprint!("  Press Enter to retry (attempt {}/{}), Ctrl-D to abort: ", attempt + 1, max);
+        let _ = std::io::stderr().flush();
+        let read_handle = tokio::task::spawn_blocking(|| -> std::io::Result<Option<String>> {
+            let mut line = String::new();
+            let n = std::io::stdin().lock().read_line(&mut line)?;
+            if n == 0 {
+                Ok(None) // EOF — abort
+            } else {
+                Ok(Some(line))
+            }
+        });
+        let timed = tokio::time::timeout(
+            std::time::Duration::from_secs(HEADLESS_PASTE_TIMEOUT_SECS),
+            read_handle,
+        )
+        .await;
+        match timed {
+            Ok(Ok(Ok(None))) => {
+                return Err(silent_err_for_code(
+                    "connect.verify_failed",
+                    "verify aborted by operator",
+                ));
+            }
+            Ok(Ok(Ok(Some(_)))) => continue,
+            Ok(Ok(Err(e))) => {
+                return Err(anyhow::anyhow!("stdin read failed during verify retry: {e}"));
+            }
+            Ok(Err(join_err)) => {
+                return Err(anyhow::anyhow!("stdin task panicked during verify retry: {join_err}"));
+            }
+            Err(_elapsed) => {
+                eprintln!();
+                eprintln!(
+                    "  no input within {HEADLESS_PASTE_TIMEOUT_SECS}s; aborting verify retry"
                 );
-                let _ = std::io::stderr().flush();
-                // Round-1 P6: wrap the blocking stdin read in a timeout
-                // so an AFK operator can't stall the runtime indefinitely.
-                // Mirrors `read_pasted_redirect_url` (HEADLESS_PASTE_TIMEOUT_SECS).
-                let read_handle =
-                    tokio::task::spawn_blocking(|| -> std::io::Result<Option<String>> {
-                        let mut line = String::new();
-                        let n = std::io::stdin().lock().read_line(&mut line)?;
-                        if n == 0 {
-                            Ok(None) // EOF — abort
-                        } else {
-                            Ok(Some(line))
-                        }
-                    });
-                let timed = tokio::time::timeout(
-                    std::time::Duration::from_secs(HEADLESS_PASTE_TIMEOUT_SECS),
-                    read_handle,
-                )
-                .await;
-                match timed {
-                    Ok(Ok(Ok(None))) => {
-                        // EOF
-                        return Err(silent_err_for_code(
-                            "connect.verify_failed",
-                            "verify aborted by operator",
-                        ));
-                    }
-                    Ok(Ok(Ok(Some(_)))) => continue,
-                    Ok(Ok(Err(e))) => {
-                        return Err(anyhow::anyhow!("stdin read failed during verify retry: {e}"));
-                    }
-                    Ok(Err(join_err)) => {
-                        return Err(anyhow::anyhow!(
-                            "stdin task panicked during verify retry: {join_err}"
-                        ));
-                    }
-                    Err(_elapsed) => {
-                        // Timeout — operator walked away.
-                        eprintln!();
-                        eprintln!(
-                            "  no input within {HEADLESS_PASTE_TIMEOUT_SECS}s; aborting verify retry"
-                        );
-                        return Err(silent_err_for_code(
-                            "connect.verify_failed",
-                            "verify aborted by retry-prompt timeout",
-                        ));
-                    }
-                }
+                return Err(silent_err_for_code(
+                    "connect.verify_failed",
+                    "verify aborted by retry-prompt timeout",
+                ));
             }
         }
     }
     unreachable!("loop terminates via Ok return or Err return inside the for body");
 }
 
-/// Round-1 D2 (re-audit): is this verify failure plausibly an expired
-/// access token after a long retry loop? Used to surface a re-run
-/// hint on the last verify attempt.
+/// Story 7.30: render a verify failure surfaced by the daemon's
+/// `credentials_verify_handler`. The daemon returns either:
+/// - 200 `{ ok: false, status_code, verify_reason, remediation_url, reason_text }`
+///   when Google returned a structured error (SERVICE_DISABLED, etc.)
+/// - 4xx/5xx with `{ status: "error", code, message, request_id }`
+///   for daemon-side failures (credential not found, unseal failed,
+///   transport to Google failed).
 ///
-/// Triggers on `OAuthError::VerificationFailed { status_code: Some(401), .. }`.
-fn is_unauthorized_after_long_run(e: &permitlayer_oauth::error::OAuthError) -> bool {
-    matches!(
-        e,
-        permitlayer_oauth::error::OAuthError::VerificationFailed { status_code: Some(401), .. }
-    )
-}
-
-/// Read and unseal the access token for `service`. The returned
-/// `OAuthToken` exposes `reveal() -> &[u8]` for the verify probe.
-async fn read_access_token(
-    home: &Path,
+/// This helper renders whichever shape it gets into the same
+/// `connect.verify_failed` operator block as the legacy CLI-side
+/// `render_oauth_error` produced.
+fn render_verify_error_from_daemon(
+    body: &serde_json::Value,
+    status_code: u16,
     service: &str,
-) -> anyhow::Result<permitlayer_credential::OAuthToken> {
-    let keystore_config = KeystoreConfig { fallback: FallbackMode::Auto, home: home.to_path_buf() };
-    let keystore = default_keystore(&keystore_config)?;
-    let master_key = keystore.master_key().await?.key.into_inner();
-    let active_key_id = super::start::compute_active_key_id(&home.join("vault"));
-    let vault = Vault::new(master_key, active_key_id);
-    let store = CredentialFsStore::new(home.to_path_buf())?;
-    let sealed = store
-        .get(service)
-        .await
-        .map_err(|e| anyhow::anyhow!("failed to load sealed credential for {service}: {e}"))?
-        .ok_or_else(|| anyhow::anyhow!("no sealed credential for {service}"))?;
-    vault
-        .unseal(service, &sealed)
-        .map_err(|e| anyhow::anyhow!("failed to unseal credential for {service}: {e}"))
-}
-
-/// POST `/v1/control/reload` against the running daemon.
-///
-/// Story 7.27 Round-2 review fix (P0): dispatches over UDS on macOS
-/// via `resolve_control_endpoint(&config)` + `http_post_json_via`.
-/// Pre-fix, this site (and `post_rebind` below) was missed in the
-/// AC #9 sweep — the daemon does NOT listen for `/v1/control/*`
-/// over TCP on macOS rc.22, so the call would fail with
-/// connection-refused at `127.0.0.1:3820`. Linux/Windows preserve
-/// the TCP transport via the same helper (Story 7.18/7.19 will
-/// migrate them later).
-async fn post_reload(home: &Path) -> anyhow::Result<()> {
-    let config = crate::cli::kill::load_daemon_config_or_default_with_warn("connect reload");
-    let endpoint = crate::cli::kill::resolve_control_endpoint(&config);
-    let token = crate::cli::kill::read_control_token(home);
-    let response = match crate::cli::kill::http_post_json_via(
-        &endpoint,
-        "/v1/control/reload",
-        "{}",
-        token.as_deref(),
-    )
-    .await
-    {
-        Ok(r) => r,
-        Err(e) => {
-            // Round-3 review fix (R3-C5-P3): emit the structured
-            // endpoint-aware error block for transport failures —
-            // matches the pattern in kill.rs / agent.rs / etc. The
-            // caller's existing `connect.reload_failed` error block
-            // is preserved as a fallthrough for non-transport errors
-            // (malformed response, non-ok status); only the
-            // unreachable-daemon path now classifies ENOENT/EACCES/
-            // ECONNREFUSED with targeted remediations.
-            tracing::debug!(error = %e, endpoint = %endpoint, "connect reload transport failure");
-            eprint!(
-                "{}",
-                crate::cli::kill::error_block_daemon_unreachable_endpoint_classified(
-                    "connect reload",
-                    &endpoint,
-                    Some(&e),
-                )
-            );
-            return Err(silent_err_for_code("connect.reload_failed", "reload transport failure"));
-        }
+    interactive: bool,
+    severity: OAuthErrorSeverity,
+) {
+    let _ = (service, interactive); // currently unused: render path is unified.
+    let label = match severity {
+        OAuthErrorSeverity::Fatal => "verification failed",
+        OAuthErrorSeverity::NonFatal => "verification failed (will retry)",
     };
-    let parsed: serde_json::Value = serde_json::from_str(&response)
-        .map_err(|e| anyhow::anyhow!("malformed reload response: {e} (body: {response})"))?;
-    if parsed["status"].as_str() == Some("ok") {
-        Ok(())
-    } else {
-        let msg = parsed["message"].as_str().unwrap_or("reload returned non-ok status").to_owned();
-        Err(anyhow::anyhow!(msg))
+
+    // Structured Google-side failure (HTTP 200 + ok=false).
+    if (200..300).contains(&status_code) && body.get("ok").and_then(|v| v.as_bool()) == Some(false)
+    {
+        let reason_text = body.get("reason_text").and_then(|v| v.as_str()).unwrap_or("(no detail)");
+        let google_status = body.get("status_code").and_then(|v| v.as_u64());
+        let verify_reason = body.get("verify_reason").and_then(|v| v.as_str()).unwrap_or("unknown");
+        let remediation_url = body.get("remediation_url").and_then(|v| v.as_str());
+
+        let remediation = match (verify_reason, remediation_url) {
+            ("service-disabled", Some(url)) => format!(
+                "enable the API in the Google Cloud Console:\n    {url}\n\n  \
+                 then re-run: agentsso connect {service}"
+            ),
+            ("billing-disabled", Some(url)) => format!(
+                "enable billing on your GCP project:\n    {url}\n\n  \
+                 then re-run: agentsso connect {service}"
+            ),
+            ("scope-insufficient", _) => format!(
+                "re-consent with the required scopes:\n  \
+                 agentsso connect {service} --force\n\n  \
+                 (existing credentials will be replaced)"
+            ),
+            (_, Some(url)) => format!("see: {url}"),
+            _ => "see the daemon's tracing log + audit log for the verify request_id".to_owned(),
+        };
+        eprint!(
+            "{}",
+            render::error_block(
+                "connect.verify_failed",
+                &format!(
+                    "{label}: {reason_text} (Google HTTP {}, reason {verify_reason})",
+                    google_status.map(|s| s.to_string()).unwrap_or_else(|| "?".to_owned()),
+                ),
+                &remediation,
+                None,
+            )
+        );
+        return;
     }
+
+    // Daemon-side failure (4xx/5xx with `{ status: "error", code, message }`).
+    let code = body.get("code").and_then(|v| v.as_str()).unwrap_or("verify.unknown");
+    let message = body.get("message").and_then(|v| v.as_str()).unwrap_or("(no detail)");
+    eprint!(
+        "{}",
+        render::error_block(
+            "connect.verify_failed",
+            &format!("{label}: {message} (HTTP {status_code}, daemon code {code})"),
+            "check the daemon's tracing log for the matching request_id",
+            None,
+        )
+    );
 }
 
 /// POST `/v1/control/agent/rebind` against the running daemon.
@@ -1685,7 +1664,7 @@ mod tests {
             "connect.agent_not_found",
             "connect.unknown_service",
             "connect.invalid_oauth_client",
-            "connect.daemon_must_stop",
+            "connect.daemon_must_run",
         ] {
             assert_eq!(connect_exit_code(code), 2, "code {code} should be precondition (exit 2)");
         }
@@ -1709,48 +1688,5 @@ mod tests {
     fn connect_exit_code_unknown_codes_default_to_3() {
         assert_eq!(connect_exit_code("connect.future_unknown"), 3);
         assert_eq!(connect_exit_code("agent.duplicate_name"), 3);
-    }
-
-    #[test]
-    fn credential_covers_target_returns_false_for_missing_meta() {
-        let tmp = tempfile::tempdir().unwrap();
-        let meta_path = tmp.path().join("gmail-meta.json");
-        assert!(!credential_covers_target(&meta_path, "gmail"));
-    }
-
-    #[test]
-    fn credential_covers_target_returns_true_when_all_scopes_present() {
-        let tmp = tempfile::tempdir().unwrap();
-        let meta_path = tmp.path().join("calendar-meta.json");
-        let meta = CredentialMeta {
-            client_type: "byo".to_owned(),
-            client_source: None,
-            connected_at: "2026-05-07T00:00:00Z".to_owned(),
-            last_refreshed_at: None,
-            scopes: vec![
-                "https://www.googleapis.com/auth/calendar.readonly".to_owned(),
-                "https://www.googleapis.com/auth/calendar.events".to_owned(),
-            ],
-            expires_in_secs: None,
-        };
-        std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).unwrap();
-        assert!(credential_covers_target(&meta_path, "calendar"));
-    }
-
-    #[test]
-    fn credential_covers_target_returns_false_when_scope_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let meta_path = tmp.path().join("calendar-meta.json");
-        let meta = CredentialMeta {
-            client_type: "byo".to_owned(),
-            client_source: None,
-            connected_at: "2026-05-07T00:00:00Z".to_owned(),
-            last_refreshed_at: None,
-            scopes: vec!["https://www.googleapis.com/auth/calendar.readonly".to_owned()],
-            expires_in_secs: None,
-        };
-        std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).unwrap();
-        // calendar service requires both readonly + events; only readonly present.
-        assert!(!credential_covers_target(&meta_path, "calendar"));
     }
 }

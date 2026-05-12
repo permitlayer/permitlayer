@@ -427,6 +427,30 @@ pub(crate) async fn http_get_with_status_via(
     }
 }
 
+/// Endpoint-aware POST with a JSON body that returns the status code
+/// alongside the body. Story 7.30: the credentials/policy endpoints
+/// return structured 4xx/5xx error bodies that callers need to parse
+/// alongside the HTTP status — a plain success-or-error result loses
+/// information.
+pub(crate) async fn http_post_json_with_status_via(
+    endpoint: &ControlEndpoint,
+    path: &str,
+    body: &str,
+    control_token: Option<&str>,
+) -> Result<(u16, String)> {
+    match endpoint {
+        ControlEndpoint::Tcp(addr) => {
+            http_post_json_with_status(*addr, path, body, control_token).await
+        }
+        ControlEndpoint::Uds(sock_path) => tokio::time::timeout(
+            HTTP_DEADLINE,
+            http_post_json_with_status_inner_uds(sock_path, path, body, control_token),
+        )
+        .await
+        .with_context(|| format!("HTTP POST {path} (UDS) timed out after {HTTP_DEADLINE:?}"))?,
+    }
+}
+
 async fn http_post_json_inner_uds(
     sock_path: &Path,
     path: &str,
@@ -548,6 +572,86 @@ async fn http_post_json_inner(
     let response = String::from_utf8_lossy(&response).into_owned();
 
     extract_body(&response).ok_or_else(|| anyhow::anyhow!("malformed HTTP response"))
+}
+
+/// Story 7.30: same as [`http_post_json`] but ALSO returns the HTTP
+/// status code so callers can distinguish 2xx success bodies from
+/// 4xx/5xx structured error bodies emitted by `agent_error_response`.
+pub(crate) async fn http_post_json_with_status(
+    addr: SocketAddr,
+    path: &str,
+    body: &str,
+    control_token: Option<&str>,
+) -> Result<(u16, String)> {
+    tokio::time::timeout(
+        HTTP_DEADLINE,
+        http_post_json_with_status_inner(addr, path, body, control_token),
+    )
+    .await
+    .with_context(|| format!("HTTP POST {path} timed out after {HTTP_DEADLINE:?}"))?
+}
+
+async fn http_post_json_with_status_inner(
+    addr: SocketAddr,
+    path: &str,
+    body: &str,
+    control_token: Option<&str>,
+) -> Result<(u16, String)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let mut stream =
+        TcpStream::connect(addr).await.with_context(|| format!("connect to {addr}"))?;
+
+    let auth_header =
+        control_token.map(|t| format!("X-Agentsso-Control: {t}\r\n")).unwrap_or_default();
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{auth_header}Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await.context("write HTTP request")?;
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.context("read HTTP response")?;
+    let response_str = String::from_utf8_lossy(&response).into_owned();
+
+    let status = parse_status_code(&response_str)
+        .ok_or_else(|| anyhow::anyhow!("malformed HTTP response status line"))?;
+    let body =
+        extract_body(&response_str).ok_or_else(|| anyhow::anyhow!("malformed HTTP response"))?;
+    Ok((status, body))
+}
+
+async fn http_post_json_with_status_inner_uds(
+    sock_path: &Path,
+    path: &str,
+    body: &str,
+    control_token: Option<&str>,
+) -> Result<(u16, String)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+
+    let mut stream = UnixStream::connect(sock_path)
+        .await
+        .with_context(|| format!("connect to {}", sock_path.display()))?;
+
+    let auth_header =
+        control_token.map(|t| format!("X-Agentsso-Control: {t}\r\n")).unwrap_or_default();
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{auth_header}Connection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).await.context("write HTTP request")?;
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.context("read HTTP response")?;
+    let response_str = String::from_utf8_lossy(&response).into_owned();
+
+    let status = parse_status_code(&response_str)
+        .ok_or_else(|| anyhow::anyhow!("malformed HTTP response status line"))?;
+    let body =
+        extract_body(&response_str).ok_or_else(|| anyhow::anyhow!("malformed HTTP response"))?;
+    Ok((status, body))
 }
 
 /// Minimal HTTP/1.1 GET → read full response → extract JSON body.

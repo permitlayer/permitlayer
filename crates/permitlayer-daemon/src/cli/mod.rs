@@ -8,6 +8,7 @@ pub mod audit_export;
 pub mod audit_follow;
 pub mod config;
 pub mod connect;
+pub mod connect_uds;
 pub mod connectors;
 pub mod credentials;
 pub mod kill;

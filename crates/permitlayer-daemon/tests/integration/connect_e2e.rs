@@ -71,10 +71,12 @@ fn connect_setup_legacy_verb_with_extra_args_still_intercepts() {
 // --------------------------------------------------------------------------
 
 #[test]
-fn connect_unknown_agent_exits_2_no_vault_touch() {
+fn connect_without_daemon_exits_2_with_must_run_block() {
+    // Story 7.30: post-CLI-cutover, `agentsso connect` requires the
+    // daemon to be running for every credential-touching operation.
+    // When the daemon isn't up, the structured `connect.daemon_must_run`
+    // remediation fires BEFORE any agent lookup or vault touch.
     let home = tempfile::TempDir::new().unwrap();
-
-    // Pre-state: no agents/, no vault/.
     assert!(!home.path().join("agents").exists());
     assert!(!home.path().join("vault").exists());
 
@@ -83,24 +85,19 @@ fn connect_unknown_agent_exits_2_no_vault_touch() {
         &["connect", "gmail", "--agent", "does-not-exist", "--non-interactive"],
     );
 
-    assert_eq!(status, Some(2), "unknown agent should exit 2; stderr={stderr}");
+    assert_eq!(status, Some(2), "no daemon → exit 2; stderr={stderr}");
     assert!(
-        stderr.contains("connect.agent_not_found"),
-        "stderr should name `connect.agent_not_found`: {stderr}"
-    );
-    assert!(
-        stderr.contains("agentsso agent register"),
-        "stderr should suggest `agentsso agent register`: {stderr}"
+        stderr.contains("connect.daemon_must_run"),
+        "stderr should name `connect.daemon_must_run`: {stderr}"
     );
 
-    // Post-state: vault MUST NOT have been touched. The agents/ dir
-    // is created by the FS store on `new()` but no .toml files inside.
+    // Post-state: vault MUST NOT have been touched (the CLI no longer
+    // writes there anyway, but assert anyway).
     let vault_dir = home.path().join("vault");
     if vault_dir.exists() {
         let entries: Vec<_> =
             std::fs::read_dir(&vault_dir).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
         for e in entries {
-            // Anything other than the writability probe is suspicious.
             let name = e.file_name();
             let name = name.to_string_lossy();
             assert!(
@@ -166,17 +163,21 @@ fn connect_rejects_headless_with_non_interactive() {
 }
 
 // --------------------------------------------------------------------------
-// AC #6 — daemon-running gate fires when credential needs sealing.
-// Round-1 P15 follow-up.
+// Story 7.30: daemon-running gate INVERTS. The daemon now owns every
+// credential-touching operation; `agentsso connect` requires it to be
+// up. The pre-7.30 `connect.daemon_must_stop` block (which prevented
+// seal-races with the daemon's refresh path) is replaced by
+// `connect.daemon_must_run` covered by `connect_without_daemon_*`.
+//
+// The "daemon up, agent unknown" path is now an `agent_not_found` 404
+// from the daemon's `agent_policy_name_handler` — surfaced as the
+// `connect.agent_not_found` exit-2 block. We assert it here against a
+// real running daemon.
 // --------------------------------------------------------------------------
 
 #[test]
-fn connect_daemon_running_during_seal_emits_must_stop() {
-    // Test the daemon-running gate at Step 2: daemon up, agent registered,
-    // no credential — connect must refuse with `connect.daemon_must_stop`
-    // and exit 3 BEFORE touching the vault.
+fn connect_daemon_up_unknown_agent_emits_agent_not_found() {
     use crate::common::{DaemonTestConfig, start_daemon, wait_for_health};
-    use std::time::Duration;
 
     let home = tempfile::TempDir::new().unwrap();
     let daemon = start_daemon(DaemonTestConfig {
@@ -187,41 +188,11 @@ fn connect_daemon_running_during_seal_emits_must_stop() {
     let port = daemon.port;
     assert!(wait_for_health(port), "daemon did not become healthy");
 
-    // Register an agent through the control endpoint so the agent file
-    // exists when connect's Step 1 looks for it.
-    let ctl = std::fs::read_to_string(home.path().join("control.token"))
-        .expect("control.token missing")
-        .trim()
-        .to_owned();
-    let body = r#"{"name":"test-agent","policy_name":"gmail-read-only"}"#;
-    let request = format!(
-        "POST /v1/control/agent/register HTTP/1.1\r\n\
-         Host: 127.0.0.1:{port}\r\n\
-         Content-Type: application/json\r\n\
-         Content-Length: {}\r\n\
-         X-Agentsso-Control: {ctl}\r\n\
-         Connection: close\r\n\r\n{body}",
-        body.len()
-    );
-    let raw = {
-        use std::io::{Read, Write};
-        let mut s = std::net::TcpStream::connect_timeout(
-            &format!("127.0.0.1:{port}").parse().unwrap(),
-            Duration::from_secs(2),
-        )
-        .unwrap();
-        s.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        s.write_all(request.as_bytes()).unwrap();
-        let mut buf = Vec::new();
-        let _ = s.read_to_end(&mut buf);
-        String::from_utf8_lossy(&buf).into_owned()
-    };
-    assert!(raw.contains("\"status\":\"ok\""), "agent register failed: {raw}");
-
-    // Daemon is still running; no credential is sealed. Run connect.
+    // No agent registered. Daemon's agent_policy_name_handler returns
+    // 404 → CLI maps it to `connect.agent_not_found` exit 2.
     let (status, _stdout, stderr) = {
         let output = Command::new(agentsso_bin())
-            .args(["connect", "gmail", "--agent", "test-agent", "--non-interactive"])
+            .args(["connect", "gmail", "--agent", "does-not-exist", "--non-interactive"])
             .env("AGENTSSO_PATHS__HOME", home.path().to_str().unwrap())
             .env("AGENTSSO_HTTP__BIND_ADDR", format!("127.0.0.1:{port}"))
             .stdout(Stdio::piped())
@@ -235,29 +206,12 @@ fn connect_daemon_running_during_seal_emits_must_stop() {
         )
     };
 
-    assert_eq!(
-        status,
-        Some(3),
-        "daemon-running + missing credential should exit 3; stderr={stderr}"
-    );
+    assert_eq!(status, Some(2), "unknown agent → exit 2; stderr={stderr}");
     assert!(
-        stderr.contains("connect.daemon_must_stop"),
-        "stderr should name `connect.daemon_must_stop`: {stderr}"
+        stderr.contains("connect.agent_not_found"),
+        "stderr should name `connect.agent_not_found`: {stderr}"
     );
-    assert!(stderr.contains("agentsso stop"), "stderr should suggest `agentsso stop`: {stderr}");
 
-    // Confirm vault dir is still untouched.
-    let vault_dir = home.path().join("vault");
-    if vault_dir.exists() {
-        let entries: Vec<_> =
-            std::fs::read_dir(&vault_dir).unwrap().collect::<Result<Vec<_>, _>>().unwrap();
-        for e in entries {
-            let name = e.file_name();
-            let name = name.to_string_lossy();
-            assert!(name.starts_with('.'), "vault should not contain credential artifacts: {name}");
-        }
-    }
-    // DaemonHandle's Drop kills the daemon.
     drop(daemon);
 }
 
