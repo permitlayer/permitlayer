@@ -133,29 +133,6 @@ pub enum KeyStoreError {
         native: Box<KeyStoreError>,
         fallback: Box<KeyStoreError>,
     },
-
-    /// Story 7.22 sentinel: the native keystore returned
-    /// `BackendUnavailable -25308` (macOS keychain ACL invalidated
-    /// after a binary swap) AND the wrapper was constructed with
-    /// `AclBreakRecoveryMode::Auto`. The wrapper hands this sentinel
-    /// up to the daemon's boot path INSTEAD of engaging the
-    /// passphrase prompt, so the boot path can verify the new
-    /// binary's codesign Designated Requirement against the persisted
-    /// trust anchor and auto-rekey the vault.
-    ///
-    /// Only `start.rs::ensure_master_key_bootstrapped` opts into
-    /// `AclBreakRecoveryMode::Auto`. All non-boot CLI paths
-    /// (`connect` ×2, `credentials`, `rotate-key`,
-    /// `keystore-clear-previous`, `uninstall`) construct
-    /// `KeystoreConfig` with `AclBreakRecoveryMode::Disabled` and
-    /// inherit the existing passphrase-fallback behavior unchanged.
-    ///
-    /// Carries the underlying native error for forensics.
-    #[error("keychain ACL invalidated by binary swap; auto-recovery required")]
-    AclBreakNeedsRekey {
-        #[source]
-        native: Box<KeyStoreError>,
-    },
 }
 
 impl KeyStoreError {
@@ -206,17 +183,7 @@ impl KeyStoreError {
                 native: Box::new(native.clone_for_chain()),
                 fallback: Box::new(fallback.clone_for_chain()),
             },
-            Self::AclBreakNeedsRekey { native } => {
-                Self::AclBreakNeedsRekey { native: Box::new(native.clone_for_chain()) }
-            }
         }
-    }
-
-    /// Sentinel check used by the daemon's boot path (Story 7.22) to
-    /// branch into the auto-recovery flow. True only for
-    /// [`Self::AclBreakNeedsRekey`].
-    pub fn is_acl_break_needs_rekey(&self) -> bool {
-        matches!(self, Self::AclBreakNeedsRekey { .. })
     }
 }
 
@@ -258,6 +225,13 @@ mod tests {
     /// this, an operator under launchd would see only the fallback's
     /// `PassphrasePromptUnavailable` error and lose the OSStatus that
     /// caused the fallback to engage in the first place.
+    ///
+    /// Gated to linux + windows: `RuntimeFallbackFailed` is only
+    /// constructed by `FallbackKeyStore::try_engage_fallback`, which
+    /// is itself cfg-gated to those targets. Running this test on
+    /// macOS would assert Display contract for a variant nothing
+    /// constructs on that target.
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     #[test]
     fn runtime_fallback_failed_chains_both_messages() {
         let native_sentinel = "OSSTATUS_-25308_NATIVE_SENTINEL";

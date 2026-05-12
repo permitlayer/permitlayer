@@ -168,79 +168,15 @@ interaction is not allowed`.
 
 #### Recovery after `brew upgrade agentsso`
 
-`brew upgrade agentsso` reinstalls the binary with a different codesign
-hash, which invalidates the macOS Keychain ACL on the existing
-master-key entry. Symptom on rc.16 and earlier: the next `agentsso
-start &` logs `keychain backend 'apple' is unavailable: User
-interaction is not allowed. (OSStatus -25308)`.
+On macOS rc.22 and later, the master key lives in `System.keychain`
+under an `-A` (allow-all-applications) ACL that is independent of any
+binary's codesign hash. `brew upgrade agentsso` swaps in a new binary
+with a different codesign hash, but the new binary can still read the
+existing master-key entry — no rekey, no passphrase fallback, no
+operator action.
 
-**Behavior on rc.19 and later (Story 7.22 + Story 7.23 + Story 7.24):**
-the daemon auto-detects the ACL break, verifies the new binary's
-codesign Designated Requirement against a trust anchor captured on
-first boot, and atomic-rekeys the vault under a freshly-minted master
-key. The vault, every sealed credential, and **every operator-held
-bearer token** are preserved across the rekey — operators don't need
-to re-run `connect`, re-OAuth-consent, or update MCP-client configs.
-The daemon stays up; launchd-managed installs auto-recover with no
-operator action. (rc.17 shipped the recovery code path but a
-launchd-spawned-binary capture bug — Story 7.23 — kept the trust
-anchor from being written; rc.18 fixed the daemon-side capture API
-but the x86_64-apple-darwin release tarball shipped unsigned, so
-Intel macOS still couldn't capture an anchor. Story 7.24 ad-hoc
-codesigns the x86_64 binary in the release pipeline, making rc.19
-the first release where the contract works headlessly end-to-end on
-**both** Apple Silicon and Intel macOS.)
-
-The auto-recovery path activates only when the new binary's codesign
-DR matches the persisted anchor. Mismatches (different signing
-identity, completely-unsigned binary) hard-fail with exit code 7 and
-a structured banner pointing at manual re-trust — this is the security
-gate that prevents an attacker-installed binary from inheriting the
-previous binary's vault.
-
-##### If your rc.17 or rc.18 daemon is in a respawn loop
-
-Two related bugs caused the same `AclBreakNoTrustAnchor` exit-7
-respawn loop on different release lines:
-
-- **rc.17** shipped a launchd-spawned-binary codesign capture bug
-  (Story 7.23): the trust anchor never got written.
-- **rc.18** fixed the capture API but the x86_64-apple-darwin
-  release tarball shipped unsigned (Story 7.24), so on Intel macOS
-  there was no codesign for the daemon to capture.
-
-Diagnostic signature in `~/.agentsso/logs/autostart.log`:
-
-```
-ERROR no codesign trust anchor on disk — cannot auto-recover headlessly
-```
-
-One-step fix:
-
-```sh
-brew upgrade permitlayer/tap/agentsso
-```
-
-rc.19 captures the anchor correctly on first boot on **both** Apple
-Silicon (since rc.18) and Intel macOS (new in rc.19), and recovery
-proceeds normally. No manual cleanup required.
-
-Behavior on rc.16 and earlier, by context:
-
-- **Interactive terminal (or SSH with TTY)**: the daemon drops to a
-  passphrase prompt automatically. Type any passphrase you'll
-  remember; the daemon mints a fresh master key under that
-  passphrase and stores `~/.agentsso/keystore/passphrase.state` to
-  remember the choice across restarts. **The fallback's derived key
-  cannot unseal credentials sealed under the previous native key**,
-  so existing connectors are stale until you re-run `connect`.
-- **launchd-managed contexts / `ssh -T`**: no controlling terminal.
-  The daemon fails fast with a structured `PassphrasePromptUnavailable`
-  error. The recovery path is the same manual `connect` re-run from
-  an interactive shell.
-
-For diagnostic detail, run with `AGENTSSO_LOG__LEVEL=debug` (the daemon
-does not honor `RUST_LOG`).
+For diagnostic detail on unrelated startup failures, run with
+`AGENTSSO_LOG__LEVEL=debug` (the daemon does not honor `RUST_LOG`).
 
 ### Running the daemon and the agent under different OS users
 

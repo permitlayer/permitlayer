@@ -46,7 +46,7 @@ use std::path::{Path, PathBuf};
 use clap::Args;
 use permitlayer_core::store::CredentialStore;
 use permitlayer_core::store::fs::CredentialFsStore;
-use permitlayer_keystore::{AclBreakRecoveryMode, FallbackMode, KeystoreConfig, default_keystore};
+use permitlayer_keystore::{FallbackMode, KeystoreConfig, default_keystore};
 use permitlayer_oauth::google::consent::GoogleOAuthConfig;
 use permitlayer_oauth::google::scopes;
 use permitlayer_oauth::google::verify;
@@ -663,15 +663,7 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
         }
 
         // Phase 3: browser + spinner / headless paste.
-        // Story 7.22: `acl_break_recovery: Disabled` preserves the
-        // existing passphrase-prompt fallback for non-boot CLI paths.
-        // Only `start.rs::ensure_master_key_bootstrapped` opts into
-        // `Auto`.
-        let keystore_config = KeystoreConfig {
-            fallback: FallbackMode::Auto,
-            home: home.clone(),
-            acl_break_recovery: AclBreakRecoveryMode::Disabled,
-        };
+        let keystore_config = KeystoreConfig { fallback: FallbackMode::Auto, home: home.clone() };
         let keystore = default_keystore(&keystore_config)?;
         let master_key = keystore.master_key().await?.key.into_inner();
         let active_key_id = super::start::compute_active_key_id(&home.join("vault"));
@@ -1343,13 +1335,7 @@ async fn read_access_token(
     home: &Path,
     service: &str,
 ) -> anyhow::Result<permitlayer_credential::OAuthToken> {
-    // Story 7.22: `acl_break_recovery: Disabled` preserves the
-    // existing passphrase-prompt fallback for non-boot CLI paths.
-    let keystore_config = KeystoreConfig {
-        fallback: FallbackMode::Auto,
-        home: home.to_path_buf(),
-        acl_break_recovery: AclBreakRecoveryMode::Disabled,
-    };
+    let keystore_config = KeystoreConfig { fallback: FallbackMode::Auto, home: home.to_path_buf() };
     let keystore = default_keystore(&keystore_config)?;
     let master_key = keystore.master_key().await?.key.into_inner();
     let active_key_id = super::start::compute_active_key_id(&home.join("vault"));

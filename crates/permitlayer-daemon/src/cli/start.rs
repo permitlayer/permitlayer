@@ -1453,73 +1453,6 @@ pub(crate) enum StartError {
         /// unreadable / marker phase recorded.
         reason: String,
     },
-
-    /// Story 7.22: the macOS keychain returned `BackendUnavailable
-    /// -25308` (codesign-bound ACL invalidated by the binary swap)
-    /// AND no codesign trust anchor was found at
-    /// `<home>/keystore/codesign-trust-anchor.req`. The daemon
-    /// cannot auto-recover without a stored Designated Requirement
-    /// to verify the new binary against — this is the
-    /// rc.16→rc.17 first-crossover corner where the operator
-    /// upgraded over SSH-with-no-TTY before the rc.17 trust-anchor
-    /// capture had a chance to run.
-    ///
-    /// Operator remediation: run `agentsso start` once interactively
-    /// (TTY-attached) so the passphrase fallback engages and the
-    /// trust anchor capture runs, OR remove the brew-upgraded
-    /// install, downgrade to rc.17, and re-upgrade.
-    #[error(
-        "keychain ACL invalidated and no codesign trust anchor on disk — \
-         cannot auto-recover headlessly"
-    )]
-    AclBreakNoTrustAnchor,
-
-    /// Story 7.22: the running binary's codesign Designated
-    /// Requirement does NOT match the stored anchor at
-    /// `<home>/keystore/codesign-trust-anchor.req`. This is a
-    /// security-relevant rejection — the new binary was either
-    /// signed by a different identity or has had its codesign chain
-    /// changed. The auto-rekey path REFUSES to proceed; the
-    /// operator must explicitly re-trust before the daemon will
-    /// boot under this binary.
-    ///
-    /// Until Story 7.24 lands (`agentsso doctor` for manual re-
-    /// trust), the workaround is to remove the trust anchor file
-    /// manually, run `agentsso start` once on a TTY (engaging
-    /// passphrase fallback so the new binary can capture its own
-    /// anchor), then re-enable autostart.
-    #[error("codesign Designated Requirement mismatch — refusing to auto-recover")]
-    AclBreakDrMismatch {
-        /// The stored DR string (truncated to 80 chars in banner
-        /// rendering to avoid leaking Team ID into shared logs).
-        stored_dr: String,
-    },
-
-    /// Story 7.22: codesign Designated Requirement verification
-    /// failed for a non-mismatch reason — e.g., the running binary
-    /// is completely unsigned (`errSecCSUnsigned`), the stored DR
-    /// could not be parsed, or the SecCode FFI returned an
-    /// unexpected OSStatus. Distinct from `AclBreakDrMismatch` so
-    /// operators can triage.
-    #[error("codesign verification failed during auto-recovery: {source}")]
-    CodesignVerifyFailed {
-        #[source]
-        source: permitlayer_keystore::CodesignError,
-    },
-
-    /// Story 7.22: the codesign verification gate passed but the
-    /// vault rekey itself failed — typically a vault I/O error or
-    /// envelope reseal fault. The marker file remains on disk so
-    /// the next boot resumes the rotation idempotently (see Story
-    /// 7.6b crash-resume contract).
-    #[error("auto-rekey failed at phase {phase}: {source}")]
-    AutoRekeyFailed {
-        /// Which phase of the rotation state machine failed
-        /// (see `rotate_key::marker::KeystorePhase`).
-        phase: String,
-        #[source]
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
 }
 
 /// Append a structured-cause tail to a keystore-error banner ONLY for
@@ -1583,15 +1516,6 @@ impl StartError {
             // Distinct from 3/4/5 because the operator's remediation
             // is unique: re-run `agentsso rotate-key` to finish.
             Self::VaultRotationIncomplete { .. } | Self::VaultStateUnverifiable { .. } => 6,
-            // Exit 7 — Story 7.22: ACL-break auto-recovery required
-            // but failed (no trust anchor, DR mismatch, codesign
-            // verification error, or rekey itself failed). Distinct
-            // remediation from 6: operator runs interactive
-            // recovery, NOT `agentsso rotate-key`.
-            Self::AclBreakNoTrustAnchor
-            | Self::AclBreakDrMismatch { .. }
-            | Self::CodesignVerifyFailed { .. }
-            | Self::AutoRekeyFailed { .. } => 7,
         }
     }
 
@@ -1628,13 +1552,11 @@ impl StartError {
                  request would return 401 and the vault cannot decrypt credentials.\n\
                  \n\
                  common causes:\n\
-                 - on macOS: the login keychain refused access. After\n\
-                   `brew upgrade agentsso`, the new binary's codesign hash no\n\
-                   longer matches the previously-authorized ACL on the existing\n\
-                   master-key entry — the daemon should have fallen back to the\n\
-                   passphrase prompt, so seeing this banner means either fallback\n\
-                   is disabled or the failure was a non-ACL platform error\n\
-                   (e.g., locked keychain → unlock and retry).\n\
+                 - on macOS: the System.keychain master-key entry could not be\n\
+                   read. The daemon must run as root (LaunchDaemon context) to\n\
+                   reach System.keychain; if invoked outside the daemon, ensure\n\
+                   the operator account has admin rights and the keychain is\n\
+                   unlocked.\n\
                  - on linux: the secret-service daemon is not running\n\
                    (install `libsecret` / `gnome-keyring-daemon` and start a session)\n\
                  - on fresh CI containers: no keyring backend available —\n\
@@ -1820,95 +1742,7 @@ impl StartError {
                  - if the vault directory is unreadable, fix the filesystem perms\n\
                    (`chmod 0700 ~/.agentsso/vault/`) and try again.\n"
             ),
-            // Story 7.22: ACL-break recovery banners (exit code 7).
-            Self::AclBreakNoTrustAnchor => {
-                "error: macOS keychain ACL invalidated by binary swap, but no\n\
-                 codesign trust anchor exists on disk to verify the new binary.\n\
-                 \n\
-                 this typically happens when an operator upgrades from rc.16 (or\n\
-                 earlier) directly to rc.17+ over SSH with no controlling terminal —\n\
-                 rc.17's trust-anchor capture step never ran on the previous boot.\n\
-                 \n\
-                 remediation (one-time):\n\
-                 - run `agentsso start` once from an interactive terminal (or\n\
-                   TTY-attached SSH session). This engages the passphrase prompt;\n\
-                   enter your passphrase, and rc.17's first-boot capture writes\n\
-                   the trust anchor to `~/.agentsso/keystore/codesign-trust-anchor.req`.\n\
-                 - then `agentsso autostart enable` works headlessly thereafter.\n"
-                    .to_owned()
-            }
-            Self::AclBreakDrMismatch { stored_dr } => {
-                let truncated = truncate_dr_for_banner(stored_dr);
-                format!(
-                    "error: codesign Designated Requirement mismatch.\n\
-                     \n\
-                     the running binary's codesign signature does NOT match the\n\
-                     trust anchor captured by a previous successful boot. the\n\
-                     auto-recovery path refuses to proceed because the new binary\n\
-                     was either:\n\
-                     - signed by a different identity than the previous binary, or\n\
-                     - completely unsigned / re-signed with adhoc credentials that\n\
-                       differ from the captured anchor.\n\
-                     \n\
-                     this is a security-relevant rejection — auto-recovering would\n\
-                     give the new binary access to the previous binary's vault.\n\
-                     \n\
-                     stored DR (truncated): {truncated}\n\
-                     \n\
-                     remediation (manual re-trust required):\n\
-                     - if this is a legitimate upgrade by the same publisher,\n\
-                       remove `~/.agentsso/keystore/codesign-trust-anchor.req`\n\
-                       and run `agentsso start` once interactively to re-capture\n\
-                       the anchor under the new binary's identity.\n\
-                     - if this binary was NOT installed by you, do NOT remove\n\
-                       the anchor — investigate first.\n"
-                )
-            }
-            Self::CodesignVerifyFailed { source } => format!(
-                "error: codesign verification failed during auto-recovery: {source}\n\
-                 \n\
-                 the macOS Security framework returned an unexpected error when\n\
-                 verifying the running binary's signature against the stored\n\
-                 trust anchor. common causes:\n\
-                 - running binary is completely unsigned (`errSecCSUnsigned`)\n\
-                 - stored anchor file is corrupted (cannot be parsed)\n\
-                 - macOS Security framework returned an unexpected OSStatus\n\
-                 \n\
-                 remediation:\n\
-                 - reinstall agentsso from the official release channel.\n\
-                 - if the problem persists, file a bug with this banner attached.\n"
-            ),
-            Self::AutoRekeyFailed { phase, source } => format!(
-                "error: auto-recovery vault rekey failed at phase {phase}: {source}\n\
-                 \n\
-                 the codesign verification gate passed (the new binary's identity\n\
-                 matches the trust anchor), but the vault rekey itself failed\n\
-                 partway. the rotation-state marker remains on disk so the next\n\
-                 boot will resume the rotation idempotently.\n\
-                 \n\
-                 remediation:\n\
-                 - re-run `agentsso start` to resume the rekey (safe — staged dual-\n\
-                   slot keystore guarantees recovery).\n\
-                 - if the failure recurs, file a bug with this banner attached and\n\
-                   the daemon's autostart.log tail.\n"
-            ),
         }
-    }
-}
-
-/// Story 7.22: trim a stored Designated Requirement for inclusion in
-/// an operator-facing banner. DR strings can be long (`anchor apple
-/// generic and certificate leaf[subject.OU] = "TEAM12345" and
-/// identifier "io.permitlayer.daemon"`) and a CI artifact / shared
-/// log capturing the full string would publish the operator's Apple
-/// Team ID. Truncate at 80 chars + ellipsis.
-fn truncate_dr_for_banner(dr: &str) -> String {
-    const MAX: usize = 80;
-    if dr.chars().count() <= MAX {
-        dr.to_owned()
-    } else {
-        let truncated: String = dr.chars().take(MAX).collect();
-        format!("{truncated}…")
     }
 }
 
@@ -2044,211 +1878,14 @@ pub(crate) async fn ensure_master_key_bootstrapped(
         }
     }
 
-    // Story 7.22 test seam: `AGENTSSO_TEST_FORCE_ACL_BREAK_ON_BOOT`
-    // synthesizes the `AclBreakNeedsRekey` sentinel WITHOUT touching
-    // the real OS keychain. Lets integration tests drive the
-    // `handle_acl_break_recovery` dispatch and assert
-    // `StartError::AclBreakNoTrustAnchor` /
-    // `StartError::AclBreakDrMismatch` / `StartError::AutoRekeyFailed`
-    // exit-code-7 outcomes deterministically. Compiled out of release
-    // builds via `cfg(feature = "test-seam")`.
-    #[cfg(feature = "test-seam")]
-    if std::env::var("AGENTSSO_TEST_FORCE_ACL_BREAK_ON_BOOT").is_ok() {
-        tracing::warn!(
-            "AGENTSSO_TEST_FORCE_ACL_BREAK_ON_BOOT is set — synthesizing the \
-             ACL-break sentinel for the test harness. This env var is only \
-             honored when agentsso is built with the `test-seam` Cargo feature."
-        );
-        // Intentionally do NOT call `capture_trust_anchor_on_first_boot`
-        // here: that would write the running binary's DR as the anchor,
-        // which would mask the `AclBreakNoTrustAnchor` test path. Tests
-        // that need a pre-existing anchor write it themselves before
-        // spawning the daemon.
-        let synthetic = permitlayer_keystore::KeyStoreError::AclBreakNeedsRekey {
-            native: Box::new(permitlayer_keystore::KeyStoreError::BackendUnavailable {
-                backend: "test-forced-acl-break",
-                source: Box::new(std::io::Error::other(
-                    "synthetic OSStatus -25308 from AGENTSSO_TEST_FORCE_ACL_BREAK_ON_BOOT",
-                )),
-            }),
-        };
-        return handle_acl_break_recovery(config, synthetic).await;
-    }
-
-    // Story 7.22: the daemon boot path is the ONLY caller in the
-    // codebase that opts into `AclBreakRecoveryMode::Auto`. On
-    // macOS keychain-ACL invalidation (post `brew upgrade agentsso`
-    // or any binary swap), the wrapper short-circuits with
-    // `KeyStoreError::AclBreakNeedsRekey` BEFORE engaging the
-    // passphrase prompt — and the dispatch below catches that
-    // sentinel and routes to `handle_acl_break_recovery` for
-    // codesign-verified vault rekey.
     let keystore_config = permitlayer_keystore::KeystoreConfig {
         fallback: permitlayer_keystore::FallbackMode::Auto,
         home: config.paths.home.clone(),
-        acl_break_recovery: permitlayer_keystore::AclBreakRecoveryMode::Auto,
     };
     let keystore = permitlayer_keystore::default_keystore(&keystore_config)
         .map_err(|source| StartError::KeystoreConstruction { source })?;
 
-    // Story 7.22 first-boot TOFU (Task 2.4-2.5): unconditionally
-    // capture the running binary's Designated Requirement on first
-    // rc.17+ boot — BEFORE asking the keystore for the master key.
-    // Capture point is `SecCodeCopySelf`, NOT a successful native
-    // keystore call: the capture must succeed even on the
-    // rc.16→rc.17 first-crossover where native already fails -25308
-    // (Codex Finding 10). `write_trust_anchor` is no-clobber, so
-    // subsequent boots short-circuit on `Some(_)` and don't
-    // overwrite a captured anchor.
-    #[cfg(target_os = "macos")]
-    capture_trust_anchor_on_first_boot(&config.paths.home);
-
-    match bootstrap_from_keystore(&*keystore).await {
-        Ok(key) => Ok(key),
-        Err(StartError::MasterKeyCall { source }) if source.is_acl_break_needs_rekey() => {
-            // Story 7.22 Task 3: route the sentinel into the
-            // codesign-verified auto-rekey flow. Returns the new
-            // master key on success or a structured StartError
-            // (exit code 7) if codesign verification fails or the
-            // rekey itself errors.
-            handle_acl_break_recovery(config, source).await
-        }
-        Err(other) => Err(other),
-    }
-}
-
-/// Story 7.22 Task 3.3: handle the
-/// [`permitlayer_keystore::KeyStoreError::AclBreakNeedsRekey`] sentinel
-/// raised by the boot-time keystore wrapper.
-///
-/// Sequence:
-/// 1. Read `<home>/keystore/codesign-trust-anchor.req`. If absent →
-///    [`StartError::AclBreakNoTrustAnchor`].
-/// 2. Verify the running binary's Designated Requirement against the
-///    stored anchor via [`permitlayer_keystore::verify_self_against`].
-///    On mismatch → [`StartError::AclBreakDrMismatch`]; on
-///    `CodesignError::Unsigned` (release builds) →
-///    [`StartError::CodesignVerifyFailed`]; on any other codesign
-///    error → [`StartError::CodesignVerifyFailed`].
-/// 3. Verification passed → invoke
-///    [`crate::cli::auto_rekey::run`] (Task 4) which calls
-///    `run_rotation(home, …, RotationMode::AutoRecover, vault_lock)`.
-///    Returns the new master key on success or
-///    [`StartError::AutoRekeyFailed`] on failure.
-///
-/// All four error variants map to exit code 7. On
-/// `AclBreakDrMismatch`, the rendered banner truncates the stored DR
-/// to 80 characters to avoid leaking the operator's Apple Team ID
-/// into shared logs / CI artifacts.
-async fn handle_acl_break_recovery(
-    config: &DaemonConfig,
-    native_err: permitlayer_keystore::KeyStoreError,
-) -> Result<zeroize::Zeroizing<[u8; permitlayer_keystore::MASTER_KEY_LEN]>, StartError> {
-    let home = &config.paths.home;
-
-    tracing::warn!(
-        error = %native_err,
-        "macOS keychain ACL invalidated by binary swap; entering auto-recovery flow"
-    );
-
-    // Step 1: read trust anchor.
-    let stored_dr = match permitlayer_keystore::read_trust_anchor(home) {
-        Ok(Some(dr)) => dr,
-        Ok(None) => {
-            tracing::error!("no codesign trust anchor on disk — cannot auto-recover headlessly");
-            return Err(StartError::AclBreakNoTrustAnchor);
-        }
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                "codesign trust anchor file is corrupted or unreadable; \
-                 refusing to auto-recover"
-            );
-            return Err(StartError::AclBreakNoTrustAnchor);
-        }
-    };
-
-    // Step 2: verify self against stored DR.
-    if let Err(e) = permitlayer_keystore::verify_self_against(&stored_dr) {
-        match e {
-            permitlayer_keystore::CodesignError::RequirementMismatch { .. } => {
-                tracing::error!(
-                    stored_dr = %stored_dr,
-                    "codesign Designated Requirement mismatch — refusing to auto-recover"
-                );
-                return Err(StartError::AclBreakDrMismatch { stored_dr });
-            }
-            other => {
-                tracing::error!(
-                    error = %other,
-                    "codesign verification failed during auto-recovery"
-                );
-                return Err(StartError::CodesignVerifyFailed { source: other });
-            }
-        }
-    }
-
-    tracing::info!(
-        "codesign Designated Requirement verified against stored anchor; \
-         dispatching to auto-recovery rekey"
-    );
-
-    // Step 3: invoke the AutoRecover rekey (Task 4).
-    crate::cli::auto_rekey::run(home).await
-}
-
-/// Story 7.22 Task 2.4-2.5 + 3.1: Best-effort first-boot capture of
-/// the running binary's Designated Requirement at
-/// `<home>/keystore/codesign-trust-anchor.req`.
-///
-/// Idempotent: `write_trust_anchor` is no-clobber, so calling this on
-/// every boot only writes once. Failures are logged but never
-/// fatal — the daemon must not refuse to boot just because the TOFU
-/// capture step couldn't run. If the anchor isn't on disk by the
-/// time an ACL break happens, `handle_acl_break_recovery` returns
-/// `StartError::AclBreakNoTrustAnchor` and the operator runs an
-/// interactive recovery to re-seed the anchor.
-#[cfg(target_os = "macos")]
-fn capture_trust_anchor_on_first_boot(home: &std::path::Path) {
-    use permitlayer_keystore::{
-        capture_self_designated_requirement, read_trust_anchor, write_trust_anchor,
-    };
-    match read_trust_anchor(home) {
-        Ok(Some(_)) => {
-            tracing::debug!("codesign trust anchor already present — skipping first-boot capture");
-        }
-        Ok(None) => match capture_self_designated_requirement() {
-            Ok(dr) => match write_trust_anchor(home, &dr) {
-                Ok(()) => {
-                    tracing::info!(
-                        "codesign trust anchor captured on first boot (TOFU); future binary \
-                         swaps will be verified against this Designated Requirement"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "failed to persist codesign trust anchor on first boot — \
-                         auto-recovery from ACL break will require manual re-trust"
-                    );
-                }
-            },
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "failed to capture codesign Designated Requirement on first boot \
-                     (best-effort; daemon continues to boot)"
-                );
-            }
-        },
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "codesign trust anchor file is corrupted or unreadable; \
-                 NOT overwriting (operator may need to remove the file manually)"
-            );
-        }
-    }
+    bootstrap_from_keystore(&*keystore).await
 }
 
 /// Testable core of [`ensure_master_key_bootstrapped`]: given an

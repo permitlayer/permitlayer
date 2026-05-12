@@ -2252,8 +2252,6 @@ version = "0.3.0-rc.21"
 dependencies = [
  "argon2",
  "async-trait",
- "core-foundation 0.10.1",
- "core-foundation-sys",
  "hmac",
  "keyring",
  "libc",
@@ -2261,7 +2259,6 @@ dependencies = [
  "rand 0.8.5",
  "rpassword",
  "security-framework 3.7.0",
- "security-framework-sys",
  "sha2",
  "subtle",
  "tempfile",
