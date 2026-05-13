@@ -148,6 +148,16 @@ jobs:
       # captures the bearer via the documented `jq -r` pipeline,
       # then asserts the captured bearer is a real agt_v2_-prefixed
       # token. This is the headline AC for Story 7.17.
+      #
+      # rc.22 (Story 7.27): on macOS the CLI dispatches control routes
+      # over UDS at `$AGENTSSO_PATHS__HOME/run/control.sock` — the
+      # `AGENTSSO_HTTP__BIND_ADDR` env var no longer affects control
+      # plane dispatch (only the TCP MCP listener). Both processes
+      # rendezvous via the shared `AGENTSSO_PATHS__HOME`; the CLI
+      # reads `$AGENTSSO_PATHS__HOME/control.token` directly for
+      # the same-user auth path (Plan B). We wait for the daemon's
+      # `AGENTSSO_CONTROL_SOCK=<path>` stdout marker (cli/start.rs)
+      # to know the UDS listener is bound and accepting.
       # ─────────────────────────────────────────────────────────────
       - name: Scripted bearer capture via --json
         run: |
@@ -169,18 +179,21 @@ jobs:
 
           # Pin the master key via the test seam so the daemon doesn't
           # touch the real macOS keychain (which would prompt and hang
-          # the runner). The seam is debug-only at the source level but
-          # we shipped a release build above; for CI we toggle to a
-          # debug build of the daemon for this step only.
-          # NOTE: This is the test-only path — the release binary
-          # doesn't honor AGENTSSO_TEST_MASTER_KEY_HEX. Switch to debug.
-          cargo build -p permitlayer-daemon
+          # the runner). The seam is gated by the `test-seam` Cargo
+          # feature (Story 7.6b round-2 — was `debug_assertions` pre-
+          # round-2); `cargo build` without `--features test-seam`
+          # compiles the seam OUT, so we explicitly enable it here.
+          # NOTE: This is the test-only path — the shipped release
+          # binary built earlier doesn't include the seam regardless.
+          cargo build -p permitlayer-daemon --features test-seam
           BIN=./target/debug/agentsso
 
           export AGENTSSO_TEST_MASTER_KEY_HEX="00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff"
+          # Bind the (still-TCP) MCP listener on an ephemeral loopback
+          # port. Control routes are UDS in rc.22 and ignore this.
           export AGENTSSO_HTTP__BIND_ADDR="127.0.0.1:0"
 
-          # Spawn the daemon; capture its stdout to read the bound port.
+          # Spawn the daemon; capture its stdout for the readiness marker.
           DAEMON_LOG="$RUNNER_TEMP/daemon.log"
           $BIN start >"$DAEMON_LOG" 2>&1 &
           DAEMON_PID=$!
@@ -191,23 +204,28 @@ jobs:
           }
           trap cleanup EXIT
 
-          # Wait for the daemon to print AGENTSSO_BOUND_ADDR; bail if
-          # it hasn't within 30s.
+          # Wait up to 30s for the UDS listener marker. This is the
+          # readiness signal the CLI's `agent register` will actually
+          # consume — the TCP MCP listener (`AGENTSSO_BOUND_ADDR=`)
+          # binds earlier in startup and is NOT a sufficient gate.
+          SOCK_PATH="$AGENTSSO_PATHS__HOME/run/control.sock"
           for i in $(seq 1 60); do
-            if grep -qE 'AGENTSSO_BOUND_ADDR=127\.0\.0\.1:[0-9]+' "$DAEMON_LOG" 2>/dev/null; then
+            if grep -qE "AGENTSSO_CONTROL_SOCK=" "$DAEMON_LOG" 2>/dev/null && [ -S "$SOCK_PATH" ]; then
               break
             fi
             sleep 0.5
           done
-          BOUND=$(grep -oE 'AGENTSSO_BOUND_ADDR=127\.0\.0\.1:[0-9]+' "$DAEMON_LOG" | head -1 | sed 's/AGENTSSO_BOUND_ADDR=//')
-          if [ -z "$BOUND" ]; then
-            echo "::error::Daemon never bound a port; log:"
+          if ! [ -S "$SOCK_PATH" ]; then
+            echo "::error::Daemon never bound its control UDS at $SOCK_PATH within 30s"
+            echo "Daemon log:"
             cat "$DAEMON_LOG"
             exit 1
           fi
-          export AGENTSSO_HTTP__BIND_ADDR="$BOUND"
 
-          # Capture bearer via the documented pipeline.
+          # Capture bearer via the documented pipeline. Control routes
+          # dispatch over UDS — no $AGENTSSO_HTTP__BIND_ADDR override
+          # needed; the CLI reads `$AGENTSSO_PATHS__HOME/control.token`
+          # for the same-user auth header (Plan B).
           OUT=$($BIN agent register ci-bot --policy default --json)
           echo "register output: $OUT"
           TOKEN=$(echo "$OUT" | jq -r .bearer_token)
@@ -258,14 +276,21 @@ jobs:
           DAEMON_PID=$!
           trap "kill $DAEMON_PID 2>/dev/null || true" EXIT
 
+          # Wait for the UDS control listener; see Smoke test 3 above
+          # for the rc.22 readiness-signal rationale.
+          SOCK_PATH="$AGENTSSO_PATHS__HOME/run/control.sock"
           for i in $(seq 1 60); do
-            if grep -qE 'AGENTSSO_BOUND_ADDR=' "$DAEMON_LOG" 2>/dev/null; then
+            if grep -qE "AGENTSSO_CONTROL_SOCK=" "$DAEMON_LOG" 2>/dev/null && [ -S "$SOCK_PATH" ]; then
               break
             fi
             sleep 0.5
           done
-          BOUND=$(grep -oE 'AGENTSSO_BOUND_ADDR=127\.0\.0\.1:[0-9]+' "$DAEMON_LOG" | head -1 | sed 's/AGENTSSO_BOUND_ADDR=//')
-          export AGENTSSO_HTTP__BIND_ADDR="$BOUND"
+          if ! [ -S "$SOCK_PATH" ]; then
+            echo "::error::Daemon never bound its control UDS at $SOCK_PATH within 30s"
+            echo "Daemon log:"
+            cat "$DAEMON_LOG"
+            exit 1
+          fi
 
           TOKEN_PATH="$RUNNER_TEMP/bearer.tok"
           $BIN agent register ci-bot --policy default --token-out "$TOKEN_PATH"
