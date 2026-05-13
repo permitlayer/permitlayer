@@ -39,12 +39,12 @@ The master key never leaves the daemon process. The CLI never reads `/Library/Ap
 The CLI now detects non-GUI / cross-session contexts before calling `open::that()` and prints a copy-paste URL block + `--headless` / `--device-flow` suggestions when it can't reach a usable browser. Detection heuristics:
 
 1. `SSH_CONNECTION` / `SSH_TTY` set.
-2. `SUDO_USER` set AND `getuid() == 0`, with platform-specific GUI-session probes:
-   - Linux: no `DISPLAY` / `WAYLAND_DISPLAY` → non-GUI.
-   - macOS: `stat -f %Su /dev/console` ≠ `$SUDO_USER` → cross-session.
+2. `SUDO_USER` set AND `geteuid() == 0` (effective UID, so the gate fires under all `sudo` flavors — `sudo cmd`, `sudo -s`, `sudo -i`), with platform-specific GUI-session probes:
+   - Linux: none of `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`, `DBUS_SESSION_BUS_ADDRESS` reachable → non-GUI. (Default sudoers strip all four under `env_reset`; operators who opt them into `env_keep` or use `sudo -E` keep GUI reachability.)
+   - macOS: `stat -f %Su /dev/console` ≠ `$SUDO_USER` → cross-session. As a tiebreaker for the rare case where the equality holds by coincidence, `SSH_AUTH_SOCK` pointing at `/tmp/ssh-*` or `/var/tmp/ssh-*` (i.e. a forwarded sshd socket, not the launchd-managed local agent at `/private/tmp/com.apple.launchd.*/Listeners`) also trips skip.
 3. `AGENTSSO_FORCE_BROWSER_FALLBACK=1` env (test seam).
 
-When the heuristics don't trip, `open::that()` is wrapped in `tokio::time::timeout(Duration::from_secs(5), ...)` so a wedged `LSOpenURLsWithRole` can't stall the runtime indefinitely.
+When the heuristics don't trip, `open::that()` runs in `tokio::task::spawn_blocking` and its result is awaited normally. A wall-clock timeout was considered and rejected: `open::that()` returns when LaunchServices accepts the URL (microseconds), not when the browser is on-screen, and `tokio::time::timeout` does not cancel the inner blocking task — a wedged `LSOpenURLsWithRole` would still leak its worker thread. Any `Err` from `open::that()` itself routes to the same non-GUI consent block (with the underlying `io::Error` rendered) so the operator sees the `--headless` / `--device-flow` hints regardless of failure mode.
 
 ## Plaintext-token threat model
 

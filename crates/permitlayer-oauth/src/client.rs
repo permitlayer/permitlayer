@@ -185,7 +185,7 @@ impl OAuthClient {
         let url_string = auth_url.to_string();
         if should_skip_browser_open() {
             tracing::info!("skipping browser open: detected non-GUI / cross-session context");
-            print_non_gui_consent_block(&url_string);
+            print_non_gui_consent_block(&url_string, None);
         } else {
             // `open::that()` returns when LaunchServices (or xdg-open /
             // `start`) *accepts* the URL — microseconds, not "browser
@@ -198,9 +198,12 @@ impl OAuthClient {
             //
             // Instead: rely on `should_skip_browser_open()` to catch
             // known-bad contexts up front, and route any `Err` from
-            // `open::that()` to the same non-GUI consent block so the
-            // operator always sees the `--headless` / `--device-flow`
-            // hints regardless of failure mode.
+            // `open::that()` itself to the same non-GUI consent block
+            // (with the underlying io::Error rendered so the operator
+            // can distinguish "xdg-open missing" from "we decided not
+            // to try"). A `spawn_blocking` join failure — runtime
+            // shutdown or panic — aborts the whole `authorize` call
+            // since there's no useful recovery.
             let url_for_open = url_string.clone();
             let open_result = tokio::task::spawn_blocking(move || open::that(&url_for_open))
                 .await
@@ -209,7 +212,7 @@ impl OAuthClient {
                 })?;
             if let Err(e) = open_result {
                 tracing::warn!(err = %e, "browser open failed; falling back to manual copy");
-                print_non_gui_consent_block(&url_string);
+                print_non_gui_consent_block(&url_string, Some(&e));
             }
         }
 
@@ -426,10 +429,11 @@ pub(crate) fn should_skip_browser_open() -> bool {
     // `sudo -i` from SSH masks `SSH_CONNECTION` but preserves
     // `SUDO_USER`. If we're running as root via sudo AND there's no
     // DISPLAY (Linux) / no console-owner match (macOS), assume
-    // non-GUI. Use `effective` UID, not real: `sudo cmd` and
-    // `sudo -s` preserve the real UID as the invoking operator's
-    // while elevating euid to 0, so `getuid().is_root()` returns
-    // false on those flavors and the branch would be dead.
+    // non-GUI. Use `effective` UID, not real: under `sudo -s` and
+    // some sudoers configs the real UID stays as the invoking
+    // operator's while euid is elevated to 0, so `getuid().is_root()`
+    // can return false. `geteuid()` is the elevation signal we
+    // actually want — it's 0 under every sudo flavor.
     #[cfg(unix)]
     {
         let is_sudo_root =
@@ -439,10 +443,15 @@ pub(crate) fn should_skip_browser_open() -> bool {
             {
                 // Treat GUI as "reachable" if any of DISPLAY,
                 // WAYLAND_DISPLAY, XAUTHORITY, or DBUS_SESSION_BUS_ADDRESS
-                // survive sudo's env_reset. `sudo -s` strips DISPLAY by
-                // default on most distros but typically leaves XAUTHORITY,
-                // so checking only DISPLAY/WAYLAND_DISPLAY would falsely
-                // skip the browser from a GNOME terminal.
+                // survive sudo's env_reset. Default sudoers on Debian/
+                // Ubuntu/Fedora strip all four under `env_reset`, so a
+                // bare `sudo` from a GUI terminal will still trip the
+                // "no GUI" branch — that's the correct behavior (no env
+                // → can't reach the X/Wayland server anyway). The
+                // additional vars catch operator configs that opt them
+                // into `env_keep` (`Defaults env_keep += "XAUTHORITY"`)
+                // or invoke via `sudo -E`, where the GUI IS reachable
+                // and we should NOT skip.
                 let gui_env = std::env::var_os("DISPLAY").is_some()
                     || std::env::var_os("WAYLAND_DISPLAY").is_some()
                     || std::env::var_os("XAUTHORITY").is_some()
@@ -471,10 +480,17 @@ pub(crate) fn should_skip_browser_open() -> bool {
                         // Tiebreaker for the rare case where SSH stripped
                         // `SSH_CONNECTION` (sudo env_reset) and the
                         // console owner happens to match `$SUDO_USER`
-                        // by coincidence: `SSH_AUTH_SOCK` is preserved
-                        // under most sudoers configs and is a strong
-                        // signal of an active SSH agent forward.
-                        if std::env::var_os("SSH_AUTH_SOCK").is_some() {
+                        // by coincidence: a forwarded `SSH_AUTH_SOCK`
+                        // points at `/tmp/ssh-*` (sshd's per-session
+                        // socket). The macOS launchd ssh-agent uses
+                        // `/private/tmp/com.apple.launchd.*/Listeners`
+                        // which is set on every local Terminal session
+                        // by default — checking just `is_some()` here
+                        // would false-positive on every local sudo.
+                        if let Some(sock) = std::env::var_os("SSH_AUTH_SOCK")
+                            && let Some(s) = sock.to_str()
+                            && (s.starts_with("/tmp/ssh-") || s.starts_with("/var/tmp/ssh-"))
+                        {
                             return true;
                         }
                     }
@@ -500,15 +516,25 @@ pub(crate) fn should_skip_browser_open() -> bool {
 /// Print the non-GUI consent block: prominent copy-paste markers
 /// around the OAuth URL plus a suggestion to re-run with
 /// `--headless` or `--device-flow` so the redirect can be captured
-/// without a local browser.
-fn print_non_gui_consent_block(url: &str) {
+/// without a local browser. `open_err` is `Some` when the block is
+/// shown because `open::that()` failed (vs. shown because
+/// `should_skip_browser_open` tripped up front).
+fn print_non_gui_consent_block(url: &str, open_err: Option<&std::io::Error>) {
     let mut stderr = std::io::stderr();
-    let _ = render_non_gui_consent_block(&mut stderr, url);
+    let _ = render_non_gui_consent_block(&mut stderr, url, open_err);
 }
 
-fn render_non_gui_consent_block<W: std::io::Write>(w: &mut W, url: &str) -> std::io::Result<()> {
+fn render_non_gui_consent_block<W: std::io::Write>(
+    w: &mut W,
+    url: &str,
+    open_err: Option<&std::io::Error>,
+) -> std::io::Result<()> {
     writeln!(w)?;
-    writeln!(w, "  detected non-GUI / cross-session context — skipping browser-open.")?;
+    if let Some(err) = open_err {
+        writeln!(w, "  could not open browser ({err}) — falling back to manual copy.")?;
+    } else {
+        writeln!(w, "  detected non-GUI / cross-session context — skipping browser-open.")?;
+    }
     writeln!(w)?;
     writeln!(w, "  ── copy this URL into a browser on any device ──────────────")?;
     writeln!(w)?;
@@ -566,12 +592,36 @@ mod tests {
     #[test]
     fn non_gui_consent_block_renders_url_and_remediation_hints() {
         let mut buf: Vec<u8> = Vec::new();
-        render_non_gui_consent_block(&mut buf, "https://accounts.google.com/test-url").unwrap();
+        render_non_gui_consent_block(&mut buf, "https://accounts.google.com/test-url", None)
+            .unwrap();
         let text = String::from_utf8(buf).unwrap();
         assert!(text.contains("https://accounts.google.com/test-url"));
         assert!(text.contains("--headless"));
         assert!(text.contains("--device-flow"));
         assert!(text.contains("non-GUI"));
+        // rc.13 anti-regression: never recommend a curl-from-this-host
+        // recipe (that fallback was misleading because the OAuth code
+        // grant requires the browser callback, not just a fetch).
+        assert!(!text.contains("curl"), "rc.13: drop the misleading curl-from-this-host hint");
+    }
+
+    /// When the consent block is rendered because `open::that()`
+    /// returned an error (vs. because `should_skip_browser_open`
+    /// tripped up front), surface the underlying error so the
+    /// operator can distinguish "no GUI detected, didn't try" from
+    /// "tried to open and it failed."
+    #[test]
+    fn non_gui_consent_block_with_open_err_renders_underlying_error() {
+        let err = std::io::Error::other("xdg-open: command not found");
+        let mut buf: Vec<u8> = Vec::new();
+        render_non_gui_consent_block(&mut buf, "https://accounts.google.com/test-url", Some(&err))
+            .unwrap();
+        let text = String::from_utf8(buf).unwrap();
+        assert!(text.contains("could not open browser"));
+        assert!(text.contains("xdg-open: command not found"));
+        assert!(text.contains("--headless"));
+        assert!(text.contains("--device-flow"));
+        assert!(!text.contains("curl"));
     }
 
     #[test]
