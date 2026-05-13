@@ -124,6 +124,12 @@ impl std::fmt::Display for ConnectExitCode3 {
 
 impl std::error::Error for ConnectExitCode3 {}
 
+// Round-3 review verification: `exit3` is intentionally retained as
+// the parallel helper to `silent_err_for_code` for the bare-exit-3
+// path. All current callers route through `silent_err_for_code(...,
+// "agent_lookup_failed")` etc. for the structured-error block; this
+// remains as the no-message exit-3 escape valve for future use.
+#[allow(dead_code)]
 pub(crate) fn exit3() -> anyhow::Error {
     anyhow::Error::new(ConnectExitCode3).context(crate::cli::SilentCliError)
 }
@@ -561,13 +567,17 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
             // /policy/<dangling>/scopes 404. Map to a dedicated
             // operator-correctable exit-2 with the rebind hint.
             if body.code == "agent.dangling_policy_binding" {
+                // Round-3 review P67: sanitize daemon-returned text
+                // before printing — defense-in-depth against ANSI/CR/LF
+                // ever appearing in a forwarded upstream error.
                 eprint!(
                     "{}",
                     render::error_block(
                         "connect.dangling_policy_binding",
                         &format!(
                             "agent '{}' is bound to a policy that doesn't exist in the active set: {}",
-                            args.agent, body.message
+                            args.agent,
+                            sanitize_for_terminal(&body.message)
                         ),
                         &format!(
                             "agentsso agent rebind {} --policy <new-policy>\n\n  \
@@ -584,13 +594,15 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
                 ));
             }
             // Any other daemon-side error → exit 3.
+            // Round-3 review P67: sanitize daemon-returned text.
             eprint!(
                 "{}",
                 render::error_block(
                     "connect.agent_lookup_failed",
                     &format!(
                         "agent lookup failed (HTTP {status_code}, daemon code {}): {}",
-                        body.code, body.message
+                        sanitize_for_terminal(&body.code),
+                        sanitize_for_terminal(&body.message)
                     ),
                     "check the daemon's tracing log and the audit log for the matching request_id",
                     None,
@@ -652,13 +664,15 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
     {
         Ok(super::connect_uds::ControlOutcome::Ok(resp)) => resp,
         Ok(super::connect_uds::ControlOutcome::Err { status_code, body }) => {
+            // Round-3 review P67: sanitize daemon-returned text.
             eprint!(
                 "{}",
                 render::error_block(
                     "connect.meta_lookup_failed",
                     &format!(
                         "credential meta lookup failed (HTTP {status_code}, daemon code {}): {}",
-                        body.code, body.message
+                        sanitize_for_terminal(&body.code),
+                        sanitize_for_terminal(&body.message)
                     ),
                     "check the daemon's tracing log for the matching request_id",
                     None,
@@ -1009,13 +1023,15 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
                 }
             }
             Ok(super::connect_uds::ControlOutcome::Err { status_code, body }) => {
+                // Round-3 review P67: sanitize daemon-returned text.
                 eprint!(
                     "{}",
                     render::error_block(
                         "connect.seal_failed",
                         &format!(
                             "credentials seal failed (HTTP {status_code}, daemon code {}): {}",
-                            body.code, body.message
+                            sanitize_for_terminal(&body.code),
+                            sanitize_for_terminal(&body.message)
                         ),
                         "check the daemon's tracing log for the matching request_id, then retry",
                         None,
@@ -1121,13 +1137,15 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
     let policy_resp = match policy_outcome {
         Ok(super::connect_uds::ControlOutcome::Ok(resp)) => resp,
         Ok(super::connect_uds::ControlOutcome::Err { status_code, body }) => {
+            // Round-3 review P67: sanitize daemon-returned text.
             eprint!(
                 "{}",
                 render::error_block(
                     "connect.policy_edit_failed",
                     &format!(
                         "policy scope merge failed (HTTP {status_code}, daemon code {}): {}",
-                        body.code, body.message
+                        sanitize_for_terminal(&body.code),
+                        sanitize_for_terminal(&body.message)
                     ),
                     // Round-1 review P35: precise remediation. The
                     // policy file lives at
@@ -1579,9 +1597,21 @@ fn render_parse_failure(
     // Cap the raw-body excerpt so a huge response doesn't flood
     // stderr; cap is generous enough to show the relevant section
     // of any structured daemon body.
+    //
+    // Round-3 review P61: walk back to the nearest UTF-8 char boundary
+    // before slicing — `&raw_body[..512]` panics if byte 512 falls
+    // mid-codepoint (multi-byte UTF-8 in localized daemon error
+    // messages, emoji, etc.). `floor_char_boundary` is unstable, so we
+    // implement the same with `char_indices().take_while(...).last()`.
     const RAW_BODY_CAP: usize = 512;
     let excerpt = if raw_body.len() > RAW_BODY_CAP {
-        let truncated = &raw_body[..RAW_BODY_CAP];
+        let boundary = raw_body
+            .char_indices()
+            .map(|(i, _)| i)
+            .take_while(|i| *i <= RAW_BODY_CAP)
+            .last()
+            .unwrap_or(0);
+        let truncated = &raw_body[..boundary];
         format!("{truncated}... ({total} bytes total)", total = raw_body.len())
     } else {
         raw_body.to_owned()

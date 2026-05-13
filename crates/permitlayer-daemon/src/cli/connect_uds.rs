@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::cli::kill::{
-    self, ControlEndpoint, http_get_via, http_get_with_status_via, http_post_json_with_status_via,
+    self, ControlEndpoint, http_get_with_status_via, http_post_json_with_status_via,
 };
 use crate::config::{CliOverrides, DaemonConfig};
 use crate::design::render;
@@ -67,6 +67,16 @@ enum DaemonDownReason {
     /// TCP path (Linux/Windows rc.21 fallback) — generic
     /// "start the daemon" message.
     TcpUnreachable,
+    /// Round-3 review P65: `launchctl print` itself failed (binary
+    /// missing, exec denied, exit code we don't understand). Distinct
+    /// from `NotRunningLaunchd` so we don't suggest a `kickstart` that
+    /// will fail the same way.
+    LaunchdProbeUnavailable,
+    /// Round-3 review P66: daemon process is up and reachable but
+    /// rejected the control token. Same operator action class as
+    /// daemon-down (regenerate/install the token), but the diagnostic
+    /// surfaces what's actually wrong.
+    ControlTokenRejected { status: u16 },
     /// Probe failed with a non-classified io::Error or daemon
     /// returned a non-2xx status (e.g. control-token mismatch).
     /// Operator gets a generic actionable hint.
@@ -101,11 +111,31 @@ pub(crate) async fn require_daemon_running(
     let control_token = kill::read_control_token(home);
 
     // Liveness probe: try `GET /v1/control/whoami` (a tiny no-state
-    // endpoint that requires the control token + loopback). If this
-    // succeeds we know the daemon is up AND we can talk to it.
-    let probe = http_get_via(&endpoint, "/v1/control/whoami", control_token.as_deref()).await;
+    // endpoint that requires the control token + loopback).
+    //
+    // Round-3 review P66: use the status-aware probe so a daemon that
+    // is reachable but rejects our control token (≥400) classifies as
+    // auth-broken instead of "daemon is up" (which would let the
+    // downstream UDS call fail with a confusing
+    // `agent_lookup_failed`). Any 4xx/5xx on whoami means the daemon
+    // process is up but the control plane isn't usable from this
+    // caller — same operator action as daemon-down (regenerate/install
+    // the control token).
+    let probe =
+        http_get_with_status_via(&endpoint, "/v1/control/whoami", control_token.as_deref()).await;
     match probe {
-        Ok(_) => Ok(ConnectControlHandle { endpoint, control_token }),
+        Ok((status, _body)) if (200..300).contains(&status) => {
+            Ok(ConnectControlHandle { endpoint, control_token })
+        }
+        Ok((status, _body)) => {
+            let reason = DaemonDownReason::ControlTokenRejected { status };
+            render_daemon_must_run(&endpoint, &reason);
+            let _ = home;
+            Err(crate::cli::connect::silent_err_for_code(
+                "connect.daemon_must_run",
+                "daemon is up but rejected the control token",
+            ))
+        }
         Err(err) => {
             let reason = classify_daemon_down_reason(&endpoint, &err);
             render_daemon_must_run(&endpoint, &reason);
@@ -152,8 +182,23 @@ fn classify_daemon_down_reason(
                 if !std::path::Path::new(MACOS_PRIVILEGED_HELPER_PATH).exists() {
                     return DaemonDownReason::NotInstalled;
                 }
-                if !launchd_daemon_running() {
-                    return DaemonDownReason::NotRunningLaunchd;
+                // Round-3 review P64: `NotFound` on UDS connect when
+                // the helper IS installed means the socket inode is
+                // missing — daemon crashed mid-bind, or operator
+                // removed the socket. Route to SocketConnectionRefused
+                // so the kickstart remediation fires instead of
+                // falling through to Unclassified.
+                if matches!(io_kind, Some(std::io::ErrorKind::NotFound)) {
+                    return DaemonDownReason::SocketConnectionRefused;
+                }
+                // Round-3 review P65: distinguish "launchctl confirmed
+                // not running" from "launchctl probe itself failed".
+                // The kickstart remediation only makes sense for the
+                // former.
+                match launchd_daemon_running() {
+                    Some(false) => return DaemonDownReason::NotRunningLaunchd,
+                    None => return DaemonDownReason::LaunchdProbeUnavailable,
+                    Some(true) => {} // loaded + running per launchctl — fall through
                 }
             }
             DaemonDownReason::Unclassified
@@ -177,17 +222,23 @@ fn walk_io_error_kind(err: &anyhow::Error) -> Option<std::io::ErrorKind> {
     None
 }
 
-/// Round-1 review P43: shell out to `launchctl print
-/// system/dev.permitlayer.daemon` and parse the exit code.
+/// Round-1 review P43 / Round-3 review P65: shell out to `launchctl
+/// print system/dev.permitlayer.daemon` and classify the result.
+///
+/// Returns:
+/// - `Some(true)` — service is loaded and the state-line check
+///   confirms it's running.
+/// - `Some(false)` — service is loaded but the state-line shows
+///   `not running` / `waiting` (kickstart remediation is appropriate).
+/// - `None` — the probe itself failed (binary missing, exec denied,
+///   non-success exit we can't interpret). The caller must not
+///   suggest `kickstart` here — it would fail the same way; route
+///   to `LaunchdProbeUnavailable` instead.
+///
 /// `launchctl print` returns exit 0 when the service is loaded
-/// (regardless of its state) and exit ~113 when the service label
-/// is not loaded. A loaded-but-not-running service still returns
-/// 0; the state line in stdout has to be parsed for a finer
-/// classification — but the AC #7 spec only distinguishes
-/// "installed but stopped" from "not installed", and a non-loaded
-/// service maps to "not installed" (operator runs `service install`).
+/// (regardless of its state); a non-loaded service exits ~113.
 #[cfg(target_os = "macos")]
-fn launchd_daemon_running() -> bool {
+fn launchd_daemon_running() -> Option<bool> {
     let output = std::process::Command::new("/bin/launchctl")
         .args(["print", "system/dev.permitlayer.daemon"])
         .output();
@@ -197,12 +248,32 @@ fn launchd_daemon_running() -> bool {
             // — a loaded-but-not-running service emits e.g. "state =
             // not running" or "state = waiting".
             let stdout = String::from_utf8_lossy(&o.stdout);
-            !stdout.lines().any(|l| {
+            let any_not_running = stdout.lines().any(|l| {
                 let l = l.trim_start();
                 l.starts_with("state =") && (l.contains("not running") || l.contains("waiting"))
-            })
+            });
+            Some(!any_not_running)
         }
-        _ => false,
+        Ok(o) => {
+            // Non-zero exit. Two cases of interest:
+            // - Exit ~113 ("Service not loaded") — operator hasn't run
+            //   `agentsso service install`, OR launchctl bootstrap
+            //   failed. In either case the kickstart remediation will
+            //   fail with the same error; treat as probe-unavailable
+            //   so we surface the "probe failed" diagnostic instead.
+            // - Any other non-zero exit — likely launchctl interface
+            //   drift; also probe-unavailable.
+            tracing::warn!(
+                exit = ?o.status.code(),
+                stderr = %String::from_utf8_lossy(&o.stderr),
+                "launchctl print returned non-success exit; cannot classify daemon state"
+            );
+            None
+        }
+        Err(e) => {
+            tracing::warn!(error = %e, "launchctl exec failed; cannot classify daemon state");
+            None
+        }
     }
 }
 
@@ -247,6 +318,26 @@ fn render_daemon_must_run(endpoint: &ControlEndpoint, reason: &DaemonDownReason)
              # Linux/Windows: run `agentsso start` (or your service-manager equivalent).\n\
              # macOS: this codepath should not fire — file a bug if it does."
         ),
+        DaemonDownReason::LaunchdProbeUnavailable => format!(
+            "verify the daemon is healthy: `sudo launchctl print system/dev.permitlayer.daemon`\n\
+             \n\
+             # Could not reach the control plane at {endpoint}, and\n\
+             # `launchctl print system/dev.permitlayer.daemon` itself\n\
+             # failed — the kickstart remediation would fail the same\n\
+             # way. Run the launchctl print command above (or check\n\
+             # the daemon's tracing log) to see why the LaunchDaemon\n\
+             # is in an unexpected state."
+        ),
+        DaemonDownReason::ControlTokenRejected { status } => format!(
+            "regenerate the control token and try again\n\
+             \n\
+             # The daemon process is up at {endpoint} but rejected the\n\
+             # control token (HTTP {status}). Either the token in\n\
+             # ~/.agentsso/control.token (or AGENTSSO_CONTROL_TOKEN env)\n\
+             # is wrong, or it has been rotated by the daemon. Re-run\n\
+             # `sudo agentsso service install` to re-provision the\n\
+             # token, then re-try."
+        ),
         DaemonDownReason::Unclassified => format!(
             "verify the daemon is healthy: `agentsso status`\n\
              \n\
@@ -269,7 +360,16 @@ fn render_daemon_must_run(endpoint: &ControlEndpoint, reason: &DaemonDownReason)
 }
 
 // ── Wire types: mirror server-side response shapes ─────────────────
+//
+// Round-3 review verification: these structs are Deserialize targets
+// that mirror the daemon's response envelopes exactly, so we get a
+// hard parse error if the daemon ever drifts the wire shape. Some
+// fields aren't read on the CLI side today (e.g. CredentialsSealResponse.meta
+// is computed daemon-side and CLI-side state stays canonical); the
+// allow blocks intentional rather than silently `#[serde(skip)]`-ing
+// them and losing wire-shape pinning.
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct AgentPolicyNameResponse {
     pub name: String,
@@ -297,6 +397,7 @@ pub(crate) struct CredentialsSealRequest<'a> {
     pub if_exists: &'a str,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct CredentialsSealResponse {
     pub sealed: bool,
@@ -311,6 +412,7 @@ pub(crate) struct CredentialsVerifyRequest<'a> {
     pub project_id: Option<&'a str>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct CredentialsVerifyOk {
     pub ok: bool, // true here
@@ -320,6 +422,7 @@ pub(crate) struct CredentialsVerifyOk {
     pub email: Option<String>,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct CredentialsVerifyStructuredError {
     pub ok: bool, // false here
@@ -334,6 +437,7 @@ pub(crate) struct PolicyScopesRequest<'a> {
     pub short_names: &'a [&'a str],
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct PolicyScopesResponse {
     pub policy_name: String,
@@ -343,6 +447,7 @@ pub(crate) struct PolicyScopesResponse {
     pub reloaded: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Deserialize)]
 pub(crate) struct ControlErrorBody {
     #[serde(default)]
