@@ -408,7 +408,7 @@ mod fallback_tests {
             false,
         );
         let key = wrapper.master_key().await.expect("fallback must engage");
-        assert_eq!(*key, [0xAA; MASTER_KEY_LEN]);
+        assert_eq!(**key.key, [0xAA; MASTER_KEY_LEN]);
     }
 
     /// Test #2: native returns PlatformError; wrapper does NOT engage
@@ -451,9 +451,9 @@ mod fallback_tests {
         );
         let key1 = wrapper.master_key().await.expect("first call engages fallback");
         let key2 = wrapper.master_key().await.expect("second call routes to engaged fallback");
-        assert_eq!(*key1, *key2);
+        assert_eq!(*key1.key, *key2.key);
         // Synthetic fallback always returns 0xAA.
-        assert_eq!(*key1, [0xAA; MASTER_KEY_LEN]);
+        assert_eq!(**key1.key, [0xAA; MASTER_KEY_LEN]);
     }
 
     /// Test #4: after fallback engages on master_key, set_master_key
@@ -535,7 +535,7 @@ mod fallback_tests {
         // First call should NOT touch native — fallback is already
         // installed. Synthetic fallback returns 0xAA.
         let key = wrapper.master_key().await.expect("eager fallback engages");
-        assert_eq!(*key, [0xAA; MASTER_KEY_LEN]);
+        assert_eq!(**key.key, [0xAA; MASTER_KEY_LEN]);
     }
 
     /// Test #8: concurrent first-failure constructs fallback ONCE.
