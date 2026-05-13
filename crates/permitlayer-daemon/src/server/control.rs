@@ -95,6 +95,10 @@ pub(crate) struct ControlState {
     pub policy_set: Arc<ArcSwap<PolicySet>>,
     pub policies_dir: std::path::PathBuf,
     pub reload_mutex: Arc<std::sync::Mutex<()>>,
+    /// Serializes policy-scope edits before the reload step. The
+    /// underlying file edit is a read/modify/write operation and the
+    /// editor deliberately does not own process-wide locking.
+    pub policy_edit_mutex: Arc<tokio::sync::Mutex<()>>,
     /// Story 4.4: registry handle for the bearer-token lookup index.
     /// Required so the register/remove handlers can `replace_with(...)`
     /// after a successful CRUD operation.
@@ -3763,6 +3767,12 @@ pub(crate) async fn policy_scopes_handler(
         }
     };
 
+    // `add_scopes_to_policy` is a read/modify/write operation with a
+    // caller-owned serialization contract. With the seeded multi-policy
+    // default layout, unrelated policy names can now share one file, so
+    // serialize the whole edit + reload sequence to avoid lost updates.
+    let _policy_edit_guard = state.policy_edit_mutex.lock().await;
+
     let policies_dir = state.policies_dir.clone();
     let policy_name_for_blocking = policy_name.clone();
     let short_names_for_blocking: Vec<String> = payload.short_names.clone();
@@ -3993,6 +4003,7 @@ fn policy_edit_error_code(err: &permitlayer_core::policy::edit::PolicyEditError)
         PolicyEditError::PolicyFileNotFound { .. } | PolicyEditError::PolicyNotInFile { .. } => {
             "policy.not_found"
         }
+        PolicyEditError::PolicyDuplicateName { .. } => "policy.duplicate_name",
         PolicyEditError::PolicyFileIsSymlink { .. } => "policy.is_symlink",
         PolicyEditError::ParseFailed { .. } => "policy.parse_failed",
         PolicyEditError::CompileFailedAfterEdit { .. } => "policy.compile_failed_after_edit",
@@ -4024,6 +4035,17 @@ fn policy_edit_error_response(
             StatusCode::NOT_FOUND,
             "policy.not_found",
             format!("policy {name:?} not found in file {}", path.display()),
+            Some(request_id.to_owned()),
+        ),
+        PolicyEditError::PolicyDuplicateName { name, dir, paths } => agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "policy.duplicate_name",
+            format!(
+                "policies dir {} contains multiple files with policy {name:?}: {paths:?}; \
+                 the daemon's compile_from_dir should have rejected this at startup, \
+                 so inspect the policies dir manually",
+                dir.display()
+            ),
             Some(request_id.to_owned()),
         ),
         PolicyEditError::ParseFailed { source } => agent_error_response(
@@ -4794,6 +4816,7 @@ pub(crate) fn router(
         policy_set,
         policies_dir,
         reload_mutex,
+        policy_edit_mutex: Arc::new(tokio::sync::Mutex::new(())),
         agent_registry,
         agent_store,
         agent_lookup_key,
@@ -7223,6 +7246,40 @@ mod tests {
         std::fs::write(policies_dir.join(format!("{name}.toml")), body).unwrap();
     }
 
+    fn stage_multi_policy_default(policies_dir: &std::path::Path, gmail_scopes: &[&str]) {
+        let scopes_toml: String =
+            gmail_scopes.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(", ");
+        let body = format!(
+            r#"[[policies]]
+name = "gmail-read-only"
+scopes = [{scopes_toml}]
+resources = ["*"]
+approval-mode = "auto"
+auto-approve-reads = true
+
+[[policies]]
+name = "calendar-prompt-on-write"
+scopes = ["calendar.readonly", "calendar.events"]
+resources = ["primary"]
+approval-mode = "prompt"
+auto-approve-reads = true
+
+[[policies.rules]]
+id = "allow-calendar-reads"
+scopes = ["calendar.readonly"]
+action = "allow"
+
+[[policies]]
+name = "drive-research-scope-restricted"
+scopes = ["drive.readonly", "drive.metadata"]
+resources = ["research-shared"]
+approval-mode = "auto"
+auto-approve-reads = true
+"#,
+        );
+        std::fs::write(policies_dir.join("default.toml"), body).unwrap();
+    }
+
     fn post_policy_scopes(policy_name: &str, short_names: &[&str]) -> Request<Body> {
         let body = serde_json::json!({ "short_names": short_names });
         let mut r = Request::builder()
@@ -7234,6 +7291,94 @@ mod tests {
             .unwrap();
         r.extensions_mut().insert(ConnectInfo(loopback_v4()));
         r
+    }
+
+    #[tokio::test]
+    async fn policy_scopes_handler_multi_policy_default_toml_noops_for_seeded_gmail() {
+        let home_tmp = tempfile::tempdir().unwrap();
+        let store = build_audit_store(home_tmp.path());
+
+        let policies_dir = tempfile::tempdir().unwrap();
+        stage_multi_policy_default(policies_dir.path(), &["gmail.readonly", "gmail.metadata"]);
+        let default_path = policies_dir.path().join("default.toml");
+        let before = std::fs::read(&default_path).unwrap();
+
+        let app =
+            build_with_policies_dir(policies_dir.path().to_path_buf(), Some(Arc::clone(&store)));
+        let resp =
+            app.oneshot(post_policy_scopes("gmail-read-only", &["gmail.readonly"])).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["policy_name"], "gmail-read-only");
+        assert_eq!(json["added"].as_array().unwrap().len(), 0);
+        assert_eq!(json["reloaded"], false);
+        assert!(!policies_dir.path().join("gmail-read-only.toml").exists());
+        assert_eq!(std::fs::read(&default_path).unwrap(), before);
+
+        let events = read_audit_events(home_tmp.path());
+        let scope_events: Vec<_> =
+            events.iter().filter(|e| e.event_type == "policy-scopes-added").collect();
+        assert_eq!(scope_events.len(), 0, "seeded-gmail no-op must not emit add audit");
+    }
+
+    #[tokio::test]
+    async fn policy_scopes_handler_merges_into_default_toml_when_scope_absent() {
+        let policies_dir = tempfile::tempdir().unwrap();
+        stage_multi_policy_default(policies_dir.path(), &["gmail.readonly"]);
+
+        let app = build_with_policies_dir(policies_dir.path().to_path_buf(), None);
+        let resp =
+            app.oneshot(post_policy_scopes("gmail-read-only", &["gmail.metadata"])).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["policy_name"], "gmail-read-only");
+        assert_eq!(json["added"][0], "gmail.metadata");
+        assert_eq!(json["reloaded"], true);
+        assert!(!policies_dir.path().join("gmail-read-only.toml").exists());
+
+        let text = std::fs::read_to_string(policies_dir.path().join("default.toml")).unwrap();
+        let parsed: permitlayer_core::policy::schema::TomlPolicyFile =
+            toml::from_str(&text).unwrap();
+        let gmail = parsed.policies.iter().find(|p| p.name == "gmail-read-only").unwrap();
+        assert_eq!(gmail.scopes, vec!["gmail.metadata", "gmail.readonly"]);
+        let calendar =
+            parsed.policies.iter().find(|p| p.name == "calendar-prompt-on-write").unwrap();
+        assert_eq!(calendar.resources, vec!["primary"]);
+        assert_eq!(calendar.rules.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn policy_scopes_handler_duplicate_name_returns_500_and_audit() {
+        let home_tmp = tempfile::tempdir().unwrap();
+        let store = build_audit_store(home_tmp.path());
+
+        let policies_dir = tempfile::tempdir().unwrap();
+        stage_minimal_policy(policies_dir.path(), "gmail-read-only", &["gmail.readonly"]);
+        let duplicate = r#"[[policies]]
+name = "gmail-read-only"
+scopes = ["gmail.readonly"]
+resources = ["*"]
+approval-mode = "auto"
+auto-approve-reads = true
+"#;
+        std::fs::write(policies_dir.path().join("duplicate.toml"), duplicate).unwrap();
+
+        let app =
+            build_with_policies_dir(policies_dir.path().to_path_buf(), Some(Arc::clone(&store)));
+        let resp =
+            app.oneshot(post_policy_scopes("gmail-read-only", &["gmail.metadata"])).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "policy.duplicate_name");
+
+        let events = read_audit_events(home_tmp.path());
+        let denied: Vec<_> =
+            events.iter().filter(|e| e.event_type == "policy-scopes-denied").collect();
+        assert_eq!(denied.len(), 1);
+        assert_eq!(denied[0].extra["error_code"], "policy.duplicate_name");
     }
 
     #[tokio::test]

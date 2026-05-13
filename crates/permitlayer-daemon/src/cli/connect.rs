@@ -1147,23 +1147,21 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
                         sanitize_for_terminal(&body.code),
                         sanitize_for_terminal(&body.message)
                     ),
-                    // Round-1 review P35: precise remediation. The
-                    // policy file lives at
-                    // /Library/Application Support/permitlayer/policies/<name>.toml
-                    // (macOS rc.22), root:wheel. Operators don't have
-                    // write access. If the daemon's `policy.reload_failed`
-                    // surfaced here, `agentsso reload` retries.
-                    // Otherwise: inspect the daemon's tracing log for
-                    // the parse/IO error and fix the file out-of-band
+                    // Policy files may use either one-file-per-policy or
+                    // multi-policy layouts (e.g. default.toml), so point
+                    // operators at the directory rather than inventing a
+                    // `<policy>.toml` path. If the daemon's
+                    // `policy.reload_failed` surfaced here, `agentsso reload`
+                    // retries. Otherwise: inspect the daemon's tracing log
+                    // for the parse/IO error and fix the file out-of-band
                     // with sudo.
                     &format!(
                         "agentsso reload   # if the daemon's in-memory \
                          policy set drifted from disk\n\
-                         # else: inspect /Library/Application Support/permitlayer/policies/{policy}.toml \
-                         (root-only) for the underlying issue;\n\
+                         # else: inspect /Library/Application Support/permitlayer/policies/ \
+                         (root-only; policies may live inside default.toml) for the underlying issue;\n\
                          # the daemon's tracing log carries the parse/IO error detail.\n\
                          # Scopes requested in this run: {scopes}",
-                        policy = agent_policy_name,
                         scopes = short_names.join(", "),
                     ),
                     None,

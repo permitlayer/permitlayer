@@ -24,15 +24,16 @@
 //!
 //! # Comment preservation
 //!
-//! TOML round-tripping via `toml::Value` does **not** preserve
-//! comments or original key ordering. The default fixture files
-//! ship with rich operator-facing comments; running
-//! [`add_scopes_to_policy`] on them will reformat the file (comments
-//! removed, fields re-ordered to deserialization order). This is an
-//! explicit MVP tradeoff: correctness over formatting. A future story
-//! can layer a comment-preserving editor (e.g., via the `toml_edit`
-//! crate) on top.
+//! TOML round-tripping via the typed [`TomlPolicyFile`] serializer
+//! does **not** preserve comments or original key ordering. The
+//! default fixture files ship with rich operator-facing comments;
+//! running [`add_scopes_to_policy`] on them will reformat the file
+//! (comments removed, fields re-ordered to serialization order). This
+//! is an explicit MVP tradeoff: correctness over formatting. A future
+//! story can layer a comment-preserving editor (e.g., via the
+//! `toml_edit` crate) on top.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use crate::policy::compile::PolicySet;
@@ -90,6 +91,16 @@ pub enum PolicyEditError {
     #[error("policy '{name}' not found in file: {path}")]
     PolicyNotInFile { name: String, path: PathBuf },
 
+    /// More than one policy file contains the same policy name. The
+    /// daemon rejects this at startup via `compile_from_dir`, so this
+    /// variant usually means the policies directory changed out of
+    /// band after boot. Refuse to edit before creating disk/memory
+    /// drift.
+    #[error(
+        "multiple files in {dir} contain policy {name:?}: {paths:?} - the daemon's compile_from_dir would have rejected this state at startup"
+    )]
+    PolicyDuplicateName { name: String, dir: PathBuf, paths: Vec<PathBuf> },
+
     /// The file failed to parse against the policy schema (malformed
     /// TOML, unknown field, missing required field). Wraps the
     /// canonical [`PolicyCompileError::Parse`] / similar variant from
@@ -129,8 +140,91 @@ pub enum PolicyEditError {
     },
 }
 
-/// Idempotently merge `scopes_to_add` into `<policies_dir>/<policy_name>.toml`'s
-/// scope allow-list.
+fn legacy_policy_path(policies_dir: &Path, policy_name: &str) -> PathBuf {
+    policies_dir.join(format!("{policy_name}.toml"))
+}
+
+fn parse_toml_policy_file(text: &str, path: &Path) -> Result<TomlPolicyFile, PolicyEditError> {
+    toml::from_str(text).map_err(|err| PolicyEditError::ParseFailed {
+        source: PolicyCompileError::Parse {
+            path: path.to_path_buf(),
+            line: None,
+            message: err.message().to_owned(),
+        },
+    })
+}
+
+fn resolve_policy_file(
+    policies_dir: &Path,
+    policy_name: &str,
+) -> Result<(PathBuf, TomlPolicyFile, usize), PolicyEditError> {
+    let entries = match std::fs::read_dir(policies_dir) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(PolicyEditError::PolicyFileNotFound {
+                path: legacy_policy_path(policies_dir, policy_name),
+            });
+        }
+        Err(e) => return Err(PolicyEditError::Io { source: e }),
+    };
+
+    let mut toml_files = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|source| PolicyEditError::Io { source })?;
+        let path = entry.path();
+        if crate::policy::compile::is_candidate_policy_file(&path) {
+            toml_files.push(path);
+        }
+    }
+    toml_files.sort();
+
+    let mut paths_for_name: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
+    let mut target_matches: Vec<(PathBuf, TomlPolicyFile, usize)> = Vec::new();
+
+    for path in toml_files {
+        let text =
+            std::fs::read_to_string(&path).map_err(|source| PolicyEditError::Io { source })?;
+        PolicySet::compile_from_str(&text, &path)
+            .map_err(|source| PolicyEditError::ParseFailed { source })?;
+        let file = parse_toml_policy_file(&text, &path)?;
+
+        for policy in &file.policies {
+            paths_for_name.entry(policy.name.clone()).or_default().push(path.clone());
+        }
+
+        if let Some(target_idx) = file.policies.iter().position(|p| p.name == policy_name) {
+            target_matches.push((path, file, target_idx));
+        }
+    }
+
+    if let Some((name, mut paths)) = paths_for_name.into_iter().find(|(_, paths)| paths.len() > 1) {
+        paths.sort();
+        paths.dedup();
+        return Err(PolicyEditError::PolicyDuplicateName {
+            name,
+            dir: policies_dir.to_path_buf(),
+            paths,
+        });
+    }
+
+    match target_matches.len() {
+        0 => Err(PolicyEditError::PolicyFileNotFound {
+            path: legacy_policy_path(policies_dir, policy_name),
+        }),
+        1 => Ok(target_matches.remove(0)),
+        _ => {
+            let paths = target_matches.into_iter().map(|(path, _, _)| path).collect();
+            Err(PolicyEditError::PolicyDuplicateName {
+                name: policy_name.to_owned(),
+                dir: policies_dir.to_path_buf(),
+                paths,
+            })
+        }
+    }
+}
+
+/// Idempotently merge `scopes_to_add` into the named policy's scope
+/// allow-list.
 ///
 /// `scopes_to_add` is a slice of short scope names (e.g.,
 /// `["calendar.readonly", "calendar.events"]`) — NOT full Google
@@ -151,7 +245,7 @@ pub enum PolicyEditError {
 /// **Caller must serialize concurrent calls against the same policy
 /// file.** This function does NOT take a file lock around the
 /// read-compute-write sequence; two parallel callers targeting the
-/// same `<policy_name>.toml` will both read the pre-state, compute
+/// same resolved policy file will both read the pre-state, compute
 /// their own merged scope list, and last-writer-wins on the rename.
 /// One caller's added scopes can be lost.
 ///
@@ -167,7 +261,7 @@ pub fn add_scopes_to_policy(
     policy_name: &str,
     scopes_to_add: &[&str],
 ) -> Result<ScopeMergeDiff, PolicyEditError> {
-    let policy_path = policies_dir.join(format!("{policy_name}.toml"));
+    let (policy_path, mut file, target_idx) = resolve_policy_file(policies_dir, policy_name)?;
 
     // Step 1a (round-1 P7): refuse to edit symlinks. `symlink_metadata`
     // does NOT follow the link, so it sees the link itself.
@@ -181,45 +275,6 @@ pub fn add_scopes_to_policy(
         }
         Err(e) => return Err(PolicyEditError::Io { source: e }),
     }
-
-    // Step 1b: read the file.
-    let text = match std::fs::read_to_string(&policy_path) {
-        Ok(t) => t,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Race window between symlink_metadata and read; treat as missing.
-            return Err(PolicyEditError::PolicyFileNotFound { path: policy_path });
-        }
-        Err(e) => return Err(PolicyEditError::Io { source: e }),
-    };
-
-    // Step 2: parse against the schema. Reuse the canonical parser via
-    // PolicySet::compile_from_str to make sure the file is syntactically
-    // AND semantically valid before we touch it. If this fails the
-    // operator's policy file is already broken; surface that, don't
-    // make it worse.
-    PolicySet::compile_from_str(&text, &policy_path)
-        .map_err(|source| PolicyEditError::ParseFailed { source })?;
-
-    let mut file: TomlPolicyFile = toml::from_str(&text).map_err(|err| {
-        // This branch is unreachable in practice because compile_from_str
-        // would have already failed above with the same TOML error. Map
-        // to a generic ParseFailed for the typed error path.
-        PolicyEditError::ParseFailed {
-            source: PolicyCompileError::Parse {
-                path: policy_path.clone(),
-                line: None,
-                message: err.message().to_owned(),
-            },
-        }
-    })?;
-
-    // Step 3: locate the target policy block.
-    let Some(target_idx) = file.policies.iter().position(|p| p.name == policy_name) else {
-        return Err(PolicyEditError::PolicyNotInFile {
-            name: policy_name.to_owned(),
-            path: policy_path,
-        });
-    };
 
     // Step 4: compute the diff. `before` is captured verbatim before
     // any mutation so the returned summary reflects the on-disk state
@@ -354,6 +409,12 @@ mod tests {
         path
     }
 
+    fn write_named_policy_file(dir: &Path, file_name: &str, contents: &str) -> PathBuf {
+        let path = dir.join(file_name);
+        std::fs::write(&path, contents).unwrap();
+        path
+    }
+
     const GMAIL_READONLY_BASE: &str = r#"[[policies]]
 name = "gmail-read-only"
 scopes = ["gmail.readonly"]
@@ -361,6 +422,276 @@ resources = ["*"]
 approval-mode = "auto"
 auto-approve-reads = true
 "#;
+
+    const DEFAULT_MULTI_POLICY: &str = r#"[[policies]]
+name = "gmail-read-only"
+scopes = ["gmail.readonly", "gmail.metadata"]
+resources = ["*"]
+approval-mode = "auto"
+auto-approve-reads = true
+
+[[policies]]
+name = "calendar-prompt-on-write"
+scopes = ["calendar.readonly", "calendar.events"]
+resources = ["primary"]
+approval-mode = "prompt"
+auto-approve-reads = true
+
+[[policies.rules]]
+id = "allow-calendar-reads"
+scopes = ["calendar.readonly"]
+action = "allow"
+
+[[policies.rules]]
+id = "prompt-calendar-writes"
+scopes = ["calendar.events"]
+action = "prompt"
+
+[[policies]]
+name = "drive-research-scope-restricted"
+scopes = ["drive.readonly", "drive.metadata"]
+resources = ["research-shared"]
+approval-mode = "auto"
+auto-approve-reads = true
+"#;
+
+    #[test]
+    fn add_scopes_finds_policy_in_multi_policy_file_noop_for_seeded_gmail() {
+        let tmp = tempfile::tempdir().unwrap();
+        let default_path =
+            write_named_policy_file(tmp.path(), "default.toml", DEFAULT_MULTI_POLICY);
+        let before = std::fs::read(&default_path).unwrap();
+
+        let diff =
+            add_scopes_to_policy(tmp.path(), "gmail-read-only", &["gmail.readonly"]).unwrap();
+
+        assert!(diff.is_no_op());
+        assert_eq!(diff.policy_path, default_path);
+        assert_eq!(diff.added, Vec::<String>::new());
+        assert_eq!(diff.before, vec!["gmail.readonly", "gmail.metadata"]);
+        assert_eq!(diff.after, vec!["gmail.metadata", "gmail.readonly"]);
+        assert!(!tmp.path().join("gmail-read-only.toml").exists());
+        let after = std::fs::read(&default_path).unwrap();
+        assert_eq!(before, after, "multi-policy no-op must not rewrite default.toml");
+    }
+
+    #[test]
+    fn add_scopes_merges_policy_in_multi_policy_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let multi = r#"[[policies]]
+name = "gmail-read-only"
+scopes = ["gmail.readonly"]
+resources = ["*"]
+approval-mode = "auto"
+auto-approve-reads = true
+
+[[policies]]
+name = "calendar-prompt-on-write"
+scopes = ["calendar.readonly", "calendar.events"]
+resources = ["primary"]
+approval-mode = "prompt"
+auto-approve-reads = true
+
+[[policies.rules]]
+id = "allow-calendar-reads"
+scopes = ["calendar.readonly"]
+action = "allow"
+"#;
+        let default_path = write_named_policy_file(tmp.path(), "default.toml", multi);
+        let before_text = std::fs::read_to_string(&default_path).unwrap();
+        let before: TomlPolicyFile = toml::from_str(&before_text).unwrap();
+
+        let diff =
+            add_scopes_to_policy(tmp.path(), "gmail-read-only", &["gmail.metadata"]).unwrap();
+
+        assert_eq!(diff.policy_path, default_path);
+        assert_eq!(diff.added, vec!["gmail.metadata"]);
+        assert!(!tmp.path().join("gmail-read-only.toml").exists());
+
+        let after_text = std::fs::read_to_string(&default_path).unwrap();
+        let after: TomlPolicyFile = toml::from_str(&after_text).unwrap();
+        let gmail = after.policies.iter().find(|p| p.name == "gmail-read-only").unwrap();
+        assert_eq!(gmail.scopes, vec!["gmail.metadata", "gmail.readonly"]);
+
+        let before_calendar =
+            before.policies.iter().find(|p| p.name == "calendar-prompt-on-write").unwrap();
+        let after_calendar =
+            after.policies.iter().find(|p| p.name == "calendar-prompt-on-write").unwrap();
+        assert_eq!(after_calendar.scopes, before_calendar.scopes);
+        assert_eq!(after_calendar.resources, before_calendar.resources);
+        assert_eq!(after_calendar.approval_mode, before_calendar.approval_mode);
+        assert_eq!(after_calendar.auto_approve_reads, before_calendar.auto_approve_reads);
+        assert_eq!(after_calendar.rules.len(), before_calendar.rules.len());
+        assert_eq!(after_calendar.rules[0].id, before_calendar.rules[0].id);
+        assert_eq!(after_calendar.rules[0].scopes, before_calendar.rules[0].scopes);
+        assert_eq!(after_calendar.rules[0].action, before_calendar.rules[0].action);
+    }
+
+    #[test]
+    fn add_scopes_per_file_layout_still_works() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = write_policy_file(
+            tmp.path(),
+            "my-policy",
+            r#"[[policies]]
+name = "my-policy"
+scopes = ["x.read"]
+resources = ["*"]
+approval-mode = "auto"
+auto-approve-reads = true
+"#,
+        );
+
+        let diff = add_scopes_to_policy(tmp.path(), "my-policy", &["x.write"]).unwrap();
+
+        assert_eq!(diff.policy_path, path);
+        assert_eq!(diff.before, vec!["x.read"]);
+        assert_eq!(diff.added, vec!["x.write"]);
+        assert_eq!(diff.after, vec!["x.read", "x.write"]);
+    }
+
+    #[test]
+    fn add_scopes_duplicate_target_name_across_files_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_named_policy_file(tmp.path(), "a.toml", GMAIL_READONLY_BASE);
+        write_named_policy_file(tmp.path(), "b.toml", GMAIL_READONLY_BASE);
+
+        let err =
+            add_scopes_to_policy(tmp.path(), "gmail-read-only", &["gmail.metadata"]).unwrap_err();
+
+        match err {
+            PolicyEditError::PolicyDuplicateName { name, dir, paths } => {
+                assert_eq!(name, "gmail-read-only");
+                assert_eq!(dir, tmp.path());
+                assert_eq!(paths.len(), 2);
+                assert!(paths.iter().any(|p| p.ends_with("a.toml")));
+                assert!(paths.iter().any(|p| p.ends_with("b.toml")));
+            }
+            other => panic!("expected PolicyDuplicateName, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_scopes_duplicate_non_target_name_across_files_errors_before_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let target_path = write_named_policy_file(
+            tmp.path(),
+            "target.toml",
+            r#"[[policies]]
+name = "target"
+scopes = ["x.read"]
+resources = ["*"]
+approval-mode = "auto"
+auto-approve-reads = true
+"#,
+        );
+        let duplicate = r#"[[policies]]
+name = "dupe"
+scopes = ["y.read"]
+resources = ["*"]
+approval-mode = "auto"
+auto-approve-reads = true
+"#;
+        write_named_policy_file(tmp.path(), "a.toml", duplicate);
+        write_named_policy_file(tmp.path(), "b.toml", duplicate);
+        let before = std::fs::read(&target_path).unwrap();
+
+        let err = add_scopes_to_policy(tmp.path(), "target", &["x.write"]).unwrap_err();
+
+        match err {
+            PolicyEditError::PolicyDuplicateName { name, paths, .. } => {
+                assert_eq!(name, "dupe");
+                assert_eq!(paths.len(), 2);
+            }
+            other => panic!("expected PolicyDuplicateName, got {other:?}"),
+        }
+        let after = std::fs::read(&target_path).unwrap();
+        assert_eq!(before, after, "duplicate sibling names must fail before target write");
+    }
+
+    #[test]
+    fn add_scopes_truly_missing_policy_errors_with_legacy_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_named_policy_file(tmp.path(), "default.toml", GMAIL_READONLY_BASE);
+
+        let err = add_scopes_to_policy(tmp.path(), "nope", &["gmail.metadata"]).unwrap_err();
+
+        match err {
+            PolicyEditError::PolicyFileNotFound { path } => {
+                assert_eq!(path, tmp.path().join("nope.toml"));
+            }
+            other => panic!("expected PolicyFileNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_scopes_missing_policies_dir_errors_with_legacy_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("missing-policies");
+
+        let err = add_scopes_to_policy(&missing, "nope", &["gmail.metadata"]).unwrap_err();
+
+        match err {
+            PolicyEditError::PolicyFileNotFound { path } => {
+                assert_eq!(path, missing.join("nope.toml"));
+            }
+            other => panic!("expected PolicyFileNotFound, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_scopes_non_directory_policies_path_errors_io() {
+        let tmp = tempfile::tempdir().unwrap();
+        let not_a_dir = tmp.path().join("policies-file");
+        std::fs::write(&not_a_dir, "not a directory").unwrap();
+
+        let err = add_scopes_to_policy(&not_a_dir, "nope", &["gmail.metadata"]).unwrap_err();
+
+        match err {
+            PolicyEditError::Io { source } => {
+                assert_ne!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected Io, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn add_scopes_skips_non_toml_dotfiles_and_editor_lockfiles() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_named_policy_file(tmp.path(), "default.toml", GMAIL_READONLY_BASE);
+        write_named_policy_file(tmp.path(), "README.md", "not toml");
+        write_named_policy_file(tmp.path(), ".hidden.toml", "not valid toml");
+        write_named_policy_file(tmp.path(), ".#default.toml", "not valid toml");
+        let readme_before = std::fs::read(tmp.path().join("README.md")).unwrap();
+
+        let diff =
+            add_scopes_to_policy(tmp.path(), "gmail-read-only", &["gmail.metadata"]).unwrap();
+
+        assert_eq!(diff.added, vec!["gmail.metadata"]);
+        assert_eq!(std::fs::read(tmp.path().join("README.md")).unwrap(), readme_before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn add_scopes_resolved_path_symlink_still_refused() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let real_dir = tempfile::tempdir().unwrap();
+        let real_path = write_named_policy_file(real_dir.path(), "real.toml", GMAIL_READONLY_BASE);
+        let link_path = tmp.path().join("default.toml");
+        symlink(&real_path, &link_path).unwrap();
+
+        let err =
+            add_scopes_to_policy(tmp.path(), "gmail-read-only", &["gmail.metadata"]).unwrap_err();
+
+        match err {
+            PolicyEditError::PolicyFileIsSymlink { path } => {
+                assert_eq!(path, link_path);
+            }
+            other => panic!("expected PolicyFileIsSymlink, got {other:?}"),
+        }
+    }
 
     #[test]
     fn merges_into_existing_scopes_preserves_other_fields() {
@@ -438,10 +769,12 @@ auto-approve-reads = true
     }
 
     #[test]
-    fn policy_not_in_file_returns_typed_error() {
+    fn policy_not_in_file_returns_tree_level_not_found() {
         let tmp = tempfile::tempdir().unwrap();
         // Create a file at the expected path but with a DIFFERENT
-        // policy name inside.
+        // policy name inside. The resolver now scans the whole policy
+        // tree and reports "policy not found" rather than "expected
+        // file exists but target block is absent".
         let mismatched = r#"[[policies]]
 name = "different-name"
 scopes = ["gmail.readonly"]
@@ -452,8 +785,8 @@ approval-mode = "auto"
         let result = add_scopes_to_policy(tmp.path(), "gmail-read-only", &["gmail.metadata"]);
         let err = result.unwrap_err();
         assert!(
-            matches!(err, PolicyEditError::PolicyNotInFile { .. }),
-            "expected PolicyNotInFile, got {err:?}"
+            matches!(err, PolicyEditError::PolicyFileNotFound { .. }),
+            "expected PolicyFileNotFound, got {err:?}"
         );
     }
 
