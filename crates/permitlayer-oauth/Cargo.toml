@@ -41,8 +41,12 @@ serde_json.workspace = true
 tempfile.workspace = true
 thiserror.workspace = true
 
-# Story 7.30: `should_skip_browser_open` reads `getuid()` to detect
-# the `sudo -i` from SSH context where `SSH_CONNECTION` is masked.
+# Story 7.30 (Round-3 review P72): `should_skip_browser_open` calls
+# `nix::unistd::Uid::effective()` (i.e. `geteuid(2)`, not `getuid(2)`)
+# to detect the `sudo -i` from SSH context where `SSH_CONNECTION` is
+# masked. Effective UID is the elevation signal that reliably reads
+# `0` under every sudo flavor (sudo / sudo -s / sudo -i / sudo -E),
+# while real UID can stay as the invoking operator's.
 [target.'cfg(unix)'.dependencies]
 nix = { workspace = true }
 

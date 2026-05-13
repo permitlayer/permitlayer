@@ -256,8 +256,12 @@ If you're not the operator who ran `sudo agentsso service install`,
 you may not be in the `permitlayer-clients` group. Add yourself:
 
 ```sh
-sudo dseditgroup -o edit -a $(whoami) -t user permitlayer-clients
+sudo dseditgroup -o edit -a "$(whoami)" -t user permitlayer-clients
 ```
+
+(`$(whoami)` is quoted so AD / Open Directory accounts whose usernames
+contain spaces — e.g. `first.last@corp` or federated identities —
+don't word-split through to `dseditgroup`'s arg parser.)
 
 Log out and back in so the new group membership takes effect.
 
@@ -276,6 +280,15 @@ on the detected failure:
   didn't restore the socket): fully re-bootstrap the daemon:
   ```sh
   sudo launchctl bootout system/dev.permitlayer.daemon
+  # Wait for the previous instance to actually exit. `launchctl bootout`
+  # is async — it sends SIGTERM and returns before the process is gone
+  # (default `ExitTimeOut` 20s). Bootstrapping while the old instance
+  # is still tearing down can fail with "Bootstrap failed: 5: Input/output
+  # error" or "Service already loaded". This loop polls until the service
+  # label is unloaded:
+  until ! sudo launchctl print system/dev.permitlayer.daemon >/dev/null 2>&1; do
+    sleep 1
+  done
   sudo launchctl bootstrap system /Library/LaunchDaemons/dev.permitlayer.daemon.plist
   ```
 - **Socket connect with EACCES** (you're not in the group):

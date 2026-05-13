@@ -423,6 +423,14 @@ pub(crate) fn should_skip_browser_open() -> bool {
     if std::env::var_os("AGENTSSO_FORCE_BROWSER_FALLBACK").is_some() {
         return true;
     }
+    // Round-3 review P71: inverse escape hatch. Operators inside tmux
+    // or screen sessions that preserve `SSH_TTY` across local reattaches
+    // (a common rc-file pattern) would otherwise hit a permanent
+    // false-positive skip with no in-band override. This env var lets
+    // them force the browser path back on without changing system env.
+    if std::env::var_os("AGENTSSO_FORCE_BROWSER_OPEN").is_some() {
+        return false;
+    }
     if std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some() {
         return true;
     }
@@ -472,8 +480,17 @@ pub(crate) fn should_skip_browser_open() -> bool {
                     .output()
                 {
                     Ok(out) if out.status.success() => {
+                        // Round-3 review P70: read `SUDO_USER` via
+                        // `var_os` + lossy decode to match `stat`'s
+                        // lossy stdout handling. Prior `env::var()`
+                        // returned `""` on non-UTF8, while
+                        // `from_utf8_lossy` substitutes U+FFFD —
+                        // asymmetric decoding could produce a spurious
+                        // match (or non-match) on unusual usernames.
                         let console_owner = String::from_utf8_lossy(&out.stdout).trim().to_owned();
-                        let sudo_user = std::env::var("SUDO_USER").unwrap_or_default();
+                        let sudo_user = std::env::var_os("SUDO_USER")
+                            .map(|v| String::from_utf8_lossy(v.as_encoded_bytes()).into_owned())
+                            .unwrap_or_default();
                         if console_owner != sudo_user {
                             return true;
                         }
@@ -487,24 +504,48 @@ pub(crate) fn should_skip_browser_open() -> bool {
                         // which is set on every local Terminal session
                         // by default — checking just `is_some()` here
                         // would false-positive on every local sudo.
+                        //
+                        // Round-3 review P69: macOS canonicalizes
+                        // `/tmp` → `/private/tmp` at the kernel level,
+                        // and some shells / sshd configs export the
+                        // canonicalized form. Match both prefixes so
+                        // the tiebreaker doesn't silently miss
+                        // forwarded sockets carrying the canonical path.
                         if let Some(sock) = std::env::var_os("SSH_AUTH_SOCK")
                             && let Some(s) = sock.to_str()
-                            && (s.starts_with("/tmp/ssh-") || s.starts_with("/var/tmp/ssh-"))
+                            && (s.starts_with("/tmp/ssh-")
+                                || s.starts_with("/var/tmp/ssh-")
+                                || s.starts_with("/private/tmp/ssh-")
+                                || s.starts_with("/private/var/tmp/ssh-"))
                         {
                             return true;
                         }
                     }
                     Ok(out) => {
+                        // Round-3 review P68: fail-closed on probe
+                        // failure. Prior posture ("assuming GUI
+                        // session" → return false → attempt
+                        // `open::that()`) contradicted ADR-0007's
+                        // "when in doubt, surface URL" framing. A
+                        // non-zero `stat /dev/console` exit means we
+                        // couldn't determine console ownership; the
+                        // safer default for a *sudo-from-something*
+                        // context is to print the URL.
                         tracing::warn!(
                             stderr = %String::from_utf8_lossy(&out.stderr),
-                            "/usr/bin/stat /dev/console exited non-zero; assuming GUI session"
+                            "/usr/bin/stat /dev/console exited non-zero; surfacing URL instead of attempting open"
                         );
+                        return true;
                     }
                     Err(e) => {
+                        // Round-3 review P68: same posture for probe
+                        // exec failure (binary missing, exec denied,
+                        // SIP-restricted environment).
                         tracing::warn!(
                             err = %e,
-                            "console-owner probe failed; assuming GUI session"
+                            "console-owner probe failed; surfacing URL instead of attempting open"
                         );
+                        return true;
                     }
                 }
             }
