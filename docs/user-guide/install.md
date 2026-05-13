@@ -272,6 +272,12 @@ on the detected failure:
   run `sudo agentsso service install`.
 - **Helper installed but the LaunchDaemon isn't running**:
   `sudo launchctl kickstart -k system/dev.permitlayer.daemon`.
+- **Helper running but the listener is wedged** (`kickstart -k`
+  didn't restore the socket): fully re-bootstrap the daemon:
+  ```sh
+  sudo launchctl bootout system/dev.permitlayer.daemon
+  sudo launchctl bootstrap system /Library/LaunchDaemons/dev.permitlayer.daemon.plist
+  ```
 - **Socket connect with EACCES** (you're not in the group):
   see the permission-error troubleshooting above.
 

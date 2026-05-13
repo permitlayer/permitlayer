@@ -50,8 +50,8 @@ When the heuristics don't trip, `open::that()` is wrapped in `tokio::time::timeo
 
 The seal endpoint accepts OAuth access + refresh tokens in the request body as JSON strings. The token plaintext crosses the UDS in cleartext (the UDS is a kernel-mediated channel; eavesdropping requires CAP_SYS_PTRACE or equivalent; `LOCAL_PEERCRED` attests the caller's UID). On the daemon side the JSON parser deserializes into `Zeroizing<String>` fields, so:
 
-- The `Zeroizing<T>` wrapper's `Drop` impl calls `String::zeroize`, which writes zeros over the full `Vec<u8>` capacity backing the String before the allocator frees it (zeroize 1.8 `impl Zeroize for String`, `RustCrypto/utils:zeroize/src/lib.rs:524-528`).
-- The deserialize chain is `Z::deserialize(deserializer)?` wrapped in `Self()` (zeroize 1.8 `impl Deserialize for Zeroizing<T>`, `RustCrypto/utils:zeroize/src/lib.rs:568-580`) — no intermediate non-zeroized `String` survives.
+- The `Zeroizing<T>` wrapper's `Drop` impl calls `String::zeroize`, which writes zeros over the full `Vec<u8>` capacity backing the String before the allocator frees it (zeroize 1.8: `impl Zeroize for String`).
+- The deserialize chain is `Z::deserialize(deserializer)?` wrapped in `Self()` (zeroize 1.8: `impl<'de, Z: Zeroize + Deserialize<'de>> Deserialize<'de> for Zeroizing<Z>`, gated on the `serde` feature) — no intermediate non-zeroized `String` survives. Line numbers are deliberately not pinned: zeroize is workspace-pinned to 1.8, and a bump revisit is captured below as a Revisit trigger.
 - The seal handler's local bindings (`access_token_str`, `refresh_token_str` on the CLI side; the deserialized `payload.access_token` on the daemon side) drop at the end of the handler scope. The total plaintext window is the handler's microsecond lifetime per request.
 
 The non-zeroizing window is `axum`'s `Bytes` request-body buffer. `Bytes` does NOT zeroize on drop; the bytes survive in the heap allocator's freelist until reuse. This is accepted as the threat boundary. Mitigations against future drift:

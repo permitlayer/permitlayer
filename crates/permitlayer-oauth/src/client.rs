@@ -184,40 +184,32 @@ impl OAuthClient {
         // `--headless` / `--device-flow` instead.
         let url_string = auth_url.to_string();
         if should_skip_browser_open() {
-            tracing::info!("skipping browser open: detected non-GUI / cross-session context",);
+            tracing::info!("skipping browser open: detected non-GUI / cross-session context");
             print_non_gui_consent_block(&url_string);
         } else {
-            // Wrap `open::that()` in a 5-second timeout so a hung
-            // `LSOpenURLsWithRole` call can't stall the runtime. The
-            // bound is loose enough that a normal browser launch
-            // completes well within it; a timeout indicates the call
-            // is wedged or about to fail silently.
+            // `open::that()` returns when LaunchServices (or xdg-open /
+            // `start`) *accepts* the URL — microseconds, not "browser
+            // is on-screen." A wall-clock timeout doesn't help: it
+            // either fires before the accept (false positive) or after
+            // a slow accept that already succeeded. And tokio's
+            // `timeout` would not cancel the inner `spawn_blocking`
+            // worker anyway, so a wedged accept would leak the worker
+            // thread.
+            //
+            // Instead: rely on `should_skip_browser_open()` to catch
+            // known-bad contexts up front, and route any `Err` from
+            // `open::that()` to the same non-GUI consent block so the
+            // operator always sees the `--headless` / `--device-flow`
+            // hints regardless of failure mode.
             let url_for_open = url_string.clone();
-            let timeout_result = tokio::time::timeout(
-                Duration::from_secs(5),
-                tokio::task::spawn_blocking(move || open::that(&url_for_open)),
-            )
-            .await;
-            match timeout_result {
-                Ok(Ok(Ok(()))) => {}
-                Ok(Ok(Err(e))) => {
-                    print_browser_fallback_message(&url_string, &e);
-                }
-                Ok(Err(e)) => {
-                    return Err(OAuthError::BrowserOpenFailed {
-                        source: std::io::Error::other(e.to_string()),
-                    });
-                }
-                Err(_elapsed) => {
-                    tracing::warn!(
-                        "browser-open call did not return within 5s; falling back to manual copy",
-                    );
-                    let io_err = std::io::Error::new(
-                        std::io::ErrorKind::TimedOut,
-                        "open::that() did not return within 5s",
-                    );
-                    print_browser_fallback_message(&url_string, &io_err);
-                }
+            let open_result = tokio::task::spawn_blocking(move || open::that(&url_for_open))
+                .await
+                .map_err(|e| OAuthError::BrowserOpenFailed {
+                    source: std::io::Error::other(e.to_string()),
+                })?;
+            if let Err(e) = open_result {
+                tracing::warn!(err = %e, "browser open failed; falling back to manual copy");
+                print_non_gui_consent_block(&url_string);
             }
         }
 
@@ -411,33 +403,6 @@ impl OAuthClient {
     }
 }
 
-/// Render the auto-fallback "browser launch failed" message to the
-/// given writer. Extracted as a writer-injected helper so unit tests
-/// can assert the rendered text without capturing global stdout.
-/// Production callers pipe through [`print_browser_fallback_message`].
-pub(crate) fn render_browser_fallback_message(
-    w: &mut dyn std::io::Write,
-    url: &str,
-    err: &std::io::Error,
-) -> std::io::Result<()> {
-    writeln!(w)?;
-    writeln!(w, "  Could not open browser ({err}). Open this URL manually:")?;
-    writeln!(w)?;
-    writeln!(w, "    {url}")?;
-    writeln!(w)?;
-    writeln!(w, "  If you're SSH'd from a different machine, cancel this and")?;
-    writeln!(w, "  re-run with --headless instead — that flow accepts the redirect")?;
-    writeln!(w, "  URL via stdin paste (no loopback listener needed).")?;
-    writeln!(w)?;
-    Ok(())
-}
-
-/// Print the auto-fallback message to stderr when `open::that()` fails.
-fn print_browser_fallback_message(url: &str, err: &std::io::Error) {
-    let mut stderr = std::io::stderr();
-    let _ = render_browser_fallback_message(&mut stderr, url, err);
-}
-
 /// Story 7.30 AC #9: detect non-GUI / cross-session contexts where
 /// `/usr/bin/open` (and `xdg-open` / `start`) are likely to fail
 /// silently — SSH sessions without a local browser, `sudo` from SSH,
@@ -461,17 +426,28 @@ pub(crate) fn should_skip_browser_open() -> bool {
     // `sudo -i` from SSH masks `SSH_CONNECTION` but preserves
     // `SUDO_USER`. If we're running as root via sudo AND there's no
     // DISPLAY (Linux) / no console-owner match (macOS), assume
-    // non-GUI.
+    // non-GUI. Use `effective` UID, not real: `sudo cmd` and
+    // `sudo -s` preserve the real UID as the invoking operator's
+    // while elevating euid to 0, so `getuid().is_root()` returns
+    // false on those flavors and the branch would be dead.
     #[cfg(unix)]
     {
         let is_sudo_root =
-            std::env::var_os("SUDO_USER").is_some() && nix::unistd::Uid::current().is_root();
+            std::env::var_os("SUDO_USER").is_some() && nix::unistd::Uid::effective().is_root();
         if is_sudo_root {
             #[cfg(target_os = "linux")]
             {
-                if std::env::var_os("DISPLAY").is_none()
-                    && std::env::var_os("WAYLAND_DISPLAY").is_none()
-                {
+                // Treat GUI as "reachable" if any of DISPLAY,
+                // WAYLAND_DISPLAY, XAUTHORITY, or DBUS_SESSION_BUS_ADDRESS
+                // survive sudo's env_reset. `sudo -s` strips DISPLAY by
+                // default on most distros but typically leaves XAUTHORITY,
+                // so checking only DISPLAY/WAYLAND_DISPLAY would falsely
+                // skip the browser from a GNOME terminal.
+                let gui_env = std::env::var_os("DISPLAY").is_some()
+                    || std::env::var_os("WAYLAND_DISPLAY").is_some()
+                    || std::env::var_os("XAUTHORITY").is_some()
+                    || std::env::var_os("DBUS_SESSION_BUS_ADDRESS").is_some();
+                if !gui_env {
                     return true;
                 }
             }
@@ -482,16 +458,37 @@ pub(crate) fn should_skip_browser_open() -> bool {
                 // mismatch (e.g. `_root` while `alice` holds the GUI
                 // session) means `open::that()` would attempt to talk
                 // to a session this process can't reach.
-                if let Ok(out) = std::process::Command::new("/usr/bin/stat")
+                match std::process::Command::new("/usr/bin/stat")
                     .args(["-f", "%Su", "/dev/console"])
                     .output()
                 {
-                    if out.status.success() {
+                    Ok(out) if out.status.success() => {
                         let console_owner = String::from_utf8_lossy(&out.stdout).trim().to_owned();
                         let sudo_user = std::env::var("SUDO_USER").unwrap_or_default();
                         if console_owner != sudo_user {
                             return true;
                         }
+                        // Tiebreaker for the rare case where SSH stripped
+                        // `SSH_CONNECTION` (sudo env_reset) and the
+                        // console owner happens to match `$SUDO_USER`
+                        // by coincidence: `SSH_AUTH_SOCK` is preserved
+                        // under most sudoers configs and is a strong
+                        // signal of an active SSH agent forward.
+                        if std::env::var_os("SSH_AUTH_SOCK").is_some() {
+                            return true;
+                        }
+                    }
+                    Ok(out) => {
+                        tracing::warn!(
+                            stderr = %String::from_utf8_lossy(&out.stderr),
+                            "/usr/bin/stat /dev/console exited non-zero; assuming GUI session"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            err = %e,
+                            "console-owner probe failed; assuming GUI session"
+                        );
                     }
                 }
             }
@@ -747,26 +744,6 @@ mod tests {
         assert!(
             form_body.contains(&format!("redirect_uri={encoded_redirect_uri}")),
             "token-exchange form body must reuse the auth-URL redirect_uri (got body: {form_body})",
-        );
-    }
-
-    #[test]
-    fn render_browser_fallback_includes_url_and_error_and_headless_pointer() {
-        let err = std::io::Error::other("simulated open failure");
-        let mut buf = Vec::new();
-        render_browser_fallback_message(&mut buf, "https://example.test/auth", &err)
-            .expect("write into Vec cannot fail");
-        let out = String::from_utf8(buf).expect("ascii output");
-        assert!(out.contains("https://example.test/auth"), "URL must appear in fallback output");
-        assert!(out.contains("Could not open browser"), "fallback header must appear");
-        assert!(out.contains("simulated open failure"), "underlying error must appear");
-        assert!(
-            out.contains("--headless"),
-            "rc.13: cross-machine SSH operators should be pointed at --headless"
-        );
-        assert!(
-            !out.contains("curl"),
-            "rc.13: drop the misleading curl-from-this-host instruction"
         );
     }
 }

@@ -1,10 +1,12 @@
 # ADR 0006 — macOS: LaunchDaemon system-service over per-user LaunchAgent
 
-**Status:** Accepted
+**Status:** Accepted (refined by [ADR-0007](./0007-uds-mediated-credential-seal-boundary.md))
 
 **Date:** 2026-05-12
 
 **Story:** 7.25 (parent spec) → 7.26 → 7.27 → 7.28 → 7.29 (this release)
+
+**Refined by:** [ADR-0007 — UDS-mediated credential-seal boundary](./0007-uds-mediated-credential-seal-boundary.md) (Story 7.30) extends this LaunchDaemon model with five `/v1/control/*` endpoints so `agentsso connect` runs as a normal operator (no root, no group-write to the master-key directory). The peer-credential boundary stays where this ADR put it.
 
 ## Context
 
