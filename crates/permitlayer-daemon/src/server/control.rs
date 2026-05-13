@@ -1431,6 +1431,12 @@ pub(crate) struct RegisterAgentResponse {
 /// the operator can take corrective action.
 #[derive(Debug, serde::Serialize)]
 #[serde(tag = "outcome", rename_all = "snake_case")]
+// Constructed only inside `#[cfg(target_os = "macos")]` (the per-user
+// file-write path lives behind peer-credential attestation, which is
+// macOS UDS-only); on Linux + Windows the variants are dead but the
+// type must stay cross-platform because `RegisterAgentResponse` carries
+// `Option<Self>` unconditionally.
+#[allow(dead_code)]
 pub(crate) enum BearerTokenFileWriteResult {
     Written { path: String, replace_existing: bool },
     Failed { message: String },

@@ -54,9 +54,12 @@ const MACOS_PRIVILEGED_HELPER_PATH: &str = "/Library/PrivilegedHelperTools/agent
 enum DaemonDownReason {
     /// macOS: privileged helper binary not installed.
     /// Spec discriminator: `Path::new(MACOS_PRIVILEGED_HELPER_PATH).exists()`.
+    #[allow(dead_code)] // constructed only on macOS; the match arm in
+    // `render_daemon_must_run` must still cover it cross-platform
     NotInstalled,
     /// macOS: helper installed but `launchctl print
     /// system/dev.permitlayer.daemon` indicates not-running.
+    #[allow(dead_code)] // constructed only on macOS
     NotRunningLaunchd,
     /// Socket connect refused (e.g. stale socket inode after a
     /// force-kill). Per kill.rs::error_block_daemon_unreachable_endpoint_classified.
@@ -71,6 +74,7 @@ enum DaemonDownReason {
     /// missing, exec denied, exit code we don't understand). Distinct
     /// from `NotRunningLaunchd` so we don't suggest a `kickstart` that
     /// will fail the same way.
+    #[allow(dead_code)] // constructed only on macOS
     LaunchdProbeUnavailable,
     /// Round-3 review P66: daemon process is up and reachable but
     /// rejected the control token. Same operator action class as
@@ -166,6 +170,7 @@ fn classify_daemon_down_reason(
             }
             _ => DaemonDownReason::TcpUnreachable,
         },
+        #[cfg(unix)]
         ControlEndpoint::Uds(_) => {
             // Order matters: EACCES first because a permission error
             // tells us we DO have a daemon running (the socket exists
@@ -675,6 +680,7 @@ mod tests {
         anyhow::Error::new(std::io::Error::new(kind, msg.to_owned()))
     }
 
+    #[cfg(unix)]
     fn fake_uds_endpoint() -> ControlEndpoint {
         ControlEndpoint::Uds(std::path::PathBuf::from("/tmp/agentsso-test-control.sock"))
     }
@@ -683,6 +689,7 @@ mod tests {
         ControlEndpoint::Tcp("127.0.0.1:3820".parse().unwrap())
     }
 
+    #[cfg(unix)]
     #[test]
     fn classify_daemon_down_uds_permission_denied_routes_to_group_membership() {
         let err = synthetic_io_error(std::io::ErrorKind::PermissionDenied, "permission denied");
@@ -693,6 +700,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn classify_daemon_down_uds_connection_refused_routes_to_stale_socket() {
         let err = synthetic_io_error(std::io::ErrorKind::ConnectionRefused, "connection refused");
@@ -730,6 +738,7 @@ mod tests {
     /// CRLF-injection inputs. Verified end-to-end via the file-read
     /// path, but the validator's own unit test is here in the crate
     /// that owns its callers.
+    #[cfg(unix)]
     #[test]
     fn control_token_round_trip_classification() {
         // Synthesize the same scenarios the renderer dispatches on

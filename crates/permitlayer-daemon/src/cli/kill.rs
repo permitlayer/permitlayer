@@ -25,7 +25,9 @@
 //! `KillSwitchLayer` so resume still works when killed.
 
 use std::net::SocketAddr;
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -327,7 +329,12 @@ pub(crate) enum ControlEndpoint {
     /// Loopback TCP — rc.21 fallback / Linux + Windows path.
     #[allow(dead_code)] // unreachable on macOS where every CLI uses UDS
     Tcp(SocketAddr),
-    /// Unix domain socket — rc.22 macOS path.
+    /// Unix domain socket — rc.22 macOS path. `cfg(unix)`-gated because
+    /// `tokio::net::UnixStream` (used by the dispatch helpers below)
+    /// is not available on Windows; the variant has no constructor on
+    /// non-Unix anyway since `resolve_control_endpoint` only produces
+    /// `Uds(_)` under `target_os = "macos"`.
+    #[cfg(unix)]
     #[allow(dead_code)] // unreachable on non-macOS where every CLI uses TCP
     Uds(PathBuf),
 }
@@ -336,6 +343,7 @@ impl std::fmt::Display for ControlEndpoint {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Tcp(addr) => write!(f, "{addr}"),
+            #[cfg(unix)]
             Self::Uds(path) => write!(f, "unix:{}", path.display()),
         }
     }
@@ -404,6 +412,7 @@ pub(crate) async fn http_post_json_via(
 ) -> Result<String> {
     match endpoint {
         ControlEndpoint::Tcp(addr) => http_post_json(*addr, path, body, control_token).await,
+        #[cfg(unix)]
         ControlEndpoint::Uds(sock_path) => tokio::time::timeout(
             HTTP_DEADLINE,
             http_post_json_inner_uds(sock_path, path, body, control_token),
@@ -421,6 +430,7 @@ pub(crate) async fn http_get_via(
 ) -> Result<String> {
     match endpoint {
         ControlEndpoint::Tcp(addr) => http_get(*addr, path, control_token).await,
+        #[cfg(unix)]
         ControlEndpoint::Uds(sock_path) => {
             tokio::time::timeout(HTTP_DEADLINE, http_get_inner_uds(sock_path, path, control_token))
                 .await
@@ -439,6 +449,7 @@ pub(crate) async fn http_get_with_status_via(
 ) -> Result<(u16, String)> {
     match endpoint {
         ControlEndpoint::Tcp(addr) => http_get_with_status(*addr, path, control_token).await,
+        #[cfg(unix)]
         ControlEndpoint::Uds(sock_path) => tokio::time::timeout(
             HTTP_DEADLINE,
             http_get_with_status_inner_uds(sock_path, path, control_token),
@@ -463,6 +474,7 @@ pub(crate) async fn http_post_json_with_status_via(
         ControlEndpoint::Tcp(addr) => {
             http_post_json_with_status(*addr, path, body, control_token).await
         }
+        #[cfg(unix)]
         ControlEndpoint::Uds(sock_path) => tokio::time::timeout(
             HTTP_DEADLINE,
             http_post_json_with_status_inner_uds(sock_path, path, body, control_token),
@@ -495,6 +507,7 @@ pub(crate) async fn http_post_zeroizing_with_status_via(
         )
         .await
         .with_context(|| format!("HTTP POST {path} (TCP) timed out after {HTTP_DEADLINE:?}"))?,
+        #[cfg(unix)]
         ControlEndpoint::Uds(sock_path) => tokio::time::timeout(
             HTTP_DEADLINE,
             http_post_zeroizing_with_status_inner_uds(sock_path, path, body, control_token),
@@ -543,6 +556,7 @@ async fn http_post_zeroizing_with_status_inner_tcp(
 
 /// Round-1 review P42 UDS variant: same two-write split, over a Unix
 /// domain socket.
+#[cfg(unix)]
 async fn http_post_zeroizing_with_status_inner_uds(
     sock_path: &Path,
     path: &str,
@@ -575,6 +589,7 @@ async fn http_post_zeroizing_with_status_inner_uds(
     Ok((status, body))
 }
 
+#[cfg(unix)]
 async fn http_post_json_inner_uds(
     sock_path: &Path,
     path: &str,
@@ -603,6 +618,7 @@ async fn http_post_json_inner_uds(
     extract_body(&response).ok_or_else(|| anyhow::anyhow!("malformed HTTP response"))
 }
 
+#[cfg(unix)]
 async fn http_get_inner_uds(
     sock_path: &Path,
     path: &str,
@@ -628,6 +644,7 @@ async fn http_get_inner_uds(
     extract_body(&response).ok_or_else(|| anyhow::anyhow!("malformed HTTP response"))
 }
 
+#[cfg(unix)]
 async fn http_get_with_status_inner_uds(
     sock_path: &Path,
     path: &str,
@@ -746,6 +763,7 @@ async fn http_post_json_with_status_inner(
     Ok((status, body))
 }
 
+#[cfg(unix)]
 async fn http_post_json_with_status_inner_uds(
     sock_path: &Path,
     path: &str,
@@ -968,6 +986,7 @@ mod tests {
         assert!(out.contains("AGENTSSO_HTTP__BIND_ADDR"), "out: {out}");
     }
 
+    #[cfg(unix)]
     #[test]
     fn error_block_daemon_unreachable_endpoint_uds_shape() {
         // Story 7.27 Round-2 review fix (P2): UDS endpoint Display
