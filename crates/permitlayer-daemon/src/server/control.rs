@@ -2099,7 +2099,7 @@ pub(crate) async fn agent_policy_name_handler(
 
 /// Service set the credential endpoints accept (Story 7.30 AC #2
 /// + #3). Mirrors `crates/permitlayer-daemon/src/cli/connect.rs::SUPPORTED_SERVICES`;
-/// kept private until Task 12 deduplicates the constant.
+///   kept private until Task 12 deduplicates the constant.
 pub(crate) const CREDENTIAL_SUPPORTED_SERVICES: &[&str] = &["gmail", "calendar", "drive"];
 
 fn credential_service_supported(service: &str) -> bool {
@@ -2532,47 +2532,22 @@ pub(crate) async fn credentials_seal_handler(
             );
         }
         (SealIfExists::Skip, true) => {
-            // Round-1 review P3 + P16: dispatch the read to a
-            // blocking worker AND use `symlink_metadata` so a
-            // symlinked meta file is rejected before we read its
-            // target (defense-in-depth — vault dir is 0700 root:wheel
-            // so a daemon-spawned symlink is unlikely, but the
-            // discipline matches `policy::edit::add_scopes_to_policy`).
-            let meta_path_for_read = meta_path.clone();
-            let read_result =
-                tokio::task::spawn_blocking(move || -> Result<String, std::io::Error> {
-                    let md = std::fs::symlink_metadata(&meta_path_for_read)?;
-                    if md.file_type().is_symlink() {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::InvalidInput,
-                            format!(
-                                "meta file is a symlink (refusing to follow): {}",
-                                meta_path_for_read.display()
-                            ),
-                        ));
-                    }
-                    std::fs::read_to_string(&meta_path_for_read)
-                })
-                .await;
-            let meta_raw = match read_result {
-                Ok(Ok(s)) => s,
-                Ok(Err(e)) => {
-                    emit_seal_denied_audit(
-                        &state,
-                        &request_id,
-                        Some(&payload.service),
-                        Some(&payload.agent),
-                        "credentials.meta_io_failed",
-                        peer_creds_for_audit,
-                    )
-                    .await;
-                    return agent_error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "credentials.meta_io_failed",
-                        format!("could not read existing meta file: {e}"),
-                        Some(request_id),
-                    );
-                }
+            // Round-3 review P78: sanity-check the access envelope
+            // alongside the meta sentinel. After a partial cleanup
+            // (operator manually removed `{service}.sealed` but left
+            // the meta file behind), the credential is NOT actually
+            // usable — returning `sealed: false` here would lie. Fall
+            // through to the fresh-seal path in that case so the
+            // operator's `--no-force` re-run rebuilds the credential
+            // instead of silently asserting it's fine.
+            let envelope_path = state.vault_dir.join(format!("{}.sealed", payload.service));
+            let envelope_path_for_exists = envelope_path.clone();
+            let envelope_exists = match tokio::task::spawn_blocking(move || {
+                envelope_path_for_exists.exists()
+            })
+            .await
+            {
+                Ok(exists) => exists,
                 Err(e) => {
                     emit_seal_denied_audit(
                         &state,
@@ -2586,42 +2561,165 @@ pub(crate) async fn credentials_seal_handler(
                     return agent_error_response(
                         StatusCode::INTERNAL_SERVER_ERROR,
                         "credentials.meta_io_failed",
-                        format!("blocking task join failed reading meta file: {e}"),
+                        format!("blocking task join failed during envelope existence check: {e}"),
                         Some(request_id),
                     );
                 }
             };
-            let meta: permitlayer_oauth::metadata::CredentialMeta =
-                match serde_json::from_str(&meta_raw) {
-                    Ok(m) => m,
+            if !envelope_exists {
+                tracing::warn!(
+                    target: "control",
+                    request_id = %request_id,
+                    service = %payload.service,
+                    "Skip: meta present but `{service}.sealed` envelope missing — falling through to fresh seal",
+                    service = payload.service,
+                );
+                // Don't return — fall out of the match and proceed to
+                // the Replace-equivalent seal path. `replaced_previous`
+                // stays `true` (computed from `credential_exists` below)
+                // so audit accurately reflects that a sentinel was overwritten.
+            } else {
+                // Round-1 review P3 + P16: dispatch the read to a
+                // blocking worker AND use `symlink_metadata` so a
+                // symlinked meta file is rejected before we read its
+                // target (defense-in-depth — vault dir is 0700 root:wheel
+                // so a daemon-spawned symlink is unlikely, but the
+                // discipline matches `policy::edit::add_scopes_to_policy`).
+                let meta_path_for_read = meta_path.clone();
+                let read_result =
+                    tokio::task::spawn_blocking(move || -> Result<String, std::io::Error> {
+                        let md = std::fs::symlink_metadata(&meta_path_for_read)?;
+                        if md.file_type().is_symlink() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!(
+                                    "meta file is a symlink (refusing to follow): {}",
+                                    meta_path_for_read.display()
+                                ),
+                            ));
+                        }
+                        std::fs::read_to_string(&meta_path_for_read)
+                    })
+                    .await;
+                let meta_raw = match read_result {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        emit_seal_denied_audit(
+                            &state,
+                            &request_id,
+                            Some(&payload.service),
+                            Some(&payload.agent),
+                            "credentials.meta_io_failed",
+                            peer_creds_for_audit,
+                        )
+                        .await;
+                        return agent_error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "credentials.meta_io_failed",
+                            format!("could not read existing meta file: {e}"),
+                            Some(request_id),
+                        );
+                    }
                     Err(e) => {
                         emit_seal_denied_audit(
                             &state,
                             &request_id,
                             Some(&payload.service),
                             Some(&payload.agent),
-                            "credentials.meta_parse_failed",
+                            "credentials.meta_io_failed",
                             peer_creds_for_audit,
                         )
                         .await;
                         return agent_error_response(
                             StatusCode::INTERNAL_SERVER_ERROR,
-                            "credentials.meta_parse_failed",
-                            format!("could not parse existing meta file: {e}"),
+                            "credentials.meta_io_failed",
+                            format!("blocking task join failed reading meta file: {e}"),
                             Some(request_id),
                         );
                     }
                 };
-            return (
-                StatusCode::OK,
-                Json(CredentialsSealResponse { sealed: false, replaced_previous: false, meta }),
-            )
-                .into_response();
+                let meta: permitlayer_oauth::metadata::CredentialMeta =
+                    match serde_json::from_str(&meta_raw) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            emit_seal_denied_audit(
+                                &state,
+                                &request_id,
+                                Some(&payload.service),
+                                Some(&payload.agent),
+                                "credentials.meta_parse_failed",
+                                peer_creds_for_audit,
+                            )
+                            .await;
+                            return agent_error_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "credentials.meta_parse_failed",
+                                format!("could not parse existing meta file: {e}"),
+                                Some(request_id),
+                            );
+                        }
+                    };
+                return (
+                    StatusCode::OK,
+                    Json(CredentialsSealResponse { sealed: false, replaced_previous: false, meta }),
+                )
+                    .into_response();
+            } // close P78 else branch (envelope_exists == true)
+            // If we get here, envelope was missing — fall through to
+            // the Replace-equivalent seal path.
         }
         _ => {} // Replace branch or no existing credential — proceed.
     }
 
     let replaced_previous = credential_exists;
+
+    // Round-3 review D1: when a Replace re-seal omits a fresh refresh
+    // token, unlink the stale `{service}-refresh.sealed` so the proxy
+    // refresh path can't reach for a prior consent's refresh token
+    // paired with the just-sealed access token. Best-effort: any I/O
+    // error degrades to the pre-D1 behavior. Held inside the
+    // per-service seal lock so no concurrent reader sees a half-state.
+    if replaced_previous && payload.refresh_token.is_none() {
+        let refresh_envelope = state.vault_dir.join(format!("{}-refresh.sealed", payload.service));
+        let refresh_envelope_for_unlink = refresh_envelope.clone();
+        let unlink_result = tokio::task::spawn_blocking(move || {
+            match std::fs::remove_file(&refresh_envelope_for_unlink) {
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(e),
+            }
+        })
+        .await;
+        match unlink_result {
+            Ok(Ok(true)) => {
+                tracing::info!(
+                    target: "control",
+                    request_id = %request_id,
+                    service = %payload.service,
+                    "stale refresh envelope unlinked on Replace without new refresh token"
+                );
+            }
+            Ok(Ok(false)) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    target: "control",
+                    request_id = %request_id,
+                    service = %payload.service,
+                    error = %e,
+                    "best-effort unlink of stale refresh envelope failed"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "control",
+                    request_id = %request_id,
+                    service = %payload.service,
+                    error = %e,
+                    "blocking task join failed during stale refresh unlink"
+                );
+            }
+        }
+    }
 
     let access_token = permitlayer_credential::OAuthToken::from_trusted_bytes(
         payload.access_token.as_bytes().to_vec(),
@@ -2884,6 +2982,80 @@ async fn emit_seal_denied_audit(
     }
 }
 
+/// Round-3 review P62: emit `credentials-verify-denied` audit event on
+/// every verify-handler failure path that bails BEFORE the
+/// verify-result match (where the inline `emit_audit` closure runs).
+/// Without this, security-relevant failures — notably
+/// `credentials.unseal_failed` (post-key-rotation, possible compromise)
+/// and `credentials.not_found` — leave no forensic trail. Mirror of
+/// `emit_seal_denied_audit`.
+async fn emit_verify_denied_audit(
+    state: &ControlState,
+    request_id: &str,
+    service: Option<&str>,
+    agent: Option<&str>,
+    error_code: &str,
+    peer_creds: Option<crate::server::PeerCredentials>,
+) {
+    let Some(audit) = state.audit_store.as_ref() else {
+        return;
+    };
+    let mut event = AuditEvent::with_request_id(
+        request_id.to_owned(),
+        agent.unwrap_or("-").to_owned(),
+        "permitlayer".to_owned(),
+        service.unwrap_or("-").to_owned(),
+        "credentials-verify".to_owned(),
+        "denied".to_owned(),
+        "credentials-verify-denied".to_owned(),
+    );
+    event.extra = serde_json::json!({
+        "error_code": error_code,
+        "service": service,
+        "agent": agent,
+    });
+    enrich_audit_extra_with_peer_creds(&mut event.extra, peer_creds);
+    if let Err(e) = audit.append(event).await {
+        tracing::warn!(error = %e, "credentials-verify-denied audit write failed (best-effort)");
+    }
+}
+
+/// Round-3 review P63: emit `policy-scopes-denied` audit event on every
+/// policy-scopes-handler failure path that bails BEFORE the success
+/// path's `policy-scopes-added` event. Symmetric to
+/// `emit_seal_denied_audit`/`emit_verify_denied_audit`. Covers
+/// invalid-name, bad-request, and every `PolicyEditError` variant —
+/// these are the security-relevant denials (path-traversal attempts,
+/// symlink rejections, schema-violating edits).
+async fn emit_policy_scopes_denied_audit(
+    state: &ControlState,
+    request_id: &str,
+    policy_name: Option<&str>,
+    error_code: &str,
+    peer_creds: Option<crate::server::PeerCredentials>,
+) {
+    let Some(audit) = state.audit_store.as_ref() else {
+        return;
+    };
+    let mut event = AuditEvent::with_request_id(
+        request_id.to_owned(),
+        "-".to_owned(), // policy_scopes is policy-scoped, not agent-scoped
+        "permitlayer".to_owned(),
+        "-".to_owned(),
+        "policy-scopes-add".to_owned(),
+        "denied".to_owned(),
+        "policy-scopes-denied".to_owned(),
+    );
+    event.extra = serde_json::json!({
+        "error_code": error_code,
+        "policy_name": policy_name,
+    });
+    enrich_audit_extra_with_peer_creds(&mut event.extra, peer_creds);
+    if let Err(e) = audit.append(event).await {
+        tracing::warn!(error = %e, "policy-scopes-denied audit write failed (best-effort)");
+    }
+}
+
 /// Round-1 review P1: roll back sealed envelope files when a
 /// downstream step (meta write, etc.) fails. Best-effort: a roll-back
 /// failure logs at warn but does not change the response code (the
@@ -3011,6 +3183,15 @@ pub(crate) async fn credentials_verify_handler(
         req.extensions().get::<crate::server::PeerCredentials>().copied();
 
     if !credential_service_supported(&service) {
+        emit_verify_denied_audit(
+            &state,
+            &request_id,
+            Some(&service),
+            None,
+            "credentials.unknown_service",
+            peer_creds_for_audit,
+        )
+        .await;
         return agent_error_response(
             StatusCode::BAD_REQUEST,
             "credentials.unknown_service",
@@ -3027,6 +3208,15 @@ pub(crate) async fn credentials_verify_handler(
     let bytes = match axum::body::to_bytes(body, 16 * 1024).await {
         Ok(b) => b,
         Err(e) => {
+            emit_verify_denied_audit(
+                &state,
+                &request_id,
+                Some(&service),
+                None,
+                "credentials.bad_request",
+                peer_creds_for_audit,
+            )
+            .await;
             return agent_error_response(
                 StatusCode::BAD_REQUEST,
                 "credentials.bad_request",
@@ -3038,6 +3228,15 @@ pub(crate) async fn credentials_verify_handler(
     let payload: CredentialsVerifyRequest = match serde_json::from_slice(&bytes) {
         Ok(p) => p,
         Err(e) => {
+            emit_verify_denied_audit(
+                &state,
+                &request_id,
+                Some(&service),
+                None,
+                "credentials.bad_request",
+                peer_creds_for_audit,
+            )
+            .await;
             return agent_error_response(
                 StatusCode::BAD_REQUEST,
                 "credentials.bad_request",
@@ -3048,6 +3247,15 @@ pub(crate) async fn credentials_verify_handler(
     };
 
     let Some(home) = state.vault_dir.parent().map(std::path::Path::to_path_buf) else {
+        emit_verify_denied_audit(
+            &state,
+            &request_id,
+            Some(&service),
+            Some(&payload.agent),
+            "credentials.vault_layout_invalid",
+            peer_creds_for_audit,
+        )
+        .await;
         return agent_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "credentials.vault_layout_invalid",
@@ -3062,6 +3270,15 @@ pub(crate) async fn credentials_verify_handler(
     let store = match permitlayer_core::store::fs::CredentialFsStore::new(home) {
         Ok(s) => s,
         Err(e) => {
+            emit_verify_denied_audit(
+                &state,
+                &request_id,
+                Some(&service),
+                Some(&payload.agent),
+                "credentials.store_init_failed",
+                peer_creds_for_audit,
+            )
+            .await;
             return agent_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "credentials.store_init_failed",
@@ -3074,6 +3291,15 @@ pub(crate) async fn credentials_verify_handler(
     let sealed = match store.get(&service).await {
         Ok(Some(s)) => s,
         Ok(None) => {
+            emit_verify_denied_audit(
+                &state,
+                &request_id,
+                Some(&service),
+                Some(&payload.agent),
+                "credentials.not_found",
+                peer_creds_for_audit,
+            )
+            .await;
             return agent_error_response(
                 StatusCode::NOT_FOUND,
                 "credentials.not_found",
@@ -3082,6 +3308,15 @@ pub(crate) async fn credentials_verify_handler(
             );
         }
         Err(e) => {
+            emit_verify_denied_audit(
+                &state,
+                &request_id,
+                Some(&service),
+                Some(&payload.agent),
+                "credentials.store_io_failed",
+                peer_creds_for_audit,
+            )
+            .await;
             return agent_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "credentials.store_io_failed",
@@ -3098,6 +3333,18 @@ pub(crate) async fn credentials_verify_handler(
             // master key was rotated between seal and verify (Story
             // 7.6a/b rotate-key paths). Surface the recovery
             // remediation so operators don't have to guess.
+            // Round-3 review P62: emit audit on this load-bearing
+            // failure — post-rotation unseal failures are the
+            // highest-signal forensic event in the verify path.
+            emit_verify_denied_audit(
+                &state,
+                &request_id,
+                Some(&service),
+                Some(&payload.agent),
+                "credentials.unseal_failed",
+                peer_creds_for_audit,
+            )
+            .await;
             return agent_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "credentials.unseal_failed",
@@ -3425,7 +3672,7 @@ pub(crate) struct PolicyScopesAddResponse {
 /// Idempotent: when the requested `short_names` are already present,
 /// the helper returns a no-op diff and the daemon skips the reload
 /// + skips the audit event (matches the CLI's existing
-/// `policy_was_modified` gating).
+///   `policy_was_modified` gating).
 ///
 /// On a real merge, runs the same reload sequence as
 /// `reload_handler`: clear approval caches, swap the `ArcSwap`
@@ -3460,6 +3707,14 @@ pub(crate) async fn policy_scopes_handler(
         || policy_name.contains("..")
         || policy_name.starts_with('.')
     {
+        emit_policy_scopes_denied_audit(
+            &state,
+            &request_id,
+            Some(&policy_name),
+            "policy.invalid_name",
+            peer_creds_for_audit,
+        )
+        .await;
         return agent_error_response(
             StatusCode::BAD_REQUEST,
             "policy.invalid_name",
@@ -3472,6 +3727,14 @@ pub(crate) async fn policy_scopes_handler(
     let bytes = match axum::body::to_bytes(body, 16 * 1024).await {
         Ok(b) => b,
         Err(e) => {
+            emit_policy_scopes_denied_audit(
+                &state,
+                &request_id,
+                Some(&policy_name),
+                "policy.bad_request",
+                peer_creds_for_audit,
+            )
+            .await;
             return agent_error_response(
                 StatusCode::BAD_REQUEST,
                 "policy.bad_request",
@@ -3483,6 +3746,14 @@ pub(crate) async fn policy_scopes_handler(
     let payload: PolicyScopesAddRequest = match serde_json::from_slice(&bytes) {
         Ok(p) => p,
         Err(e) => {
+            emit_policy_scopes_denied_audit(
+                &state,
+                &request_id,
+                Some(&policy_name),
+                "policy.bad_request",
+                peer_creds_for_audit,
+            )
+            .await;
             return agent_error_response(
                 StatusCode::BAD_REQUEST,
                 "policy.bad_request",
@@ -3509,9 +3780,29 @@ pub(crate) async fn policy_scopes_handler(
     let diff = match edit_result {
         Ok(Ok(d)) => d,
         Ok(Err(e)) => {
+            // Round-3 review P63: audit every PolicyEditError variant.
+            // The variant determines the error_code label so operators
+            // can grep `policy-scopes-denied` rows for the exact cause.
+            let error_code = policy_edit_error_code(&e);
+            emit_policy_scopes_denied_audit(
+                &state,
+                &request_id,
+                Some(&policy_name),
+                error_code,
+                peer_creds_for_audit,
+            )
+            .await;
             return policy_edit_error_response(e, &request_id);
         }
         Err(e) => {
+            emit_policy_scopes_denied_audit(
+                &state,
+                &request_id,
+                Some(&policy_name),
+                "policy.io_failed",
+                peer_creds_for_audit,
+            )
+            .await;
             return agent_error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "policy.io_failed",
@@ -3607,27 +3898,27 @@ pub(crate) async fn policy_scopes_handler(
 
     // policy-scopes-added audit event (only when a real merge happened,
     // matching the CLI's existing `policy_was_modified` gating).
-    if !diff.is_no_op() {
-        if let Some(audit) = &state.audit_store {
-            let mut event = AuditEvent::with_request_id(
-                request_id.clone(),
-                "operator".to_owned(),
-                "permitlayer".to_owned(),
-                "-".to_owned(),
-                "policy-scopes-add".to_owned(),
-                "ok".to_owned(),
-                "policy-scopes-added".to_owned(),
-            );
-            event.extra = serde_json::json!({
-                "policy_name": diff.policy_name,
-                "before": diff.before,
-                "added": diff.added,
-                "after": diff.after,
-            });
-            enrich_audit_extra_with_peer_creds(&mut event.extra, peer_creds_for_audit);
-            if let Err(e) = audit.append(event).await {
-                tracing::warn!(error = %e, "policy-scopes-added audit write failed (best-effort)");
-            }
+    if !diff.is_no_op()
+        && let Some(audit) = &state.audit_store
+    {
+        let mut event = AuditEvent::with_request_id(
+            request_id.clone(),
+            "operator".to_owned(),
+            "permitlayer".to_owned(),
+            "-".to_owned(),
+            "policy-scopes-add".to_owned(),
+            "ok".to_owned(),
+            "policy-scopes-added".to_owned(),
+        );
+        event.extra = serde_json::json!({
+            "policy_name": diff.policy_name,
+            "before": diff.before,
+            "added": diff.added,
+            "after": diff.after,
+        });
+        enrich_audit_extra_with_peer_creds(&mut event.extra, peer_creds_for_audit);
+        if let Err(e) = audit.append(event).await {
+            tracing::warn!(error = %e, "policy-scopes-added audit write failed (best-effort)");
         }
     }
 
@@ -3689,6 +3980,24 @@ async fn emit_policy_scopes_partial_failure_audit(
     enrich_audit_extra_with_peer_creds(&mut event.extra, peer_creds);
     if let Err(e) = audit.append(event).await {
         tracing::warn!(error = %e, "policy-scopes-add-partial-failure audit write failed (best-effort)");
+    }
+}
+
+/// Round-3 review P63: map `PolicyEditError` to a stable audit-log
+/// `error_code` string. Kept in lock-step with the HTTP-side mapping
+/// in `policy_edit_error_response` so audit and response codes line
+/// up for forensic correlation.
+fn policy_edit_error_code(err: &permitlayer_core::policy::edit::PolicyEditError) -> &'static str {
+    use permitlayer_core::policy::edit::PolicyEditError;
+    match err {
+        PolicyEditError::PolicyFileNotFound { .. } | PolicyEditError::PolicyNotInFile { .. } => {
+            "policy.not_found"
+        }
+        PolicyEditError::PolicyFileIsSymlink { .. } => "policy.is_symlink",
+        PolicyEditError::ParseFailed { .. } => "policy.parse_failed",
+        PolicyEditError::CompileFailedAfterEdit { .. } => "policy.compile_failed_after_edit",
+        PolicyEditError::Io { .. } => "policy.io_failed",
+        PolicyEditError::SerializeFailed { .. } => "policy.serialize_failed",
     }
 }
 
@@ -6241,13 +6550,16 @@ mod tests {
     /// stage a meta JSON fixture on disk.
     fn build_with_vault_dir(kill_switch: Arc<KillSwitch>, vault_dir: std::path::PathBuf) -> Router {
         let policy_set = Arc::new(ArcSwap::from_pointee(PolicySet::empty()));
-        // Round-1 review P23: drop the policies-dir TempDir
-        // immediately. `build_with_vault_dir` callers exercise the
-        // credentials-meta endpoint, which doesn't read
-        // `state.policies_dir`. The path persists in router state
-        // but the directory is reaped at scope exit — no per-test
-        // leak.
-        let policies_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+        // Round-3 review P77: hold the TempDir for the router's
+        // lifetime via `.keep()`. The prior pattern
+        // `tempfile::tempdir().unwrap().path().to_path_buf()` dropped
+        // the TempDir at end of let-binding, leaving a dangling
+        // PathBuf to a removed directory — fine for handlers that
+        // never touch policies_dir, but a footgun for any future
+        // test using the helper that does. `.keep()` is consistent
+        // with sibling test helpers in this file (e.g.
+        // build_with_policies_dir).
+        let policies_dir = tempfile::tempdir().unwrap().keep();
         let reload_mutex = Arc::new(std::sync::Mutex::new(()));
         let agent_registry = Arc::new(AgentRegistry::new(vec![]));
         let (ato, cs, co, stub, _placeholder_vault_dir) = test_reload_wiring();
@@ -6316,7 +6628,7 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp).await;
         assert_eq!(json["exists"], false);
-        assert!(json.get("meta").map_or(true, serde_json::Value::is_null));
+        assert!(json.get("meta").is_none_or(serde_json::Value::is_null));
     }
 
     #[tokio::test]
@@ -6389,10 +6701,12 @@ mod tests {
         let agent_registry = Arc::new(AgentRegistry::new(vec![identity]));
 
         let policy_set = Arc::new(ArcSwap::from_pointee(PolicySet::empty()));
-        // Round-1 review P23: drop the policies-dir TempDir
-        // immediately. Seal/verify endpoints don't read
-        // `state.policies_dir`.
-        let policies_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+        // Round-3 review P77: hold the TempDir for the router's
+        // lifetime via `.keep()`. Seal/verify endpoints don't read
+        // `state.policies_dir`, but the prior pattern left a dangling
+        // PathBuf — fix the foundation rather than rely on the
+        // handlers staying policies_dir-free.
+        let policies_dir = tempfile::tempdir().unwrap().keep();
         let reload_mutex = Arc::new(std::sync::Mutex::new(()));
         let (ato, cs, co, stub, _placeholder_vault_dir) = test_reload_wiring();
 
@@ -6523,10 +6837,9 @@ mod tests {
         let agent_registry = Arc::new(AgentRegistry::new(vec![identity]));
 
         let policy_set = Arc::new(ArcSwap::from_pointee(PolicySet::empty()));
-        // Round-1 review P23: drop the policies-dir TempDir
-        // immediately. Seal/verify endpoints don't read
-        // `state.policies_dir`.
-        let policies_dir = tempfile::tempdir().unwrap().path().to_path_buf();
+        // Round-3 review P77: hold the TempDir for the router's
+        // lifetime via `.keep()`. See sibling helper.
+        let policies_dir = tempfile::tempdir().unwrap().keep();
         let reload_mutex = Arc::new(std::sync::Mutex::new(()));
         let (ato, cs, co, stub, _placeholder_vault_dir) = test_reload_wiring();
 
