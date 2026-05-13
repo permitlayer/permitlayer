@@ -66,16 +66,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
-        # `rustup show active-toolchain` alone is not enough to populate
-        # the `cargo` / `rustc` rustup proxies on a fresh macos-14 GitHub
-        # runner image (observed 2026-05-13: `cargo build` resolved to
-        # `rustup-init` despite `rustup show` succeeding). Adding the
-        # `component add` step forces rustup to materialize the proxy
-        # binaries; the headless-install workflow's macos-14 job uses
-        # the same pattern and never hits the failure mode.
+        # On the macos-14 GitHub runner image (observed 2026-05-13),
+        # `cargo` was resolving to `rustup-init` even after
+        # `rustup show active-toolchain` and `rustup component add`
+        # succeeded (`cargo build` → `error: unexpected argument
+        # 'build'; Usage: rustup-init`). The fix is to invoke `cargo`
+        # at least once during the install step: this triggers rustup
+        # to materialize the proxy binary on top of `rustup-init` in
+        # `~/.cargo/bin/`. Subsequent `cargo` calls (in the cargo
+        # build / nextest steps below) then resolve correctly.
         run: |
           rustup show active-toolchain || rustup toolchain install
           rustup component add rustfmt clippy
+          # Force `cargo` proxy materialization; without this, the
+          # next step's `cargo build` invokes the rustup-init binary
+          # left in PATH by the runner image.
+          which cargo
+          cargo --version
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
       # Try the fast path first (taiki-e/install-action pulls a
