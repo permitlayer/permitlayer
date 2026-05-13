@@ -284,14 +284,35 @@ pub(crate) fn error_block_protocol_error() -> String {
 pub(crate) fn read_control_token(home: &std::path::Path) -> Option<String> {
     if let Ok(env) = std::env::var("AGENTSSO_CONTROL_TOKEN") {
         let trimmed = env.trim();
-        if !trimmed.is_empty() {
+        if validate_control_token(trimmed) {
             return Some(trimmed.to_owned());
         }
     }
     let path = home.join("control.token");
     let content = std::fs::read_to_string(&path).ok()?;
     let trimmed = content.trim();
-    if trimmed.is_empty() { None } else { Some(trimmed.to_owned()) }
+    if validate_control_token(trimmed) { Some(trimmed.to_owned()) } else { None }
+}
+
+/// Round-1 review P37: validate a control-token string is safe to
+/// embed in an HTTP header. Defends against CRLF-injection
+/// (request-smuggling) if the token file ever gets corrupted or
+/// tampered with — the token is daemon-minted random bytes today
+/// but the file is on the operator's filesystem.
+///
+/// Acceptance criteria: non-empty, ASCII-only, no CR/LF/NUL, no
+/// other control characters. Standard tokens are URL-safe base64
+/// which trivially satisfies this; anything else is rejected.
+fn validate_control_token(s: &str) -> bool {
+    if s.is_empty() {
+        return false;
+    }
+    s.bytes().all(|b| {
+        // Printable ASCII (0x21..=0x7E) plus we reject space too
+        // since tokens shouldn't have whitespace. Excludes CR (0x0D),
+        // LF (0x0A), NUL (0x00), and every other control char.
+        (0x21..=0x7E).contains(&b)
+    })
 }
 
 /// Control-plane endpoint — either loopback TCP (rc.21 model, still
@@ -449,6 +470,109 @@ pub(crate) async fn http_post_json_with_status_via(
         .await
         .with_context(|| format!("HTTP POST {path} (UDS) timed out after {HTTP_DEADLINE:?}"))?,
     }
+}
+
+/// Round-1 review P42: same as `http_post_json_with_status_via` but
+/// takes `body: &zeroize::Zeroizing<String>` and writes the request
+/// header + body as TWO separate socket writes so the plaintext body
+/// is never concatenated into a third heap String alongside the
+/// header. Caller's `Zeroizing<String>` scrubs on drop; this helper
+/// adds no fresh plaintext heap copies between caller and kernel
+/// buffer.
+///
+/// Used for the credentials-seal POST (plaintext OAuth tokens in the
+/// body). All other POSTs use `http_post_json_with_status_via`.
+pub(crate) async fn http_post_zeroizing_with_status_via(
+    endpoint: &ControlEndpoint,
+    path: &str,
+    body: &zeroize::Zeroizing<String>,
+    control_token: Option<&str>,
+) -> Result<(u16, String)> {
+    match endpoint {
+        ControlEndpoint::Tcp(addr) => tokio::time::timeout(
+            HTTP_DEADLINE,
+            http_post_zeroizing_with_status_inner_tcp(*addr, path, body, control_token),
+        )
+        .await
+        .with_context(|| format!("HTTP POST {path} (TCP) timed out after {HTTP_DEADLINE:?}"))?,
+        ControlEndpoint::Uds(sock_path) => tokio::time::timeout(
+            HTTP_DEADLINE,
+            http_post_zeroizing_with_status_inner_uds(sock_path, path, body, control_token),
+        )
+        .await
+        .with_context(|| format!("HTTP POST {path} (UDS) timed out after {HTTP_DEADLINE:?}"))?,
+    }
+}
+
+/// Round-1 review P42 TCP variant: two-write split (header, then
+/// plaintext body) so the body never lives in a `format!`-allocated
+/// String alongside the header.
+async fn http_post_zeroizing_with_status_inner_tcp(
+    addr: SocketAddr,
+    path: &str,
+    body: &zeroize::Zeroizing<String>,
+    control_token: Option<&str>,
+) -> Result<(u16, String)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::TcpStream;
+
+    let mut stream =
+        TcpStream::connect(addr).await.with_context(|| format!("connect to {addr}"))?;
+
+    let auth_header =
+        control_token.map(|t| format!("X-Agentsso-Control: {t}\r\n")).unwrap_or_default();
+    let header = format!(
+        "POST {path} HTTP/1.1\r\nHost: {addr}\r\nContent-Type: application/json\r\nContent-Length: {len}\r\n{auth_header}Connection: close\r\n\r\n",
+        len = body.len(),
+    );
+    stream.write_all(header.as_bytes()).await.context("write HTTP request header")?;
+    // Body write: borrows the zeroizing String directly. The bytes
+    // never get copied into a separate allocation; the kernel
+    // socket buffer is the next-hop copy.
+    stream.write_all(body.as_bytes()).await.context("write HTTP request body")?;
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.context("read HTTP response")?;
+    let response_str = String::from_utf8_lossy(&response).into_owned();
+    let status = parse_status_code(&response_str)
+        .ok_or_else(|| anyhow::anyhow!("malformed HTTP response status line"))?;
+    let body =
+        extract_body(&response_str).ok_or_else(|| anyhow::anyhow!("malformed HTTP response"))?;
+    Ok((status, body))
+}
+
+/// Round-1 review P42 UDS variant: same two-write split, over a Unix
+/// domain socket.
+async fn http_post_zeroizing_with_status_inner_uds(
+    sock_path: &Path,
+    path: &str,
+    body: &zeroize::Zeroizing<String>,
+    control_token: Option<&str>,
+) -> Result<(u16, String)> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::UnixStream;
+
+    let mut stream = UnixStream::connect(sock_path)
+        .await
+        .with_context(|| format!("connect to {}", sock_path.display()))?;
+
+    let auth_header =
+        control_token.map(|t| format!("X-Agentsso-Control: {t}\r\n")).unwrap_or_default();
+    let header = format!(
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {len}\r\n{auth_header}Connection: close\r\n\r\n",
+        len = body.len(),
+    );
+    stream.write_all(header.as_bytes()).await.context("write HTTP request header")?;
+    stream.write_all(body.as_bytes()).await.context("write HTTP request body")?;
+
+    let mut response = Vec::new();
+    stream.read_to_end(&mut response).await.context("read HTTP response")?;
+    let response_str = String::from_utf8_lossy(&response).into_owned();
+    let status = parse_status_code(&response_str)
+        .ok_or_else(|| anyhow::anyhow!("malformed HTTP response status line"))?;
+    let body =
+        extract_body(&response_str).ok_or_else(|| anyhow::anyhow!("malformed HTTP response"))?;
+    Ok((status, body))
 }
 
 async fn http_post_json_inner_uds(

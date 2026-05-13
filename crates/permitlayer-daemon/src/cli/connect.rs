@@ -136,11 +136,12 @@ pub(crate) fn exit3() -> anyhow::Error {
 /// fit the agent CRUD shape.
 ///
 /// - **2 (operator-correctable)**: connect.agent_not_found,
-///   connect.unknown_service, connect.invalid_oauth_client,
-///   connect.daemon_must_run, connect.non_interactive_required.
+///   connect.dangling_policy_binding, connect.unknown_service,
+///   connect.invalid_oauth_client, connect.daemon_must_run,
+///   connect.non_interactive_required.
 /// - **3 (system / retry)**: connect.oauth_failed, connect.seal_failed,
 ///   connect.verify_failed, connect.policy_edit_failed,
-///   connect.reload_failed, connect.rebind_failed, connect.openclaw_failed,
+///   connect.rebind_failed, connect.openclaw_failed,
 ///   connect.agent_lookup_failed, connect.meta_lookup_failed.
 ///
 /// Used both by the unit tests (mapping table) and by [`silent_err_for_code`]
@@ -152,10 +153,15 @@ pub(crate) fn exit3() -> anyhow::Error {
 /// Story 7.30 deviation: `connect.daemon_must_stop` (exit 2) is replaced
 /// by `connect.daemon_must_run` (exit 2) because the daemon now owns
 /// every credential write. `connect.vault_dir_symlink` / `_unwritable`
-/// are gone: the daemon owns the vault dir.
+/// are gone: the daemon owns the vault dir. Round-1 review P34 dropped
+/// `connect.reload_failed` from the table — reload-failure now surfaces
+/// as `connect.policy_edit_failed` (folded into the single policy/scopes
+/// POST). Round-1 review P24 added `connect.dangling_policy_binding`
+/// (operator-correctable via `agentsso agent rebind`).
 pub(crate) fn connect_exit_code(code: &str) -> i32 {
     match code {
         "connect.agent_not_found"
+        | "connect.dangling_policy_binding"
         | "connect.unknown_service"
         | "connect.invalid_oauth_client"
         | "connect.daemon_must_run"
@@ -173,6 +179,33 @@ pub(crate) fn connect_exit_code(code: &str) -> i32 {
 ///
 /// Round-1 P1 fix: replaces bare `crate::cli::silent_cli_error(msg)` calls
 /// throughout `run` so the spec's exit-code table actually fires at runtime.
+/// Round-1 review P36: strip control characters from text we
+/// interpolate into operator-facing stderr blocks. Daemon-returned
+/// strings (remediation URLs, error messages) cross a trust boundary;
+/// without this, a control-char in (e.g.) a forwarded Google response
+/// could reposition the operator's cursor or set terminal modes.
+///
+/// Strategy: keep printable ASCII + common whitespace; replace
+/// everything else with U+FFFD. This is intentionally aggressive —
+/// our wire-format is JSON which is always UTF-8 printable; anything
+/// outside that range is a bug in the producer.
+pub(crate) fn sanitize_for_terminal(s: &str) -> String {
+    s.chars()
+        .map(|c| {
+            if c.is_ascii() && (c.is_ascii_graphic() || c == ' ' || c == '\t' || c == '\n') {
+                c
+            } else if c.is_alphanumeric() || c.is_whitespace() {
+                // Allow non-ASCII alphanumerics / common Unicode
+                // whitespace — operators in non-English locales
+                // shouldn't see U+FFFD splatter on legitimate text.
+                c
+            } else {
+                '\u{FFFD}'
+            }
+        })
+        .collect()
+}
+
 pub(crate) fn silent_err_for_code(code: &str, internal_msg: &'static str) -> anyhow::Error {
     let marker_attached = match connect_exit_code(code) {
         2 => anyhow::Error::new(ConnectExitCode2),
@@ -501,6 +534,10 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
         Ok(super::connect_uds::ControlOutcome::Ok(resp)) => resp.policy_name,
         Ok(super::connect_uds::ControlOutcome::Err { status_code, body }) => {
             // 404 → operator-correctable agent-not-found.
+            // Round-1 review P33: use silent_err_for_code instead of
+            // bare `exit2()` so the typed marker matches the rest of
+            // the new flow (consistent with the seal/verify/policy
+            // error paths).
             if body.code == "agent.not_found" {
                 eprint!(
                     "{}",
@@ -516,7 +553,35 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
                         None,
                     )
                 );
-                return Err(exit2());
+                return Err(silent_err_for_code("connect.agent_not_found", "agent not found"));
+            }
+            // Round-1 review P24: 422 dangling-policy-binding is the
+            // daemon-side surface Group 1 P21 added to save the CLI
+            // a round-trip discovering the inconsistency via
+            // /policy/<dangling>/scopes 404. Map to a dedicated
+            // operator-correctable exit-2 with the rebind hint.
+            if body.code == "agent.dangling_policy_binding" {
+                eprint!(
+                    "{}",
+                    render::error_block(
+                        "connect.dangling_policy_binding",
+                        &format!(
+                            "agent '{}' is bound to a policy that doesn't exist in the active set: {}",
+                            args.agent, body.message
+                        ),
+                        &format!(
+                            "agentsso agent rebind {} --policy <new-policy>\n\n  \
+                             then re-run this command:\n  \
+                             agentsso connect {service} --agent {}",
+                            args.agent, args.agent
+                        ),
+                        None,
+                    )
+                );
+                return Err(silent_err_for_code(
+                    "connect.dangling_policy_binding",
+                    "agent bound to non-existent policy",
+                ));
             }
             // Any other daemon-side error → exit 3.
             eprint!(
@@ -532,6 +597,18 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
                 )
             );
             return Err(silent_err_for_code("connect.agent_lookup_failed", "agent lookup failed"));
+        }
+        Ok(super::connect_uds::ControlOutcome::ParseFailure { status_code, raw_body }) => {
+            // Round-1 review P31: daemon returned an unparseable
+            // response. Surface as a distinct diagnostic from
+            // transport failure so operators don't think the daemon
+            // is down when it actually returned a malformed body.
+            return Err(render_parse_failure(
+                "connect.agent_lookup_failed",
+                "agent lookup",
+                status_code,
+                &raw_body,
+            ));
         }
         Err(transport_err) => {
             eprint!(
@@ -590,6 +667,14 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
             return Err(silent_err_for_code(
                 "connect.meta_lookup_failed",
                 "credential meta lookup failed",
+            ));
+        }
+        Ok(super::connect_uds::ControlOutcome::ParseFailure { status_code, raw_body }) => {
+            return Err(render_parse_failure(
+                "connect.meta_lookup_failed",
+                "credential meta lookup",
+                status_code,
+                &raw_body,
             ));
         }
         Err(transport_err) => {
@@ -849,30 +934,57 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
         // semantics map: `--force` → replace; otherwise → replace too
         // (this branch only fires when the idempotent re-run check
         // above already concluded "we need to seal").
-        let granted_scopes_for_seal: Vec<String> =
-            if result.scopes.is_empty() { scopes_owned.clone() } else { result.scopes.clone() };
+        // Round-1 review P38: scope-resolution priority on empty
+        // `result.scopes`. Some OAuth flows return empty `scopes`
+        // even on success (Google's behavior varies). If we have
+        // existing meta with a wider set than the service default,
+        // prefer that — otherwise fall back to default scopes.
+        // Without this, `--force` re-run after a granted-scope
+        // expansion silently downgrades meta's scope set.
+        let granted_scopes_for_seal: Vec<String> = if !result.scopes.is_empty() {
+            result.scopes.clone()
+        } else if let Some(existing) = existing_meta.meta.as_ref().filter(|m| !m.scopes.is_empty())
+        {
+            tracing::info!(
+                "OAuth result returned empty scopes; using existing meta scopes ({} scope(s)) as fallback",
+                existing.scopes.len()
+            );
+            existing.scopes.clone()
+        } else {
+            scopes_owned.clone()
+        };
 
         // `access_token` and `refresh_token` are `OAuthToken` /
         // `OAuthRefreshToken` — non-Display, non-Debug. Convert the raw
         // bytes to UTF-8 strings via `reveal()` for the JSON wire body;
         // the seal handler deserializes them into `Zeroizing<String>`.
-        let access_token_str = std::str::from_utf8(result.access_token.reveal())
-            .map_err(|e| anyhow::anyhow!("access token is not valid UTF-8: {e}"))?
-            .to_owned();
-        let refresh_token_str: Option<String> = match result.refresh_token.as_ref() {
-            Some(t) => Some(
-                std::str::from_utf8(t.reveal())
-                    .map_err(|e| anyhow::anyhow!("refresh token is not valid UTF-8: {e}"))?
-                    .to_owned(),
-            ),
-            None => None,
-        };
+        //
+        // Round-1 review P42: wrap the CLI-side String copies in
+        // `Zeroizing<String>` so the heap is scrubbed on drop. Closes
+        // the first two of the four CLI-side plaintext windows the
+        // Edge Case Hunter flagged. The JSON-body and HTTP-request
+        // buffers close further down via the Zeroizing-aware POST
+        // helper.
+        let access_token_str: zeroize::Zeroizing<String> = zeroize::Zeroizing::new(
+            std::str::from_utf8(result.access_token.reveal())
+                .map_err(|e| anyhow::anyhow!("access token is not valid UTF-8: {e}"))?
+                .to_owned(),
+        );
+        let refresh_token_str: Option<zeroize::Zeroizing<String>> =
+            match result.refresh_token.as_ref() {
+                Some(t) => Some(zeroize::Zeroizing::new(
+                    std::str::from_utf8(t.reveal())
+                        .map_err(|e| anyhow::anyhow!("refresh token is not valid UTF-8: {e}"))?
+                        .to_owned(),
+                )),
+                None => None,
+            };
         let client_source_str = oauth_config.source_path().display().to_string();
         let seal_req = super::connect_uds::CredentialsSealRequest {
             service: &service,
             agent: &args.agent,
-            access_token: &access_token_str,
-            refresh_token: refresh_token_str.as_deref(),
+            access_token: access_token_str.as_str(),
+            refresh_token: refresh_token_str.as_ref().map(|z| z.as_str()),
             granted_scopes: &granted_scopes_for_seal,
             client_type: "byo",
             client_source: &client_source_str,
@@ -910,6 +1022,14 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
                     )
                 );
                 return Err(silent_err_for_code("connect.seal_failed", "seal failed"));
+            }
+            Ok(super::connect_uds::ControlOutcome::ParseFailure { status_code, raw_body }) => {
+                return Err(render_parse_failure(
+                    "connect.seal_failed",
+                    "credentials seal",
+                    status_code,
+                    &raw_body,
+                ));
             }
             Err(transport_err) => {
                 eprint!(
@@ -1009,15 +1129,37 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
                         "policy scope merge failed (HTTP {status_code}, daemon code {}): {}",
                         body.code, body.message
                     ),
+                    // Round-1 review P35: precise remediation. The
+                    // policy file lives at
+                    // /Library/Application Support/permitlayer/policies/<name>.toml
+                    // (macOS rc.22), root:wheel. Operators don't have
+                    // write access. If the daemon's `policy.reload_failed`
+                    // surfaced here, `agentsso reload` retries.
+                    // Otherwise: inspect the daemon's tracing log for
+                    // the parse/IO error and fix the file out-of-band
+                    // with sudo.
                     &format!(
-                        "inspect the policy file (server-side) and re-run, \
-                         or manually add the scopes: {}",
-                        short_names.join(", ")
+                        "agentsso reload   # if the daemon's in-memory \
+                         policy set drifted from disk\n\
+                         # else: inspect /Library/Application Support/permitlayer/policies/{policy}.toml \
+                         (root-only) for the underlying issue;\n\
+                         # the daemon's tracing log carries the parse/IO error detail.\n\
+                         # Scopes requested in this run: {scopes}",
+                        policy = agent_policy_name,
+                        scopes = short_names.join(", "),
                     ),
                     None,
                 )
             );
             return Err(silent_err_for_code("connect.policy_edit_failed", "policy edit failed"));
+        }
+        Ok(super::connect_uds::ControlOutcome::ParseFailure { status_code, raw_body }) => {
+            return Err(render_parse_failure(
+                "connect.policy_edit_failed",
+                "policy scope merge",
+                status_code,
+                &raw_body,
+            ));
         }
         Err(transport_err) => {
             eprint!(
@@ -1036,6 +1178,11 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
         }
     };
     let policy_was_modified = !policy_resp.added.is_empty();
+    // Round-1 review P30: detect the disk-edited-but-not-reloaded
+    // case explicitly. Daemon emits `policy-scopes-add-partial-failure`
+    // audit event on that path; surface an operator-facing warning so
+    // they don't think the new scopes are live in memory yet.
+    let disk_drift = policy_was_modified && !policy_resp.reloaded;
     if interactive {
         if policy_was_modified {
             let added = policy_resp.added.join(", ");
@@ -1044,6 +1191,12 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
             if policy_resp.reloaded {
                 let check = styled("\u{2713}", theme.tokens().accent, color_support);
                 println!("  {check} daemon reloaded");
+            } else {
+                let warn = styled("!", theme.tokens().accent, color_support);
+                eprintln!(
+                    "  {warn} policy file updated on disk but daemon has NOT reloaded yet \u{2014} \
+                     the new scopes are NOT live until you run `agentsso reload`."
+                );
             }
         } else {
             let check = styled("\u{2713}", theme.tokens().accent, color_support);
@@ -1054,6 +1207,13 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
             println!("  {check} reload \u{00b7} skipped (policy unchanged)");
         }
     } else {
+        if disk_drift {
+            tracing::warn!(
+                policy = %agent_policy_name,
+                added = ?policy_resp.added,
+                "policy file updated on disk but daemon did not reload — run `agentsso reload` to make the new scopes live",
+            );
+        }
         tracing::info!(
             policy = %agent_policy_name,
             added = ?policy_resp.added,
@@ -1224,15 +1384,75 @@ async fn verify_with_retry(
             super::connect_uds::CredentialsVerifyRequest { agent: &args.agent, project_id };
         let verify_outcome =
             super::connect_uds::post_credentials_verify(control_handle, service, &verify_req).await;
-        let (status_code, body) = match verify_outcome {
-            Ok(pair) => pair,
+        let (status_code, body): (u16, serde_json::Value) = match verify_outcome {
+            Ok(super::connect_uds::VerifyOutcome::Body { status_code, body }) => {
+                (status_code, body)
+            }
+            Ok(super::connect_uds::VerifyOutcome::Err { status_code, body: err_body }) => {
+                // Lift the structured error envelope into a serde
+                // Value so render_verify_error_from_daemon sees a
+                // uniform shape across the 4xx/5xx daemon-side path
+                // and the 200+ok=false Google-side path.
+                (
+                    status_code,
+                    serde_json::json!({
+                        "ok": false,
+                        "code": err_body.code,
+                        "message": err_body.message,
+                        "request_id": err_body.request_id,
+                    }),
+                )
+            }
+            Ok(super::connect_uds::VerifyOutcome::ParseFailure { status_code, raw_body }) => {
+                // Round-1 review P29: parse failures are retry-eligible
+                // (the daemon responded, the wire just drifted). Log
+                // verbose + continue the retry loop in interactive
+                // mode; abort with the parse-failure block in
+                // non-interactive.
+                tracing::warn!(
+                    target: "connect.verify",
+                    status_code,
+                    raw_excerpt = raw_body.chars().take(256).collect::<String>().as_str(),
+                    "verify response body did not parse; attempt {attempt}/{max}",
+                );
+                if !interactive || attempt == max {
+                    return Err(render_parse_failure(
+                        "connect.verify_failed",
+                        "verify",
+                        status_code,
+                        &raw_body,
+                    ));
+                }
+                // Interactive + not last attempt → fall through to
+                // the retry prompt below by constructing a synthetic
+                // "transient parse failure" body that render_verify
+                // will surface generically.
+                (
+                    status_code,
+                    serde_json::json!({
+                        "ok": false,
+                        "code": "verify.body_parse_failed",
+                        "message": "daemon response did not parse as JSON",
+                    }),
+                )
+            }
             Err(e) => {
+                // Round-1 review P27: transport failure mid-retry.
+                // The credential IS already sealed by this point —
+                // re-running connect would skip OAuth and retry
+                // verify. Surface that hint specifically rather
+                // than generic "verify the daemon is healthy".
                 eprint!(
                     "{}",
                     render::error_block(
                         "connect.verify_failed",
                         &format!("verify transport error: {e}"),
-                        "verify the daemon is healthy: agentsso status",
+                        &format!(
+                            "the daemon went down or the control plane is unreachable, but the credential IS already sealed.\n  \
+                             - check the daemon: `agentsso status`\n  \
+                             - if running: re-run `agentsso connect {service} --agent {}` — Step 2 will skip OAuth (credential is sealed) and resume at verify.",
+                            args.agent
+                        ),
                         None,
                     )
                 );
@@ -1344,6 +1564,45 @@ async fn verify_with_retry(
 ///   transport to Google failed).
 ///
 /// This helper renders whichever shape it gets into the same
+/// Round-1 review P31: render a body-parse failure when the daemon
+/// returned an unparseable response. Distinct from transport-failure
+/// (the request reached the daemon and got a response; the response
+/// just didn't match our wire contract). Returns the typed-marker
+/// error so `connect_to_exit_code` produces the right exit (3, system
+/// error).
+fn render_parse_failure(
+    code: &'static str,
+    operation: &str,
+    status_code: u16,
+    raw_body: &str,
+) -> anyhow::Error {
+    // Cap the raw-body excerpt so a huge response doesn't flood
+    // stderr; cap is generous enough to show the relevant section
+    // of any structured daemon body.
+    const RAW_BODY_CAP: usize = 512;
+    let excerpt = if raw_body.len() > RAW_BODY_CAP {
+        let truncated = &raw_body[..RAW_BODY_CAP];
+        format!("{truncated}... ({total} bytes total)", total = raw_body.len())
+    } else {
+        raw_body.to_owned()
+    };
+    eprint!(
+        "{}",
+        render::error_block(
+            code,
+            &format!(
+                "daemon returned a malformed {operation} response (HTTP {status_code}); \
+                 the wire contract between CLI and daemon may have drifted. \
+                 Body excerpt: {excerpt}"
+            ),
+            "check the daemon's tracing log for the request_id, and confirm both CLI and daemon \
+             are on the same release (run `agentsso --version` and `agentsso status`)",
+            None,
+        )
+    );
+    silent_err_for_code(code, "daemon body parse failed")
+}
+
 /// `connect.verify_failed` operator block as the legacy CLI-side
 /// `render_oauth_error` produced.
 fn render_verify_error_from_daemon(
@@ -1353,7 +1612,6 @@ fn render_verify_error_from_daemon(
     interactive: bool,
     severity: OAuthErrorSeverity,
 ) {
-    let _ = (service, interactive); // currently unused: render path is unified.
     let label = match severity {
         OAuthErrorSeverity::Fatal => "verification failed",
         OAuthErrorSeverity::NonFatal => "verification failed (will retry)",
@@ -1362,10 +1620,16 @@ fn render_verify_error_from_daemon(
     // Structured Google-side failure (HTTP 200 + ok=false).
     if (200..300).contains(&status_code) && body.get("ok").and_then(|v| v.as_bool()) == Some(false)
     {
-        let reason_text = body.get("reason_text").and_then(|v| v.as_str()).unwrap_or("(no detail)");
+        let reason_text = sanitize_for_terminal(
+            body.get("reason_text").and_then(|v| v.as_str()).unwrap_or("(no detail)"),
+        );
         let google_status = body.get("status_code").and_then(|v| v.as_u64());
         let verify_reason = body.get("verify_reason").and_then(|v| v.as_str()).unwrap_or("unknown");
-        let remediation_url = body.get("remediation_url").and_then(|v| v.as_str());
+        // Round-1 review P36: sanitize daemon-returned URL before
+        // interpolating into operator-facing output.
+        let remediation_url_owned: Option<String> =
+            body.get("remediation_url").and_then(|v| v.as_str()).map(sanitize_for_terminal);
+        let remediation_url = remediation_url_owned.as_deref();
 
         let remediation = match (verify_reason, remediation_url) {
             ("service-disabled", Some(url)) => format!(
@@ -1384,33 +1648,86 @@ fn render_verify_error_from_daemon(
             (_, Some(url)) => format!("see: {url}"),
             _ => "see the daemon's tracing log + audit log for the verify request_id".to_owned(),
         };
-        eprint!(
-            "{}",
-            render::error_block(
-                "connect.verify_failed",
-                &format!(
-                    "{label}: {reason_text} (Google HTTP {}, reason {verify_reason})",
-                    google_status.map(|s| s.to_string()).unwrap_or_else(|| "?".to_owned()),
+        // Round-1 review P28: dispatch on `interactive` mode. The
+        // legacy `render_oauth_error` used the design-system error
+        // block for interactive runs and structured tracing for
+        // non-interactive (so log pipes see one line per failure,
+        // not a multi-line block). The P6 unification accidentally
+        // dropped the non-interactive branch; restore it.
+        if interactive {
+            eprint!(
+                "{}",
+                render::error_block(
+                    "connect.verify_failed",
+                    &format!(
+                        "{label}: {reason_text} (Google HTTP {}, reason {verify_reason})",
+                        google_status.map(|s| s.to_string()).unwrap_or_else(|| "?".to_owned()),
+                    ),
+                    &remediation,
+                    None,
+                )
+            );
+        } else {
+            // Single-line tracing entry — log pipes / scripted callers
+            // get one structured record per failure.
+            let remediation_single_line = remediation.replace('\n', " \\n ");
+            match severity {
+                OAuthErrorSeverity::Fatal => tracing::error!(
+                    service = %service,
+                    error_code = "connect.verify_failed",
+                    verify_reason = %verify_reason,
+                    google_status = ?google_status,
+                    remediation = %remediation_single_line,
+                    "{label}: {reason_text}"
                 ),
-                &remediation,
-                None,
-            )
-        );
+                OAuthErrorSeverity::NonFatal => tracing::warn!(
+                    service = %service,
+                    error_code = "connect.verify_failed",
+                    verify_reason = %verify_reason,
+                    google_status = ?google_status,
+                    remediation = %remediation_single_line,
+                    "{label}: {reason_text}"
+                ),
+            }
+        }
         return;
     }
 
     // Daemon-side failure (4xx/5xx with `{ status: "error", code, message }`).
+    // Round-1 review P36: sanitize message in case a future daemon
+    // forwards control chars from an upstream error.
     let code = body.get("code").and_then(|v| v.as_str()).unwrap_or("verify.unknown");
-    let message = body.get("message").and_then(|v| v.as_str()).unwrap_or("(no detail)");
-    eprint!(
-        "{}",
-        render::error_block(
-            "connect.verify_failed",
-            &format!("{label}: {message} (HTTP {status_code}, daemon code {code})"),
-            "check the daemon's tracing log for the matching request_id",
-            None,
-        )
+    let message = sanitize_for_terminal(
+        body.get("message").and_then(|v| v.as_str()).unwrap_or("(no detail)"),
     );
+    if interactive {
+        eprint!(
+            "{}",
+            render::error_block(
+                "connect.verify_failed",
+                &format!("{label}: {message} (HTTP {status_code}, daemon code {code})"),
+                "check the daemon's tracing log for the matching request_id",
+                None,
+            )
+        );
+    } else {
+        match severity {
+            OAuthErrorSeverity::Fatal => tracing::error!(
+                service = %service,
+                error_code = "connect.verify_failed",
+                daemon_code = %code,
+                http_status = status_code,
+                "{label}: {message}"
+            ),
+            OAuthErrorSeverity::NonFatal => tracing::warn!(
+                service = %service,
+                error_code = "connect.verify_failed",
+                daemon_code = %code,
+                http_status = status_code,
+                "{label}: {message}"
+            ),
+        }
+    }
 }
 
 /// POST `/v1/control/agent/rebind` against the running daemon.
@@ -1693,23 +2010,30 @@ mod tests {
     fn connect_exit_code_preconditions_map_to_2() {
         for code in [
             "connect.agent_not_found",
+            "connect.dangling_policy_binding",
             "connect.unknown_service",
             "connect.invalid_oauth_client",
             "connect.daemon_must_run",
+            "connect.non_interactive_required",
         ] {
             assert_eq!(connect_exit_code(code), 2, "code {code} should be precondition (exit 2)");
         }
     }
 
+    /// Round-1 review P34: `connect.reload_failed` dropped — reload
+    /// failure now surfaces as `connect.policy_edit_failed` via the
+    /// single policy/scopes POST.
     #[test]
     fn connect_exit_code_system_errors_map_to_3() {
         for code in [
             "connect.oauth_failed",
+            "connect.seal_failed",
             "connect.verify_failed",
             "connect.policy_edit_failed",
-            "connect.reload_failed",
             "connect.rebind_failed",
             "connect.openclaw_failed",
+            "connect.agent_lookup_failed",
+            "connect.meta_lookup_failed",
         ] {
             assert_eq!(connect_exit_code(code), 3, "code {code} should be system/retry (exit 3)");
         }
