@@ -14,8 +14,8 @@
 use std::time::Duration;
 
 use crate::common::{
-    DaemonTestConfig, assert_daemon_pid_matches, start_daemon as start_daemon_common,
-    wait_for_health,
+    DaemonTestConfig, assert_daemon_pid_matches, http_post_control,
+    start_daemon as start_daemon_common, wait_for_health,
 };
 
 fn start_daemon(home: &std::path::Path) -> crate::common::DaemonHandle {
@@ -24,51 +24,6 @@ fn start_daemon(home: &std::path::Path) -> crate::common::DaemonHandle {
         home: home.to_path_buf(),
         ..Default::default()
     })
-}
-
-fn http_request(
-    port: u16,
-    method: &str,
-    path: &str,
-    headers: &[(&str, &str)],
-    body: Option<&str>,
-) -> (u16, String) {
-    use std::io::{Read, Write};
-    let mut stream = std::net::TcpStream::connect_timeout(
-        &format!("127.0.0.1:{port}").parse().unwrap(),
-        Duration::from_secs(2),
-    )
-    .expect("failed to connect");
-    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-
-    let body_str = body.unwrap_or("");
-    let mut req =
-        format!("{method} {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n");
-    if body.is_some() {
-        req.push_str(&format!(
-            "Content-Type: application/json\r\nContent-Length: {}\r\n",
-            body_str.len()
-        ));
-    }
-    for (k, v) in headers {
-        req.push_str(&format!("{k}: {v}\r\n"));
-    }
-    req.push_str("\r\n");
-    if !body_str.is_empty() {
-        req.push_str(body_str);
-    }
-
-    stream.write_all(req.as_bytes()).unwrap();
-    let mut buf = Vec::new();
-    let _ = stream.read_to_end(&mut buf);
-    let raw = String::from_utf8_lossy(&buf).to_string();
-    let status = raw.split_whitespace().nth(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
-    let body = raw.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default();
-    (status, body)
-}
-
-fn http_post(port: u16, path: &str, body: &str, headers: &[(&str, &str)]) -> (u16, String) {
-    http_request(port, "POST", path, headers, Some(body))
 }
 
 const TWO_POLICY_TOML: &str = r#"
@@ -102,8 +57,12 @@ fn read_test_control_token(home: &std::path::Path) -> String {
 fn register_agent(port: u16, home: &std::path::Path, name: &str, policy: &str) -> String {
     let body = serde_json::json!({"name": name, "policy_name": policy}).to_string();
     let ctl = read_test_control_token(home);
-    let headers = [("X-Agentsso-Control", ctl.as_str())];
-    let (status, resp_body) = http_post(port, "/v1/control/agent/register", &body, &headers);
+    let headers = [
+        ("X-Agentsso-Control", ctl.as_str()),
+        ("Content-Type", "application/json"),
+    ];
+    let (status, resp_body) =
+        http_post_control(home, port, "/v1/control/agent/register", &body, &headers);
     assert_eq!(
         status, 200,
         "agent register should succeed for {name} → {policy}, got {status}: {resp_body}"
@@ -121,8 +80,12 @@ fn rebind_agent(
 ) -> (u16, serde_json::Value) {
     let body = serde_json::json!({"name": name, "policy_name": new_policy}).to_string();
     let ctl = read_test_control_token(home);
-    let headers = [("X-Agentsso-Control", ctl.as_str())];
-    let (status, resp_body) = http_post(port, "/v1/control/agent/rebind", &body, &headers);
+    let headers = [
+        ("X-Agentsso-Control", ctl.as_str()),
+        ("Content-Type", "application/json"),
+    ];
+    let (status, resp_body) =
+        http_post_control(home, port, "/v1/control/agent/rebind", &body, &headers);
     let parsed: serde_json::Value = serde_json::from_str(&resp_body)
         .unwrap_or_else(|e| panic!("rebind response not JSON: {resp_body} ({e})"));
     (status, parsed)
@@ -267,8 +230,12 @@ fn rebind_handler_response_does_not_include_bearer_token() {
     })
     .to_string();
     let ctl = read_test_control_token(home.path());
-    let headers = [("X-Agentsso-Control", ctl.as_str())];
-    let (status, resp_body) = http_post(port, "/v1/control/agent/rebind", &body, &headers);
+    let headers = [
+        ("X-Agentsso-Control", ctl.as_str()),
+        ("Content-Type", "application/json"),
+    ];
+    let (status, resp_body) =
+        http_post_control(home.path(), port, "/v1/control/agent/rebind", &body, &headers);
     assert_eq!(status, 200, "rebind should succeed: {resp_body}");
 
     // Primary check: deserialize against the typed contract. Any

@@ -98,6 +98,7 @@ fn http_get_loopback(port: u16, path: &str, headers: &[(&str, &str)]) -> (u16, S
     http_request(port, "GET", path, headers, None)
 }
 
+#[allow(dead_code)] // retained for ad-hoc test additions
 fn http_post_loopback(
     port: u16,
     path: &str,
@@ -147,9 +148,17 @@ fn read_test_control_token(home: &std::path::Path) -> String {
 fn register_agent(port: u16, home: &std::path::Path, name: &str, policy: &str) -> String {
     let body = serde_json::json!({"name": name, "policy_name": policy}).to_string();
     let ctl = read_test_control_token(home);
-    let headers = [("X-Agentsso-Control", ctl.as_str())];
-    let (status, resp_body) =
-        http_post_loopback(port, "/v1/control/agent/register", &body, &headers);
+    let headers = [
+        ("X-Agentsso-Control", ctl.as_str()),
+        ("Content-Type", "application/json"),
+    ];
+    let (status, resp_body) = crate::common::http_post_control(
+        home,
+        port,
+        "/v1/control/agent/register",
+        &body,
+        &headers,
+    );
     assert_eq!(
         status, 200,
         "agent register should succeed for {name} → {policy}, got {status}: {resp_body}"
@@ -164,8 +173,17 @@ fn register_agent(port: u16, home: &std::path::Path, name: &str, policy: &str) -
 fn remove_agent(port: u16, home: &std::path::Path, name: &str) -> bool {
     let body = serde_json::json!({"name": name}).to_string();
     let ctl = read_test_control_token(home);
-    let headers = [("X-Agentsso-Control", ctl.as_str())];
-    let (status, resp_body) = http_post_loopback(port, "/v1/control/agent/remove", &body, &headers);
+    let headers = [
+        ("X-Agentsso-Control", ctl.as_str()),
+        ("Content-Type", "application/json"),
+    ];
+    let (status, resp_body) = crate::common::http_post_control(
+        home,
+        port,
+        "/v1/control/agent/remove",
+        &body,
+        &headers,
+    );
     assert_eq!(status, 200, "agent remove should succeed for {name}, got {status}: {resp_body}");
     let parsed: serde_json::Value = serde_json::from_str(&resp_body).unwrap();
     parsed["removed"].as_bool().unwrap_or(false)
@@ -174,7 +192,14 @@ fn remove_agent(port: u16, home: &std::path::Path, name: &str) -> bool {
 fn list_agents(port: u16, home: &std::path::Path) -> serde_json::Value {
     let ctl = read_test_control_token(home);
     let headers = [("X-Agentsso-Control", ctl.as_str())];
-    let (status, resp_body) = http_get_loopback(port, "/v1/control/agent/list", &headers);
+    let (status, resp_body) = crate::common::http_request_control(
+        home,
+        port,
+        "GET",
+        "/v1/control/agent/list",
+        None,
+        &headers,
+    );
     assert_eq!(status, 200, "agent list should succeed, got {status}: {resp_body}");
     serde_json::from_str(&resp_body).unwrap()
 }
@@ -342,11 +367,12 @@ fn register_with_unknown_policy_returns_422() {
 
     let body = serde_json::json!({"name": "agent1", "policy_name": "nonexistent"}).to_string();
     let ctl = read_test_control_token(home.path());
-    let (status, resp_body) = http_post_loopback(
+    let (status, resp_body) = crate::common::http_post_control(
+        home.path(),
         port,
         "/v1/control/agent/register",
         &body,
-        &[("X-Agentsso-Control", ctl.as_str())],
+        &[("X-Agentsso-Control", ctl.as_str()), ("Content-Type", "application/json")],
     );
     assert_eq!(status, 422, "unknown policy should be 422, body: {resp_body}");
     let parsed: serde_json::Value = serde_json::from_str(&resp_body).unwrap();
@@ -375,11 +401,12 @@ fn register_duplicate_name_returns_409() {
     let body =
         serde_json::json!({"name": "duplicate-test", "policy_name": "policy-readonly"}).to_string();
     let ctl = read_test_control_token(home.path());
-    let (status, resp_body) = http_post_loopback(
+    let (status, resp_body) = crate::common::http_post_control(
+        home.path(),
         port,
         "/v1/control/agent/register",
         &body,
-        &[("X-Agentsso-Control", ctl.as_str())],
+        &[("X-Agentsso-Control", ctl.as_str()), ("Content-Type", "application/json")],
     );
     assert_eq!(status, 409, "duplicate name should be 409, body: {resp_body}");
     let parsed: serde_json::Value = serde_json::from_str(&resp_body).unwrap();
@@ -442,7 +469,14 @@ fn wait_for_audit_event(
 /// Winsock interactions in the larger subprocess matrix have been
 /// flake-prone (see `kill_resume_e2e.rs::setup_blocked_when_killed`);
 /// the change being tested is platform-independent.
-#[cfg(unix)]
+///
+/// Story 7.27: on macOS the CLI now derives the control socket from
+/// the caller's `AGENTSSO_PATHS__HOME` (`<home>/run/control.sock`),
+/// so the "different home, same daemon over TCP" pattern this test
+/// was built for is no longer expressible — the caller's home has
+/// no socket. Skip on macOS; Linux preserves the TCP-loopback model
+/// and the test still has bite there.
+#[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn agent_register_works_cross_home() {
     use std::process::Command;

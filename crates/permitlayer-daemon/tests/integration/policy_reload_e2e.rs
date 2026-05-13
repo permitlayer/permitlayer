@@ -47,7 +47,8 @@ fn reload_lifecycle_add_and_error_and_audit() {
 
     // --- Reload 1: no changes, should report unchanged=1 ---
     let _ctl = crate::common::read_test_control_token(home.path());
-    let (status, body) = crate::common::http_request_with_headers(
+    let (status, body) = crate::common::http_request_control(
+        home.path(),
         port,
         "POST",
         "/v1/control/reload",
@@ -65,7 +66,8 @@ fn reload_lifecycle_add_and_error_and_audit() {
     // --- Reload 2: add a second policy, should report added=1 ---
     std::fs::write(policies_dir.join("b.toml"), POLICY_B).unwrap();
     let _ctl = crate::common::read_test_control_token(home.path());
-    let (status, body) = crate::common::http_request_with_headers(
+    let (status, body) = crate::common::http_request_control(
+        home.path(),
         port,
         "POST",
         "/v1/control/reload",
@@ -92,7 +94,8 @@ approval-mode = "auto"
     )
     .unwrap();
     let _ctl = crate::common::read_test_control_token(home.path());
-    let (status, body) = crate::common::http_request_with_headers(
+    let (status, body) = crate::common::http_request_control(
+        home.path(),
         port,
         "POST",
         "/v1/control/reload",
@@ -107,7 +110,8 @@ approval-mode = "auto"
     // Remove the bad file and reload to confirm old set is intact.
     std::fs::remove_file(policies_dir.join("bad.toml")).unwrap();
     let _ctl = crate::common::read_test_control_token(home.path());
-    let (status, body) = crate::common::http_request_with_headers(
+    let (status, body) = crate::common::http_request_control(
+        home.path(),
         port,
         "POST",
         "/v1/control/reload",

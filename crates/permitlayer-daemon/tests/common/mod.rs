@@ -692,7 +692,8 @@ pub fn assert_daemon_pid_matches(handle: &DaemonHandle) {
     // Plan B: /v1/control/* requires `X-Agentsso-Control` token. Read
     // it from the daemon's home (where it was minted at startup).
     let token = read_test_control_token(&handle.home);
-    let (status, body) = http_request_with_headers(
+    let (status, body) = http_request_control(
+        &handle.home,
         handle.port,
         "GET",
         "/v1/control/whoami",
@@ -872,6 +873,95 @@ pub fn http_request_with_headers(
 /// Convert a `127.0.0.1:<port>` string to a [`SocketAddr`].
 pub fn loopback_addr(port: u16) -> SocketAddr {
     format!("127.0.0.1:{port}").parse().unwrap()
+}
+
+/// Issue an HTTP request against the daemon's CONTROL plane, picking
+/// the right transport for the current platform (Story 7.27):
+///
+/// - macOS: UDS at `<home>/run/control.sock` — control routes are
+///   not exposed on TCP on macOS.
+/// - Linux + Windows: TCP loopback at `127.0.0.1:<port>` — the rc.21
+///   model is preserved on non-Darwin platforms.
+///
+/// On macOS the daemon's `record_peer_credentials_layer` middleware
+/// requires kernel-attested peer credentials; raw `UnixStream` from
+/// a sibling test process is fine because the test runs as the same
+/// UID that owns the socket. The `X-Agentsso-Control` token must
+/// still be supplied by the caller in `extra_headers`.
+pub fn http_request_control(
+    home: &Path,
+    port: u16,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    extra_headers: &[(&str, &str)],
+) -> (u16, String) {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = port;
+        http_request_uds(home, method, path, body, extra_headers)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = home;
+        http_request_with_headers(port, method, path, body, extra_headers)
+    }
+}
+
+/// POST helper that mirrors `http_request_control` for callers that
+/// only need POST. Matches the legacy local `http_post(port, path,
+/// body, headers)` shape used by `agent_rebind_e2e.rs` etc.
+pub fn http_post_control(
+    home: &Path,
+    port: u16,
+    path: &str,
+    body: &str,
+    extra_headers: &[(&str, &str)],
+) -> (u16, String) {
+    http_request_control(home, port, "POST", path, Some(body), extra_headers)
+}
+
+/// UDS implementation backing `http_request_control` on macOS. The
+/// daemon serves `/v1/control/*` (plus `/health` and `/v1/health`) on
+/// `<home>/run/control.sock` per Story 7.27 AC #2.
+#[cfg(unix)]
+fn http_request_uds(
+    home: &Path,
+    method: &str,
+    path: &str,
+    body: Option<&str>,
+    extra_headers: &[(&str, &str)],
+) -> (u16, String) {
+    use std::io::{Read, Write};
+    use std::os::unix::net::UnixStream;
+
+    let sock = home.join("run").join("control.sock");
+    let mut stream = UnixStream::connect(&sock)
+        .unwrap_or_else(|e| panic!("connect UDS at {}: {e}", sock.display()));
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+
+    let body_str = body.unwrap_or("");
+    let mut req = format!(
+        "{method} {path} HTTP/1.1\r\nHost: localhost\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body_str.len(),
+    );
+    for (k, v) in extra_headers {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
+    req.push_str(body_str);
+
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut buf = Vec::new();
+    let _ = stream.read_to_end(&mut buf);
+    let raw = String::from_utf8_lossy(&buf).to_string();
+
+    let status = raw.split_whitespace().nth(1).and_then(|s| s.parse::<u16>().ok()).unwrap_or(0);
+    let body_resp = match raw.split_once("\r\n\r\n") {
+        Some((_, b)) => b.to_string(),
+        None => raw,
+    };
+    (status, body_resp)
 }
 
 /// Canonical `&Path`-to-`&str` conversion used by env-var plumbing.

@@ -383,6 +383,10 @@ fn http_get_loopback(port: u16, path: &str, headers: &[(&str, &str)]) -> (u16, S
 /// `http_get_loopback` variant that auto-adds the `X-Agentsso-Control`
 /// header read from `<home>/control.token`. Use this for any
 /// `/v1/control/*` endpoint call (Plan B).
+///
+/// rc.22 (Story 7.27): on macOS dispatches over UDS at
+/// `<home>/run/control.sock` because TCP no longer carries control
+/// routes. Linux + Windows preserved on TCP.
 fn http_get_control(
     port: u16,
     home: &std::path::Path,
@@ -392,9 +396,10 @@ fn http_get_control(
     let ctl = crate::common::read_test_control_token(home);
     let mut all = vec![("X-Agentsso-Control", ctl.as_str())];
     all.extend_from_slice(extra_headers);
-    http_request(port, "GET", path, &all, None)
+    crate::common::http_request_control(home, port, "GET", path, None, &all)
 }
 
+#[allow(dead_code)] // retained for ad-hoc test additions
 fn http_post_loopback(
     port: u16,
     path: &str,
@@ -424,11 +429,12 @@ fn seed_single_policy(home: &std::path::Path) {
 fn register_agent(port: u16, home: &std::path::Path, name: &str, policy: &str) -> String {
     let body = serde_json::json!({"name": name, "policy_name": policy}).to_string();
     let ctl = crate::common::read_test_control_token(home);
-    let (status, resp_body) = http_post_loopback(
+    let (status, resp_body) = crate::common::http_post_control(
+        home,
         port,
         "/v1/control/agent/register",
         &body,
-        &[("X-Agentsso-Control", ctl.as_str())],
+        &[("X-Agentsso-Control", ctl.as_str()), ("Content-Type", "application/json")],
     );
     assert_eq!(status, 200, "agent register should succeed for {name}: {resp_body}");
     let parsed: serde_json::Value = serde_json::from_str(&resp_body).unwrap();

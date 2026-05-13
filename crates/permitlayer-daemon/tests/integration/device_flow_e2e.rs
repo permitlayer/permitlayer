@@ -137,13 +137,18 @@ fn device_flow_with_non_interactive_is_accepted_by_clap() {
         .output()
         .expect("failed to run connect");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // Clap-conflict exit 2 would name the flag in stderr; the
-    // agent-not-found path exits 2 too but with `connect.agent_not_found`.
-    // The latter proves clap accepted the combo.
+    // Clap-conflict exit 2 would name the flag in stderr; reaching
+    // EITHER the agent-not-found gate (rc.21 path, still wired on
+    // Linux + Windows) OR the daemon-must-run gate (rc.22 macOS
+    // path: `connect` now goes through the daemon's UDS first, and
+    // the gate runs before agent lookup) proves clap accepted the
+    // combo. The bug we're guarding against is clap rejecting
+    // `--device-flow --non-interactive` with a hard-coded conflict.
     assert_eq!(output.status.code(), Some(2));
     assert!(
-        stderr.contains("connect.agent_not_found"),
-        "should reach the agent-not-found gate, not a clap conflict; stderr={stderr}"
+        stderr.contains("connect.agent_not_found")
+            || stderr.contains("connect.daemon_must_run"),
+        "should reach a connect-flow gate (agent-not-found or daemon-must-run), not a clap conflict; stderr={stderr}"
     );
     assert!(
         !stderr.contains("cannot be used with"),

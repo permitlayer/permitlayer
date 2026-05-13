@@ -110,6 +110,21 @@ fn send_http_request(port: u16, request: &str) -> String {
     String::from_utf8_lossy(&buf).to_string()
 }
 
+/// rc.22 (Story 7.27): on macOS control routes are UDS-only. UDS
+/// variant of `send_http_request` for `/v1/control/*` endpoints.
+#[cfg(target_os = "macos")]
+fn send_http_request_uds(home: &std::path::Path, request: &str) -> String {
+    use std::os::unix::net::UnixStream;
+    let sock = home.join("run").join("control.sock");
+    let mut stream = UnixStream::connect(&sock)
+        .unwrap_or_else(|e| panic!("connect UDS at {}: {e}", sock.display()));
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.write_all(request.as_bytes()).unwrap();
+    let mut buf = Vec::new();
+    stream.read_to_end(&mut buf).expect("read HTTP response over UDS");
+    String::from_utf8_lossy(&buf).to_string()
+}
+
 fn parse_status_code(raw: &str) -> u16 {
     let first_line = raw.lines().next().unwrap_or("");
     first_line.split_whitespace().nth(1).and_then(|s| s.parse().ok()).unwrap_or(0)
@@ -230,22 +245,38 @@ fn read_test_control_token(home: &std::path::Path) -> String {
         .to_owned()
 }
 
-fn post_control(port: u16, path: &str, control_token: &str) -> String {
+fn post_control(home: &std::path::Path, port: u16, path: &str, control_token: &str) -> String {
     let body = "{}";
     let request = format!(
-        "POST {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Agentsso-Control: {control_token}\r\nConnection: close\r\n\r\n{body}",
+        "POST {path} HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\nX-Agentsso-Control: {control_token}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
-    send_http_request(port, &request)
+    #[cfg(target_os = "macos")]
+    {
+        let _ = port;
+        send_http_request_uds(home, &request)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = home;
+        send_http_request(port, &request)
+    }
 }
 
-fn get_control(port: u16, path: &str, control_token: &str) -> String {
-    send_http_request(
-        port,
-        &format!(
-            "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nX-Agentsso-Control: {control_token}\r\nConnection: close\r\n\r\n"
-        ),
-    )
+fn get_control(home: &std::path::Path, port: u16, path: &str, control_token: &str) -> String {
+    let request = format!(
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nX-Agentsso-Control: {control_token}\r\nConnection: close\r\n\r\n"
+    );
+    #[cfg(target_os = "macos")]
+    {
+        let _ = port;
+        send_http_request_uds(home, &request)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = home;
+        send_http_request(port, &request)
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -430,7 +461,7 @@ fn control_resume_bypasses_kill_middleware() {
 
     // Kill via direct POST (not via CLI) so we isolate the test to the
     // control endpoint behavior.
-    let raw = post_control(port, "/v1/control/kill", &token);
+    let raw = post_control(home.path(), port, "/v1/control/kill", &token);
     assert_eq!(parse_status_code(&raw), 200, "control kill must be 200: {raw}");
 
     // /health is now blocked.
@@ -438,7 +469,7 @@ fn control_resume_bypasses_kill_middleware() {
     assert_eq!(parse_status_code(&raw), 403, "post-kill /health must be 403");
 
     // But /v1/control/resume must still reach the handler.
-    let raw = post_control(port, "/v1/control/resume", &token);
+    let raw = post_control(home.path(), port, "/v1/control/resume", &token);
     assert_eq!(
         parse_status_code(&raw),
         200,
@@ -467,7 +498,7 @@ fn main_endpoints_still_blocked_while_killed() {
     assert!(wait_for_health(port, Duration::from_secs(5)));
     let token = read_test_control_token(home.path());
 
-    assert_eq!(parse_status_code(&post_control(port, "/v1/control/kill", &token)), 200);
+    assert_eq!(parse_status_code(&post_control(home.path(), port, "/v1/control/kill", &token)), 200);
 
     for path in ["/health", "/v1/health", "/mcp"] {
         let raw = send_http_request(
@@ -498,9 +529,9 @@ fn control_state_endpoint_reports_active_while_killed() {
     assert!(wait_for_health(port, Duration::from_secs(5)));
     let token = read_test_control_token(home.path());
 
-    assert_eq!(parse_status_code(&post_control(port, "/v1/control/kill", &token)), 200);
+    assert_eq!(parse_status_code(&post_control(home.path(), port, "/v1/control/kill", &token)), 200);
 
-    let raw = get_control(port, "/v1/control/state", &token);
+    let raw = get_control(home.path(), port, "/v1/control/state", &token);
     assert_eq!(parse_status_code(&raw), 200);
     let body = parse_response_body(&raw);
     assert!(body.contains("\"active\":true"), "state must report active=true: {body}");
@@ -518,7 +549,7 @@ fn connect_blocked_when_killed() {
     assert!(wait_for_health(port, Duration::from_secs(5)));
     let token = read_test_control_token(home.path());
 
-    assert_eq!(parse_status_code(&post_control(port, "/v1/control/kill", &token)), 200);
+    assert_eq!(parse_status_code(&post_control(home.path(), port, "/v1/control/kill", &token)), 200);
 
     // Run `agentsso connect gmail --agent me --non-interactive` — it
     // should be blocked by the kill-state probe before any OAuth flow
@@ -555,7 +586,7 @@ fn control_state_endpoint_content_type_is_json() {
     assert!(wait_for_health(port, Duration::from_secs(5)));
     let token = read_test_control_token(home.path());
 
-    let raw = get_control(port, "/v1/control/state", &token);
+    let raw = get_control(home.path(), port, "/v1/control/state", &token);
     assert_eq!(parse_status_code(&raw), 200);
     assert_eq!(
         parse_header(&raw, "content-type").as_deref(),
