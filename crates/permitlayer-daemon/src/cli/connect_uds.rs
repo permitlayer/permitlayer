@@ -84,6 +84,7 @@ enum DaemonDownReason {
     /// Probe failed with a non-classified io::Error or daemon
     /// returned a non-2xx status (e.g. control-token mismatch).
     /// Operator gets a generic actionable hint.
+    #[allow(dead_code)] // constructed only inside the cfg(unix) UDS arm
     Unclassified,
 }
 

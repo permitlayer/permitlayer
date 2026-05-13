@@ -146,8 +146,7 @@ fn device_flow_with_non_interactive_is_accepted_by_clap() {
     // `--device-flow --non-interactive` with a hard-coded conflict.
     assert_eq!(output.status.code(), Some(2));
     assert!(
-        stderr.contains("connect.agent_not_found")
-            || stderr.contains("connect.daemon_must_run"),
+        stderr.contains("connect.agent_not_found") || stderr.contains("connect.daemon_must_run"),
         "should reach a connect-flow gate (agent-not-found or daemon-must-run), not a clap conflict; stderr={stderr}"
     );
     assert!(

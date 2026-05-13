@@ -148,17 +148,9 @@ fn read_test_control_token(home: &std::path::Path) -> String {
 fn register_agent(port: u16, home: &std::path::Path, name: &str, policy: &str) -> String {
     let body = serde_json::json!({"name": name, "policy_name": policy}).to_string();
     let ctl = read_test_control_token(home);
-    let headers = [
-        ("X-Agentsso-Control", ctl.as_str()),
-        ("Content-Type", "application/json"),
-    ];
-    let (status, resp_body) = crate::common::http_post_control(
-        home,
-        port,
-        "/v1/control/agent/register",
-        &body,
-        &headers,
-    );
+    let headers = [("X-Agentsso-Control", ctl.as_str()), ("Content-Type", "application/json")];
+    let (status, resp_body) =
+        crate::common::http_post_control(home, port, "/v1/control/agent/register", &body, &headers);
     assert_eq!(
         status, 200,
         "agent register should succeed for {name} → {policy}, got {status}: {resp_body}"
@@ -173,17 +165,9 @@ fn register_agent(port: u16, home: &std::path::Path, name: &str, policy: &str) -
 fn remove_agent(port: u16, home: &std::path::Path, name: &str) -> bool {
     let body = serde_json::json!({"name": name}).to_string();
     let ctl = read_test_control_token(home);
-    let headers = [
-        ("X-Agentsso-Control", ctl.as_str()),
-        ("Content-Type", "application/json"),
-    ];
-    let (status, resp_body) = crate::common::http_post_control(
-        home,
-        port,
-        "/v1/control/agent/remove",
-        &body,
-        &headers,
-    );
+    let headers = [("X-Agentsso-Control", ctl.as_str()), ("Content-Type", "application/json")];
+    let (status, resp_body) =
+        crate::common::http_post_control(home, port, "/v1/control/agent/remove", &body, &headers);
     assert_eq!(status, 200, "agent remove should succeed for {name}, got {status}: {resp_body}");
     let parsed: serde_json::Value = serde_json::from_str(&resp_body).unwrap();
     parsed["removed"].as_bool().unwrap_or(false)

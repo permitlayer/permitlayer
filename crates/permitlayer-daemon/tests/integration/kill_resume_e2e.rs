@@ -498,7 +498,10 @@ fn main_endpoints_still_blocked_while_killed() {
     assert!(wait_for_health(port, Duration::from_secs(5)));
     let token = read_test_control_token(home.path());
 
-    assert_eq!(parse_status_code(&post_control(home.path(), port, "/v1/control/kill", &token)), 200);
+    assert_eq!(
+        parse_status_code(&post_control(home.path(), port, "/v1/control/kill", &token)),
+        200
+    );
 
     for path in ["/health", "/v1/health", "/mcp"] {
         let raw = send_http_request(
@@ -529,7 +532,10 @@ fn control_state_endpoint_reports_active_while_killed() {
     assert!(wait_for_health(port, Duration::from_secs(5)));
     let token = read_test_control_token(home.path());
 
-    assert_eq!(parse_status_code(&post_control(home.path(), port, "/v1/control/kill", &token)), 200);
+    assert_eq!(
+        parse_status_code(&post_control(home.path(), port, "/v1/control/kill", &token)),
+        200
+    );
 
     let raw = get_control(home.path(), port, "/v1/control/state", &token);
     assert_eq!(parse_status_code(&raw), 200);
@@ -549,7 +555,10 @@ fn connect_blocked_when_killed() {
     assert!(wait_for_health(port, Duration::from_secs(5)));
     let token = read_test_control_token(home.path());
 
-    assert_eq!(parse_status_code(&post_control(home.path(), port, "/v1/control/kill", &token)), 200);
+    assert_eq!(
+        parse_status_code(&post_control(home.path(), port, "/v1/control/kill", &token)),
+        200
+    );
 
     // Run `agentsso connect gmail --agent me --non-interactive` — it
     // should be blocked by the kill-state probe before any OAuth flow

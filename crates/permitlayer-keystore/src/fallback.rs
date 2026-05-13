@@ -132,9 +132,7 @@ impl FallbackKeyStore {
         passphrase_state_exists: bool,
     ) -> Self {
         let fallback: OnceCell<Arc<dyn KeyStore>> = OnceCell::new();
-        if passphrase_state_exists
-            && let Ok(fb) = (construct_fallback)(&home)
-        {
+        if passphrase_state_exists && let Ok(fb) = (construct_fallback)(&home) {
             let _ = fallback.set(fb);
         }
         Self { native, home, fallback_mode, fallback, construct_fallback }
