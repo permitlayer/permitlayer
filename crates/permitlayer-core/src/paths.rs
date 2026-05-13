@@ -302,7 +302,10 @@ mod tests {
         let state = daemon_state_dir(None);
         // Hard to assert exact path because it depends on $HOME, but
         // the trailing component must be `.agentsso`.
-        assert_eq!(state.file_name().unwrap(), ".agentsso");
+        assert_eq!(
+            state.file_name().expect("daemon_state_dir must have a final component"),
+            ".agentsso"
+        );
 
         // Linux runtime dir is /run/agentsso (the systemd-canonical
         // location), not under $HOME.
@@ -314,6 +317,9 @@ mod tests {
     #[test]
     fn windows_default_paths_use_dot_agentsso() {
         let state = daemon_state_dir(None);
-        assert_eq!(state.file_name().unwrap(), ".agentsso");
+        assert_eq!(
+            state.file_name().expect("daemon_state_dir must have a final component"),
+            ".agentsso"
+        );
     }
 }

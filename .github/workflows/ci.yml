@@ -66,7 +66,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
-        run: rustup show active-toolchain || rustup toolchain install
+        # `rustup show active-toolchain` alone is not enough to populate
+        # the `cargo` / `rustc` rustup proxies on a fresh macos-14 GitHub
+        # runner image (observed 2026-05-13: `cargo build` resolved to
+        # `rustup-init` despite `rustup show` succeeding). Adding the
+        # `component add` step forces rustup to materialize the proxy
+        # binaries; the headless-install workflow's macos-14 job uses
+        # the same pattern and never hits the failure mode.
+        run: |
+          rustup show active-toolchain || rustup toolchain install
+          rustup component add rustfmt clippy
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
       # Try the fast path first (taiki-e/install-action pulls a
