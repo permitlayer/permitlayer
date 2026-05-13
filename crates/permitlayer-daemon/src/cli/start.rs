@@ -2593,6 +2593,15 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     // is a pure constructor (no I/O) and `compute_active_key_id`
     // returns `0` on an empty vault, so this is safe even on a fresh
     // install with no sealed credentials yet.
+    //
+    // `Vault::new` consumes the master key by value, so we clone the
+    // bytes into a fresh `Zeroizing` buffer. This is the one place
+    // where the key bytes exist in two buffers simultaneously (the
+    // caller's bootstrap buffer + the vault's internal buffer); both
+    // are zeroized on drop. (Restored from the pre-Task-1 version of
+    // `try_build_proxy_service` per round-1 review P11 — the safety
+    // rationale is operator-relevant and shouldn't drift out of the
+    // codebase even though the construction site moved.)
     let vault = {
         let mut vault_key = zeroize::Zeroizing::new([0u8; permitlayer_keystore::MASTER_KEY_LEN]);
         vault_key.copy_from_slice(master_key.as_slice());
