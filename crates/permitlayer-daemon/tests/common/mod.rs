@@ -322,16 +322,11 @@ fn wait_for_control_socket(child: &mut Child, home: &Path, timeout: Duration) {
         }
 
         match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut stderr = String::new();
-                if let Some(mut pipe) = child.stderr.take() {
-                    let _ = pipe.read_to_string(&mut stderr);
-                }
-                panic!(
-                    "daemon exited with {status} before control socket appeared at {}. stderr={stderr}",
-                    sock_path.display()
-                );
-            }
+            // Some tests intentionally assert startup refusal after
+            // the TCP bind marker has been emitted. Preserve the old
+            // helper contract for those cases: return the handle so
+            // the test can inspect the exit status and stderr.
+            Ok(Some(_)) => return,
             Ok(None) => {}
             Err(e) => panic!("failed to poll daemon while waiting for control socket: {e}"),
         }

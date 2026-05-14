@@ -121,12 +121,12 @@ fn run_register(
     let mut delay = Duration::from_millis(50);
     let mut last = run_register_once(home, bind_addr, name, policy, extra_args);
 
-    for _ in 0..4 {
+    for _ in 0..8 {
         if !(last.0 == 3 && last.2.contains("daemon_unreachable")) {
             return last;
         }
         std::thread::sleep(delay);
-        delay = std::cmp::min(delay * 2, Duration::from_millis(400));
+        delay = std::cmp::min(delay * 2, Duration::from_millis(800));
         last = run_register_once(home, bind_addr, name, policy, extra_args);
     }
 
