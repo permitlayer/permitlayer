@@ -73,25 +73,43 @@ jobs:
         uses: Swatinem/rust-cache@v2
       - name: Re-materialize cargo proxy (post-cache)
         # On the macos-14 GitHub runner image the
-        # `Swatinem/rust-cache@v2` restore step replaces the freshly-
-        # materialized `~/.cargo/bin/cargo` rustup-proxy with the
-        # cached one — which on macos-14 is symlinked to `rustup-init`
-        # (the GH Actions image ships `cargo` as the rustup-init
-        # binary by default; the symlink survives in the cache).
-        # Result: `cargo build` in the next step prints
-        # `error: unexpected argument 'build'` because it's actually
-        # invoking `rustup-init build`.
+        # `Swatinem/rust-cache@v2` restore step replaces
+        # `~/.cargo/bin/cargo` with a cached copy that is literally
+        # the `rustup-init` binary (not a rustup proxy hardlinked to
+        # `rustup`). Verified in CI:
         #
-        # Fix: re-invoke `cargo --version` AFTER the cache restore.
-        # That triggers rustup to overwrite the cached symlink with
-        # a real proxy. Cheap (no toolchain re-download) but
-        # load-bearing: removing this step regresses macos-14 only.
+        #   $ which cargo
+        #   /Users/runner/.cargo/bin/cargo
+        #   $ cargo --version
+        #   rustup-init 1.29.0 (2026-03-05)   # ← NOT a rustup proxy
         #
-        # `which cargo` is retained as a diagnostic so the path is
-        # visible in CI logs if this ever drifts again.
+        # `cargo --version` succeeds against rustup-init (which accepts
+        # `--version`), so a sanity check doesn't catch it; only the
+        # NEXT `cargo build` call fails with
+        # `error: unexpected argument 'build'; Usage: rustup-init`.
+        #
+        # The proxies in `~/.cargo/bin/` are supposed to be hardlinks
+        # to `rustup`. Fix: delete the stale `cargo` binary and let
+        # `rustup default <toolchain>` re-create the hardlinks. Cheap
+        # (no toolchain re-download) and idempotent.
         shell: bash
         run: |
-          which cargo
+          set -euo pipefail
+          # Print pre-state for future debugging.
+          ls -l "$HOME/.cargo/bin/cargo" || true
+          file "$HOME/.cargo/bin/cargo" || true
+          # Force-regenerate the proxy hardlinks. `rustup default` reads
+          # the active toolchain from `rust-toolchain.toml` (the override
+          # set during the Install step) and (re)creates the standard
+          # proxies — cargo, rustc, rustdoc, rustfmt, etc. — in
+          # `~/.cargo/bin/` as hardlinks to `~/.rustup/.../bin/<tool>`.
+          rm -f "$HOME/.cargo/bin/cargo" "$HOME/.cargo/bin/rustc" \
+                "$HOME/.cargo/bin/rustdoc" "$HOME/.cargo/bin/cargo-fmt" \
+                "$HOME/.cargo/bin/cargo-clippy" "$HOME/.cargo/bin/clippy-driver" \
+                "$HOME/.cargo/bin/rustfmt"
+          rustup default "$(rustup show active-toolchain | awk '{print $1}')"
+          # Confirm post-state.
+          ls -l "$HOME/.cargo/bin/cargo"
           cargo --version
       # Try the fast path first (taiki-e/install-action pulls a
       # prebuilt binary). On Windows runners the action's bash
