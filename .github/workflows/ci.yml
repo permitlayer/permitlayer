@@ -66,25 +66,33 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
-        # On the macos-14 GitHub runner image (observed 2026-05-13),
-        # `cargo` was resolving to `rustup-init` even after
-        # `rustup show active-toolchain` and `rustup component add`
-        # succeeded (`cargo build` → `error: unexpected argument
-        # 'build'; Usage: rustup-init`). The fix is to invoke `cargo`
-        # at least once during the install step: this triggers rustup
-        # to materialize the proxy binary on top of `rustup-init` in
-        # `~/.cargo/bin/`. Subsequent `cargo` calls (in the cargo
-        # build / nextest steps below) then resolve correctly.
         run: |
           rustup show active-toolchain || rustup toolchain install
           rustup component add rustfmt clippy
-          # Force `cargo` proxy materialization; without this, the
-          # next step's `cargo build` invokes the rustup-init binary
-          # left in PATH by the runner image.
-          which cargo
-          cargo --version
       - name: Cache cargo registry
         uses: Swatinem/rust-cache@v2
+      - name: Re-materialize cargo proxy (post-cache)
+        # On the macos-14 GitHub runner image the
+        # `Swatinem/rust-cache@v2` restore step replaces the freshly-
+        # materialized `~/.cargo/bin/cargo` rustup-proxy with the
+        # cached one — which on macos-14 is symlinked to `rustup-init`
+        # (the GH Actions image ships `cargo` as the rustup-init
+        # binary by default; the symlink survives in the cache).
+        # Result: `cargo build` in the next step prints
+        # `error: unexpected argument 'build'` because it's actually
+        # invoking `rustup-init build`.
+        #
+        # Fix: re-invoke `cargo --version` AFTER the cache restore.
+        # That triggers rustup to overwrite the cached symlink with
+        # a real proxy. Cheap (no toolchain re-download) but
+        # load-bearing: removing this step regresses macos-14 only.
+        #
+        # `which cargo` is retained as a diagnostic so the path is
+        # visible in CI logs if this ever drifts again.
+        shell: bash
+        run: |
+          which cargo
+          cargo --version
       # Try the fast path first (taiki-e/install-action pulls a
       # prebuilt binary). On Windows runners the action's bash
       # shim has been failing intermittently with
