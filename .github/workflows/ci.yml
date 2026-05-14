@@ -66,25 +66,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Install Rust toolchain
-        # On the macos-14 GitHub runner image (observed 2026-05-13),
-        # `cargo` was resolving to `rustup-init` even after
-        # `rustup show active-toolchain` and `rustup component add`
-        # succeeded (`cargo build` → `error: unexpected argument
-        # 'build'; Usage: rustup-init`). The fix is to invoke `cargo`
-        # at least once during the install step: this triggers rustup
-        # to materialize the proxy binary on top of `rustup-init` in
-        # `~/.cargo/bin/`. Subsequent `cargo` calls (in the cargo
-        # build / nextest steps below) then resolve correctly.
         run: |
           rustup show active-toolchain || rustup toolchain install
           rustup component add rustfmt clippy
-          # Force `cargo` proxy materialization; without this, the
-          # next step's `cargo build` invokes the rustup-init binary
-          # left in PATH by the runner image.
-          which cargo
-          cargo --version
       - name: Cache cargo registry
+        # `cache-bin: false` keeps `~/.cargo/bin/` (the rustup proxies)
+        # OUT of the cache. Without it, `Swatinem/rust-cache@v2` saves
+        # and later restores `~/.cargo/bin/cargo` on top of whatever
+        # the install step just materialized. On the macos-14 runner
+        # image, the cached copy was literally the `rustup-init`
+        # installer binary (not a rustup proxy), which `cargo
+        # --version` accepts but `cargo build` rejects with
+        # `error: unexpected argument 'build'; Usage: rustup-init`.
+        # Diagnosed in run 25835900746 with `file $HOME/.cargo/bin/cargo`.
+        #
+        # The proxies are tiny — re-downloading via
+        # `rustup component add` (in the Install step) is faster than
+        # restoring them from cache anyway. Only the toolchain itself
+        # (under `~/.rustup/`) and target/ need to be cached; both
+        # remain cached because they're separate paths.
         uses: Swatinem/rust-cache@v2
+        with:
+          cache-bin: false
       # Try the fast path first (taiki-e/install-action pulls a
       # prebuilt binary). On Windows runners the action's bash
       # shim has been failing intermittently with

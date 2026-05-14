@@ -83,9 +83,9 @@ fn http_request(
     (status, body)
 }
 
-/// Run `agentsso agent register <name> --policy <policy> [extra_args]`
-/// against the live daemon. Returns (exit_code, stdout, stderr).
-fn run_register(
+/// Run one `agentsso agent register <name> --policy <policy> [extra_args]`
+/// attempt against the live daemon. Returns (exit_code, stdout, stderr).
+fn run_register_once(
     home: &std::path::Path,
     bind_addr: &str,
     name: &str,
@@ -107,6 +107,30 @@ fn run_register(
         String::from_utf8_lossy(&output.stdout).into_owned(),
         String::from_utf8_lossy(&output.stderr).into_owned(),
     )
+}
+
+/// Run `agentsso agent register <name> --policy <policy> [extra_args]`
+/// against the live daemon. Returns (exit_code, stdout, stderr).
+fn run_register(
+    home: &std::path::Path,
+    bind_addr: &str,
+    name: &str,
+    policy: &str,
+    extra_args: &[&str],
+) -> (i32, String, String) {
+    let mut delay = Duration::from_millis(50);
+    let mut last = run_register_once(home, bind_addr, name, policy, extra_args);
+
+    for _ in 0..8 {
+        if !(last.0 == 3 && last.2.contains("daemon_unreachable")) {
+            return last;
+        }
+        std::thread::sleep(delay);
+        delay = std::cmp::min(delay * 2, Duration::from_millis(800));
+        last = run_register_once(home, bind_addr, name, policy, extra_args);
+    }
+
+    last
 }
 
 /// Hit a tools endpoint with the bearer; assert PolicyLayer routes
@@ -159,6 +183,8 @@ fn register_json_emits_compact_single_line_with_bearer_that_authenticates() {
 
     // The token actually works — Codex review 3 fix.
     assert_token_authenticates(port, bearer);
+
+    drop(daemon);
 }
 
 #[test]
@@ -202,6 +228,8 @@ fn register_token_out_writes_owner_only_file_with_no_trailing_newline() {
 
     // The on-disk token authenticates against the daemon.
     assert_token_authenticates(port, bearer.trim());
+
+    drop(daemon);
 }
 
 #[test]
@@ -259,4 +287,6 @@ fn register_json_error_response_has_status_error_field() {
     assert_eq!(parsed["status"], "error");
     assert_eq!(parsed["code"], "agent.unknown_policy");
     assert!(!parsed["message"].as_str().unwrap().is_empty());
+
+    drop(daemon);
 }

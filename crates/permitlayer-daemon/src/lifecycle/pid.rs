@@ -146,12 +146,37 @@ fn pid_to_raw(pid: u32) -> Option<i32> {
 fn is_process_alive(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        // kill(pid, 0) checks if the process exists without sending a signal.
-        // Returns ESRCH if the process doesn't exist.
+        // `kill(pid, 0)` is the canonical existence probe — it sends no
+        // signal but resolves the PID through the kernel. Three outcomes
+        // matter:
+        //
+        //   Ok(())     — process exists AND caller has signal permission.
+        //   Err(EPERM) — process exists BUT caller cannot signal it
+        //                (different UID + not root). Story 7.27 rc.22
+        //                made this case load-bearing: the daemon now
+        //                runs as a root LaunchDaemon while the CLI runs
+        //                as the operator's user, so a non-root CLI
+        //                checking the daemon's PID gets EPERM, NOT Ok.
+        //                Treating EPERM as "dead" (the pre-rc.23
+        //                behavior of `.is_ok()`) caused
+        //                `agentsso status` to print "stale PID file"
+        //                against a perfectly healthy daemon.
+        //   Err(ESRCH) — no such PID. Definitively dead.
+        //
+        // Any other errno (rare — e.g. EINVAL on signal 0 is impossible
+        // per POSIX, but defensively handled) we treat as "dead" so a
+        // genuine probe failure doesn't permanently block a crashed
+        // daemon's recovery path. The OS-level PID-file lock is the
+        // real mutual-exclusion guarantee; this probe is advisory.
+        use nix::errno::Errno;
         use nix::sys::signal::kill;
         use nix::unistd::Pid;
         match pid_to_raw(pid) {
-            Some(raw) => kill(Pid::from_raw(raw), None).is_ok(),
+            Some(raw) => match kill(Pid::from_raw(raw), None) {
+                Ok(()) => true,
+                Err(Errno::EPERM) => true,
+                Err(_) => false, // ESRCH and everything else → dead.
+            },
             None => false, // Invalid PID range — treat as not alive.
         }
     }
@@ -292,5 +317,38 @@ mod tests {
         let home = test_home();
         let _pid_file = PidFile::acquire(home.path()).unwrap();
         assert!(PidFile::is_daemon_running(home.path()).unwrap());
+    }
+
+    /// rc.23 regression pin (Story 7.27 follow-up).
+    ///
+    /// `is_process_alive` MUST treat `EPERM` as "process exists" — this
+    /// is the cross-UID case that the rc.22 root-LaunchDaemon model
+    /// introduced. PID 1 (`launchd` on macOS, `init`/`systemd` on Linux)
+    /// is root-owned on every Unix and always exists, so a non-root
+    /// test process probing PID 1 reliably gets `Err(EPERM)`. Pre-fix
+    /// (rc.22 `.is_ok()` shape) this returned `false`, causing
+    /// `agentsso status` to print "stale PID file" against a healthy
+    /// root-owned daemon.
+    ///
+    /// Skipped when the test process happens to be running as root
+    /// (`getuid() == 0`) — `kill(1, 0)` then returns `Ok(())` and the
+    /// EPERM path isn't exercised. CI runners and developer boxes are
+    /// non-root.
+    #[cfg(unix)]
+    #[test]
+    fn is_process_alive_treats_eperm_as_alive() {
+        // Skip if we're root — `kill(1, 0)` returns `Ok(())` for root
+        // and the EPERM code path isn't exercised. CI runners and dev
+        // boxes are non-root.
+        if nix::unistd::getuid().is_root() {
+            eprintln!("skipping is_process_alive_treats_eperm_as_alive — test process is root");
+            return;
+        }
+        assert!(
+            is_process_alive(1),
+            "PID 1 (launchd/init) is root-owned and always alive on Unix; \
+             `kill(1, 0)` returns EPERM for non-root callers and the function \
+             MUST treat that as alive — see Story 7.27 rc.23 fix"
+        );
     }
 }

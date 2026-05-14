@@ -142,6 +142,44 @@ fn read_test_control_token(home: &std::path::Path) -> String {
         .to_owned()
 }
 
+#[cfg(all(unix, not(target_os = "macos")))]
+fn run_cross_home_agent_register(
+    home_caller: &std::path::Path,
+    bind_addr: &str,
+    control_token: &str,
+) -> std::process::Output {
+    let mut delay = Duration::from_millis(50);
+    let mut last = None;
+
+    for _ in 0..8 {
+        let output = std::process::Command::new(crate::common::agentsso_bin())
+            .env_clear()
+            .env("PATH", std::env::var("PATH").unwrap_or_default())
+            .env("HOME", home_caller)
+            .env("AGENTSSO_PATHS__HOME", home_caller)
+            .env("AGENTSSO_HTTP__BIND_ADDR", bind_addr)
+            .env("AGENTSSO_CONTROL_TOKEN", control_token)
+            .arg("agent")
+            .arg("register")
+            .arg("cross-home-agent")
+            .arg("--policy")
+            .arg("policy-readonly")
+            .output()
+            .expect("failed to spawn agentsso agent register");
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if output.status.code() != Some(3) || !stderr.contains("daemon_unreachable") {
+            return output;
+        }
+
+        last = Some(output);
+        std::thread::sleep(delay);
+        delay = std::cmp::min(delay * 2, Duration::from_millis(800));
+    }
+
+    last.expect("register retry loop must record at least one attempt")
+}
+
 /// Register an agent via the loopback control endpoint and return the
 /// minted bearer token. Panics on any failure — the test is hard-fail
 /// on the happy path because every assertion downstream depends on it.
@@ -463,8 +501,6 @@ fn wait_for_audit_event(
 #[cfg(all(unix, not(target_os = "macos")))]
 #[test]
 fn agent_register_works_cross_home() {
-    use std::process::Command;
-
     let home_daemon = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home_daemon.path().join("config")).unwrap();
     seed_two_policies(home_daemon.path());
@@ -483,21 +519,7 @@ fn agent_register_works_cross_home() {
     // directly; they read from `AGENTSSO_CONTROL_TOKEN` env var. This
     // mirrors the documented production usage.
     let control_token = read_test_control_token(home_daemon.path());
-    let output = Command::new(crate::common::agentsso_bin())
-        .env_clear()
-        .envs(crate::common::forward_windows_required_env())
-        .env("PATH", std::env::var("PATH").unwrap_or_default())
-        .env("HOME", home_caller.path())
-        .env("AGENTSSO_PATHS__HOME", home_caller.path())
-        .env("AGENTSSO_HTTP__BIND_ADDR", &bind_addr)
-        .env("AGENTSSO_CONTROL_TOKEN", &control_token)
-        .arg("agent")
-        .arg("register")
-        .arg("cross-home-agent")
-        .arg("--policy")
-        .arg("policy-readonly")
-        .output()
-        .expect("failed to spawn agentsso agent register");
+    let output = run_cross_home_agent_register(home_caller.path(), &bind_addr, &control_token);
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -517,4 +539,5 @@ fn agent_register_works_cross_home() {
         !stderr.contains("daemon_not_running"),
         "daemon_not_running should not fire for cross-home register; stderr={stderr}",
     );
+    drop(daemon);
 }

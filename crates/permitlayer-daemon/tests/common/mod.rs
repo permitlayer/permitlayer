@@ -296,11 +296,49 @@ pub fn start_daemon(config: DaemonTestConfig) -> DaemonHandle {
         (config.port, None)
     };
 
+    #[cfg(target_os = "macos")]
+    wait_for_control_socket(&mut child, &config.home, Duration::from_secs(30));
+
     DaemonHandle {
         child: Some(child),
         port: resolved_port,
         home: config.home.clone(),
         captured_stdout,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_control_socket(child: &mut Child, home: &Path, timeout: Duration) {
+    use std::os::unix::fs::FileTypeExt;
+
+    let sock_path = home.join("run").join("control.sock");
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if let Ok(metadata) = std::fs::metadata(&sock_path)
+            && metadata.file_type().is_socket()
+        {
+            return;
+        }
+
+        match child.try_wait() {
+            // Some tests intentionally assert startup refusal after
+            // the TCP bind marker has been emitted. Preserve the old
+            // helper contract for those cases: return the handle so
+            // the test can inspect the exit status and stderr.
+            Ok(Some(_)) => return,
+            Ok(None) => {}
+            Err(e) => panic!("failed to poll daemon while waiting for control socket: {e}"),
+        }
+
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out after {timeout:?} waiting for control socket at {}",
+                sock_path.display()
+            );
+        }
+
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
