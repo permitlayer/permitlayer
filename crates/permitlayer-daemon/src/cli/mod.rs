@@ -6,10 +6,9 @@ pub mod audit;
 pub mod audit_anomaly;
 pub mod audit_export;
 pub mod audit_follow;
-pub mod auto_rekey;
-pub mod autostart;
 pub mod config;
 pub mod connect;
+pub mod connect_uds;
 pub mod connectors;
 pub mod credentials;
 pub mod kill;
@@ -20,23 +19,35 @@ pub mod reload;
 pub mod resume;
 pub mod rotate_key;
 pub mod scrub;
+pub mod service;
 pub mod start;
 pub mod status;
 pub mod stop;
 pub mod uninstall;
 pub mod update;
 
-/// Resolve the `~/.agentsso/` home directory.
+/// Resolve the daemon state-dir.
 ///
-/// Honors the `AGENTSSO_PATHS__HOME` environment variable (same as the
-/// daemon's config layer) for testing and custom deployments.
+/// Honors the `AGENTSSO_PATHS__HOME` environment variable (the
+/// integration-test override seam used by the daemon's config layer
+/// and 12+ test files); otherwise delegates to
+/// [`permitlayer_core::paths::daemon_state_dir`] for the per-platform
+/// default.
+///
+/// Returns `Err` only when no override is set AND the per-platform
+/// default cannot be resolved (Linux/Windows: `dirs::home_dir()`
+/// returned `None` AND no env override is set — vanishingly rare,
+/// but the `?` callers depend on the fallible signature).
 pub(crate) fn agentsso_home() -> anyhow::Result<PathBuf> {
-    if let Ok(override_path) = std::env::var("AGENTSSO_PATHS__HOME") {
-        return Ok(PathBuf::from(override_path));
+    // Story 7.27 Round-2 review fix (P3): consolidate the env-var
+    // lookup through `permitlayer_core::paths::home_override()` so
+    // empty-string + whitespace normalization (P1 fix) applies here
+    // too. Pre-fix, this fifth inline-`std::env::var` site was
+    // missed in the Round-1 consolidation pass (story line 773).
+    if let Some(override_path) = permitlayer_core::paths::home_override() {
+        return Ok(override_path);
     }
-    let home =
-        dirs::home_dir().ok_or_else(|| anyhow::anyhow!("cannot determine home directory"))?;
-    Ok(home.join(".agentsso"))
+    Ok(permitlayer_core::paths::daemon_state_dir(None))
 }
 
 /// Marker error wrapped inside an `anyhow::Error` to tell

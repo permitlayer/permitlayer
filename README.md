@@ -14,8 +14,10 @@ normal OAuth client. The tokens never touch the agent.
 > **Status:** alpha. The `agentsso` binary version is tracked in
 > `Cargo.toml`; the plugin host-API surface is separately versioned at
 > `1.0.0-rc.1` and is what [CHANGELOG.md](CHANGELOG.md) documents.
-> Desktop binaries are macOS ARM64 only for now; Linux and Windows are
-> planned.
+> The fully-supported install path is macOS (ARM64 + Intel) via
+> Homebrew with `sudo agentsso service install`; Linux and Windows
+> builds compile but ship a legacy per-user layout under
+> `~/.agentsso/` and are not yet supported end-to-end.
 
 ## Install
 
@@ -29,19 +31,38 @@ normal OAuth client. The tokens never touch the agent.
 ```sh
 brew tap permitlayer/tap
 brew install permitlayer/tap/agentsso
+sudo agentsso service install                       # one-time, per machine
+# Log out + back in (or open a new login shell) — the install adds
+# you to permitlayer-clients; group membership doesn't take effect in
+# your current shell. Then, from your end-user account:
+agentsso agent register <name> --policy gmail-read-only
 agentsso connect gmail --oauth-client ./client_secret.json --agent <name>
 ```
 
-Start the daemon and enable login-autostart (SSH-friendly per Story
-7.16 — works over SSH on macOS 13+ without a GUI session):
+`sudo agentsso service install` provisions a root LaunchDaemon at
+`/Library/LaunchDaemons/dev.permitlayer.daemon.plist`, creates
+`/Library/Application Support/permitlayer/`, sets up the
+`permitlayer-clients` macOS group, and starts the daemon. macOS will
+display a "Background item added" notification — if the daemon doesn't
+appear running, check **System Settings → General → Login Items →
+Allow in the Background**. If `agentsso agent register` returns a
+permission error, your `permitlayer-clients` group membership hasn't
+taken effect yet — log out and back in.
 
-```sh
-agentsso start            # foreground for this session
-agentsso autostart enable # persistent across reboots
-```
+`agentsso agent register <name> --policy <policy-name>` mints a
+per-user bearer token at `~/.agentsso/agent-bearer.token` (mode 0600).
+MCP clients (OpenClaw / Claude Desktop / Cursor) read that token and
+connect to the daemon at `http://127.0.0.1:3820/mcp` with transport
+`streamable-http`.
+
+Running the daemon and end-user under different OS accounts? See
+[Running the daemon and the agent under different OS users](#running-the-daemon-and-the-agent-under-different-os-users)
+below — additional operators need to be added to the
+`permitlayer-clients` group explicitly.
 
 See [docs/user-guide/install.md](docs/user-guide/install.md) for the
-full lifecycle (`brew upgrade`, `brew uninstall`, autostart details).
+full lifecycle (`brew upgrade`, `brew uninstall`, `service status`,
+troubleshooting).
 
 ### macOS / Linux — curl | sh
 
@@ -73,34 +94,54 @@ permitlayer uses **bring-your-own OAuth credentials** — you create an OAuth
 client in your own Google Cloud project, and permitlayer uses it. This
 keeps tokens scoped to your Google account, not a shared app.
 
-1. **Create a Google OAuth client** (one-time):
+1. **Set up the daemon** (one-time per machine):
+
+   ```sh
+   sudo agentsso service install
+   agentsso service status        # confirm daemon is running
+   ```
+
+   After this completes, log out and back in (or open a new login
+   shell) so your new `permitlayer-clients` group membership takes
+   effect. Steps 2-6 below run from your end-user account, NOT under
+   `sudo`.
+
+2. **Register an agent** (from your end-user account, once per MCP client):
+
+   ```sh
+   agentsso agent register <name> --policy gmail-read-only
+   ```
+
+   `--policy` is required and must name a policy that already exists
+   under `/Library/Application Support/permitlayer/policies/`. The
+   seeded `gmail-read-only` policy is a safe starting point. Add
+   `--json` for a `jq`-parseable envelope (scripted installs).
+
+   Mints a bearer token at `~/.agentsso/agent-bearer.token` (mode 0600,
+   owned by you). MCP clients read this file.
+
+3. **Create a Google OAuth client** (one-time):
 
    - <https://console.cloud.google.com/apis/credentials> → **Create
      Credentials** → **OAuth client ID** → **Application type: Desktop app**.
    - Download the JSON file (Google calls it `client_secret_*.json`).
 
-2. **Connect Gmail** (or `calendar`, `drive`):
+4. **Connect Gmail** (or `calendar`, `drive`):
 
    ```sh
    agentsso connect gmail --oauth-client ./client_secret_XXXX.json --agent <name>
    ```
 
    A browser window opens for Google consent. Tokens get sealed into the
-   OS keychain (Keychain on macOS; Secret Service on Linux; Credential
-   Manager on Windows). The `--agent <name>` flag is required (Story 7.13
-   verb rename); `connect` composes credential sealing + policy update +
-   agent rebind in one idempotent command.
+   OS keychain (System.keychain on macOS; Secret Service on Linux;
+   Credential Manager on Windows). The `--agent <name>` flag is required;
+   `connect` composes credential sealing + policy update + agent rebind in
+   one idempotent command.
 
-3. **Start the daemon**:
+5. **Point your MCP client** at `http://127.0.0.1:3820/mcp` with
+   transport `streamable-http`, using the bearer token from step 2.
 
-   ```sh
-   agentsso start
-   ```
-
-   It listens on `127.0.0.1:3820` by default. Point your MCP client at
-   `http://127.0.0.1:3820/mcp` with transport `streamable-http`.
-
-4. **Inspect activity**:
+6. **Inspect activity**:
 
    ```sh
    agentsso audit --follow
@@ -124,11 +165,14 @@ polling completes without operator interaction at the target machine:
 ```sh
 # Scripted-install scenario (CI, Ansible, cloud-init):
 # OAuth client must be type "TV and Limited Input Device" (NOT "Desktop app").
-# See docs/user-guide/install.md → "Device-flow OAuth client setup".
+# See the "Fully-headless / scripted installs" section in
+# docs/user-guide/install.md for the OAuth client setup details.
+sudo agentsso service install
+# Mint a bearer token first — `connect` requires the agent to be
+# pre-registered. `--json` parses cleanly through jq for scripted use.
+AGENTSSO_BEARER_TOKEN=$(agentsso agent register ci-bot --policy gmail-read-only --json | jq -r .bearer_token)
 agentsso connect gmail --oauth-client ./client_secret_device.json --agent ci-bot \
   --device-flow --device-flow-timeout 300 --non-interactive
-AGENTSSO_BEARER_TOKEN=$(agentsso agent register ci-bot --policy default --json | jq -r .bearer_token)
-agentsso autostart enable
 ```
 
 `--device-flow` is mutually exclusive with `--headless` (the paste-
@@ -156,137 +200,55 @@ The daemon validates the pasted URL against the redirect URI it
 issued (scheme, host, port, path, and CSRF state must all match)
 and exchanges the authorization code for tokens locally.
 
-On macOS, `su`-ing to a user that is not the foreground GUI user also
-requires unlocking that user's login keychain in the same shell:
-
-```sh
-security unlock-keychain ~/Library/Keychains/login.keychain-db
-```
-
-Otherwise the keychain rejects the master-key probe with `User
-interaction is not allowed`.
-
-#### Recovery after `brew upgrade agentsso`
-
-`brew upgrade agentsso` reinstalls the binary with a different codesign
-hash, which invalidates the macOS Keychain ACL on the existing
-master-key entry. Symptom on rc.16 and earlier: the next `agentsso
-start &` logs `keychain backend 'apple' is unavailable: User
-interaction is not allowed. (OSStatus -25308)`.
-
-**Behavior on rc.19 and later (Story 7.22 + Story 7.23 + Story 7.24):**
-the daemon auto-detects the ACL break, verifies the new binary's
-codesign Designated Requirement against a trust anchor captured on
-first boot, and atomic-rekeys the vault under a freshly-minted master
-key. The vault, every sealed credential, and **every operator-held
-bearer token** are preserved across the rekey — operators don't need
-to re-run `connect`, re-OAuth-consent, or update MCP-client configs.
-The daemon stays up; launchd-managed installs auto-recover with no
-operator action. (rc.17 shipped the recovery code path but a
-launchd-spawned-binary capture bug — Story 7.23 — kept the trust
-anchor from being written; rc.18 fixed the daemon-side capture API
-but the x86_64-apple-darwin release tarball shipped unsigned, so
-Intel macOS still couldn't capture an anchor. Story 7.24 ad-hoc
-codesigns the x86_64 binary in the release pipeline, making rc.19
-the first release where the contract works headlessly end-to-end on
-**both** Apple Silicon and Intel macOS.)
-
-The auto-recovery path activates only when the new binary's codesign
-DR matches the persisted anchor. Mismatches (different signing
-identity, completely-unsigned binary) hard-fail with exit code 7 and
-a structured banner pointing at manual re-trust — this is the security
-gate that prevents an attacker-installed binary from inheriting the
-previous binary's vault.
-
-##### If your rc.17 or rc.18 daemon is in a respawn loop
-
-Two related bugs caused the same `AclBreakNoTrustAnchor` exit-7
-respawn loop on different release lines:
-
-- **rc.17** shipped a launchd-spawned-binary codesign capture bug
-  (Story 7.23): the trust anchor never got written.
-- **rc.18** fixed the capture API but the x86_64-apple-darwin
-  release tarball shipped unsigned (Story 7.24), so on Intel macOS
-  there was no codesign for the daemon to capture.
-
-Diagnostic signature in `~/.agentsso/logs/autostart.log`:
-
-```
-ERROR no codesign trust anchor on disk — cannot auto-recover headlessly
-```
-
-One-step fix:
-
-```sh
-brew upgrade permitlayer/tap/agentsso
-```
-
-rc.19 captures the anchor correctly on first boot on **both** Apple
-Silicon (since rc.18) and Intel macOS (new in rc.19), and recovery
-proceeds normally. No manual cleanup required.
-
-Behavior on rc.16 and earlier, by context:
-
-- **Interactive terminal (or SSH with TTY)**: the daemon drops to a
-  passphrase prompt automatically. Type any passphrase you'll
-  remember; the daemon mints a fresh master key under that
-  passphrase and stores `~/.agentsso/keystore/passphrase.state` to
-  remember the choice across restarts. **The fallback's derived key
-  cannot unseal credentials sealed under the previous native key**,
-  so existing connectors are stale until you re-run `connect`.
-- **launchd-managed contexts / `ssh -T`**: no controlling terminal.
-  The daemon fails fast with a structured `PassphrasePromptUnavailable`
-  error. The recovery path is the same manual `connect` re-run from
-  an interactive shell.
-
-For diagnostic detail, run with `AGENTSSO_LOG__LEVEL=debug` (the daemon
-does not honor `RUST_LOG`).
+For diagnostic detail on startup failures, run the daemon with
+`AGENTSSO_LOG__LEVEL=debug` (the daemon does not honor `RUST_LOG`).
 
 ### Running the daemon and the agent under different OS users
 
-A common multi-user pattern: run the daemon as one user (e.g.
-`vault-keeper`) so the OAuth refresh token and master key live in a
-filesystem the agent's OS user (e.g. `agent`) cannot read. The agent
-talks to the daemon over loopback with a bearer token issued by
-`agentsso agent register`.
+On macOS the daemon runs as `root` via LaunchDaemon. End-users
+authenticate to it on two separate channels:
 
-All control-plane CLI commands (`agent register`, `agent list`,
-`agent remove`, `kill`, `resume`, `reload`, `connectors list`,
-`status --connections`) require an operator authentication token.
-The daemon mints `<home>/control.token` (mode `0o600`) at startup
-and persists it across restarts.
+- **Control plane** (`/v1/control/*` — `agent register`, `agent list`,
+  `kill`, `resume`, `reload`, `connectors list`, `status --connections`)
+  lives on a Unix domain socket at `/var/run/permitlayer/control.sock`,
+  mode `0660`, owned `root:permitlayer-clients`. Members of the
+  `permitlayer-clients` group can connect; the daemon reads the
+  caller's UID via `LOCAL_PEERCRED` and audit-logs it alongside any
+  bearer-token claim. `sudo agentsso service install` adds the
+  invoking operator to that group; add additional operators with
+  `sudo dseditgroup -o edit -a <user> -t user permitlayer-clients`,
+  then have the user log out and back in for the group membership to
+  take effect.
 
-**Same-user invocation** reads the token automatically from the
-daemon owner's home directory (the file is mode `0o600`, only
-readable by the owner):
+- **MCP data plane** (`/mcp/*`) lives on TCP loopback at
+  `127.0.0.1:3820`. MCP clients (OpenClaw, Claude Desktop, Cursor)
+  speak HTTP-over-streamable-http, which is TCP-only; we keep this
+  channel on loopback specifically for compatibility. The daemon
+  authenticates MCP clients via per-user bearer tokens minted by
+  `agentsso agent register <name> --policy <policy-name>` and written
+  to `~/.agentsso/agent-bearer.token` (mode `0600`, owned by the
+  invoking user). MCP clients read the token **value** from that file
+  (not the path — e.g., Claude Desktop's `env` block needs the bearer
+  string itself, not a `~/.agentsso/...` path expression).
 
-```sh
-# As the daemon-owner user:
-agentsso agent list
-agentsso kill
-```
+  If the operator who ran `sudo agentsso service install` is a
+  different OS account than the end-user who'll run
+  `agentsso agent register`, that end-user must be added to the
+  `permitlayer-clients` group too — `sudo dseditgroup -o edit -a
+  <end-user> -t user permitlayer-clients` then log them out and back
+  in.
 
-**Cross-user invocation** requires the operator to share the token
-explicitly via the `AGENTSSO_CONTROL_TOKEN` env var. The calling user
-cannot read `<home>/control.token` from a different user's home (mode
-`0o600` blocks it):
+The split is deliberate. The control plane gets kernel-attested peer
+identity from UDS; the MCP plane gets backward-compatibility with
+existing HTTP-only MCP clients.
 
-```sh
-# As the agent user, against a daemon owned by a different user:
-AGENTSSO_CONTROL_TOKEN=$(sudo cat /Users/<svc-user>/.agentsso/control.token) \
-AGENTSSO_HTTP__BIND_ADDR=127.0.0.1:3820 \
-  agentsso agent register angie --policy gmail-read-only
-```
-
-If the daemon owner has overridden the default `127.0.0.1:3820`,
-point the caller at the right port via `AGENTSSO_HTTP__BIND_ADDR`.
-
-**Token rotation.** The token survives daemon restarts (Codex review
-finding from 2026-05-05: rotating on every restart would break ops
-automation that holds the token). To rotate explicitly, stop the
-daemon, delete `<home>/control.token`, and start the daemon again —
-it'll mint a fresh token. All in-flight tokens lose access as soon
-as the file is replaced.
+The MCP plane's TCP bind address is configurable via the
+`AGENTSSO_HTTP__BIND_ADDR` env var (figment env-layering applies via
+`Env::prefixed("AGENTSSO_").split("__")`, so `AGENTSSO_HTTP__BIND_ADDR=
+127.0.0.1:3920` overrides the default `127.0.0.1:3820`). Set it in
+the LaunchDaemon plist's `EnvironmentVariables` if you need a
+non-default port — `sudo agentsso service install` regenerates the
+plist, so this is a one-time edit per machine.
 
 ## What's in the box
 

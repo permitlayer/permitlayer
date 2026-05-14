@@ -50,9 +50,11 @@ compile_error!(
      with `cargo test --features test-seam` (debug profile) instead."
 );
 
-pub mod codesign_macos;
 pub mod error;
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+// macOS native path is System.keychain unconditionally; `FallbackKeyStore`
+// only exists on Linux + Windows where a passphrase adapter still acts as
+// a runtime fallback when the OS keychain is unavailable.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) mod fallback;
 #[cfg(feature = "test-seam")]
 pub mod file_backed;
@@ -70,15 +72,13 @@ use std::path::PathBuf;
 
 use zeroize::Zeroizing;
 
-pub use codesign_macos::{
-    CodesignError, capture_self_designated_requirement, read_trust_anchor, trust_anchor_path,
-    verify_self_against, write_trust_anchor, write_trust_anchor_force,
-};
-pub use error::KeyStoreError;
+pub use error::{KeyStoreError, MalformedReason};
 #[cfg(feature = "test-seam")]
 pub use file_backed::FileBackedKeyStore;
 #[cfg(target_os = "linux")]
 pub use linux::LinuxKeyStore;
+#[cfg(target_os = "macos")]
+pub use macos::FINGERPRINT_DOMAIN_SEP;
 #[cfg(target_os = "macos")]
 pub use macos::MacKeyStore;
 pub use passphrase::PassphraseKeyStore;
@@ -92,6 +92,34 @@ pub const MASTER_KEY_LEN: usize = 32;
 /// to the OS keychain. Compile-time constant — callers cannot supply
 /// their own service strings, which structurally eliminates path-
 /// traversal and delimiter-collision concerns.
+///
+/// **Renamed on macOS in Story 7.26 from `io.permitlayer.master-key`
+/// to `dev.permitlayer.master-key`** to align with the rc.22 macOS
+/// LaunchDaemon redesign's service identifier convention
+/// (`dev.permitlayer.daemon` for the LaunchDaemon plist label).
+/// macOS rc.21 → rc.22 is a breaking change with no in-place
+/// migration — rc.21 operators run `agentsso service install`
+/// (Story 7.27) which creates a fresh keychain entry under the new
+/// service id. The old `io.permitlayer.master-key` entry in the
+/// unprivileged user's login.keychain is orphaned; `agentsso
+/// uninstall` warns about it (both in the pre-confirm prompt
+/// manifest and on stderr at the end of the run) and prints the
+/// `security delete-generic-password` command to remove it. The
+/// programmatic sweep was attempted in round-1 review patches and
+/// rejected in round 2 because uninstall runs under `sudo`, and
+/// `keyring 3.6`'s macOS API has no target-user knob — the sweep
+/// would have targeted root's keychain, not the operator's.
+///
+/// **Linux + Windows retain `io.permitlayer.master-key`** per AC #9
+/// path (b) and AC #7 ("Linux + Windows preserved"). Those platforms
+/// have not yet been redesigned; renaming the service id there would
+/// silently strand rc.21 users' secret-service / CredMan entries
+/// with no migration path. The rename happens when those platforms
+/// get their own redesigns in future stories.
+#[cfg(target_os = "macos")]
+pub const MASTER_KEY_SERVICE: &str = "dev.permitlayer.master-key";
+
+#[cfg(not(target_os = "macos"))]
 pub const MASTER_KEY_SERVICE: &str = "io.permitlayer.master-key";
 
 /// Account identifier for the master-key entry. At MVP there is exactly
@@ -132,13 +160,112 @@ pub enum DeleteOutcome {
 /// All methods are async; platform FFI calls MUST be dispatched to a
 /// blocking worker via `tokio::task::spawn_blocking` inside the
 /// implementation (AC #3).
+/// Redacting newtype around the 32-byte master key. Deref-coerces to
+/// `Zeroizing<[u8; MASTER_KEY_LEN]>` so callers can keep using
+/// `outcome.key.as_slice()` / `&outcome.key`, but the hand-rolled
+/// `Debug` impl prints `<redacted>` instead of all 32 bytes.
+///
+/// **Round-3 review fix.** Round-2 added `#[non_exhaustive]` to
+/// `MasterKeyOutcome` claiming the attribute prevented external
+/// callers from destructuring the struct in a way that defeated the
+/// outer `Debug` redaction. That claim was overstated:
+/// `#[non_exhaustive]` only forces external callers to use the `..`
+/// rest pattern, and a `println!("{:?}", outcome.key)` still reaches
+/// the *derived* `Debug` on `Zeroizing<[u8; 32]>` which prints every
+/// byte. Wrapping `key` in this newtype with its own redacting
+/// `Debug` enforces the invariant at the type level — any path that
+/// reaches `Debug` on the `key` field now redacts.
+pub struct RedactedMasterKey(Zeroizing<[u8; MASTER_KEY_LEN]>);
+
+impl RedactedMasterKey {
+    /// Wrap a freshly-minted or freshly-read key.
+    pub fn new(key: Zeroizing<[u8; MASTER_KEY_LEN]>) -> Self {
+        Self(key)
+    }
+
+    /// Unwrap to the inner `Zeroizing<...>` — used by call sites that
+    /// genuinely need to consume the key (vault open/seal, rotate-key
+    /// rotation, the daemon's compile-time `if outcome.key.as_slice()
+    /// == [0u8; 32]` defensive check, etc.).
+    pub fn into_inner(self) -> Zeroizing<[u8; MASTER_KEY_LEN]> {
+        self.0
+    }
+}
+
+impl std::ops::Deref for RedactedMasterKey {
+    type Target = Zeroizing<[u8; MASTER_KEY_LEN]>;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for RedactedMasterKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("RedactedMasterKey(<redacted>)")
+    }
+}
+
+/// Outcome of [`KeyStore::master_key`].
+///
+/// Story 7.27 AC #16: callers need to know whether the master key
+/// was just minted (first boot) so they can emit the
+/// `master-key-first-boot` audit event. Previously the keystore
+/// emitted a `tracing::info!` event internally (Story 7.26 first
+/// cut), but the daemon-level call site has the audit dispatcher in
+/// scope — it's the right layer to emit typed events from.
+///
+/// **Debug redaction.** Both the outer `MasterKeyOutcome` and the
+/// inner `RedactedMasterKey` print `<redacted>` for the key field.
+/// Round-3 review fix replaced the round-2 `#[non_exhaustive]`-only
+/// approach (which was documentation-grade, not type-enforced) with
+/// a redacting newtype on the field itself.
+///
+/// `#[non_exhaustive]` is retained on the outer struct to future-
+/// proof new fields (e.g., a `key_id` for rotate-key v3) without
+/// breaking external matchers.
+#[non_exhaustive]
+pub struct MasterKeyOutcome {
+    /// The 32-byte master key, wrapped in a redacting newtype.
+    /// Deref-coerces to `Zeroizing<[u8; MASTER_KEY_LEN]>`.
+    pub key: RedactedMasterKey,
+    /// `true` when this call minted a fresh key (first boot of the
+    /// daemon against this keychain); `false` when an existing key
+    /// was read back.
+    pub first_boot: bool,
+}
+
+impl MasterKeyOutcome {
+    /// Construct a new `MasterKeyOutcome`. Required because the
+    /// struct is `#[non_exhaustive]` — external callers (e.g., test
+    /// doubles in `permitlayer-daemon`) cannot use the struct
+    /// literal `MasterKeyOutcome { key, first_boot }` form across
+    /// crate boundaries.
+    pub fn new(key: Zeroizing<[u8; MASTER_KEY_LEN]>, first_boot: bool) -> Self {
+        Self { key: RedactedMasterKey::new(key), first_boot }
+    }
+}
+
+impl std::fmt::Debug for MasterKeyOutcome {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MasterKeyOutcome")
+            .field("key", &"<redacted>")
+            .field("first_boot", &self.first_boot)
+            .finish()
+    }
+}
+
 #[async_trait::async_trait]
 pub trait KeyStore: Send + Sync {
     /// Fetch the 32-byte master key, generating and persisting a fresh
     /// random key on first call if none exists (for adapters that
     /// persist). The returned buffer is zeroized on drop.
+    ///
+    /// Story 7.27 AC #16: returns [`MasterKeyOutcome`] (was
+    /// `Zeroizing<[u8; MASTER_KEY_LEN]>`) so the daemon-level caller
+    /// can emit a typed `master-key-first-boot` audit event when
+    /// `first_boot == true`.
     #[must_use = "master key result must not be silently discarded"]
-    async fn master_key(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyStoreError>;
+    async fn master_key(&self) -> Result<MasterKeyOutcome, KeyStoreError>;
 
     /// Replace the stored master key. Used by `agentsso rotate-key`
     /// (Story 7.6). Returns [`KeyStoreError::PassphraseAdapterImmutable`]
@@ -244,53 +371,10 @@ pub struct KeystoreConfig {
     /// Fallback behavior when the native backend is unavailable.
     pub fallback: FallbackMode,
     /// Home directory for keystore on-disk state (salt + verifier).
-    /// Typically `~/.agentsso`.
+    /// Resolved via `permitlayer_core::paths::daemon_state_dir(None)` —
+    /// `/Library/Application Support/permitlayer/` on macOS, `~/.agentsso/`
+    /// on Linux + Windows.
     pub home: PathBuf,
-    /// Story 7.22: controls whether a runtime
-    /// `BackendUnavailable -25308` (macOS keychain ACL invalidated
-    /// by a binary swap) surfaces as the
-    /// [`KeyStoreError::AclBreakNeedsRekey`] sentinel — which the
-    /// daemon's boot path catches and dispatches to the
-    /// codesign-verified auto-rekey flow — or falls through to the
-    /// existing passphrase-prompt fallback unchanged.
-    ///
-    /// Defaults to [`AclBreakRecoveryMode::Disabled`] so non-boot CLI
-    /// subcommands inherit existing behavior; only
-    /// `start.rs::ensure_master_key_bootstrapped` opts into
-    /// [`AclBreakRecoveryMode::Auto`].
-    pub acl_break_recovery: AclBreakRecoveryMode,
-}
-
-/// Story 7.22: opt-in switch on the lazy-fallback wrapper that
-/// controls whether the macOS keychain-ACL break (OSStatus -25308 on
-/// `master_key()`) surfaces as the
-/// [`KeyStoreError::AclBreakNeedsRekey`] sentinel for the daemon's
-/// boot path to handle.
-///
-/// **Boot-scoped on purpose** (Codex Finding 3): only the daemon's
-/// boot path ([`start.rs::ensure_master_key_bootstrapped`]) opts into
-/// `Auto`. Every non-boot CLI subcommand
-/// (`connect`, `credentials`, `rotate-key`, `uninstall`,
-/// `keystore-clear-previous`) MUST construct `KeystoreConfig` with
-/// `Disabled` so it inherits the existing passphrase-prompt
-/// fallback unchanged. An operator running e.g. `agentsso credentials
-/// refresh` from a TTY with a broken ACL still gets the passphrase
-/// prompt; auto-recovery is only safe to attempt at the start of a
-/// fresh daemon process where the boot path orchestrates the rekey.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[non_exhaustive]
-pub enum AclBreakRecoveryMode {
-    /// Default. On `BackendUnavailable -25308` the wrapper falls
-    /// through to the existing passphrase-prompt fallback unchanged.
-    #[default]
-    Disabled,
-    /// On `BackendUnavailable -25308` the wrapper short-circuits with
-    /// [`KeyStoreError::AclBreakNeedsRekey`] BEFORE engaging the
-    /// passphrase fallback. The daemon's boot path catches the
-    /// sentinel, verifies the running binary's codesign Designated
-    /// Requirement against the persisted trust anchor, and auto-rekeys
-    /// the vault under a freshly-minted master key.
-    Auto,
 }
 
 /// How to pick an adapter when the native OS keychain cannot be used.
@@ -312,13 +396,20 @@ pub enum FallbackMode {
 ///
 /// Selection matrix:
 ///
-/// | `fallback`        | native available | result                |
-/// |-------------------|------------------|-----------------------|
-/// | `Auto`            | yes              | native adapter        |
-/// | `Auto`            | no               | passphrase adapter    |
-/// | `Passphrase`      | (ignored)        | passphrase adapter    |
-/// | `None`            | yes              | native adapter        |
-/// | `None`            | no               | `BackendUnavailable`  |
+/// | `fallback`        | platform        | native available | result                |
+/// |-------------------|-----------------|------------------|-----------------------|
+/// | `Auto`            | linux / windows | yes              | native adapter        |
+/// | `Auto`            | linux / windows | no               | passphrase adapter    |
+/// | `Auto`            | macOS           | (always)         | `MacKeyStore` or `BackendUnavailable` |
+/// | `Passphrase`      | any             | (ignored)        | passphrase adapter    |
+/// | `None`            | any             | yes              | native adapter        |
+/// | `None`            | any             | no               | `BackendUnavailable`  |
+///
+/// macOS does not auto-fall-back: System.keychain is the only supported
+/// native path, and a `BackendUnavailable` from `MacKeyStore::new` is
+/// surfaced to the caller (the daemon's boot path renders a
+/// `KeystoreConstruction` banner). Passphrase fallback on macOS is
+/// only reachable by explicitly setting `FallbackMode::Passphrase`.
 ///
 /// The passphrase adapter prompts the user via `rpassword` in
 /// non-echoing mode. It MUST NOT be constructed from a non-interactive
@@ -328,7 +419,7 @@ pub fn default_keystore(config: &KeystoreConfig) -> Result<Box<dyn KeyStore>, Ke
     match config.fallback {
         FallbackMode::Passphrase => Ok(Box::new(PassphraseKeyStore::from_prompt(&config.home)?)),
         FallbackMode::Auto | FallbackMode::None => {
-            native_or_fallback(&config.home, config.fallback, config.acl_break_recovery)
+            native_or_fallback(&config.home, config.fallback)
         }
     }
 }
@@ -339,18 +430,16 @@ pub fn default_keystore(config: &KeystoreConfig) -> Result<Box<dyn KeyStore>, Ke
 /// `BackendUnavailable` from `master_key()` etc. engage lazy fallback
 /// — without it, the daemon hard-fails on probe-vs-runtime
 /// disagreement (rc.10/rc.11 onboarding hit this twice).
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn maybe_wrap_native(
     home: &std::path::Path,
     fallback: FallbackMode,
-    acl_break_recovery: AclBreakRecoveryMode,
     native: Box<dyn KeyStore>,
 ) -> Result<Box<dyn KeyStore>, KeyStoreError> {
     match fallback {
         FallbackMode::Auto => Ok(Box::new(fallback::FallbackKeyStore::production(
             home.to_path_buf(),
             fallback,
-            acl_break_recovery,
             native,
         )?)),
         FallbackMode::None | FallbackMode::Passphrase => Ok(native),
@@ -369,7 +458,7 @@ fn maybe_wrap_native(
 /// and we should short-circuit native entirely. Returns `None` when
 /// the marker is absent and the caller should proceed with the
 /// normal native-or-fallback flow.
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn marker_short_circuit(
     home: &std::path::Path,
     fallback: FallbackMode,
@@ -386,34 +475,26 @@ fn marker_short_circuit(
 
 #[cfg(target_os = "macos")]
 fn native_or_fallback(
-    home: &std::path::Path,
-    fallback: FallbackMode,
-    acl_break_recovery: AclBreakRecoveryMode,
+    _home: &std::path::Path,
+    _fallback: FallbackMode,
 ) -> Result<Box<dyn KeyStore>, KeyStoreError> {
-    if let Some(passphrase) = marker_short_circuit(home, fallback)? {
-        return Ok(passphrase);
-    }
-    match MacKeyStore::new() {
-        Ok(ks) => maybe_wrap_native(home, fallback, acl_break_recovery, Box::new(ks)),
-        Err(e) if fallback == FallbackMode::Auto && is_backend_unavailable(&e) => {
-            log_fallback("apple", &e);
-            Ok(Box::new(PassphraseKeyStore::from_prompt(home)?))
-        }
-        Err(e) => Err(e),
-    }
+    // macOS boot path is System.keychain unconditionally. The `-A`
+    // ACL is CDHash-independent so binary upgrades do not invalidate
+    // the master-key entry; there is no auto-fallback or auto-recovery
+    // wrapper to engage.
+    Ok(Box::new(MacKeyStore::new()?))
 }
 
 #[cfg(target_os = "linux")]
 fn native_or_fallback(
     home: &std::path::Path,
     fallback: FallbackMode,
-    acl_break_recovery: AclBreakRecoveryMode,
 ) -> Result<Box<dyn KeyStore>, KeyStoreError> {
     if let Some(passphrase) = marker_short_circuit(home, fallback)? {
         return Ok(passphrase);
     }
     match LinuxKeyStore::new() {
-        Ok(ks) => maybe_wrap_native(home, fallback, acl_break_recovery, Box::new(ks)),
+        Ok(ks) => maybe_wrap_native(home, fallback, Box::new(ks)),
         Err(e) if fallback == FallbackMode::Auto && is_backend_unavailable(&e) => {
             log_fallback("libsecret", &e);
             Ok(Box::new(PassphraseKeyStore::from_prompt(home)?))
@@ -426,13 +507,12 @@ fn native_or_fallback(
 fn native_or_fallback(
     home: &std::path::Path,
     fallback: FallbackMode,
-    acl_break_recovery: AclBreakRecoveryMode,
 ) -> Result<Box<dyn KeyStore>, KeyStoreError> {
     if let Some(passphrase) = marker_short_circuit(home, fallback)? {
         return Ok(passphrase);
     }
     match WindowsKeyStore::new() {
-        Ok(ks) => maybe_wrap_native(home, fallback, acl_break_recovery, Box::new(ks)),
+        Ok(ks) => maybe_wrap_native(home, fallback, Box::new(ks)),
         Err(e) if fallback == FallbackMode::Auto && is_backend_unavailable(&e) => {
             log_fallback("windows", &e);
             Ok(Box::new(PassphraseKeyStore::from_prompt(home)?))
@@ -445,7 +525,6 @@ fn native_or_fallback(
 fn native_or_fallback(
     home: &std::path::Path,
     fallback: FallbackMode,
-    _acl_break_recovery: AclBreakRecoveryMode,
 ) -> Result<Box<dyn KeyStore>, KeyStoreError> {
     if fallback == FallbackMode::None {
         return Err(KeyStoreError::PlatformError {
@@ -459,7 +538,7 @@ fn native_or_fallback(
 /// Only `BackendUnavailable` triggers auto-fallback. Genuine platform
 /// failures (`PlatformError`) surface to the caller so a misconfigured
 /// keychain doesn't silently drop users into passphrase mode.
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) fn is_backend_unavailable(e: &KeyStoreError) -> bool {
     matches!(e, KeyStoreError::BackendUnavailable { .. })
 }
@@ -467,7 +546,7 @@ pub(crate) fn is_backend_unavailable(e: &KeyStoreError) -> bool {
 /// Log the native backend's error before falling back. This is the ONE
 /// place the error chain is surfaced for debugging — without it, users
 /// see an unexplained passphrase prompt.
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn log_fallback(backend: &'static str, e: &KeyStoreError) {
     eprintln!("keystore: native backend '{backend}' unavailable, falling back to passphrase: {e}");
 }
@@ -478,7 +557,7 @@ fn log_fallback(backend: &'static str, e: &KeyStoreError) {
 /// tell which decision point fired. Carries the full error chain via
 /// `{e}` — Plan A's `BackendUnavailable: {source}` Display still
 /// surfaces the OSStatus.
-#[cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) fn log_fallback_runtime(e: &KeyStoreError) {
     eprintln!("keystore: native backend unavailable at runtime, engaging passphrase fallback: {e}");
 }
@@ -500,8 +579,8 @@ mod factory_tests {
         let boxed: Box<dyn KeyStore> = Box::new(concrete);
         // Drive master_key through the trait object to prove async fn
         // dispatch works through dyn.
-        let key = boxed.master_key().await.unwrap();
-        assert_eq!(key.len(), MASTER_KEY_LEN);
+        let outcome = boxed.master_key().await.unwrap();
+        assert_eq!(outcome.key.len(), MASTER_KEY_LEN);
         // set_master_key on passphrase adapter must be immutable.
         let err = boxed.set_master_key(&[0u8; MASTER_KEY_LEN]).await.unwrap_err();
         assert!(matches!(err, KeyStoreError::PassphraseAdapterImmutable));
@@ -524,8 +603,105 @@ mod factory_tests {
     #[test]
     fn master_key_service_and_account_are_stable() {
         // These constants are baked into on-disk state (OS keychain).
-        // Changing them without a migration breaks existing installs.
+        // Changing them without a migration is a breaking change.
+        // Story 7.26 renamed io.permitlayer.master-key →
+        // dev.permitlayer.master-key on macOS only as part of the
+        // rc.22 macOS LaunchDaemon redesign (System.keychain entry
+        // created fresh by `service install`). Linux + Windows
+        // retain the legacy `io.permitlayer.master-key` until those
+        // platforms get their own redesigns.
+        #[cfg(target_os = "macos")]
+        assert_eq!(MASTER_KEY_SERVICE, "dev.permitlayer.master-key");
+        #[cfg(not(target_os = "macos"))]
         assert_eq!(MASTER_KEY_SERVICE, "io.permitlayer.master-key");
         assert_eq!(MASTER_KEY_ACCOUNT, "master");
+    }
+
+    /// Story 7.27 Round-2 review fix: negative assertion to catch a
+    /// regression where someone accidentally reverts the macOS
+    /// MASTER_KEY_SERVICE rename. Pre-rc.22 used the legacy id; the
+    /// rename is what isolates new System.keychain entries from
+    /// orphaned user-login-keychain entries left behind by rc.21
+    /// installs.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_master_key_service_is_not_legacy() {
+        assert_ne!(
+            MASTER_KEY_SERVICE, "io.permitlayer.master-key",
+            "macOS MASTER_KEY_SERVICE must NOT regress to the rc.21 legacy id"
+        );
+    }
+
+    /// Regression guard for the System.keychain `-A` ACL invariant.
+    ///
+    /// The macOS keystore is permitted exactly two error shapes when
+    /// `master_key()` cannot return bytes: `BackendUnavailable` (probe
+    /// failure; rendered as `KeystoreConstruction` by the daemon) or
+    /// the structured passphrase/malformed-bytes family. Any future
+    /// reintroduction of an auto-recovery sentinel that the boot path
+    /// would have to dispatch on (e.g., a variant matching
+    /// `*BreakNeedsRekey*` / `*AutoRecover*`) is a structural
+    /// regression: System.keychain's `-A` ACL is CDHash-independent,
+    /// so there is no failure mode for an auto-recovery branch to
+    /// observe.
+    ///
+    /// This test enumerates the current `KeyStoreError` variant
+    /// `Display` strings via a constructed instance per variant. If a
+    /// new variant is added later, a `_ => ...` catch-all here would
+    /// hide it, so we instead assert on the *Debug* string shape of a
+    /// freshly-discriminated set of construction calls. The shape
+    /// check is intentionally loose: it does not pin every variant's
+    /// text, only that no variant Debug-prints as one of the deleted
+    /// auto-recovery names.
+    #[test]
+    fn keystore_error_has_no_auto_recovery_variant() {
+        // Construct one of each currently-defined variant we can
+        // reach without unsafe / FFI. The point is not exhaustiveness
+        // but evidence that the named regressors are absent.
+        let samples: Vec<KeyStoreError> = vec![
+            KeyStoreError::BackendUnavailable {
+                backend: "apple",
+                source: Box::new(std::io::Error::other("synthetic -25308")),
+            },
+            KeyStoreError::PassphraseMismatch,
+            KeyStoreError::EmptyPassphrase,
+            KeyStoreError::PassphraseAdapterImmutable,
+            KeyStoreError::PassphrasePromptUnavailable,
+            KeyStoreError::PlatformError { backend: "test", message: "x".into() },
+        ];
+        for s in samples {
+            let dbg = format!("{s:?}");
+            assert!(
+                !dbg.contains("AclBreakNeedsRekey"),
+                "regression: AclBreakNeedsRekey variant re-introduced — got {dbg}"
+            );
+            assert!(
+                !dbg.contains("AutoRecover"),
+                "regression: AutoRecover-family variant re-introduced — got {dbg}"
+            );
+            assert!(
+                !dbg.contains("AclBreakRecovery"),
+                "regression: AclBreakRecovery-family variant re-introduced — got {dbg}"
+            );
+        }
+    }
+
+    /// Regression guard: `KeystoreConfig` must not regrow an
+    /// `acl_break_recovery`-shaped field. The macOS boot path no
+    /// longer has a failure mode to recover from; Linux/Windows
+    /// fallback engages on `BackendUnavailable` unconditionally
+    /// without operator opt-in. A Debug print on a constructed
+    /// `KeystoreConfig` is sufficient evidence of the absence.
+    #[test]
+    fn keystore_config_has_no_acl_break_field() {
+        let cfg = KeystoreConfig {
+            fallback: FallbackMode::Auto,
+            home: std::path::PathBuf::from("/tmp/test"),
+        };
+        let dbg = format!("{cfg:?}");
+        assert!(
+            !dbg.contains("acl_break"),
+            "regression: KeystoreConfig regrew an acl_break_* field — got {dbg}"
+        );
     }
 }

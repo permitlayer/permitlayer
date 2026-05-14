@@ -69,8 +69,11 @@ enum Commands {
     Agent(cli::agent::AgentArgs),
     /// List plugin connectors loaded by the daemon (built-in + user-installed) — FR40
     Connectors(cli::connectors::ConnectorsArgs),
-    /// Manage opt-in autostart at login (FR7) — enable/disable/status
-    Autostart(cli::autostart::AutostartArgs),
+    /// Manage the daemon as a macOS system service (Story 7.27 +
+    /// rc.22). Replaces `agentsso autostart`. Three subcommands:
+    /// `install` (root-required one-time setup), `uninstall`
+    /// (root-required teardown), `status` (no-root state report).
+    Service(cli::service::ServiceArgs),
     /// Uninstall permitlayer cleanly: stop daemon, remove keychain
     /// entry, autostart, data dir, and binary (FR8). Destructive —
     /// requires interactive confirmation OR --yes.
@@ -111,6 +114,59 @@ enum Commands {
 /// `ExitCode::FAILURE` (1) on error, matching the pre-1.15 behavior.
 #[tokio::main]
 async fn main() -> ExitCode {
+    // Story 7.27 review fix: locate the first non-flag arg so the
+    // interceptors fire even when global flags (`--verbose`, `--log`,
+    // etc.) precede the subcommand. Previous `args().nth(1)` matched
+    // only the literal second token, so `agentsso --verbose autostart`
+    // bypassed the interceptor and hit clap's "unrecognized" error.
+    //
+    // Story 7.27 Round-2 review note: this heuristic is correct for
+    // the current `Cli` struct because no global flag takes a bare
+    // separate-token value (all `Cli` options use either bool flags
+    // or `--flag=value` form). If a future flag is added with the
+    // shape `--log <value>` (separate-token form), `find` would
+    // match the value instead of the subcommand. Switching to
+    // `clap::Command::try_get_matches_from_mut` would be more robust
+    // but adds parsing cost on every CLI invocation. Re-evaluate if
+    // a value-taking global flag is added.
+    //
+    // Known edge cases (all acceptable as documented):
+    //   - `agentsso help autostart` falls through to clap's own
+    //     "unrecognized subcommand" rendering (autostart was
+    //     removed from `Commands` enum). Operators see clap's
+    //     standard error, not the structured migration block —
+    //     but the binary's `--help` output also no longer lists
+    //     `autostart` so the discovery path is consistent.
+    //   - `agentsso autostart status --json`: the interceptor emits
+    //     a non-JSON `error_block` on stderr. Legacy script users
+    //     of the `autostart status --json` form must migrate to
+    //     `agentsso service status` (eventually `--json` flag) or
+    //     check exit code 2 (the `autostart.removed` interceptor's
+    //     deliberate "loud failure" semantics).
+    // Round-3 review fix (R3-C5-P7) doc-only: this heuristic has
+    // known limitations the clap-driven full-fidelity parse would
+    // handle:
+    //   - `agentsso --help autostart` matches `autostart` here and
+    //     fires the interceptor BEFORE clap's `--help` rendering.
+    //     Operator wanted help; got the autostart-removed error
+    //     block. Acceptable: `--help` to find a removed command
+    //     should at least surface the removal note.
+    //   - `agentsso -- autostart` (conventional end-of-options
+    //     marker) matches `autostart` here too. clap would treat
+    //     `autostart` as a positional argument, not a subcommand,
+    //     so the interceptor's "you removed this subcommand"
+    //     message is slightly misleading — but operator intent was
+    //     still to invoke autostart, so the message is helpful.
+    //   - A future value-taking global flag (`--config /path`)
+    //     would cause `find` to return `/path` (no leading `-`),
+    //     which won't match `autostart`/`setup` so the interceptor
+    //     silently passes through to clap. Worth a clap
+    //     `try_get_matches_from` migration if such a flag is
+    //     added — but the parsing-cost objection is overblown
+    //     (clap parse is microsecond-scale).
+    let first_subcommand_arg: Option<String> =
+        std::env::args().skip(1).find(|a| !a.starts_with('-'));
+
     // Story 7.13 AC #7 — legacy `agentsso setup` interceptor.
     //
     // The `setup` subcommand was removed in favor of the
@@ -119,7 +175,7 @@ async fn main() -> ExitCode {
     // remediation block instead of clap's terse "unrecognized
     // subcommand" error. Runs BEFORE clap parsing so it short-circuits
     // even when later args would themselves fail clap.
-    if std::env::args().nth(1).as_deref() == Some("setup") {
+    if first_subcommand_arg.as_deref() == Some("setup") {
         eprint!(
             "{}",
             crate::design::render::error_block(
@@ -127,6 +183,30 @@ async fn main() -> ExitCode {
                 "`agentsso setup` was removed; use `agentsso connect <service> --agent <name>`",
                 "agentsso connect <service> --agent <name> --oauth-client <path>\n\n  \
                  supported services: gmail, calendar, drive",
+                None,
+            )
+        );
+        return ExitCode::from(2);
+    }
+
+    // Story 7.27 — legacy `agentsso autostart` interceptor.
+    //
+    // The `autostart` subcommand was replaced by
+    // `agentsso service install/uninstall/status` in rc.22 (Sprint
+    // Change Proposal 2026-05-10, "burn the boats" direction).
+    // Operators (or scripts) still typing `agentsso autostart enable`
+    // get a structured remediation block instead of clap's terse
+    // "unrecognized subcommand" error.
+    if first_subcommand_arg.as_deref() == Some("autostart") {
+        eprint!(
+            "{}",
+            crate::design::render::error_block(
+                "autostart.removed",
+                "`agentsso autostart` was replaced by `agentsso service install/uninstall/status` \
+                 in rc.22",
+                "sudo agentsso service install   # one-time setup, root required\n  \
+                 agentsso service status         # report state (no root)\n  \
+                 sudo agentsso service uninstall # teardown, root required",
                 None,
             )
         );
@@ -184,7 +264,7 @@ async fn main() -> ExitCode {
         Some(Commands::Resume(args)) => anyhow_to_exit_code(cli::resume::run(args).await),
         Some(Commands::Agent(args)) => anyhow_to_exit_code(cli::agent::run(args).await),
         Some(Commands::Connectors(args)) => anyhow_to_exit_code(cli::connectors::run(args).await),
-        Some(Commands::Autostart(args)) => anyhow_to_exit_code(cli::autostart::run(args).await),
+        Some(Commands::Service(args)) => anyhow_to_exit_code(cli::service::run(args).await),
         Some(Commands::Uninstall(args)) => uninstall_to_exit_code(cli::uninstall::run(args).await),
         Some(Commands::Update(args)) => update_to_exit_code(cli::update::run(args).await),
         Some(Commands::RotateKey(args)) => {

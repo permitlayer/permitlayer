@@ -39,6 +39,7 @@ pub mod agent;
 pub mod audit;
 pub mod error;
 pub mod killswitch;
+pub mod paths;
 pub mod policy;
 pub mod scrub;
 pub mod store;

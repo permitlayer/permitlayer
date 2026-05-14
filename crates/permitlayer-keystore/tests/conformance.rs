@@ -65,8 +65,8 @@ const ARGON2_KAT_EXPECTED: [u8; MASTER_KEY_LEN] = [
 async fn assert_master_key_idempotent<K: KeyStore>(ks: &K) -> Result<(), KeyStoreError> {
     let k1 = ks.master_key().await?;
     let k2 = ks.master_key().await?;
-    assert_eq!(&*k1, &*k2, "master_key() must be idempotent in-process");
-    assert_eq!(k1.len(), MASTER_KEY_LEN);
+    assert_eq!(&*k1.key, &*k2.key, "master_key() must be idempotent in-process");
+    assert_eq!(k1.key.len(), MASTER_KEY_LEN);
     Ok(())
 }
 
@@ -100,7 +100,7 @@ async fn conformance_passphrase() {
     // derive the same key (same salt → same Argon2id output).
     let ks2 = PassphraseKeyStore::from_passphrase(home.path(), TEST_PASSPHRASE).unwrap();
     let k2 = ks2.master_key().await.unwrap();
-    assert_eq!(&*k1, &*k2, "passphrase adapter must derive stable key across instances");
+    assert_eq!(&*k1.key, &*k2.key, "passphrase adapter must derive stable key across instances");
 
     // set_master_key is immutable for passphrase adapter.
     let err = ks2.set_master_key(&[0u8; MASTER_KEY_LEN]).await.unwrap_err();
@@ -141,7 +141,7 @@ async fn passphrase_adapter_no_plaintext_on_disk() {
     // The derived key must never appear on disk. The passphrase also
     // must never appear (it's not persisted; this guards against
     // regressions that might log or stage it).
-    let key_bytes: &[u8] = &*key;
+    let key_bytes: &[u8] = &**key.key;
     assert!(
         !any_file_contains(home.path(), key_bytes),
         "derived master key must not appear in any file under home"
@@ -250,7 +250,7 @@ async fn native_conformance<K: KeyStore>(ks: &K) {
 
     // 1. Read the baseline (either pre-existing or just-minted).
     let original = ks.master_key().await.unwrap();
-    let original_bytes: [u8; MASTER_KEY_LEN] = *original;
+    let original_bytes: [u8; MASTER_KEY_LEN] = **original.key;
 
     // 2. Idempotency.
     assert_master_key_idempotent(ks).await.unwrap();
@@ -263,7 +263,7 @@ async fn native_conformance<K: KeyStore>(ks: &K) {
     ks.set_master_key(&snapshot).await.unwrap();
     let read_after_idempotent_write = ks.master_key().await.unwrap();
     assert_eq!(
-        &*read_after_idempotent_write, &snapshot,
+        &**read_after_idempotent_write.key, &snapshot,
         "idempotent set_master_key with original bytes must round-trip — Story 7.6 Phase C invariant"
     );
 
@@ -272,7 +272,7 @@ async fn native_conformance<K: KeyStore>(ks: &K) {
     let test_key = [0x5Au8; MASTER_KEY_LEN];
     ks.set_master_key(&test_key).await.unwrap();
     let read_back = ks.master_key().await.unwrap();
-    assert_eq!(&*read_back, &test_key, "set_master_key + master_key must round-trip");
+    assert_eq!(&**read_back.key, &test_key, "set_master_key + master_key must round-trip");
 
     // 4. Restore the original key so this test is re-runnable and
     //    doesn't clobber whatever was there.
@@ -310,7 +310,7 @@ async fn native_conformance<K: KeyStore>(ks: &K) {
     // hits the NoEntry branch and auto-mints a fresh random key.
     let post_delete = ks.master_key().await.unwrap();
     assert_ne!(
-        *post_delete, original_bytes,
+        **post_delete.key, original_bytes,
         "post-delete master_key must mint a fresh key, not return the deleted one"
     );
 
@@ -402,7 +402,7 @@ async fn set_previous_master_key_persists_and_reads_back() {
 
     // Snapshot whatever's there now so we can restore at the end.
     let original = ks.master_key().await.unwrap();
-    let original_bytes: [u8; MASTER_KEY_LEN] = *original;
+    let original_bytes: [u8; MASTER_KEY_LEN] = **original.key;
 
     let key_a = [0xAAu8; MASTER_KEY_LEN];
     let key_b = [0xBBu8; MASTER_KEY_LEN];
@@ -418,7 +418,7 @@ async fn set_previous_master_key_persists_and_reads_back() {
     // Phase C' step 2: write the primary slot (existing API).
     ks.set_master_key(&key_b).await.unwrap();
     let primary = ks.master_key().await.unwrap();
-    assert_eq!(&*primary, &key_b, "primary slot must hold the new key after primary install");
+    assert_eq!(&**primary.key, &key_b, "primary slot must hold the new key after primary install");
     // Re-confirm previous still holds OLD (primary write must not
     // disturb previous).
     let prev = ks.previous_master_key().await.unwrap().expect("previous still present");
@@ -441,7 +441,7 @@ async fn set_previous_master_key_overwrites_prior_value() {
     }
     let Some(ks) = open_native().await else { return };
     let original = ks.master_key().await.unwrap();
-    let original_bytes: [u8; MASTER_KEY_LEN] = *original;
+    let original_bytes: [u8; MASTER_KEY_LEN] = **original.key;
 
     let key_a = [0x11u8; MASTER_KEY_LEN];
     let key_b = [0x22u8; MASTER_KEY_LEN];
@@ -477,7 +477,7 @@ async fn set_previous_master_key_is_idempotent() {
     }
     let Some(ks) = open_native().await else { return };
     let original = ks.master_key().await.unwrap();
-    let original_bytes: [u8; MASTER_KEY_LEN] = *original;
+    let original_bytes: [u8; MASTER_KEY_LEN] = **original.key;
 
     let key_a = [0x77u8; MASTER_KEY_LEN];
     ks.set_previous_master_key(&key_a).await.unwrap();
@@ -502,7 +502,7 @@ async fn previous_master_key_returns_none_after_clear() {
     }
     let Some(ks) = open_native().await else { return };
     let original = ks.master_key().await.unwrap();
-    let original_bytes: [u8; MASTER_KEY_LEN] = *original;
+    let original_bytes: [u8; MASTER_KEY_LEN] = **original.key;
 
     let key_a = [0x44u8; MASTER_KEY_LEN];
 
@@ -549,7 +549,7 @@ async fn previous_master_key_zeroizes_on_drop() {
     }
     let Some(ks) = open_native().await else { return };
     let original = ks.master_key().await.unwrap();
-    let original_bytes: [u8; MASTER_KEY_LEN] = *original;
+    let original_bytes: [u8; MASTER_KEY_LEN] = **original.key;
 
     let key_a = [0x66u8; MASTER_KEY_LEN];
     ks.set_previous_master_key(&key_a).await.unwrap();

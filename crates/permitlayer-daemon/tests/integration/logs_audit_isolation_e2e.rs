@@ -1,8 +1,8 @@
 //! Story 5.4 AC #10 — log/audit path isolation test.
 //!
 //! Asserts the architectural invariant from NFR45: operational logs
-//! (`~/.agentsso/logs/daemon.log`) and audit logs
-//! (`~/.agentsso/audit/YYYY-MM-DD.jsonl`) are separate streams. A
+//! (`<state-dir>/logs/daemon.log`) and audit logs
+//! (`<state-dir>/audit/YYYY-MM-DD.jsonl`) are separate streams. A
 //! message written via `tracing::info!`/`warn!`/etc. MUST NOT appear
 //! in the audit log, and an `AuditEvent` written via `AuditStore::
 //! append` MUST NOT appear in the operational log.

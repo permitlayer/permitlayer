@@ -150,8 +150,14 @@ fn start_daemon_with_env_zero_port(
 /// (it leaked daemon identity to LAN peers under `0.0.0.0` binds).
 fn assert_daemon_pid_matches(port: u16, home: &std::path::Path, expected_pid: u32) {
     let ctl = crate::common::read_test_control_token(home);
-    let (status, body) =
-        http_get(port, "/v1/control/whoami", &[("X-Agentsso-Control", ctl.as_str())]);
+    let (status, body) = crate::common::http_request_control(
+        home,
+        port,
+        "GET",
+        "/v1/control/whoami",
+        None,
+        &[("X-Agentsso-Control", ctl.as_str())],
+    );
     assert_eq!(status, 200, "/v1/control/whoami should return 200, got {status}: {body}");
     let json: serde_json::Value = serde_json::from_str(&body)
         .unwrap_or_else(|e| panic!("/v1/control/whoami response not JSON: {e}\nbody: {body}"));
@@ -243,6 +249,7 @@ fn http_get(port: u16, path: &str, headers: &[(&str, &str)]) -> (u16, String) {
     http_request(port, "GET", path, headers, None)
 }
 
+#[allow(dead_code)] // retained for ad-hoc test additions
 fn http_post(port: u16, path: &str, body: &str, headers: &[(&str, &str)]) -> (u16, String) {
     http_request(port, "POST", path, headers, Some(body))
 }
@@ -298,11 +305,12 @@ approval-mode = "auto"
 fn register_agent(port: u16, home: &std::path::Path, name: &str, policy: &str) -> String {
     let body = serde_json::json!({"name": name, "policy_name": policy}).to_string();
     let ctl = crate::common::read_test_control_token(home);
-    let (status, resp_body) = http_post(
+    let (status, resp_body) = crate::common::http_post_control(
+        home,
         port,
         "/v1/control/agent/register",
         &body,
-        &[("X-Agentsso-Control", ctl.as_str())],
+        &[("X-Agentsso-Control", ctl.as_str()), ("Content-Type", "application/json")],
     );
     assert_eq!(status, 200, "register should succeed: {resp_body}");
     let parsed: serde_json::Value = serde_json::from_str(&resp_body).unwrap();
@@ -807,11 +815,12 @@ fn reload_clears_approval_cache() {
 
     // POST /v1/control/reload to clear the cache.
     let ctl_for_reload = crate::common::read_test_control_token(home.path());
-    let (reload_status, reload_body) = http_post(
+    let (reload_status, reload_body) = crate::common::http_post_control(
+        home.path(),
         port,
         "/v1/control/reload",
         "",
-        &[("X-Agentsso-Control", ctl_for_reload.as_str())],
+        &[("X-Agentsso-Control", ctl_for_reload.as_str()), ("Content-Type", "application/json")],
     );
     assert_eq!(reload_status, 200, "reload should succeed: {reload_body}");
 
@@ -967,11 +976,12 @@ fn approval_timeout_updates_via_sighup_without_restart() {
     // Swap the config to a 2-second timeout and hit the HTTP reload.
     std::fs::write(config_dir.join("daemon.toml"), "[approval]\ntimeout_seconds = 2\n").unwrap();
     let ctl_for_reload = crate::common::read_test_control_token(home.path());
-    let (reload_status, reload_body) = http_post(
+    let (reload_status, reload_body) = crate::common::http_post_control(
+        home.path(),
         port,
         "/v1/control/reload",
         "",
-        &[("X-Agentsso-Control", ctl_for_reload.as_str())],
+        &[("X-Agentsso-Control", ctl_for_reload.as_str()), ("Content-Type", "application/json")],
     );
     assert_eq!(reload_status, 200, "reload should succeed: {reload_body}");
 
@@ -1024,11 +1034,12 @@ fn sighup_warns_on_stale_stub_branch_after_vault_appears() {
     std::fs::create_dir_all(home.path().join("vault")).unwrap();
 
     let ctl_for_reload = crate::common::read_test_control_token(home.path());
-    let (status, body) = http_post(
+    let (status, body) = crate::common::http_post_control(
+        home.path(),
         port,
         "/v1/control/reload",
         "",
-        &[("X-Agentsso-Control", ctl_for_reload.as_str())],
+        &[("X-Agentsso-Control", ctl_for_reload.as_str()), ("Content-Type", "application/json")],
     );
     assert_eq!(status, 200, "reload should succeed: {body}");
 

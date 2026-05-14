@@ -175,7 +175,8 @@ fn control_endpoint_returns_registry() {
         panic!("daemon did not become healthy");
     }
     let ctl = crate::common::read_test_control_token(tmp.path());
-    let (status, body) = crate::common::http_request_with_headers(
+    let (status, body) = crate::common::http_request_control(
+        tmp.path(),
         port,
         "GET",
         "/v1/control/connectors",

@@ -30,15 +30,22 @@
 
 #![cfg(any(target_os = "macos", target_os = "linux", target_os = "windows"))]
 
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use zeroize::{Zeroize, Zeroizing};
 
 use crate::error::KeyStoreError;
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 use crate::{DeleteOutcome, MASTER_KEY_LEN};
 
 /// Probe the keychain backend by constructing an entry against
 /// `account` and attempting a read. Tolerates `NoEntry`; real
 /// failures surface as `BackendUnavailable`. Any retrieved bytes are
 /// zeroized immediately.
+///
+/// Linux + Windows only post-Story 7.26: macOS dispatches to its
+/// own probe in `macos::MacKeyStore::new` which targets
+/// System.keychain via `keyring::Entry::new_with_target("System", ...)`.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) fn probe_backend(backend: &'static str, account: &str) -> Result<(), KeyStoreError> {
     let entry =
         keyring::Entry::new(crate::MASTER_KEY_SERVICE, account).map_err(|e| map_err(backend, e))?;
@@ -67,6 +74,7 @@ pub(crate) fn probe_backend(backend: &'static str, account: &str) -> Result<(), 
 ///   decides whether that's a recoverable race outcome or a fatal
 ///   "set silently failed" platform error.
 /// - `Err(...)` for any non-`NoEntry` error from the keychain.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn read_after_write_with_retry(entry: &keyring::Entry) -> Result<Option<Vec<u8>>, keyring::Error> {
     read_after_write_with_retry_inner(|| entry.get_secret())
 }
@@ -76,6 +84,7 @@ fn read_after_write_with_retry(entry: &keyring::Entry) -> Result<Option<Vec<u8>>
 /// public wrapper above; tests can supply a closure that fails the
 /// first N times and then succeeds, deterministically pinning the
 /// retry behavior on every CI leg without needing a real keychain.
+#[cfg(any(target_os = "linux", target_os = "windows", test))]
 fn read_after_write_with_retry_inner<F>(
     mut get_secret: F,
 ) -> Result<Option<Vec<u8>>, keyring::Error>
@@ -129,6 +138,7 @@ where
 ///   operator hitting `errSecAuthFailed`, `Ambiguous`, etc. sees the
 ///   real cause classified through `map_err`'s normal routing
 ///   (including the macOS ACL-denial classification from Plan A).
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) fn fetch_or_create_master_key_at_account(
     backend: &'static str,
     account: &str,
@@ -203,6 +213,7 @@ pub(crate) fn fetch_or_create_master_key_at_account(
 /// Write `key` to `account`, then read-back-verify with constant-
 /// time comparison. Catches keychains that buffer writes or silently
 /// discard them on permission quirks.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) fn set_and_verify_at_account(
     backend: &'static str,
     account: &str,
@@ -240,6 +251,7 @@ pub(crate) fn set_and_verify_at_account(
 
 /// Read the key at `account` if it exists. Returns `Ok(None)` if
 /// no entry was ever written; surfaces other errors verbatim.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) fn read_account(
     backend: &'static str,
     account: &str,
@@ -259,6 +271,7 @@ pub(crate) fn read_account(
 
 /// Idempotent delete of `account`. Returns Ok regardless of whether
 /// the entry existed beforehand.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) fn clear_account(backend: &'static str, account: &str) -> Result<(), KeyStoreError> {
     let entry =
         keyring::Entry::new(crate::MASTER_KEY_SERVICE, account).map_err(|e| map_err(backend, e))?;
@@ -273,6 +286,7 @@ pub(crate) fn clear_account(backend: &'static str, account: &str) -> Result<(), 
 /// `AlreadyAbsent`. Used by `delete_master_key()` (operator-facing
 /// uninstall flow) where the caller benefits from knowing which
 /// case fired in the audit log.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 pub(crate) fn delete_account(
     backend: &'static str,
     account: &str,
@@ -287,11 +301,13 @@ pub(crate) fn delete_account(
 }
 
 /// Extract a 32-byte key from a `Vec<u8>`, validating length.
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn read_key_from_bytes(bytes: &[u8]) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyStoreError> {
     if bytes.len() != MASTER_KEY_LEN {
         return Err(KeyStoreError::MalformedMasterKey {
             expected_len: MASTER_KEY_LEN,
             actual_len: bytes.len(),
+            reason: crate::MalformedReason::BadLength,
         });
     }
     let mut key = Zeroizing::new([0u8; MASTER_KEY_LEN]);
@@ -302,6 +318,7 @@ fn read_key_from_bytes(bytes: &[u8]) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, 
 /// Constant-time byte comparison via `subtle`. Used after read-back
 /// to match the discipline expected by the rotation orchestrator
 /// (which uses `subtle` for the same purpose).
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     use subtle::ConstantTimeEq;
     a.ct_eq(b).into()

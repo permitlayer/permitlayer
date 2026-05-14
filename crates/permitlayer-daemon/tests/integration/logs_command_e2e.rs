@@ -229,8 +229,8 @@ fn logs_lines_caps_output_at_n() {
 #[test]
 fn logs_help_mentions_all_flags() {
     // Subprocess run of `agentsso logs --help` lists every flag.
-    // L8 fix: isolate env so the maintainer's real
-    // `~/.agentsso/config/daemon.toml` cannot influence the test.
+    // L8 fix: isolate env so the maintainer's real config dir
+    // cannot influence the test.
     let home = tempfile::tempdir().unwrap();
     let output = Command::new(env!("CARGO_BIN_EXE_agentsso"))
         .arg("logs")

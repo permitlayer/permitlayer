@@ -51,6 +51,14 @@ zeroize.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# Story 7.26: paths::legacy_dot_agentsso() resolves $HOME for Linux +
+# Windows defaults. macOS callers go through the new system paths
+# under /Library/Application Support/permitlayer/ (no home-dir lookup),
+# so the dep is gated off on that platform to keep the link surface
+# minimal and silence unused-dep lints.
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+dirs.workspace = true
+
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "sync", "macros", "time"] }
 walkdir.workspace = true

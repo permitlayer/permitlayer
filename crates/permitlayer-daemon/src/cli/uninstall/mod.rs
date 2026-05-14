@@ -41,8 +41,7 @@ use crate::design::render;
 use crate::design::terminal::ColorSupport;
 use crate::lifecycle::autostart::{self, AutostartError, AutostartStatus, DisableOutcome};
 use permitlayer_keystore::{
-    AclBreakRecoveryMode, DeleteOutcome, FallbackMode, KeyStoreError, KeystoreConfig,
-    default_keystore,
+    DeleteOutcome, FallbackMode, KeyStoreError, KeystoreConfig, default_keystore,
 };
 
 /// Binary-path resolver and `BinaryRemover` abstraction.
@@ -291,6 +290,23 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
     print_step(&g, &keystore_outcome);
     outcomes.push(keystore_outcome);
 
+    // Story 7.26 code-review round 3 (P12): the rc.21 → rc.22 macOS
+    // upgrade may leave an `io.permitlayer.master-key` entry in the
+    // unprivileged user's login.keychain. The pre-confirm manifest
+    // already warns about this, but operators using `--yes` (CI,
+    // scripted flows) never see the manifest. Mirror the warning on
+    // stderr so the canonical scripted path also surfaces it.
+    #[cfg(target_os = "macos")]
+    {
+        eprintln!(
+            "{} note: legacy rc.21 keychain entry, if present, is NOT removed by this uninstall.\n    \
+             To remove it, run as your unprivileged user (NOT via sudo):\n      \
+             security delete-generic-password -s io.permitlayer.master-key -a {}",
+            g.arrow,
+            permitlayer_keystore::MASTER_KEY_ACCOUNT,
+        );
+    }
+
     // 4. Remove the data dir (or just keystore/ + pid on --keep-data).
     let data_outcome = remove_data_dir_warn_on_fail(&home, args.keep_data);
     print_step(&g, &data_outcome);
@@ -362,8 +378,36 @@ fn build_prompt_manifest(
         ));
     }
 
-    // Keychain line — always.
-    out.push_str("  • the OS keychain master-key entry (io.permitlayer.master-key / master)\n");
+    // Keychain line — always. Service id renamed on macOS in Story
+    // 7.26 (io.permitlayer.master-key → dev.permitlayer.master-key)
+    // per the rc.22 macOS LaunchDaemon redesign convention; Linux +
+    // Windows retain the legacy name.
+    out.push_str(&format!(
+        "  • the OS keychain master-key entry ({} / {})\n",
+        permitlayer_keystore::MASTER_KEY_SERVICE,
+        permitlayer_keystore::MASTER_KEY_ACCOUNT
+    ));
+
+    // Story 7.26 code-review round 2 (R2): on macOS, rc.21 → rc.22
+    // upgraders carry a legacy `io.permitlayer.master-key` entry in
+    // their unprivileged user's login.keychain. Uninstall runs under
+    // `sudo` per the rc.22 install banner — the effective uid is
+    // root, and `keyring`'s default-target API resolves to root's
+    // login.keychain, not the operator's. A best-effort programmatic
+    // sweep from inside uninstall would be a silent no-op in the
+    // canonical flow. Surface the cleanup command operators can run
+    // as their unprivileged user instead. Round-3 (P12) also mirrors
+    // this to stderr in the closing flow so `--yes` runs see it.
+    #[cfg(target_os = "macos")]
+    {
+        out.push_str(&format!(
+            "  • (note) if you upgraded from rc.21 or earlier, an orphan entry may remain\n    \
+             in your user login.keychain at `io.permitlayer.master-key / {account}`.\n    \
+             To remove it, run as your unprivileged user (NOT via sudo):\n      \
+             security delete-generic-password -s io.permitlayer.master-key -a {account}\n",
+            account = permitlayer_keystore::MASTER_KEY_ACCOUNT,
+        ));
+    }
 
     // Autostart line.
     // P20 (review): distinguish "Disabled" (status query succeeded,
@@ -691,11 +735,6 @@ async fn delete_keychain_entry_warn_on_fail(home: &Path) -> StepOutcome {
         // native backend; treat backend-unavailable as warn-and-continue.
         fallback: FallbackMode::None,
         home: home.to_path_buf(),
-        // Story 7.22: explicit `Disabled` so any future change to the
-        // wrapping rules cannot accidentally route uninstall into
-        // boot-only auto-rekey. Uninstall must never auto-rekey — it's
-        // tearing the install down.
-        acl_break_recovery: AclBreakRecoveryMode::Disabled,
     };
     let keystore = match default_keystore(&config) {
         Ok(k) => k,
@@ -745,10 +784,22 @@ async fn delete_keychain_entry_warn_on_fail(home: &Path) -> StepOutcome {
         }
     };
 
+    // Story 7.26 code-review round 2 (R2): the previous round's P11
+    // programmatic sweep of the legacy rc.21 `io.permitlayer.master-key`
+    // login.keychain entry was removed — it targeted root's keychain
+    // under the canonical `sudo agentsso service uninstall` flow and
+    // was a silent no-op in the case it was meant to clean up. The
+    // operator-facing guidance now lives in `build_prompt_manifest`
+    // (see the rc.21-orphan note appended on macOS) which tells the
+    // operator the exact command to run as their unprivileged user.
     match keystore.delete_master_key().await {
         Ok(DeleteOutcome::Removed) => StepOutcome::Done {
             step: "removing keychain entry",
-            detail: "io.permitlayer.master-key / master removed".to_owned(),
+            detail: format!(
+                "{} / {} removed",
+                permitlayer_keystore::MASTER_KEY_SERVICE,
+                permitlayer_keystore::MASTER_KEY_ACCOUNT
+            ),
         },
         Ok(DeleteOutcome::AlreadyAbsent) => StepOutcome::Done {
             step: "removing keychain entry",
@@ -1144,7 +1195,11 @@ mod tests {
         assert!(out.contains("This will remove:"));
         assert!(out.contains("the agentsso binary at /usr/local/bin/agentsso"));
         assert!(out.contains("/home/maya/.agentsso/ (vault, audit log, policies"));
-        assert!(out.contains("io.permitlayer.master-key / master"));
+        assert!(out.contains(&format!(
+            "{} / {}",
+            permitlayer_keystore::MASTER_KEY_SERVICE,
+            permitlayer_keystore::MASTER_KEY_ACCOUNT
+        )));
         assert!(out.contains("autostart at login (systemd-user)"));
     }
 

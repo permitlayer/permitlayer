@@ -16,8 +16,6 @@
 //!   that guarantees `finish_and_clear()` even on panic.
 //! - [`build_teal_theme`] — accent-color `dialoguer::ColorfulTheme`
 //!   that matches the rest of the CLI design system.
-//! - [`check_vault_dir_writable`] — symlink-rejecting + 0o700-tightening
-//!   probe used before any vault write. Story 2.7 invariants preserved.
 //! - [`OAuthErrorSeverity`] + [`render_oauth_error`] — surface
 //!   `OAuthError::remediation_owned()` (Story 7.12) into either the
 //!   design-system error block (interactive) or structured tracing
@@ -27,7 +25,6 @@
 //!   prefetch.
 
 use std::io::Write as _;
-use std::path::Path;
 
 use permitlayer_oauth::error::OAuthError;
 
@@ -72,49 +69,6 @@ pub(crate) fn build_teal_theme(theme: &Theme) -> dialoguer::theme::ColorfulTheme
         values_style: console::Style::new().for_stderr().color256(accent_256),
         ..dialoguer::theme::ColorfulTheme::default()
     }
-}
-
-/// Verify that the vault directory exists (or can be created) and is
-/// writable, with the same security invariants `cli::setup` enforced
-/// (no symlinks, 0o700 perms on Unix, sentinel-file probe).
-///
-/// 1. **Symlink rejection**: refuses to operate on a vault directory
-///    that exists as a symlink — protects against attacker-planted
-///    redirects on multi-user hosts.
-/// 2. **`0o700` tightening on Unix**: closes the umask-induced
-///    enumeration window between dir creation and the first credential
-///    write.
-/// 3. **Sentinel-file probe**: `create_dir_all` proves the directory
-///    exists, not that this process can write to it. The probe catches
-///    read-only bind mounts and cross-user perms before the OAuth
-///    browser flow opens.
-pub(crate) fn check_vault_dir_writable(vault_dir: &Path) -> std::io::Result<()> {
-    match std::fs::symlink_metadata(vault_dir) {
-        Ok(md) if md.file_type().is_symlink() => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "vault_dir is a symlink: {} — refusing to follow it for security reasons",
-                    vault_dir.display()
-                ),
-            ));
-        }
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(e) => return Err(e),
-    }
-    std::fs::create_dir_all(vault_dir)?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let perms = std::fs::Permissions::from_mode(0o700);
-        std::fs::set_permissions(vault_dir, perms)?;
-    }
-    let probe_path = vault_dir.join(".permitlayer-writability-probe");
-    let file = std::fs::File::create(&probe_path)?;
-    drop(file);
-    let _ = std::fs::remove_file(&probe_path);
-    Ok(())
 }
 
 /// Severity of an `OAuthError` for the non-interactive tracing-log
@@ -307,41 +261,5 @@ mod tests {
             assert!(!spinner.is_finished());
         }
         assert!(spinner.is_finished(), "SpinnerGuard::drop should finish the spinner");
-    }
-
-    #[test]
-    fn check_vault_dir_writable_creates_missing_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let vault_dir = tmp.path().join("vault");
-        assert!(!vault_dir.exists());
-        check_vault_dir_writable(&vault_dir).expect("helper should succeed");
-        assert!(vault_dir.exists());
-        assert!(vault_dir.is_dir());
-        assert!(!vault_dir.join(".permitlayer-writability-probe").exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn check_vault_dir_writable_sets_0o700_on_created_dir() {
-        use std::os::unix::fs::PermissionsExt;
-        let tmp = tempfile::tempdir().unwrap();
-        let vault_dir = tmp.path().join("vault");
-        check_vault_dir_writable(&vault_dir).expect("helper should succeed");
-        let mode = std::fs::metadata(&vault_dir).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o700);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn check_vault_dir_writable_rejects_symlink() {
-        use std::os::unix::fs::symlink;
-        let tmp = tempfile::tempdir().unwrap();
-        let target = tmp.path().join("target");
-        std::fs::create_dir_all(&target).unwrap();
-        let vault_dir = tmp.path().join("vault");
-        symlink(&target, &vault_dir).unwrap();
-        let err = check_vault_dir_writable(&vault_dir).unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
-        assert!(err.to_string().contains("symlink"));
     }
 }

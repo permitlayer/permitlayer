@@ -47,6 +47,13 @@ const MECHANISM: &str = "task-scheduler";
 /// the embedded daemon path back out (mirrors macOS plist + Linux unit
 /// patterns; lets Story 7.5 detect post-upgrade path drift).
 pub(crate) fn xml_record_path(home: &Path) -> PathBuf {
+    // Story 7.26 code-review round 2 (R1): this site receives the user's
+    // home directory (from `autostart::home_dir()`, which returns
+    // `dirs::home_dir()` — NOT a state-dir root). Routing through
+    // `paths::daemon_state_dir(Some(home))` would drop the `.agentsso`
+    // segment in production. Per-user Task Scheduler artifacts stay
+    // anchored to the user's home dir and are intentionally exempt
+    // from the centralized path module.
     home.join(".agentsso").join("autostart").join("task-scheduler.xml")
 }
 

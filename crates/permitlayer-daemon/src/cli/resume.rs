@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::cli::kill::{
-    error_block_daemon_unreachable, error_block_protocol_error, http_get, http_post_empty_json,
-    load_daemon_config_or_default_with_warn,
+    error_block_daemon_unreachable_endpoint, error_block_protocol_error, http_get_via,
+    http_post_empty_json_via, load_daemon_config_or_default_with_warn, resolve_control_endpoint,
 };
 use crate::design::kill_banner::{
     DeactivationSummaryView, ResumeBannerInputs, render_resume_banner,
@@ -40,17 +40,17 @@ pub async fn run(_args: ResumeArgs) -> Result<()> {
     // `error_block_daemon_unreachable` handles the genuine "no daemon"
     // case below.
 
-    let bind_addr = config.http.bind_addr;
+    let endpoint = resolve_control_endpoint(&config);
     let token = crate::cli::kill::read_control_token(&home);
 
     // 1. GET /v1/control/state to capture `activated_at` (for
     //    `duration_killed` in the banner) AND short-circuit when the
     //    daemon is already running (cheaper idempotent path).
-    let state_body = match http_get(bind_addr, "/v1/control/state", token.as_deref()).await {
+    let state_body = match http_get_via(&endpoint, "/v1/control/state", token.as_deref()).await {
         Ok(b) => b,
         Err(e) => {
-            tracing::debug!(error = %e, addr = %bind_addr, "state probe failed during resume");
-            eprint!("{}", error_block_daemon_unreachable("resume", bind_addr));
+            tracing::debug!(error = %e, endpoint = %endpoint, "state probe failed during resume");
+            eprint!("{}", error_block_daemon_unreachable_endpoint("resume", &endpoint));
             std::process::exit(3);
         }
     };
@@ -75,11 +75,11 @@ pub async fn run(_args: ResumeArgs) -> Result<()> {
     //    idempotency). We rely on its returned `was_already_inactive` flag
     //    as the canonical answer rather than the pre-probe reading.
     let resume_body =
-        match http_post_empty_json(bind_addr, "/v1/control/resume", token.as_deref()).await {
+        match http_post_empty_json_via(&endpoint, "/v1/control/resume", token.as_deref()).await {
             Ok(b) => b,
             Err(e) => {
-                tracing::debug!(error = %e, addr = %bind_addr, "resume request failed");
-                eprint!("{}", error_block_daemon_unreachable("resume", bind_addr));
+                tracing::debug!(error = %e, endpoint = %endpoint, "resume request failed");
+                eprint!("{}", error_block_daemon_unreachable_endpoint("resume", &endpoint));
                 std::process::exit(3);
             }
         };

@@ -1,0 +1,29 @@
+[package]
+name = "permitlayer-platform-macos"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "macOS-specific platform integration (UDS+peercred, renameatx_np, System.keychain helpers). Carries unsafe FFI; deliberately NOT under #![forbid(unsafe_code)]."
+
+[dependencies]
+thiserror.workspace = true
+
+# Target-gated macOS deps for the FFI wrappers landed in Story 7.27.
+# `libc` for the `renameatx_np` extern + AT_FDCWD/RENAME_EXCL/SOL_LOCAL
+# constants; `nix` for the safe-API socketpair test seam (sockets
+# feature). `tokio` (net + io-util) for the `UnixStream` integration
+# in `peer_cred::peer_uid_from_unix_stream`.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+nix = { version = "0.29", features = ["socket"] }
+tokio = { workspace = true, features = ["net", "io-util"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

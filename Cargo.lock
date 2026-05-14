@@ -1833,6 +1833,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
+name = "memoffset"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "488016bfae457b036d996092f6cb448677611ce4449e970ceaf42695203f218a"
+dependencies = [
+ "autocfg",
+]
+
+[[package]]
 name = "mime"
 version = "0.3.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1913,6 +1922,7 @@ dependencies = [
  "cfg-if",
  "cfg_aliases",
  "libc",
+ "memoffset",
 ]
 
 [[package]]
@@ -2124,14 +2134,14 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 
 [[package]]
 name = "permitlayer-connectors"
-version = "0.3.0-rc.21"
+version = "0.3.0-rc.22"
 dependencies = [
  "thiserror 2.0.18",
 ]
 
 [[package]]
 name = "permitlayer-core"
-version = "0.3.0-rc.21"
+version = "0.3.0-rc.22"
 dependencies = [
  "aho-corasick",
  "arc-swap",
@@ -2139,6 +2149,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "criterion",
+ "dirs",
  "fs4",
  "hmac",
  "insta",
@@ -2164,7 +2175,7 @@ dependencies = [
 
 [[package]]
 name = "permitlayer-credential"
-version = "0.3.0-rc.21"
+version = "0.3.0-rc.22"
 dependencies = [
  "serde",
  "static_assertions",
@@ -2174,7 +2185,7 @@ dependencies = [
 
 [[package]]
 name = "permitlayer-daemon"
-version = "0.3.0-rc.21"
+version = "0.3.0-rc.22"
 dependencies = [
  "anyhow",
  "arc-swap",
@@ -2191,6 +2202,7 @@ dependencies = [
  "figment",
  "flate2",
  "hkdf",
+ "hmac",
  "http-body-util",
  "indicatif",
  "insta",
@@ -2204,6 +2216,7 @@ dependencies = [
  "permitlayer-credential",
  "permitlayer-keystore",
  "permitlayer-oauth",
+ "permitlayer-platform-macos",
  "permitlayer-plugins",
  "permitlayer-proxy",
  "permitlayer-vault",
@@ -2235,34 +2248,34 @@ dependencies = [
 
 [[package]]
 name = "permitlayer-keystore"
-version = "0.3.0-rc.21"
+version = "0.3.0-rc.22"
 dependencies = [
  "argon2",
  "async-trait",
- "core-foundation 0.10.1",
- "core-foundation-sys",
  "hmac",
  "keyring",
  "libc",
+ "nix",
  "rand 0.8.5",
  "rpassword",
  "security-framework 3.7.0",
- "security-framework-sys",
  "sha2",
  "subtle",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tracing",
  "walkdir",
  "zeroize",
 ]
 
 [[package]]
 name = "permitlayer-oauth"
-version = "0.3.0-rc.21"
+version = "0.3.0-rc.22"
 dependencies = [
  "axum",
  "mockito",
+ "nix",
  "oauth2",
  "open",
  "permitlayer-credential",
@@ -2280,8 +2293,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "permitlayer-platform-macos"
+version = "0.3.0-rc.22"
+dependencies = [
+ "libc",
+ "nix",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "permitlayer-plugins"
-version = "0.3.0-rc.21"
+version = "0.3.0-rc.22"
 dependencies = [
  "arc-swap",
  "chrono",
@@ -2303,7 +2327,7 @@ dependencies = [
 
 [[package]]
 name = "permitlayer-proxy"
-version = "0.3.0-rc.21"
+version = "0.3.0-rc.22"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -2346,7 +2370,7 @@ dependencies = [
 
 [[package]]
 name = "permitlayer-vault"
-version = "0.3.0-rc.21"
+version = "0.3.0-rc.22"
 dependencies = [
  "aes-gcm",
  "hkdf",
@@ -4660,7 +4684,7 @@ dependencies = [
 
 [[package]]
 name = "xtask"
-version = "0.3.0-rc.21"
+version = "0.3.0-rc.22"
 dependencies = [
  "anyhow",
  "clap",
@@ -4750,6 +4774,7 @@ version = "1.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b97154e67e32c85465826e8bcc1c59429aaaf107c1e4a9e53c8d8ccd5eff88d0"
 dependencies = [
+ "serde",
  "zeroize_derive",
 ]
 

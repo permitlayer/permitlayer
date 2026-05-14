@@ -2,26 +2,38 @@
     <<~EOS
       permitlayer is installed. To get started:
 
-          1. Create a Desktop OAuth client at
-             https://console.cloud.google.com/apis/credentials and
-             download the JSON ("client_secret_XXXX.json").
-          2. Connect a service, pointing at that JSON:
+      1. Set up the system service (one-time, per machine):
 
-                 agentsso connect gmail --oauth-client ./client_secret.json --agent <name>
+             sudo agentsso service install
 
-             For SSH-from-another-machine, add --headless. The bare
-             `agentsso connect gmail` will interactively prompt for the
-             file path if you forget the flag.
+         macOS will display a "Background item added" notification. If
+         the daemon doesn't appear running, check
+         System Settings → General → Login Items → Allow in the Background.
 
-      Start the daemon yourself:
+      2. From your end-user account, register an agent and mint a
+         bearer token:
 
-          agentsso start
+             agentsso agent register <name> --policy <policy-name>
 
-      Enable login-autostart so the daemon comes up automatically at
-      login (Story 7.16: SSH-friendly — no GUI session required, works
-      over SSH on macOS 13+):
+         The token is written to ~/.agentsso/agent-bearer.token and is
+         the credential your MCP client (OpenClaw / Claude Desktop /
+         Cursor) authenticates with.
 
-          agentsso autostart enable
+      3. Connect a service. Create a Desktop OAuth client at
+         https://console.cloud.google.com/apis/credentials, download
+         the JSON, and run:
+
+             agentsso connect gmail --oauth-client ./client_secret.json --agent <name>
+
+         For SSH-from-another-machine, add --headless.
+
+      Verify the daemon is up:
+
+          agentsso service status
+
+      Daemon logs:
+
+          /Library/Logs/permitlayer/daemon.log
 
       Docs: https://github.com/permitlayer/permitlayer
     EOS

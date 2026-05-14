@@ -61,11 +61,11 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use arc_swap::ArcSwap;
 use axum::Json;
 use axum::Router;
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Path, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use permitlayer_core::agent::{
     AgentIdentity, AgentRegistry, BEARER_TOKEN_PREFIX, LOOKUP_KEY_BYTES, compute_lookup_key,
@@ -76,7 +76,7 @@ use permitlayer_core::killswitch::{
     ActivationSummary, DeactivationSummary, KillReason, KillSwitch,
 };
 use permitlayer_core::policy::PolicySet;
-use permitlayer_core::store::AgentIdentityStore;
+use permitlayer_core::store::{AgentIdentityStore, CredentialStore};
 
 /// Lightweight state for the control router.
 ///
@@ -95,6 +95,10 @@ pub(crate) struct ControlState {
     pub policy_set: Arc<ArcSwap<PolicySet>>,
     pub policies_dir: std::path::PathBuf,
     pub reload_mutex: Arc<std::sync::Mutex<()>>,
+    /// Serializes policy-scope edits before the reload step. The
+    /// underlying file edit is a read/modify/write operation and the
+    /// editor deliberately does not own process-wide locking.
+    pub policy_edit_mutex: Arc<tokio::sync::Mutex<()>>,
     /// Story 4.4: registry handle for the bearer-token lookup index.
     /// Required so the register/remove handlers can `replace_with(...)`
     /// after a successful CRUD operation.
@@ -192,6 +196,32 @@ pub(crate) struct ControlState {
     /// Story 8.7 AC #4: vault directory path to consult when the
     /// stub-active flag fires. Typically `{config.paths.home}/vault`.
     pub vault_dir: PathBuf,
+    /// Story 7.30 AC #11: vault used by the credentials-seal /
+    /// credentials-verify handlers. Constructed at boot from the
+    /// eagerly-bootstrapped master key (see `cli/start.rs`). Shared
+    /// via `Arc` with the proxy service so both sides see the same
+    /// `active_key_id` and refresh-rotation seals stay consistent.
+    pub vault: Arc<permitlayer_vault::Vault>,
+    /// Story 7.30 AC #11 + Round-1 review P2: per-service seal lock
+    /// map. Concurrent seals against the same service serialize on
+    /// the per-service `Arc<Mutex<()>>`; seals against disjoint
+    /// services (e.g., gmail + drive) run in parallel.
+    ///
+    /// Map access is guarded by `std::sync::Mutex` because the
+    /// critical section is "insert-if-missing then clone the Arc" —
+    /// pure CPU with no `.await`. The per-service inner mutex is
+    /// `tokio::sync::Mutex` because it's held across
+    /// `vault.seal` + `store.put` + `write_metadata_atomic` await
+    /// points.
+    pub credentials_seal_locks:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Round-1 review P7: cap concurrent seal operations across all
+    /// services. Mirrors `agent_crud_semaphore`. Without this, a
+    /// loopback caller can flood the seal handler — each call holds a
+    /// per-service mutex + does blocking disk I/O + AEAD seal —
+    /// exhausting the blocking thread pool and starving other control
+    /// endpoints that share the runtime.
+    pub credentials_seal_semaphore: Arc<tokio::sync::Semaphore>,
     /// Operator authentication token for `/v1/control/*` endpoints.
     /// The middleware layer at the router level (`require_control_token`)
     /// reads `X-Agentsso-Control` from each inbound request and
@@ -212,6 +242,13 @@ pub(crate) struct ControlState {
 /// remaining workers free for the rest of the daemon. See Story 4.4
 /// code-review HIGH finding "No rate limit on `register_agent_handler`."
 pub(crate) const AGENT_CRUD_MAX_CONCURRENT: usize = 4;
+
+/// Story 7.30 Round-1 review P7: cap on concurrent
+/// credentials-seal operations. Each seal does AES-GCM seal (CPU) +
+/// two `store.put` writes (blocking I/O) + `write_metadata_atomic`
+/// (blocking I/O). 4 concurrent seals match the agent CRUD ceiling
+/// and leave blocking-pool capacity for the rest of the daemon.
+pub(crate) const CREDENTIALS_SEAL_MAX_CONCURRENT: usize = 4;
 
 /// Daemon-side mirror of `permitlayer_core::killswitch::ActivationSummary`
 /// that serializes `activated_at` as an RFC 3339 string with millisecond
@@ -444,6 +481,77 @@ fn require_loopback(peer: SocketAddr) -> Result<(), ControlError> {
     }
 }
 
+/// Story 7.27 AC #1 (review fix): enrich an `AuditEvent.extra` JSON
+/// object with the kernel-attested peer UID + GID from the request's
+/// `Extension<PeerCredentials>`. No-op when the request has no
+/// `PeerCredentials` extension (TCP control routes in dev/test mode,
+/// non-macOS platforms) — those audit events stay schema-compatible
+/// with rc.21.
+///
+/// Callers pass `req.extensions()`; the helper looks up
+/// `PeerCredentials` and, when present, inserts `peer_uid` +
+/// `peer_gid` keys into the JSON object. The `extra` value MUST be a
+/// JSON object (`serde_json::Value::Object`) — every existing audit
+/// emit site in this file uses `serde_json::json!({ ... })` which
+/// produces an object, so this contract is upheld in practice.
+pub(crate) fn enrich_audit_extra_with_peer(
+    extra: &mut serde_json::Value,
+    extensions: &axum::http::Extensions,
+) {
+    let Some(creds) = extensions.get::<crate::server::PeerCredentials>() else {
+        return;
+    };
+    enrich_audit_extra_with_peer_creds(extra, Some(*creds));
+}
+
+/// Variant of [`enrich_audit_extra_with_peer`] that takes the
+/// captured creds directly. Use in handlers that consume `req` via
+/// `into_parts()` before the audit emit — snapshot the creds at the
+/// top of the handler, then call this helper at each emit site.
+pub(crate) fn enrich_audit_extra_with_peer_creds(
+    extra: &mut serde_json::Value,
+    creds: Option<crate::server::PeerCredentials>,
+) {
+    let Some(creds) = creds else { return };
+    if creds.uid == u32::MAX {
+        return;
+    }
+    // Story 7.27 Round-2 review fix (P2): upgrade `Value::Null`
+    // to an empty object so freshly-constructed `AuditEvent::new(...)`
+    // events (whose `extra` defaults to `Value::Null`) still
+    // receive peer-cred enrichment. Pre-fix, the helper silently
+    // returned for non-Object values — a future contributor
+    // forgetting to set `event.extra = serde_json::json!({...})`
+    // before calling this would lose peer attribution without any
+    // warning. `debug_assert!` catches non-object non-null values
+    // in test builds; release builds log via tracing::warn so
+    // operators see the contract violation in the field.
+    if extra.is_null() {
+        *extra = serde_json::json!({});
+    }
+    let Some(obj) = extra.as_object_mut() else {
+        debug_assert!(
+            false,
+            "enrich_audit_extra_with_peer_creds called with non-object `extra`: {extra:?}"
+        );
+        tracing::warn!(
+            target: "control",
+            extra = %extra,
+            "enrich_audit_extra_with_peer_creds called with non-object `extra`; \
+             peer-cred attribution dropped — fix the caller to pass a JSON object"
+        );
+        return;
+    };
+    // Round-3 review fix (R3-C3-P4): `entry(...).or_insert(...)` instead
+    // of `insert(...)` so the helper is additive-only. Several handlers
+    // (register, remove, rebind) already set `peer_uid`/`peer_gid`
+    // explicitly in their `event.extra = serde_json::json!({...})` AND
+    // call this helper afterward. The previous `insert` form clobbered
+    // the explicit values silently; `or_insert` preserves them.
+    obj.entry("peer_uid".to_owned()).or_insert_with(|| serde_json::json!(creds.uid));
+    obj.entry("peer_gid".to_owned()).or_insert_with(|| serde_json::json!(creds.gid));
+}
+
 /// Header name carried by the CLI to authenticate against
 /// `/v1/control/*`. Distinct from `Authorization: Bearer <agt_v2_*>`
 /// (the agent-identity tokens used by /mcp/* and /v1/tools/*) so the
@@ -466,6 +574,54 @@ const CONTROL_TOKEN_HEADER: &str = "x-agentsso-control";
 /// defense in depth (`subtle::ConstantTimeEq`); the primary security
 /// boundary is the `0o600` mode on `<home>/control.token`. See the
 /// module-level doc on `ControlToken` for the full threat model.
+/// Resolve `PERMITLAYER_OPERATOR_UID` once at first use; return `None`
+/// if unset or malformed.
+///
+/// Story 7.27 Round-2 review fix (P1): pre-fix, `require_control_token`
+/// called `std::env::var("PERMITLAYER_OPERATOR_UID")` on every
+/// authenticated request — which (a) serializes through the global
+/// env mutex on every request and (b) silently disables the
+/// identity-mismatch check when an admin `setenv`s the variable
+/// away. Reading once into a `OnceLock` at first-touch:
+///   - amortizes the env-var lookup
+///   - documents intent (env-var is a boot-time invariant, not a
+///     runtime knob)
+///   - emits a structured `WARN` audit-event surface at first-touch
+///     if the env-var is missing or malformed, so operators know
+///     the supplementary check is degraded.
+fn operator_uid() -> Option<u32> {
+    use std::sync::OnceLock;
+    static OPERATOR_UID: OnceLock<Option<u32>> = OnceLock::new();
+    *OPERATOR_UID.get_or_init(|| {
+        let raw = std::env::var("PERMITLAYER_OPERATOR_UID").ok();
+        match raw.as_deref().map(str::trim) {
+            None => {
+                tracing::warn!(
+                    event = "control.operator_uid_missing",
+                    "PERMITLAYER_OPERATOR_UID is not set; the supplementary \
+                     kernel-attested-UID match against the operator-secret \
+                     bearer-token is disabled. Set this in the LaunchDaemon \
+                     plist (`<key>EnvironmentVariables</key>`) to enable it."
+                );
+                None
+            }
+            Some(s) => match s.parse::<u32>() {
+                Ok(uid) => Some(uid),
+                Err(e) => {
+                    tracing::warn!(
+                        event = "control.operator_uid_malformed",
+                        raw = %s,
+                        error = %e,
+                        "PERMITLAYER_OPERATOR_UID is set but not a valid u32; \
+                         the supplementary UID-match check is disabled."
+                    );
+                    None
+                }
+            },
+        }
+    })
+}
+
 pub(crate) async fn require_control_token(
     State(state): State<ControlState>,
     req: axum::extract::Request,
@@ -501,6 +657,147 @@ pub(crate) async fn require_control_token(
         );
         return ControlError::ForbiddenInvalidControlToken.into_response();
     }
+
+    // Story 7.27 AC #15 (review fix): identity-mismatch detection.
+    // The bearer-token (X-Agentsso-Control) is an operator-shared
+    // secret. The kernel-attested peer UID identifies WHO is calling.
+    // When PERMITLAYER_OPERATOR_UID is set (installed-as-LaunchDaemon
+    // mode) AND the peer UID disagrees, log a WARN audit event but
+    // DO NOT reject — the operator-secret IS the auth credential in
+    // rc.22; the UID check is a supplementary forensics signal that
+    // catches the case where a non-operator user on the Mac has
+    // gained access to the operator-secret.
+    //
+    // Story 7.27 Round-2 review fix (P1): also enrich the
+    // current tracing span with `peer_uid`/`peer_gid` here. The
+    // outer `record_peer_credentials_layer` runs ABOVE the
+    // `RequestTraceLayer` (axum layer order is outer-runs-first),
+    // so its `Span::current().record(...)` calls hit the ambient
+    // daemon span — which doesn't declare `peer_uid`/`peer_gid`
+    // as fields, making the record a documented no-op. By moving
+    // the recording here (inside `require_control_token`, which
+    // runs INSIDE `RequestTraceLayer`'s `info_span!("request")`),
+    // and by declaring `peer_uid` / `peer_gid` as `Empty` fields
+    // in the request-span macro, the values now reach the
+    // tracing surface for grep-correlation.
+    if let Some(creds) = req.extensions().get::<crate::server::PeerCredentials>().copied() {
+        tracing::Span::current().record("peer_uid", creds.uid);
+        tracing::Span::current().record("peer_gid", creds.gid);
+    }
+    if let Some(creds) = req.extensions().get::<crate::server::PeerCredentials>().copied()
+        && let Some(expected_uid) = operator_uid()
+        && creds.uid != u32::MAX
+        && creds.uid != expected_uid
+    {
+        let path = req.uri().path().to_owned();
+        tracing::warn!(
+            target: "control",
+            path = %path,
+            peer_uid = creds.uid,
+            peer_gid = creds.gid,
+            operator_uid = expected_uid,
+            "control.identity_mismatch: peer UID differs from operator UID",
+        );
+        if let Some(store) = &state.audit_store {
+            let mut event = AuditEvent::new(
+                "system".to_owned(),
+                "permitlayer".to_owned(),
+                "-".to_owned(),
+                "control-plane".to_owned(),
+                "warn".to_owned(),
+                "control.identity_mismatch".to_owned(),
+            );
+            event.extra = serde_json::json!({
+                "peer_uid": creds.uid,
+                "peer_gid": creds.gid,
+                "operator_uid": expected_uid,
+                "route": path,
+            });
+            if let Err(e) = store.append(event).await {
+                tracing::warn!(
+                    target: "control",
+                    error = %e,
+                    "control.identity_mismatch audit write failed",
+                );
+            }
+        }
+    }
+
+    // Story 7.27 AC #1 (review fix): emit a per-request audit event
+    // for every authenticated /v1/control/* request, carrying the
+    // kernel-attested peer_uid + peer_gid. This gives universal
+    // audit coverage for inspection handlers (whoami, list-agents,
+    // state, connections, connectors, reload) that don't emit
+    // domain-specific events of their own. Handlers that DO emit
+    // their own domain event (kill, resume, register, remove,
+    // rebind) get this as a request-level breadcrumb plus the
+    // domain event with the same request_id — the two correlate
+    // via the request_id field.
+    //
+    // Round-3 review fix (R3-C3-P3): `tokio::spawn` the audit-append
+    // so the handler does NOT block on the audit store. The Round-2
+    // patch wrapped the append in `tokio::time::timeout(5s, …)`
+    // inline before `next.run(req).await`, which meant a slow store
+    // serialized every authenticated request behind one append. The
+    // spawned task holds an `Arc` clone of the audit store, runs the
+    // same 5s-timeout discipline, and logs `WARN` on failure or
+    // timeout — best-effort semantics preserved; latency restored.
+    //
+    // Round-3 review fix (R3-C3-P5): outcome field is
+    // `"authenticated"` (not `"ok"`) because this emit fires BEFORE
+    // the handler runs. `"ok"` would silently contradict downstream
+    // 4xx/5xx / rate-limit responses; `"authenticated"` is neutral
+    // and accurate (bearer-token + peer-cred check passed).
+    if let Some(store) = &state.audit_store {
+        let creds = req.extensions().get::<crate::server::PeerCredentials>().copied();
+        let request_id = req
+            .extensions()
+            .get::<permitlayer_proxy::error::RequestId>()
+            .map(|r| r.0.clone())
+            .unwrap_or_else(|| ulid::Ulid::new().to_string());
+        let path = req.uri().path().to_owned();
+        let method = req.method().to_string();
+        let mut event = AuditEvent::with_request_id(
+            request_id,
+            "system".to_owned(),
+            "permitlayer".to_owned(),
+            "-".to_owned(),
+            "control-plane".to_owned(),
+            "authenticated".to_owned(),
+            "control-request-authenticated".to_owned(),
+        );
+        let mut extra = serde_json::json!({ "method": method, "path": path });
+        if let Some(c) = creds
+            && c.uid != u32::MAX
+            && let Some(obj) = extra.as_object_mut()
+        {
+            obj.insert("peer_uid".to_owned(), serde_json::json!(c.uid));
+            obj.insert("peer_gid".to_owned(), serde_json::json!(c.gid));
+        }
+        event.extra = extra;
+        let store = std::sync::Arc::clone(store);
+        tokio::spawn(async move {
+            const AUDIT_APPEND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+            match tokio::time::timeout(AUDIT_APPEND_TIMEOUT, store.append(event)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!(
+                        target: "control",
+                        error = %e,
+                        "control-request audit write failed (best-effort)",
+                    );
+                }
+                Err(_elapsed) => {
+                    tracing::warn!(
+                        target: "control",
+                        "control-request audit write timed out after 5s; \
+                         event dropped (best-effort)",
+                    );
+                }
+            }
+        });
+    }
+
     next.run(req).await
 }
 
@@ -573,6 +870,7 @@ pub(crate) async fn kill_handler(
             "in_flight_cancelled": 0,
             "was_already_active": summary.was_already_active,
         });
+        enrich_audit_extra_with_peer(&mut event.extra, req.extensions());
         if let Err(e) = store.append(event).await {
             tracing::warn!(
                 target: "control",
@@ -670,6 +968,7 @@ pub(crate) async fn resume_handler(
             "duration_killed_seconds": duration_killed_seconds,
             "was_already_inactive": summary.was_already_inactive,
         });
+        enrich_audit_extra_with_peer(&mut event.extra, req.extensions());
         if let Err(e) = store.append(event).await {
             tracing::warn!(
                 target: "control",
@@ -1113,6 +1412,34 @@ pub(crate) struct RegisterAgentResponse {
     pub policy_name: String,
     pub bearer_token: String,
     pub created_at: String,
+    /// Story 7.27 AC #8: when the request came over the UDS
+    /// control listener, the daemon writes the plaintext bearer
+    /// token to `<home>/.agentsso/agent-bearer.token`. If that
+    /// write fails (e.g., parent dir is a symlink), the agent is
+    /// still registered successfully — this field carries the
+    /// per-user-file failure message so the calling CLI can
+    /// surface a partial-success warning to the operator. `None`
+    /// on the happy path AND on TCP-served requests (which don't
+    /// have a kernel-attested peer to write the file for).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer_token_file: Option<BearerTokenFileWriteResult>,
+}
+
+/// Per-user `agent-bearer.token` file write result, surfaced in
+/// `RegisterAgentResponse::bearer_token_file`. `Ok` carries the
+/// path the daemon wrote to; `Err` carries the error message so
+/// the operator can take corrective action.
+#[derive(Debug, serde::Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+// Constructed only inside `#[cfg(target_os = "macos")]` (the per-user
+// file-write path lives behind peer-credential attestation, which is
+// macOS UDS-only); on Linux + Windows the variants are dead but the
+// type must stay cross-platform because `RegisterAgentResponse` carries
+// `Option<Self>` unconditionally.
+#[allow(dead_code)]
+pub(crate) enum BearerTokenFileWriteResult {
+    Written { path: String, replace_existing: bool },
+    Failed { message: String },
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1201,6 +1528,32 @@ pub(crate) async fn register_agent_handler(
     }
 
     let request_id = read_request_id(&req);
+
+    // Story 7.27 AC #6 + #8: snapshot kernel-attested peer
+    // credentials (injected by
+    // `server::control_listener::record_peer_credentials_layer` on
+    // the macOS UDS serve path) BEFORE the request body is
+    // consumed. On TCP-served requests (Linux/Windows or pre-
+    // 7.27 macOS fallback) the extension is absent and the
+    // per-user token-write step is skipped.
+    //
+    // The value is `Copy` (`PeerCredentials { uid, gid }`) so we
+    // dereference + copy out immediately, releasing the borrow on
+    // `req.extensions()` before the body-consumption step.
+    #[cfg(target_os = "macos")]
+    let _peer_creds_for_register: Option<crate::server::PeerCredentials> =
+        req.extensions().get::<crate::server::PeerCredentials>().copied();
+    // Audit-emit peer creds snapshot (cross-platform, always None on TCP).
+    let _peer_creds_for_audit: Option<crate::server::PeerCredentials> = {
+        #[cfg(target_os = "macos")]
+        {
+            _peer_creds_for_register
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    };
 
     // Rate-limit concurrent agent CRUD. `try_acquire_owned` returns
     // immediately with an error when the semaphore is exhausted rather
@@ -1452,6 +1805,7 @@ pub(crate) async fn register_agent_handler(
             "policy_name": payload.policy_name,
             "created_at": format_audit_timestamp(created_at),
         });
+        enrich_audit_extra_with_peer_creds(&mut event.extra, _peer_creds_for_audit);
         if let Err(e) = audit.append(event).await {
             tracing::warn!(error = %e, "agent-registered audit write failed (best-effort)");
         }
@@ -1465,12 +1819,138 @@ pub(crate) async fn register_agent_handler(
         "agent registered via control endpoint"
     );
 
+    // Story 7.27 AC #6 + #8 + #14: when the request came over the
+    // UDS control listener, the daemon writes the plaintext bearer
+    // token to the kernel-attested peer's
+    // `<home>/.agentsso/agent-bearer.token` using the
+    // tmp+chown+fchmod+renameatx_np(RENAME_EXCL)+O_NOFOLLOW pattern.
+    // The peer credentials are injected into request extensions by
+    // `server::control_listener::record_peer_credentials_layer` on
+    // the UDS serve path; TCP-served requests (the rc.21 fallback
+    // on non-macOS) have no extension, so we skip the per-user
+    // file write. The agent registration itself has already
+    // committed by this point — a token-write failure is logged +
+    // surfaced as a partial-success response field but does NOT
+    // undo the registration (the operator can re-run register to
+    // retry the token-write step idempotently).
+    #[cfg(target_os = "macos")]
+    let bearer_token_file: Option<BearerTokenFileWriteResult> = {
+        if let Some(creds) = _peer_creds_for_register {
+            // Story 7.27 Round-2 review fix (P2): wrap the
+            // bearer-token byte buffer in `Zeroizing` so the
+            // plaintext is scrubbed when this scope exits, mirroring
+            // the discipline used elsewhere in the daemon for
+            // master-key bytes. Pre-fix, the `Vec<u8>` would survive
+            // until allocator reuse, leaving plaintext token
+            // fragments on the heap.
+            let token_bytes: zeroize::Zeroizing<Vec<u8>> =
+                zeroize::Zeroizing::new(bearer_token.clone().into_bytes());
+            let state_dir = permitlayer_core::paths::daemon_state_dir(
+                permitlayer_core::paths::home_override().as_deref(),
+            );
+            match crate::server::agent_token::write_bearer_token_to_user_home(
+                &token_bytes,
+                creds.uid,
+                creds.gid,
+                &state_dir,
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    tracing::info!(
+                        target: "control",
+                        request_id = %request_id,
+                        peer_uid = creds.uid,
+                        target = %outcome.target_path.display(),
+                        replace_existing = outcome.replace_existing,
+                        "bearer-token written to per-user file"
+                    );
+                    if let Some(audit) = &state.audit_store {
+                        let event_type = if outcome.replace_existing {
+                            "bearer-token-replaced"
+                        } else {
+                            "bearer-token-written"
+                        };
+                        let mut event = AuditEvent::with_request_id(
+                            request_id.clone(),
+                            payload.name.clone(),
+                            "permitlayer".to_owned(),
+                            "-".to_owned(),
+                            "agent-bearer-token".to_owned(),
+                            "ok".to_owned(),
+                            event_type.to_owned(),
+                        );
+                        event.extra = serde_json::json!({
+                            "peer_uid": creds.uid,
+                            "peer_gid": creds.gid,
+                            "target_path": outcome.target_path.to_string_lossy(),
+                            "replace_existing": outcome.replace_existing,
+                        });
+                        if let Err(e) = audit.append(event).await {
+                            tracing::warn!(error = %e, "bearer-token audit write failed (best-effort)");
+                        }
+                    }
+                    Some(BearerTokenFileWriteResult::Written {
+                        path: outcome.target_path.to_string_lossy().into_owned(),
+                        replace_existing: outcome.replace_existing,
+                    })
+                }
+                Err(e) => {
+                    let symlink_attack = matches!(
+                        e,
+                        crate::server::agent_token::TokenWriteError::SymlinkInParentPath(_)
+                    );
+                    tracing::warn!(
+                        target: "control",
+                        request_id = %request_id,
+                        peer_uid = creds.uid,
+                        error = %e,
+                        symlink_attack,
+                        "bearer-token write to per-user file failed (partial success)"
+                    );
+                    if let Some(audit) = &state.audit_store {
+                        let event_type = if symlink_attack {
+                            "bearer-token-symlink-attack-blocked"
+                        } else {
+                            "bearer-token-write-failed"
+                        };
+                        let mut event = AuditEvent::with_request_id(
+                            request_id.clone(),
+                            payload.name.clone(),
+                            "permitlayer".to_owned(),
+                            "-".to_owned(),
+                            "agent-bearer-token".to_owned(),
+                            "error".to_owned(),
+                            event_type.to_owned(),
+                        );
+                        event.extra = serde_json::json!({
+                            "peer_uid": creds.uid,
+                            "peer_gid": creds.gid,
+                            "error": e.to_string(),
+                        });
+                        if let Err(audit_err) = audit.append(event).await {
+                            tracing::warn!(error = %audit_err, "audit append failed (best-effort)");
+                        }
+                    }
+                    Some(BearerTokenFileWriteResult::Failed {
+                        message: format!("bearer-token file write failed: {e}"),
+                    })
+                }
+            }
+        } else {
+            None
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let bearer_token_file: Option<BearerTokenFileWriteResult> = None;
+
     let body = RegisterAgentResponse {
         status: "ok",
         name: payload.name,
         policy_name: payload.policy_name,
         bearer_token,
         created_at: format_audit_timestamp(created_at),
+        bearer_token_file,
     };
     (StatusCode::OK, Json(body)).into_response()
 }
@@ -1525,6 +2005,2082 @@ pub(crate) async fn list_agents_handler(
     (StatusCode::OK, Json(ListAgentsResponse { status: "ok", agents })).into_response()
 }
 
+/// Response body for `GET /v1/control/agent/{name}/policy_name`
+/// (Story 7.30 AC #1).
+#[derive(Debug, Serialize)]
+pub(crate) struct AgentPolicyNameResponse {
+    pub name: String,
+    pub policy_name: String,
+}
+
+/// `GET /v1/control/agent/{name}/policy_name` — return the policy
+/// binding for a single agent (Story 7.30 AC #1).
+///
+/// The CLI's `agentsso connect` flow needs to resolve an agent's
+/// policy name early so it can update the policy's scope set later in
+/// the same flow. Before Story 7.30 the CLI opened the agent store
+/// directly; now the daemon owns every fs touch, so this read-only
+/// lookup moves daemon-side.
+///
+/// No audit event — read-only lookup matches the `list_agents_handler`
+/// precedent. Operator-callable.
+pub(crate) async fn agent_policy_name_handler(
+    State(state): State<ControlState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(name): Path<String>,
+    req: axum::extract::Request,
+) -> Response {
+    if let Err(e) = require_loopback(peer) {
+        return e.into_response();
+    }
+
+    let request_id = read_request_id(&req);
+
+    if let Err(e) = validate_agent_name(&name) {
+        return agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "agent.invalid_name",
+            format!("{e}"),
+            Some(request_id),
+        );
+    }
+
+    let Some(store) = state.agent_store.clone() else {
+        return agent_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "agent.store_unavailable",
+            "agent identity store is unavailable; check the daemon startup logs \
+             for 'agent registry unavailable' — the registry may have failed to \
+             load."
+                .to_owned(),
+            Some(request_id),
+        );
+    };
+
+    match store.get(&name).await {
+        Ok(Some(identity)) => {
+            // Round-1 review P21: cross-check that the agent's bound
+            // policy still exists in the active set. If the policy was
+            // removed from disk between agent registration and this
+            // lookup, the CLI would otherwise POST to
+            // `/policy/<dangling>/scopes` and get 404 `policy.not_found`
+            // — two round-trips to discover the inconsistency. A 422
+            // here with `agent.dangling_policy_binding` points the
+            // operator at the right next step (`agent rebind`) one
+            // call earlier.
+            let snapshot = state.policy_set.load();
+            if snapshot.get(&identity.policy_name).is_none() {
+                return agent_error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "agent.dangling_policy_binding",
+                    format!(
+                        "agent {name:?} is bound to policy {:?} which is not in the \
+                         active policy set. Either restore the policy file and run \
+                         `agentsso reload`, or rebind the agent: \
+                         `agentsso agent rebind {name} --policy <new-policy>`.",
+                        identity.policy_name
+                    ),
+                    Some(request_id),
+                );
+            }
+            (
+                StatusCode::OK,
+                Json(AgentPolicyNameResponse {
+                    name: identity.name().to_owned(),
+                    policy_name: identity.policy_name.clone(),
+                }),
+            )
+                .into_response()
+        }
+        Ok(None) => agent_error_response(
+            StatusCode::NOT_FOUND,
+            "agent.not_found",
+            format!("no agent with name {name:?}"),
+            Some(request_id),
+        ),
+        Err(e) => agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "agent.store_io_failed",
+            format!("agent store read failed: {e}"),
+            Some(request_id),
+        ),
+    }
+}
+
+/// Service set the credential endpoints accept (Story 7.30 AC #2
+/// + #3). Mirrors `crates/permitlayer-daemon/src/cli/connect.rs::SUPPORTED_SERVICES`;
+///   kept private until Task 12 deduplicates the constant.
+pub(crate) const CREDENTIAL_SUPPORTED_SERVICES: &[&str] = &["gmail", "calendar", "drive"];
+
+fn credential_service_supported(service: &str) -> bool {
+    CREDENTIAL_SUPPORTED_SERVICES.contains(&service)
+}
+
+/// Response body for `GET /v1/control/credentials/{service}/meta`
+/// (Story 7.30 AC #2).
+///
+/// Both branches (existing / not-existing) return HTTP 200 with a
+/// boolean discriminator. This is deliberate: the CLI's idempotent
+/// re-run branch is a single JSON-parse path, no special-casing 404.
+#[derive(Debug, Serialize)]
+pub(crate) struct CredentialMetaResponse {
+    pub exists: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub meta: Option<permitlayer_oauth::metadata::CredentialMeta>,
+}
+
+/// `GET /v1/control/credentials/{service}/meta` — return the
+/// `CredentialMeta` for a sealed credential, or `{ "exists": false }`
+/// when none exists (Story 7.30 AC #2).
+///
+/// Reads `{state.vault_dir}/{service}-meta.json` via blocking-pool
+/// tokio. No audit event — read-only, frequently polled during the
+/// CLI's idempotent re-run check. Operator-callable.
+pub(crate) async fn credentials_meta_handler(
+    State(state): State<ControlState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(service): Path<String>,
+    req: axum::extract::Request,
+) -> Response {
+    if let Err(e) = require_loopback(peer) {
+        return e.into_response();
+    }
+
+    let request_id = read_request_id(&req);
+
+    if !credential_service_supported(&service) {
+        return agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "credentials.unknown_service",
+            format!(
+                "service {:?} is not supported; allowed: {}",
+                service,
+                CREDENTIAL_SUPPORTED_SERVICES.join(", ")
+            ),
+            Some(request_id),
+        );
+    }
+
+    let meta_path = state.vault_dir.join(format!("{service}-meta.json"));
+    let read_result =
+        tokio::task::spawn_blocking(move || std::fs::read_to_string(&meta_path)).await;
+
+    let raw = match read_result {
+        Ok(Ok(s)) => s,
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (StatusCode::OK, Json(CredentialMetaResponse { exists: false, meta: None }))
+                .into_response();
+        }
+        Ok(Err(e)) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credentials.meta_io_failed",
+                format!("could not read {service} meta file: {e}"),
+                Some(request_id),
+            );
+        }
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credentials.meta_join_failed",
+                format!("blocking task join failed: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+
+    match serde_json::from_str::<permitlayer_oauth::metadata::CredentialMeta>(&raw) {
+        Ok(meta) => {
+            (StatusCode::OK, Json(CredentialMetaResponse { exists: true, meta: Some(meta) }))
+                .into_response()
+        }
+        Err(e) => agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "credentials.meta_parse_failed",
+            format!("could not parse {service} meta file: {e}"),
+            Some(request_id),
+        ),
+    }
+}
+
+/// Policy for the seal endpoint's `if_exists` field (Story 7.30 AC #3).
+///
+/// **Round-1 review fix:** spec line 57 named `replace` as the
+/// default; review re-classified that as a data-destruction footgun if
+/// a CLI bug ever drops the field. Fail-safe default `Error` returns
+/// 409 instead of silently overwriting; the CLI's production path
+/// always sets `if_exists: "replace"` explicitly so this is moot for
+/// the seal-via-connect flow but tightens future API surface against
+/// accidental overwrites.
+#[derive(Debug, Clone, Copy, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum SealIfExists {
+    /// Replace the existing credential atomically.
+    Replace,
+    /// Skip writing if a credential already exists for this service.
+    Skip,
+    /// Return 409 if a credential already exists. Default (fail-safe).
+    #[default]
+    Error,
+}
+
+/// Request body for `POST /v1/control/credentials/seal` (Story 7.30 AC #3).
+///
+/// Token fields use `Zeroizing<String>` (zeroize 1.8 `serde` feature
+/// added in Task 1, sourced from RustCrypto/utils
+/// `zeroize/src/lib.rs:568-580`'s `Deserialize for Zeroizing<T>`
+/// impl). When the handler scope exits, `Zeroizing`'s `Drop` calls
+/// `String::zeroize` which writes zeros over the full `Vec<u8>`
+/// capacity backing the String before the allocator frees it
+/// (`zeroize/src/lib.rs:524-528`). The plaintext window per request
+/// is documented in ADR-0007 (authored in Task 13).
+#[derive(Debug, Deserialize)]
+pub(crate) struct CredentialsSealRequest {
+    pub service: String,
+    pub agent: String,
+    pub access_token: zeroize::Zeroizing<String>,
+    #[serde(default)]
+    pub refresh_token: Option<zeroize::Zeroizing<String>>,
+    pub granted_scopes: Vec<String>,
+    pub client_type: String,
+    pub client_source: String,
+    #[serde(default)]
+    pub expires_in_secs: Option<u64>,
+    #[serde(default)]
+    pub if_exists: SealIfExists,
+}
+
+/// Response body for `POST /v1/control/credentials/seal`.
+#[derive(Debug, Serialize)]
+pub(crate) struct CredentialsSealResponse {
+    pub sealed: bool,
+    pub replaced_previous: bool,
+    pub meta: permitlayer_oauth::metadata::CredentialMeta,
+}
+
+/// `POST /v1/control/credentials/seal` — atomically seal OAuth tokens
+/// into the daemon's vault, write the provenance meta JSON, and emit
+/// an audit event (Story 7.30 AC #3).
+///
+/// The CLI's `agentsso connect` flow drives the operator-interactive
+/// OAuth dance, then POSTs the resulting tokens to this endpoint. The
+/// daemon owns every fs touch + every vault-key access; the CLI never
+/// reads the master key, never touches `vault/`, never writes
+/// `*-meta.json`.
+///
+/// **Concurrency (round-1 review P2 + P7):**
+/// - `state.credentials_seal_semaphore` caps concurrent seal operations
+///   across all services at `CREDENTIALS_SEAL_MAX_CONCURRENT` (matches
+///   `agent_crud_semaphore` discipline).
+/// - `state.credentials_seal_locks` provides a per-service
+///   `Arc<Mutex<()>>` so two concurrent seals of the SAME service
+///   serialize, while disjoint services (gmail + drive) run in
+///   parallel.
+///
+/// **Write order (round-1 review P1):** the meta JSON is the
+/// "credential exists" sentinel for downstream readers
+/// (`credentials_meta_handler`, the idempotent re-run check). To
+/// avoid orphan sealed envelopes after a partial write, on failure
+/// of any post-seal step we delete any envelopes we just wrote so
+/// the on-disk state reflects "no credential" — the same state the
+/// next caller will observe.
+///
+/// **Blocking I/O (round-1 review P3):** `meta_path.exists()`,
+/// `std::fs::read_to_string` (skip arm), and `write_metadata_atomic`
+/// are dispatched to `tokio::task::spawn_blocking` so a slow disk
+/// doesn't stall the runtime worker.
+///
+/// Audit events:
+/// - `credentials-sealed` on success, with `service`, `agent`,
+///   `scopes`, `client_type`, `client_source`, `replaced_previous`,
+///   `had_refresh_token`, plus `peer_uid` + `peer_gid` via
+///   `enrich_audit_extra_with_peer_creds`.
+/// - `credentials-seal-denied` on every failure path (round-1 review
+///   P17, mirrors `agent-rebind-denied`), with the same enrichment
+///   plus an `error_code` field naming the daemon-side failure code.
+///
+/// **ENOTSUP deviation from spec.** The story spec called for an
+/// `ENOTSUP` classification branch returning
+/// `credentials.unsupported_volume`. Pre-implementation research
+/// confirmed the spec is wrong about which syscall surfaces ENOTSUP:
+/// `write_metadata_atomic` goes through `tempfile::persist` →
+/// `rustix::fs::rename` (no flags) and `CredentialFsStore::put` uses
+/// `std::fs::rename` — both are plain POSIX `rename(2)`, which on
+/// macOS does NOT return ENOTSUP (`man 2 rename` scopes ENOTSUP to
+/// flag-bearing `renamex_np`/`renameatx_np` only, neither of which
+/// is called from these paths). Branch dropped as dead code; non-APFS
+/// failures surface as `EROFS`/`EIO`/`EXDEV`/`EACCES` via the generic
+/// `credentials.store_io_failed` or `credentials.meta_write_failed`
+/// arms. See ADR-0007 for the threat-model writeup.
+pub(crate) async fn credentials_seal_handler(
+    State(state): State<ControlState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: axum::extract::Request,
+) -> Response {
+    if let Err(e) = require_loopback(peer) {
+        return e.into_response();
+    }
+
+    let request_id = read_request_id(&req);
+    let peer_creds_for_audit: Option<crate::server::PeerCredentials> =
+        req.extensions().get::<crate::server::PeerCredentials>().copied();
+
+    // Round-1 review P7: rate-limit concurrent seals across all
+    // services. `try_acquire_owned` returns immediately rather than
+    // queueing, so a flood of seal requests returns 429 instead of
+    // piling up on the blocking thread pool.
+    let _seal_permit = match state.credentials_seal_semaphore.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            emit_seal_denied_audit(
+                &state,
+                &request_id,
+                None,
+                None,
+                "credentials.rate_limited",
+                peer_creds_for_audit,
+            )
+            .await;
+            return agent_error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "credentials.rate_limited",
+                format!(
+                    "too many concurrent seal operations in flight \
+                     (max {CREDENTIALS_SEAL_MAX_CONCURRENT}); retry shortly"
+                ),
+                Some(request_id.clone()),
+            );
+        }
+    };
+
+    let (_parts, body) = req.into_parts();
+    let bytes = match axum::body::to_bytes(body, 64 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            emit_seal_denied_audit(
+                &state,
+                &request_id,
+                None,
+                None,
+                "credentials.bad_request",
+                peer_creds_for_audit,
+            )
+            .await;
+            return agent_error_response(
+                StatusCode::BAD_REQUEST,
+                "credentials.bad_request",
+                format!("failed to read request body: {e}"),
+                Some(request_id.clone()),
+            );
+        }
+    };
+    let payload: CredentialsSealRequest = match serde_json::from_slice(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            emit_seal_denied_audit(
+                &state,
+                &request_id,
+                None,
+                None,
+                "credentials.bad_request",
+                peer_creds_for_audit,
+            )
+            .await;
+            return agent_error_response(
+                StatusCode::BAD_REQUEST,
+                "credentials.bad_request",
+                format!("invalid JSON body: {e}"),
+                Some(request_id.clone()),
+            );
+        }
+    };
+
+    if !credential_service_supported(&payload.service) {
+        emit_seal_denied_audit(
+            &state,
+            &request_id,
+            Some(&payload.service),
+            Some(&payload.agent),
+            "credentials.unknown_service",
+            peer_creds_for_audit,
+        )
+        .await;
+        return agent_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "credentials.unknown_service",
+            format!(
+                "service {:?} is not supported; allowed: {}",
+                payload.service,
+                CREDENTIAL_SUPPORTED_SERVICES.join(", ")
+            ),
+            Some(request_id),
+        );
+    }
+
+    if let Err(e) = validate_agent_name(&payload.agent) {
+        emit_seal_denied_audit(
+            &state,
+            &request_id,
+            Some(&payload.service),
+            None,
+            "credentials.invalid_agent_name",
+            peer_creds_for_audit,
+        )
+        .await;
+        return agent_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "credentials.invalid_agent_name",
+            format!("{e}"),
+            Some(request_id),
+        );
+    }
+
+    {
+        let snapshot = state.agent_registry.snapshot();
+        if snapshot.get_by_name(&payload.agent).is_none() {
+            emit_seal_denied_audit(
+                &state,
+                &request_id,
+                Some(&payload.service),
+                Some(&payload.agent),
+                "credentials.unknown_agent",
+                peer_creds_for_audit,
+            )
+            .await;
+            return agent_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "credentials.unknown_agent",
+                format!("no agent named {:?} is registered", payload.agent),
+                Some(request_id),
+            );
+        }
+    }
+
+    // Round-1 review P2: acquire a per-service mutex. The outer
+    // std::sync::Mutex is a pure CPU critical section
+    // (HashMap::entry → clone Arc). The inner tokio::sync::Mutex is
+    // the lock actually held across the seal/put/meta await points.
+    let service_lock = {
+        let mut locks =
+            state.credentials_seal_locks.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        Arc::clone(
+            locks
+                .entry(payload.service.clone())
+                .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))),
+        )
+    };
+    let _seal_guard = service_lock.lock().await;
+
+    let Some(home) = state.vault_dir.parent().map(std::path::Path::to_path_buf) else {
+        emit_seal_denied_audit(
+            &state,
+            &request_id,
+            Some(&payload.service),
+            Some(&payload.agent),
+            "credentials.vault_layout_invalid",
+            peer_creds_for_audit,
+        )
+        .await;
+        return agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "credentials.vault_layout_invalid",
+            format!(
+                "vault_dir {:?} has no parent — cannot derive credential store home",
+                state.vault_dir
+            ),
+            Some(request_id),
+        );
+    };
+    let meta_path = state.vault_dir.join(format!("{}-meta.json", payload.service));
+
+    // Round-1 review P3: dispatch the existence check to a blocking
+    // worker (it's a quick syscall but the principle stays consistent
+    // with the other fs touches in this handler).
+    let meta_path_for_exists = meta_path.clone();
+    let credential_exists =
+        match tokio::task::spawn_blocking(move || meta_path_for_exists.exists()).await {
+            Ok(exists) => exists,
+            Err(e) => {
+                emit_seal_denied_audit(
+                    &state,
+                    &request_id,
+                    Some(&payload.service),
+                    Some(&payload.agent),
+                    "credentials.meta_io_failed",
+                    peer_creds_for_audit,
+                )
+                .await;
+                return agent_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "credentials.meta_io_failed",
+                    format!("blocking task join failed during existence check: {e}"),
+                    Some(request_id),
+                );
+            }
+        };
+
+    match (payload.if_exists, credential_exists) {
+        (SealIfExists::Error, true) => {
+            emit_seal_denied_audit(
+                &state,
+                &request_id,
+                Some(&payload.service),
+                Some(&payload.agent),
+                "credentials.already_exists",
+                peer_creds_for_audit,
+            )
+            .await;
+            return agent_error_response(
+                StatusCode::CONFLICT,
+                "credentials.already_exists",
+                format!(
+                    "credential for service {:?} already exists; pass \
+                     `if_exists: \"replace\"` to overwrite",
+                    payload.service
+                ),
+                Some(request_id),
+            );
+        }
+        (SealIfExists::Skip, true) => {
+            // Round-3 review P78: sanity-check the access envelope
+            // alongside the meta sentinel. After a partial cleanup
+            // (operator manually removed `{service}.sealed` but left
+            // the meta file behind), the credential is NOT actually
+            // usable — returning `sealed: false` here would lie. Fall
+            // through to the fresh-seal path in that case so the
+            // operator's `--no-force` re-run rebuilds the credential
+            // instead of silently asserting it's fine.
+            let envelope_path = state.vault_dir.join(format!("{}.sealed", payload.service));
+            let envelope_path_for_exists = envelope_path.clone();
+            let envelope_exists = match tokio::task::spawn_blocking(move || {
+                envelope_path_for_exists.exists()
+            })
+            .await
+            {
+                Ok(exists) => exists,
+                Err(e) => {
+                    emit_seal_denied_audit(
+                        &state,
+                        &request_id,
+                        Some(&payload.service),
+                        Some(&payload.agent),
+                        "credentials.meta_io_failed",
+                        peer_creds_for_audit,
+                    )
+                    .await;
+                    return agent_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "credentials.meta_io_failed",
+                        format!("blocking task join failed during envelope existence check: {e}"),
+                        Some(request_id),
+                    );
+                }
+            };
+            if !envelope_exists {
+                tracing::warn!(
+                    target: "control",
+                    request_id = %request_id,
+                    service = %payload.service,
+                    "Skip: meta present but `{service}.sealed` envelope missing — falling through to fresh seal",
+                    service = payload.service,
+                );
+                // Don't return — fall out of the match and proceed to
+                // the Replace-equivalent seal path. `replaced_previous`
+                // stays `true` (computed from `credential_exists` below)
+                // so audit accurately reflects that a sentinel was overwritten.
+            } else {
+                // Round-1 review P3 + P16: dispatch the read to a
+                // blocking worker AND use `symlink_metadata` so a
+                // symlinked meta file is rejected before we read its
+                // target (defense-in-depth — vault dir is 0700 root:wheel
+                // so a daemon-spawned symlink is unlikely, but the
+                // discipline matches `policy::edit::add_scopes_to_policy`).
+                let meta_path_for_read = meta_path.clone();
+                let read_result =
+                    tokio::task::spawn_blocking(move || -> Result<String, std::io::Error> {
+                        let md = std::fs::symlink_metadata(&meta_path_for_read)?;
+                        if md.file_type().is_symlink() {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                format!(
+                                    "meta file is a symlink (refusing to follow): {}",
+                                    meta_path_for_read.display()
+                                ),
+                            ));
+                        }
+                        std::fs::read_to_string(&meta_path_for_read)
+                    })
+                    .await;
+                let meta_raw = match read_result {
+                    Ok(Ok(s)) => s,
+                    Ok(Err(e)) => {
+                        emit_seal_denied_audit(
+                            &state,
+                            &request_id,
+                            Some(&payload.service),
+                            Some(&payload.agent),
+                            "credentials.meta_io_failed",
+                            peer_creds_for_audit,
+                        )
+                        .await;
+                        return agent_error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "credentials.meta_io_failed",
+                            format!("could not read existing meta file: {e}"),
+                            Some(request_id),
+                        );
+                    }
+                    Err(e) => {
+                        emit_seal_denied_audit(
+                            &state,
+                            &request_id,
+                            Some(&payload.service),
+                            Some(&payload.agent),
+                            "credentials.meta_io_failed",
+                            peer_creds_for_audit,
+                        )
+                        .await;
+                        return agent_error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "credentials.meta_io_failed",
+                            format!("blocking task join failed reading meta file: {e}"),
+                            Some(request_id),
+                        );
+                    }
+                };
+                let meta: permitlayer_oauth::metadata::CredentialMeta =
+                    match serde_json::from_str(&meta_raw) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            emit_seal_denied_audit(
+                                &state,
+                                &request_id,
+                                Some(&payload.service),
+                                Some(&payload.agent),
+                                "credentials.meta_parse_failed",
+                                peer_creds_for_audit,
+                            )
+                            .await;
+                            return agent_error_response(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "credentials.meta_parse_failed",
+                                format!("could not parse existing meta file: {e}"),
+                                Some(request_id),
+                            );
+                        }
+                    };
+                return (
+                    StatusCode::OK,
+                    Json(CredentialsSealResponse { sealed: false, replaced_previous: false, meta }),
+                )
+                    .into_response();
+            } // close P78 else branch (envelope_exists == true)
+            // If we get here, envelope was missing — fall through to
+            // the Replace-equivalent seal path.
+        }
+        _ => {} // Replace branch or no existing credential — proceed.
+    }
+
+    let replaced_previous = credential_exists;
+
+    // Round-3 review D1: when a Replace re-seal omits a fresh refresh
+    // token, unlink the stale `{service}-refresh.sealed` so the proxy
+    // refresh path can't reach for a prior consent's refresh token
+    // paired with the just-sealed access token. Best-effort: any I/O
+    // error degrades to the pre-D1 behavior. Held inside the
+    // per-service seal lock so no concurrent reader sees a half-state.
+    if replaced_previous && payload.refresh_token.is_none() {
+        let refresh_envelope = state.vault_dir.join(format!("{}-refresh.sealed", payload.service));
+        let refresh_envelope_for_unlink = refresh_envelope.clone();
+        let unlink_result = tokio::task::spawn_blocking(move || {
+            match std::fs::remove_file(&refresh_envelope_for_unlink) {
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(e),
+            }
+        })
+        .await;
+        match unlink_result {
+            Ok(Ok(true)) => {
+                tracing::info!(
+                    target: "control",
+                    request_id = %request_id,
+                    service = %payload.service,
+                    "stale refresh envelope unlinked on Replace without new refresh token"
+                );
+            }
+            Ok(Ok(false)) => {}
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    target: "control",
+                    request_id = %request_id,
+                    service = %payload.service,
+                    error = %e,
+                    "best-effort unlink of stale refresh envelope failed"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "control",
+                    request_id = %request_id,
+                    service = %payload.service,
+                    error = %e,
+                    "blocking task join failed during stale refresh unlink"
+                );
+            }
+        }
+    }
+
+    let access_token = permitlayer_credential::OAuthToken::from_trusted_bytes(
+        payload.access_token.as_bytes().to_vec(),
+    );
+    let sealed_access = match state.vault.seal(&payload.service, &access_token) {
+        Ok(s) => s,
+        Err(e) => {
+            emit_seal_denied_audit(
+                &state,
+                &request_id,
+                Some(&payload.service),
+                Some(&payload.agent),
+                "credentials.seal_failed",
+                peer_creds_for_audit,
+            )
+            .await;
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credentials.seal_failed",
+                format!("vault seal failed for access token: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+
+    let sealed_refresh = match payload.refresh_token.as_ref() {
+        Some(refresh) => {
+            let refresh_token = permitlayer_credential::OAuthRefreshToken::from_trusted_bytes(
+                refresh.as_bytes().to_vec(),
+            );
+            let refresh_service = format!("{}-refresh", payload.service);
+            match state.vault.seal_refresh(&refresh_service, &refresh_token) {
+                Ok(s) => Some((refresh_service, s)),
+                Err(e) => {
+                    emit_seal_denied_audit(
+                        &state,
+                        &request_id,
+                        Some(&payload.service),
+                        Some(&payload.agent),
+                        "credentials.seal_failed",
+                        peer_creds_for_audit,
+                    )
+                    .await;
+                    return agent_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "credentials.seal_failed",
+                        format!("vault seal failed for refresh token: {e}"),
+                        Some(request_id),
+                    );
+                }
+            }
+        }
+        None => None,
+    };
+
+    let had_refresh_token = sealed_refresh.is_some();
+
+    let store = match permitlayer_core::store::fs::CredentialFsStore::new(home.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            emit_seal_denied_audit(
+                &state,
+                &request_id,
+                Some(&payload.service),
+                Some(&payload.agent),
+                "credentials.store_init_failed",
+                peer_creds_for_audit,
+            )
+            .await;
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credentials.store_init_failed",
+                format!("credential store init failed: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+
+    // Track which envelope files we wrote so we can roll them back on
+    // a downstream failure (round-1 review P1).
+    let mut written_services: Vec<String> = Vec::with_capacity(2);
+
+    if let Err(e) = store.put(&payload.service, sealed_access).await {
+        emit_seal_denied_audit(
+            &state,
+            &request_id,
+            Some(&payload.service),
+            Some(&payload.agent),
+            "credentials.store_io_failed",
+            peer_creds_for_audit,
+        )
+        .await;
+        return agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "credentials.store_io_failed",
+            format!("credential store write failed for sealed access token: {e}"),
+            Some(request_id),
+        );
+    }
+    written_services.push(payload.service.clone());
+
+    if let Some((refresh_service, sealed)) = sealed_refresh {
+        if let Err(e) = store.put(&refresh_service, sealed).await {
+            // Roll back the access envelope we just wrote (P1).
+            rollback_sealed_envelopes(&state.vault_dir, &written_services).await;
+            emit_seal_denied_audit(
+                &state,
+                &request_id,
+                Some(&payload.service),
+                Some(&payload.agent),
+                "credentials.store_io_failed",
+                peer_creds_for_audit,
+            )
+            .await;
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credentials.store_io_failed",
+                format!("credential store write failed for sealed refresh token: {e}"),
+                Some(request_id),
+            );
+        }
+        written_services.push(refresh_service);
+    }
+
+    let meta = permitlayer_oauth::metadata::CredentialMeta {
+        client_type: payload.client_type.clone(),
+        client_source: Some(payload.client_source.clone()),
+        // Round-1 review P4: use canonical `format_audit_timestamp`
+        // so meta.connected_at matches the audit-log `Z` format
+        // instead of rfc3339's `+00:00` suffix.
+        connected_at: format_audit_timestamp(chrono::Utc::now()),
+        last_refreshed_at: None,
+        scopes: payload.granted_scopes.clone(),
+        expires_in_secs: payload.expires_in_secs,
+    };
+
+    // Round-1 review P3: dispatch the meta write to a blocking
+    // worker.
+    let meta_path_for_write = meta_path.clone();
+    let meta_for_write = meta.clone();
+    let write_result = tokio::task::spawn_blocking(move || {
+        permitlayer_oauth::metadata::write_metadata_atomic(&meta_path_for_write, &meta_for_write)
+    })
+    .await;
+    match write_result {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => {
+            // Round-1 review P1: roll back the sealed envelopes so
+            // we don't leave orphan access/refresh files with no
+            // meta sentinel.
+            rollback_sealed_envelopes(&state.vault_dir, &written_services).await;
+            emit_seal_denied_audit(
+                &state,
+                &request_id,
+                Some(&payload.service),
+                Some(&payload.agent),
+                "credentials.meta_write_failed",
+                peer_creds_for_audit,
+            )
+            .await;
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credentials.meta_write_failed",
+                format!("meta JSON write failed (sealed envelopes rolled back): {e}"),
+                Some(request_id),
+            );
+        }
+        Err(e) => {
+            rollback_sealed_envelopes(&state.vault_dir, &written_services).await;
+            emit_seal_denied_audit(
+                &state,
+                &request_id,
+                Some(&payload.service),
+                Some(&payload.agent),
+                "credentials.meta_write_failed",
+                peer_creds_for_audit,
+            )
+            .await;
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credentials.meta_write_failed",
+                format!("blocking task join failed during meta write: {e}"),
+                Some(request_id),
+            );
+        }
+    }
+
+    if let Some(audit) = &state.audit_store {
+        let mut event = AuditEvent::with_request_id(
+            request_id.clone(),
+            payload.agent.clone(),
+            "permitlayer".to_owned(),
+            payload.service.clone(),
+            "credentials-seal".to_owned(),
+            "ok".to_owned(),
+            "credentials-sealed".to_owned(),
+        );
+        event.extra = serde_json::json!({
+            "service": payload.service,
+            "agent": payload.agent,
+            "scopes": payload.granted_scopes,
+            "client_type": payload.client_type,
+            "client_source": payload.client_source,
+            "replaced_previous": replaced_previous,
+            "had_refresh_token": had_refresh_token,
+        });
+        enrich_audit_extra_with_peer_creds(&mut event.extra, peer_creds_for_audit);
+        if let Err(e) = audit.append(event).await {
+            tracing::warn!(error = %e, "credentials-sealed audit write failed (best-effort)");
+        }
+    }
+
+    tracing::info!(
+        target: "control",
+        request_id = %request_id,
+        service = %payload.service,
+        agent = %payload.agent,
+        replaced_previous,
+        had_refresh_token,
+        "credential sealed via control endpoint"
+    );
+
+    (StatusCode::OK, Json(CredentialsSealResponse { sealed: true, replaced_previous, meta }))
+        .into_response()
+}
+
+/// Round-1 review P17: emit `credentials-seal-denied` audit event on
+/// every seal-handler failure path. Mirror of
+/// `emit_rebind_denied_audit` from the agent-rebind handler. The
+/// `error_code` field names the daemon-side failure code so operators
+/// can correlate the audit row with the HTTP response.
+async fn emit_seal_denied_audit(
+    state: &ControlState,
+    request_id: &str,
+    service: Option<&str>,
+    agent: Option<&str>,
+    error_code: &str,
+    peer_creds: Option<crate::server::PeerCredentials>,
+) {
+    let Some(audit) = state.audit_store.as_ref() else {
+        return;
+    };
+    let mut event = AuditEvent::with_request_id(
+        request_id.to_owned(),
+        agent.unwrap_or("-").to_owned(),
+        "permitlayer".to_owned(),
+        service.unwrap_or("-").to_owned(),
+        "credentials-seal".to_owned(),
+        "denied".to_owned(),
+        "credentials-seal-denied".to_owned(),
+    );
+    event.extra = serde_json::json!({
+        "error_code": error_code,
+        "service": service,
+        "agent": agent,
+    });
+    enrich_audit_extra_with_peer_creds(&mut event.extra, peer_creds);
+    if let Err(e) = audit.append(event).await {
+        tracing::warn!(error = %e, "credentials-seal-denied audit write failed (best-effort)");
+    }
+}
+
+/// Round-3 review P62: emit `credentials-verify-denied` audit event on
+/// every verify-handler failure path that bails BEFORE the
+/// verify-result match (where the inline `emit_audit` closure runs).
+/// Without this, security-relevant failures — notably
+/// `credentials.unseal_failed` (post-key-rotation, possible compromise)
+/// and `credentials.not_found` — leave no forensic trail. Mirror of
+/// `emit_seal_denied_audit`.
+async fn emit_verify_denied_audit(
+    state: &ControlState,
+    request_id: &str,
+    service: Option<&str>,
+    agent: Option<&str>,
+    error_code: &str,
+    peer_creds: Option<crate::server::PeerCredentials>,
+) {
+    let Some(audit) = state.audit_store.as_ref() else {
+        return;
+    };
+    let mut event = AuditEvent::with_request_id(
+        request_id.to_owned(),
+        agent.unwrap_or("-").to_owned(),
+        "permitlayer".to_owned(),
+        service.unwrap_or("-").to_owned(),
+        "credentials-verify".to_owned(),
+        "denied".to_owned(),
+        "credentials-verify-denied".to_owned(),
+    );
+    event.extra = serde_json::json!({
+        "error_code": error_code,
+        "service": service,
+        "agent": agent,
+    });
+    enrich_audit_extra_with_peer_creds(&mut event.extra, peer_creds);
+    if let Err(e) = audit.append(event).await {
+        tracing::warn!(error = %e, "credentials-verify-denied audit write failed (best-effort)");
+    }
+}
+
+/// Round-3 review P63: emit `policy-scopes-denied` audit event on every
+/// policy-scopes-handler failure path that bails BEFORE the success
+/// path's `policy-scopes-added` event. Symmetric to
+/// `emit_seal_denied_audit`/`emit_verify_denied_audit`. Covers
+/// invalid-name, bad-request, and every `PolicyEditError` variant —
+/// these are the security-relevant denials (path-traversal attempts,
+/// symlink rejections, schema-violating edits).
+async fn emit_policy_scopes_denied_audit(
+    state: &ControlState,
+    request_id: &str,
+    policy_name: Option<&str>,
+    error_code: &str,
+    peer_creds: Option<crate::server::PeerCredentials>,
+) {
+    let Some(audit) = state.audit_store.as_ref() else {
+        return;
+    };
+    let mut event = AuditEvent::with_request_id(
+        request_id.to_owned(),
+        "-".to_owned(), // policy_scopes is policy-scoped, not agent-scoped
+        "permitlayer".to_owned(),
+        "-".to_owned(),
+        "policy-scopes-add".to_owned(),
+        "denied".to_owned(),
+        "policy-scopes-denied".to_owned(),
+    );
+    event.extra = serde_json::json!({
+        "error_code": error_code,
+        "policy_name": policy_name,
+    });
+    enrich_audit_extra_with_peer_creds(&mut event.extra, peer_creds);
+    if let Err(e) = audit.append(event).await {
+        tracing::warn!(error = %e, "policy-scopes-denied audit write failed (best-effort)");
+    }
+}
+
+/// Round-1 review P1: roll back sealed envelope files when a
+/// downstream step (meta write, etc.) fails. Best-effort: a roll-back
+/// failure logs at warn but does not change the response code (the
+/// operator already has a 500). Without this, a meta-write failure
+/// leaves orphan `*.sealed` files that the next call sees as
+/// `meta_path.exists() == false` and silently overwrites without
+/// reporting `replaced_previous: true`.
+async fn rollback_sealed_envelopes(vault_dir: &std::path::Path, services: &[String]) {
+    for service in services {
+        let envelope_path = vault_dir.join(format!("{service}.sealed"));
+        let envelope_for_unlink = envelope_path.clone();
+        let result =
+            tokio::task::spawn_blocking(move || std::fs::remove_file(&envelope_for_unlink)).await;
+        match result {
+            Ok(Ok(())) => {
+                tracing::info!(
+                    target: "control",
+                    path = %envelope_path.display(),
+                    "rolled back orphan sealed envelope after partial-write failure"
+                );
+            }
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                // Already absent — fine.
+            }
+            Ok(Err(e)) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %envelope_path.display(),
+                    "rollback of sealed envelope failed; operator may need to clean up by hand"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    path = %envelope_path.display(),
+                    "blocking task join failed during sealed-envelope rollback"
+                );
+            }
+        }
+    }
+}
+
+/// Request body for `POST /v1/control/credentials/{service}/verify`
+/// (Story 7.30 AC #4).
+#[derive(Debug, Deserialize)]
+pub(crate) struct CredentialsVerifyRequest {
+    pub agent: String,
+    #[serde(default)]
+    pub project_id: Option<String>,
+}
+
+/// Successful-verify response body (Story 7.30 AC #4 line 74 +
+/// round-1 review P6 unified wire shape + P18 verified_scopes).
+#[derive(Debug, Serialize)]
+pub(crate) struct CredentialsVerifyOkResponse {
+    pub ok: bool, // always true on this shape
+    pub summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
+    /// Round-1 review P18: scopes the sealed credential carries.
+    /// Surfaces what the daemon successfully verified against Google
+    /// so operators can confirm the grant matches their consent.
+    /// Sourced from the credential's `*-meta.json` `scopes` field;
+    /// empty when the meta file is missing or parse-fails (the verify
+    /// probe still succeeded, the meta lookup is best-effort).
+    pub verified_scopes: Vec<String>,
+}
+
+/// Structured Google-side verify failure (HTTP 200, `ok: false`).
+/// Round-1 review P5 + P6: includes composite-flag follow-up
+/// remediations so multi-cause failures (e.g. ScopeInsufficient +
+/// also_service_disabled + also_billing_disabled on a fresh GCP
+/// project) surface every step the operator needs to take.
+#[derive(Debug, Serialize)]
+pub(crate) struct CredentialsVerifyFailResponse {
+    pub ok: bool, // always false on this shape
+    pub status_code: u16,
+    pub verify_reason: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub remediation_url: Option<String>,
+    pub reason_text: String,
+    /// Empty when the primary `verify_reason` carries no composite
+    /// flags. See `verify_reason_also_remediations`.
+    pub also_remediations: Vec<AlsoRemediation>,
+}
+
+/// `POST /v1/control/credentials/{service}/verify` — read the sealed
+/// credential, unseal via `state.vault`, and run the Google verify
+/// probe daemon-side (Story 7.30 AC #4).
+///
+/// The CLI's `agentsso connect` flow drove the verify probe locally
+/// pre-7.30 — which required CLI-side vault unseal access, which
+/// requires the master key, which only the daemon should hold. This
+/// handler keeps verify daemon-side while the CLI retains the
+/// operator-interactive retry loop ("Press Enter to retry").
+///
+/// Audit event: `credentials-verified` with outcome `"ok"` or
+/// `"error"`. `peer_uid` + `peer_gid` enriched via the standard
+/// peer-creds helper.
+///
+/// **Round-1 review P6 wire-shape contract.** Every response from
+/// this endpoint carries one of three precisely-typed shapes:
+/// - 200 + `CredentialsVerifyOkResponse` (ok=true).
+/// - 200 + `CredentialsVerifyFailResponse` (ok=false, structured
+///   Google failure with composite remediations).
+/// - 4xx/5xx + `agent_error_response` envelope (daemon-side failure:
+///   missing credential, unseal failure, transport-to-Google failure).
+///
+/// **Round-1 review P20 unseal-hint.** `credentials.unseal_failed`
+/// surfaces "re-run `agentsso connect <service>`" remediation so
+/// operators who triggered key rotation between seal and verify get
+/// an actionable next step.
+pub(crate) async fn credentials_verify_handler(
+    State(state): State<ControlState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(service): Path<String>,
+    req: axum::extract::Request,
+) -> Response {
+    if let Err(e) = require_loopback(peer) {
+        return e.into_response();
+    }
+
+    let request_id = read_request_id(&req);
+    let peer_creds_for_audit: Option<crate::server::PeerCredentials> =
+        req.extensions().get::<crate::server::PeerCredentials>().copied();
+
+    if !credential_service_supported(&service) {
+        emit_verify_denied_audit(
+            &state,
+            &request_id,
+            Some(&service),
+            None,
+            "credentials.unknown_service",
+            peer_creds_for_audit,
+        )
+        .await;
+        return agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "credentials.unknown_service",
+            format!(
+                "service {:?} is not supported; allowed: {}",
+                service,
+                CREDENTIAL_SUPPORTED_SERVICES.join(", ")
+            ),
+            Some(request_id),
+        );
+    }
+
+    let (_parts, body) = req.into_parts();
+    let bytes = match axum::body::to_bytes(body, 16 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            emit_verify_denied_audit(
+                &state,
+                &request_id,
+                Some(&service),
+                None,
+                "credentials.bad_request",
+                peer_creds_for_audit,
+            )
+            .await;
+            return agent_error_response(
+                StatusCode::BAD_REQUEST,
+                "credentials.bad_request",
+                format!("failed to read request body: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+    let payload: CredentialsVerifyRequest = match serde_json::from_slice(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            emit_verify_denied_audit(
+                &state,
+                &request_id,
+                Some(&service),
+                None,
+                "credentials.bad_request",
+                peer_creds_for_audit,
+            )
+            .await;
+            return agent_error_response(
+                StatusCode::BAD_REQUEST,
+                "credentials.bad_request",
+                format!("invalid JSON body: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+
+    let Some(home) = state.vault_dir.parent().map(std::path::Path::to_path_buf) else {
+        emit_verify_denied_audit(
+            &state,
+            &request_id,
+            Some(&service),
+            Some(&payload.agent),
+            "credentials.vault_layout_invalid",
+            peer_creds_for_audit,
+        )
+        .await;
+        return agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "credentials.vault_layout_invalid",
+            format!(
+                "vault_dir {:?} has no parent — cannot derive credential store home",
+                state.vault_dir
+            ),
+            Some(request_id),
+        );
+    };
+
+    let store = match permitlayer_core::store::fs::CredentialFsStore::new(home) {
+        Ok(s) => s,
+        Err(e) => {
+            emit_verify_denied_audit(
+                &state,
+                &request_id,
+                Some(&service),
+                Some(&payload.agent),
+                "credentials.store_init_failed",
+                peer_creds_for_audit,
+            )
+            .await;
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credentials.store_init_failed",
+                format!("credential store init failed: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+
+    let sealed = match store.get(&service).await {
+        Ok(Some(s)) => s,
+        Ok(None) => {
+            emit_verify_denied_audit(
+                &state,
+                &request_id,
+                Some(&service),
+                Some(&payload.agent),
+                "credentials.not_found",
+                peer_creds_for_audit,
+            )
+            .await;
+            return agent_error_response(
+                StatusCode::NOT_FOUND,
+                "credentials.not_found",
+                format!("no sealed credential for service {service:?}"),
+                Some(request_id),
+            );
+        }
+        Err(e) => {
+            emit_verify_denied_audit(
+                &state,
+                &request_id,
+                Some(&service),
+                Some(&payload.agent),
+                "credentials.store_io_failed",
+                peer_creds_for_audit,
+            )
+            .await;
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credentials.store_io_failed",
+                format!("credential store read failed: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+
+    let access_token = match state.vault.unseal(&service, &sealed) {
+        Ok(t) => t,
+        Err(e) => {
+            // Round-1 review P20: unseal failure usually means the
+            // master key was rotated between seal and verify (Story
+            // 7.6a/b rotate-key paths). Surface the recovery
+            // remediation so operators don't have to guess.
+            // Round-3 review P62: emit audit on this load-bearing
+            // failure — post-rotation unseal failures are the
+            // highest-signal forensic event in the verify path.
+            emit_verify_denied_audit(
+                &state,
+                &request_id,
+                Some(&service),
+                Some(&payload.agent),
+                "credentials.unseal_failed",
+                peer_creds_for_audit,
+            )
+            .await;
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "credentials.unseal_failed",
+                format!(
+                    "vault unseal failed: {e} — the sealed credential was likely \
+                     produced under a different master key. Re-run \
+                     `agentsso connect {service}` to re-seal under the current key."
+                ),
+                Some(request_id),
+            );
+        }
+    };
+
+    // Round-1 review P18: best-effort read of the credential's
+    // `*-meta.json` to surface `verified_scopes` in the success
+    // response. The verify probe is the load-bearing step; if the
+    // meta file is unreadable we still return ok=true but with an
+    // empty `verified_scopes`.
+    let meta_path = state.vault_dir.join(format!("{service}-meta.json"));
+    let verified_scopes: Vec<String> = {
+        let meta_path_for_read = meta_path.clone();
+        match tokio::task::spawn_blocking(move || std::fs::read_to_string(&meta_path_for_read))
+            .await
+        {
+            Ok(Ok(raw)) => {
+                serde_json::from_str::<permitlayer_oauth::metadata::CredentialMeta>(&raw)
+                    .map(|m| m.scopes)
+                    .unwrap_or_default()
+            }
+            _ => Vec::new(),
+        }
+    };
+
+    let verify_result = permitlayer_oauth::google::verify::verify_connection(
+        &service,
+        access_token.reveal(),
+        payload.project_id.as_deref(),
+    )
+    .await;
+
+    // Audit-emit helper used by both ok and error paths.
+    let emit_audit = |outcome: &'static str, extra: serde_json::Value| {
+        let audit_store = state.audit_store.clone();
+        let request_id = request_id.clone();
+        let agent_name = payload.agent.clone();
+        let service_for_audit = service.clone();
+        let peer_creds = peer_creds_for_audit;
+        let event_extra = extra;
+        async move {
+            if let Some(audit) = audit_store {
+                let mut event = AuditEvent::with_request_id(
+                    request_id,
+                    agent_name,
+                    "permitlayer".to_owned(),
+                    service_for_audit,
+                    "credentials-verify".to_owned(),
+                    outcome.to_owned(),
+                    "credentials-verified".to_owned(),
+                );
+                event.extra = event_extra;
+                enrich_audit_extra_with_peer_creds(&mut event.extra, peer_creds);
+                if let Err(e) = audit.append(event).await {
+                    tracing::warn!(error = %e, "credentials-verified audit write failed (best-effort)");
+                }
+            }
+        }
+    };
+
+    match verify_result {
+        Ok(result) => {
+            emit_audit(
+                "ok",
+                serde_json::json!({
+                    "service": service,
+                    "agent": payload.agent,
+                    "scopes": verified_scopes,
+                }),
+            )
+            .await;
+            tracing::info!(
+                target: "control",
+                request_id = %request_id,
+                service = %service,
+                agent = %payload.agent,
+                scope_count = verified_scopes.len(),
+                "credential verified via control endpoint",
+            );
+            (
+                StatusCode::OK,
+                Json(CredentialsVerifyOkResponse {
+                    ok: true,
+                    summary: result.summary,
+                    email: result.email,
+                    verified_scopes,
+                }),
+            )
+                .into_response()
+        }
+        Err(permitlayer_oauth::OAuthError::VerificationFailed {
+            reason,
+            status_code,
+            verify_reason,
+            ..
+        }) => {
+            let verify_reason_kebab =
+                verify_reason.as_ref().map(verify_reason_kebab_label).unwrap_or("unknown");
+            let remediation_url = verify_reason.as_ref().and_then(verify_reason_remediation_url);
+            // Round-1 review P5: composite-flag follow-ups.
+            let also_remediations =
+                verify_reason.as_ref().map(verify_reason_also_remediations).unwrap_or_default();
+            match status_code {
+                Some(code) => {
+                    emit_audit(
+                        "error",
+                        serde_json::json!({
+                            "service": service,
+                            "agent": payload.agent,
+                            "status_code": code,
+                            "verify_reason": verify_reason_kebab,
+                            "also_remediation_count": also_remediations.len(),
+                        }),
+                    )
+                    .await;
+                    (
+                        StatusCode::OK,
+                        Json(CredentialsVerifyFailResponse {
+                            ok: false,
+                            status_code: code,
+                            verify_reason: verify_reason_kebab,
+                            remediation_url,
+                            reason_text: reason,
+                            also_remediations,
+                        }),
+                    )
+                        .into_response()
+                }
+                None => {
+                    emit_audit(
+                        "error",
+                        serde_json::json!({
+                            "service": service,
+                            "agent": payload.agent,
+                            "verify_reason": verify_reason_kebab,
+                            "transport_failure": true,
+                        }),
+                    )
+                    .await;
+                    // Round-1 review P6: unified error envelope —
+                    // 4xx/5xx responses always use `agent_error_response`.
+                    agent_error_response(
+                        StatusCode::BAD_GATEWAY,
+                        "credentials.transport_failed",
+                        format!("verify transport failure: {reason}"),
+                        Some(request_id),
+                    )
+                }
+            }
+        }
+        Err(e) => {
+            emit_audit(
+                "error",
+                serde_json::json!({
+                    "service": service,
+                    "agent": payload.agent,
+                    "verify_reason": serde_json::Value::Null,
+                    "transport_failure": true,
+                }),
+            )
+            .await;
+            agent_error_response(
+                StatusCode::BAD_GATEWAY,
+                "credentials.transport_failed",
+                format!("verify call returned non-VerificationFailed error: {e}"),
+                Some(request_id),
+            )
+        }
+    }
+}
+
+/// Map a `VerifyReason` enum variant to a kebab-case wire label
+/// (Story 7.30 AC #4). Mirrors the existing `kill_reason_wire_label`
+/// pattern.
+fn verify_reason_kebab_label(reason: &permitlayer_oauth::error::VerifyReason) -> &'static str {
+    use permitlayer_oauth::error::VerifyReason;
+    match reason {
+        VerifyReason::ServiceDisabled { .. } => "service-disabled",
+        VerifyReason::BillingDisabled { .. } => "billing-disabled",
+        VerifyReason::ScopeInsufficient { .. } => "scope-insufficient",
+        VerifyReason::Other => "other",
+        // Round-1 review P13: `VerifyReason` is `#[non_exhaustive]`;
+        // future variants surface as "other" with a `tracing::warn!`
+        // so operators reading audit lines can distinguish a real
+        // `Other` from a future variant that didn't get a wire label.
+        // Mirrors the `kill_reason_wire_label` pattern.
+        other => {
+            tracing::warn!(
+                target: "control",
+                reason = ?other,
+                "unknown VerifyReason variant — extend verify_reason_kebab_label",
+            );
+            "other"
+        }
+    }
+}
+
+/// Map a `VerifyReason` to an operator-facing remediation URL when
+/// one is available. `None` if no canonical URL applies (e.g.
+/// `Other`, or `ScopeInsufficient` which the operator must resolve
+/// via re-consent rather than a URL).
+fn verify_reason_remediation_url(
+    reason: &permitlayer_oauth::error::VerifyReason,
+) -> Option<String> {
+    use permitlayer_oauth::error::VerifyReason;
+    match reason {
+        VerifyReason::ServiceDisabled { service, project, .. } => {
+            Some(service_disabled_url(service, project.as_deref()))
+        }
+        VerifyReason::BillingDisabled { project } => Some(billing_disabled_url(project.as_deref())),
+        VerifyReason::ScopeInsufficient { .. } | VerifyReason::Other => None,
+        // VerifyReason is `#[non_exhaustive]`; future variants surface no URL.
+        _ => None,
+    }
+}
+
+fn service_disabled_url(service: &str, project: Option<&str>) -> String {
+    // `service` is the canonical Google API name (e.g.
+    // `"calendar.googleapis.com"`). Operators arrive at the
+    // API-library page; the `?project=<id>` query pre-fills the
+    // project switcher when present.
+    let base = format!("https://console.cloud.google.com/apis/library/{service}");
+    match project {
+        Some(p) => format!("{base}?project={p}"),
+        None => base,
+    }
+}
+
+fn billing_disabled_url(project: Option<&str>) -> String {
+    let base = "https://console.cloud.google.com/billing".to_owned();
+    match project {
+        Some(p) => format!("{base}/linkedaccount?project={p}"),
+        None => base,
+    }
+}
+
+/// One follow-up remediation for a composite `VerifyReason`.
+/// Round-1 review P5: surfaces `also_service_disabled` /
+/// `also_billing_disabled` flags so the CLI can render the full
+/// fix-chain on the wire instead of dropping the secondary signal.
+#[derive(Debug, Serialize)]
+pub(crate) struct AlsoRemediation {
+    pub reason: &'static str,
+    pub url: String,
+}
+
+/// Round-1 review P5: collect the secondary remediations implied by
+/// a primary `VerifyReason`. Empty when the primary reason carries no
+/// composite flags. Operators with a `ScopeInsufficient`+
+/// `also_service_disabled`+`also_billing_disabled` combo on a brand-
+/// new GCP project see all three steps surfaced; without this they
+/// re-consent (primary fix), retry, hit a fresh 403 because the API
+/// is also off, etc.
+fn verify_reason_also_remediations(
+    reason: &permitlayer_oauth::error::VerifyReason,
+) -> Vec<AlsoRemediation> {
+    use permitlayer_oauth::error::VerifyReason;
+    match reason {
+        VerifyReason::ServiceDisabled { project, also_billing_disabled, .. } => {
+            if *also_billing_disabled {
+                vec![AlsoRemediation {
+                    reason: "billing-disabled",
+                    url: billing_disabled_url(project.as_deref()),
+                }]
+            } else {
+                vec![]
+            }
+        }
+        VerifyReason::ScopeInsufficient {
+            also_service_disabled, also_billing_disabled, ..
+        } => {
+            let mut out = Vec::new();
+            if let Some(service) = also_service_disabled {
+                // ScopeInsufficient doesn't carry a project id on the
+                // variant; surface the API-library URL without query.
+                out.push(AlsoRemediation {
+                    reason: "service-disabled",
+                    url: service_disabled_url(service, None),
+                });
+            }
+            if *also_billing_disabled {
+                out.push(AlsoRemediation {
+                    reason: "billing-disabled",
+                    url: billing_disabled_url(None),
+                });
+            }
+            out
+        }
+        _ => vec![],
+    }
+}
+
+/// Request body for `POST /v1/control/policy/{policy_name}/scopes`
+/// (Story 7.30 AC #5).
+#[derive(Debug, Deserialize)]
+pub(crate) struct PolicyScopesAddRequest {
+    /// Short scope names to merge into the policy's allow-list
+    /// (e.g. `["gmail.readonly", "gmail.modify"]`). NOT full Google
+    /// scope URIs — the CLI maps URIs to shorts before sending.
+    pub short_names: Vec<String>,
+}
+
+/// Response body for `POST /v1/control/policy/{policy_name}/scopes`.
+#[derive(Debug, Serialize)]
+pub(crate) struct PolicyScopesAddResponse {
+    pub policy_name: String,
+    pub before: Vec<String>,
+    pub added: Vec<String>,
+    pub after: Vec<String>,
+    pub reloaded: bool,
+}
+
+/// `POST /v1/control/policy/{policy_name}/scopes` — merge new scopes
+/// into a policy file and reload the active policy set (Story 7.30
+/// AC #5).
+///
+/// Idempotent: when the requested `short_names` are already present,
+/// the helper returns a no-op diff and the daemon skips the reload
+/// + skips the audit event (matches the CLI's existing
+///   `policy_was_modified` gating).
+///
+/// On a real merge, runs the same reload sequence as
+/// `reload_handler`: clear approval caches, swap the `ArcSwap`
+/// policy set via `reload_policies_with_diff_locked`, and emit a
+/// reload audit event via `write_reload_audit_event`.
+///
+/// Audit event: `policy-scopes-added` with `policy_name`, `before`,
+/// `added`, `after`. Plus the standard reload audit event when the
+/// merge produced a real diff.
+pub(crate) async fn policy_scopes_handler(
+    State(state): State<ControlState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(policy_name): Path<String>,
+    req: axum::extract::Request,
+) -> Response {
+    if let Err(e) = require_loopback(peer) {
+        return e.into_response();
+    }
+
+    let request_id = read_request_id(&req);
+    let peer_creds_for_audit: Option<crate::server::PeerCredentials> =
+        req.extensions().get::<crate::server::PeerCredentials>().copied();
+
+    // Defense-in-depth: reject path-traversal and obviously-invalid
+    // policy names before `add_scopes_to_policy` joins them into a
+    // filesystem path. `add_scopes_to_policy` itself will surface a
+    // not-found, but a 400 here gives the caller a clearer typed
+    // error code without ever doing fs I/O on a bad name.
+    if policy_name.is_empty()
+        || policy_name.contains('/')
+        || policy_name.contains('\\')
+        || policy_name.contains("..")
+        || policy_name.starts_with('.')
+    {
+        emit_policy_scopes_denied_audit(
+            &state,
+            &request_id,
+            Some(&policy_name),
+            "policy.invalid_name",
+            peer_creds_for_audit,
+        )
+        .await;
+        return agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "policy.invalid_name",
+            format!("policy name {policy_name:?} contains illegal characters"),
+            Some(request_id),
+        );
+    }
+
+    let (_parts, body) = req.into_parts();
+    let bytes = match axum::body::to_bytes(body, 16 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            emit_policy_scopes_denied_audit(
+                &state,
+                &request_id,
+                Some(&policy_name),
+                "policy.bad_request",
+                peer_creds_for_audit,
+            )
+            .await;
+            return agent_error_response(
+                StatusCode::BAD_REQUEST,
+                "policy.bad_request",
+                format!("failed to read request body: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+    let payload: PolicyScopesAddRequest = match serde_json::from_slice(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            emit_policy_scopes_denied_audit(
+                &state,
+                &request_id,
+                Some(&policy_name),
+                "policy.bad_request",
+                peer_creds_for_audit,
+            )
+            .await;
+            return agent_error_response(
+                StatusCode::BAD_REQUEST,
+                "policy.bad_request",
+                format!("invalid JSON body: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+
+    // `add_scopes_to_policy` is a read/modify/write operation with a
+    // caller-owned serialization contract. With the seeded multi-policy
+    // default layout, unrelated policy names can now share one file, so
+    // serialize the whole edit + reload sequence to avoid lost updates.
+    let _policy_edit_guard = state.policy_edit_mutex.lock().await;
+
+    let policies_dir = state.policies_dir.clone();
+    let policy_name_for_blocking = policy_name.clone();
+    let short_names_for_blocking: Vec<String> = payload.short_names.clone();
+    let edit_result = tokio::task::spawn_blocking(move || {
+        let short_name_refs: Vec<&str> =
+            short_names_for_blocking.iter().map(String::as_str).collect();
+        permitlayer_core::policy::edit::add_scopes_to_policy(
+            &policies_dir,
+            &policy_name_for_blocking,
+            &short_name_refs,
+        )
+    })
+    .await;
+
+    let diff = match edit_result {
+        Ok(Ok(d)) => d,
+        Ok(Err(e)) => {
+            // Round-3 review P63: audit every PolicyEditError variant.
+            // The variant determines the error_code label so operators
+            // can grep `policy-scopes-denied` rows for the exact cause.
+            let error_code = policy_edit_error_code(&e);
+            emit_policy_scopes_denied_audit(
+                &state,
+                &request_id,
+                Some(&policy_name),
+                error_code,
+                peer_creds_for_audit,
+            )
+            .await;
+            return policy_edit_error_response(e, &request_id);
+        }
+        Err(e) => {
+            emit_policy_scopes_denied_audit(
+                &state,
+                &request_id,
+                Some(&policy_name),
+                "policy.io_failed",
+                peer_creds_for_audit,
+            )
+            .await;
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "policy.io_failed",
+                format!("policy edit task join failed: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+
+    let reloaded = if diff.is_no_op() {
+        false
+    } else {
+        // Mirror `reload_handler`'s pre-swap discipline (Story 4.5):
+        // clear approval caches BEFORE the ArcSwap regardless of
+        // reload success. The cache may be referencing stale policy
+        // that's about to be invalidated; clearing unconditionally
+        // avoids serving from stale cache against the new policy.
+        // Round-1 review P8 considered moving this to post-success
+        // but rejected the change to keep behavioral parity with
+        // `reload_handler` — both reload paths flush caches the same
+        // way.
+        state.approval_service.clear_caches();
+        tracing::info!("approval service caches cleared on policy-scopes reload (pre-swap)");
+
+        let ps = Arc::clone(&state.policy_set);
+        let dir = state.policies_dir.clone();
+        let mtx = Arc::clone(&state.reload_mutex);
+        let result = tokio::task::spawn_blocking(move || {
+            super::sighup::reload_policies_with_diff_locked(&ps, &dir, &mtx)
+        })
+        .await;
+
+        match result {
+            Ok(Ok(reload_diff)) => {
+                tracing::info!(
+                    policies_loaded = reload_diff.policies_loaded,
+                    added = reload_diff.added.len(),
+                    modified = reload_diff.modified.len(),
+                    removed = reload_diff.removed.len(),
+                    "policies reloaded via policy-scopes endpoint",
+                );
+                super::sighup::write_reload_audit_event(state.audit_store.as_ref(), &reload_diff)
+                    .await;
+                true
+            }
+            Ok(Err(e)) => {
+                // Round-1 review P9 + P10: emit a partial-failure audit
+                // event since the policy file is already mutated on
+                // disk; surface `agentsso reload` as the recovery hint.
+                emit_policy_scopes_partial_failure_audit(
+                    &state,
+                    &request_id,
+                    &diff,
+                    &format!("{e}"),
+                    peer_creds_for_audit,
+                )
+                .await;
+                return agent_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "policy.reload_failed",
+                    format!(
+                        "post-edit policy reload failed: {e} — the policy file IS \
+                         already edited on disk. Recover with `agentsso reload` \
+                         once the underlying issue is resolved; the in-memory \
+                         policy set is still the pre-edit version until reload \
+                         succeeds."
+                    ),
+                    Some(request_id),
+                );
+            }
+            Err(e) => {
+                emit_policy_scopes_partial_failure_audit(
+                    &state,
+                    &request_id,
+                    &diff,
+                    &format!("task panicked: {e}"),
+                    peer_creds_for_audit,
+                )
+                .await;
+                return agent_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "policy.reload_failed",
+                    format!(
+                        "post-edit policy reload task panicked: {e} — the policy \
+                         file IS already edited on disk. Run `agentsso reload` to \
+                         attempt recovery."
+                    ),
+                    Some(request_id),
+                );
+            }
+        }
+    };
+
+    // policy-scopes-added audit event (only when a real merge happened,
+    // matching the CLI's existing `policy_was_modified` gating).
+    if !diff.is_no_op()
+        && let Some(audit) = &state.audit_store
+    {
+        let mut event = AuditEvent::with_request_id(
+            request_id.clone(),
+            "operator".to_owned(),
+            "permitlayer".to_owned(),
+            "-".to_owned(),
+            "policy-scopes-add".to_owned(),
+            "ok".to_owned(),
+            "policy-scopes-added".to_owned(),
+        );
+        event.extra = serde_json::json!({
+            "policy_name": diff.policy_name,
+            "before": diff.before,
+            "added": diff.added,
+            "after": diff.after,
+        });
+        enrich_audit_extra_with_peer_creds(&mut event.extra, peer_creds_for_audit);
+        if let Err(e) = audit.append(event).await {
+            tracing::warn!(error = %e, "policy-scopes-added audit write failed (best-effort)");
+        }
+    }
+
+    tracing::info!(
+        target: "control",
+        request_id = %request_id,
+        policy_name = %policy_name,
+        added_count = diff.added.len(),
+        reloaded,
+        "policy scope merge complete",
+    );
+
+    (
+        StatusCode::OK,
+        Json(PolicyScopesAddResponse {
+            policy_name,
+            before: diff.before,
+            added: diff.added,
+            after: diff.after,
+            reloaded,
+        }),
+    )
+        .into_response()
+}
+
+/// Round-1 review P9: emit `policy-scopes-add-partial-failure`
+/// audit event when the policy file was successfully mutated on
+/// disk but the in-memory reload failed. The audit row captures
+/// (a) the on-disk state that drifted from in-memory and (b) the
+/// underlying error so post-incident forensics can correlate the
+/// 500 response with the policy file's then-current contents.
+/// Mirrors `agent-rebind-denied`'s discipline for partial states.
+async fn emit_policy_scopes_partial_failure_audit(
+    state: &ControlState,
+    request_id: &str,
+    diff: &permitlayer_core::policy::edit::ScopeMergeDiff,
+    error_text: &str,
+    peer_creds: Option<crate::server::PeerCredentials>,
+) {
+    let Some(audit) = state.audit_store.as_ref() else {
+        return;
+    };
+    let mut event = AuditEvent::with_request_id(
+        request_id.to_owned(),
+        "operator".to_owned(),
+        "permitlayer".to_owned(),
+        "-".to_owned(),
+        "policy-scopes-add".to_owned(),
+        "denied".to_owned(),
+        "policy-scopes-add-partial-failure".to_owned(),
+    );
+    event.extra = serde_json::json!({
+        "policy_name": diff.policy_name,
+        "before": diff.before,
+        "added": diff.added,
+        "after": diff.after,
+        "error": error_text,
+    });
+    enrich_audit_extra_with_peer_creds(&mut event.extra, peer_creds);
+    if let Err(e) = audit.append(event).await {
+        tracing::warn!(error = %e, "policy-scopes-add-partial-failure audit write failed (best-effort)");
+    }
+}
+
+/// Round-3 review P63: map `PolicyEditError` to a stable audit-log
+/// `error_code` string. Kept in lock-step with the HTTP-side mapping
+/// in `policy_edit_error_response` so audit and response codes line
+/// up for forensic correlation.
+fn policy_edit_error_code(err: &permitlayer_core::policy::edit::PolicyEditError) -> &'static str {
+    use permitlayer_core::policy::edit::PolicyEditError;
+    match err {
+        PolicyEditError::PolicyFileNotFound { .. } | PolicyEditError::PolicyNotInFile { .. } => {
+            "policy.not_found"
+        }
+        PolicyEditError::PolicyDuplicateName { .. } => "policy.duplicate_name",
+        PolicyEditError::PolicyFileIsSymlink { .. } => "policy.is_symlink",
+        PolicyEditError::ParseFailed { .. } => "policy.parse_failed",
+        PolicyEditError::CompileFailedAfterEdit { .. } => "policy.compile_failed_after_edit",
+        PolicyEditError::Io { .. } => "policy.io_failed",
+        PolicyEditError::SerializeFailed { .. } => "policy.serialize_failed",
+    }
+}
+
+/// Map `PolicyEditError` variants to HTTP responses (Story 7.30 AC #5).
+fn policy_edit_error_response(
+    err: permitlayer_core::policy::edit::PolicyEditError,
+    request_id: &str,
+) -> Response {
+    use permitlayer_core::policy::edit::PolicyEditError;
+    match err {
+        PolicyEditError::PolicyFileNotFound { path } => agent_error_response(
+            StatusCode::NOT_FOUND,
+            "policy.not_found",
+            format!("policy file not found: {}", path.display()),
+            Some(request_id.to_owned()),
+        ),
+        PolicyEditError::PolicyFileIsSymlink { path } => agent_error_response(
+            StatusCode::CONFLICT,
+            "policy.is_symlink",
+            format!("policy file is a symlink (refusing to follow): {}", path.display()),
+            Some(request_id.to_owned()),
+        ),
+        PolicyEditError::PolicyNotInFile { name, path } => agent_error_response(
+            StatusCode::NOT_FOUND,
+            "policy.not_found",
+            format!("policy {name:?} not found in file {}", path.display()),
+            Some(request_id.to_owned()),
+        ),
+        PolicyEditError::PolicyDuplicateName { name, dir, paths } => agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "policy.duplicate_name",
+            format!(
+                "policies dir {} contains multiple files with policy {name:?}: {paths:?}; \
+                 the daemon's compile_from_dir should have rejected this at startup, \
+                 so inspect the policies dir manually",
+                dir.display()
+            ),
+            Some(request_id.to_owned()),
+        ),
+        PolicyEditError::ParseFailed { source } => agent_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "policy.parse_failed",
+            format!("policy file parse failed: {source}"),
+            Some(request_id.to_owned()),
+        ),
+        PolicyEditError::CompileFailedAfterEdit { source } => agent_error_response(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "policy.compile_failed_after_edit",
+            format!("post-edit policy compile failed (file unchanged): {source}"),
+            Some(request_id.to_owned()),
+        ),
+        PolicyEditError::Io { source } => agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "policy.io_failed",
+            format!("policy file IO failed: {source}"),
+            Some(request_id.to_owned()),
+        ),
+        PolicyEditError::SerializeFailed { source } => agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "policy.serialize_failed",
+            format!("policy TOML serialize failed: {source}"),
+            Some(request_id.to_owned()),
+        ),
+    }
+}
+
 /// `POST /v1/control/agent/remove` — delete an agent file and swap
 /// the registry. Returns `removed: false` for a not-found name.
 pub(crate) async fn remove_agent_handler(
@@ -1537,6 +4093,11 @@ pub(crate) async fn remove_agent_handler(
     }
 
     let request_id = read_request_id(&req);
+
+    // Snapshot peer creds before `req.into_parts()` consumes the
+    // request body. Story 7.27 AC #1 (review fix).
+    let peer_creds_for_audit: Option<crate::server::PeerCredentials> =
+        req.extensions().get::<crate::server::PeerCredentials>().copied();
 
     // Rate-limit concurrent agent CRUD (see register_agent_handler
     // for the rationale).
@@ -1688,6 +4249,7 @@ pub(crate) async fn remove_agent_handler(
         event.extra = serde_json::json!({
             "had_last_seen": had_last_seen,
         });
+        enrich_audit_extra_with_peer_creds(&mut event.extra, peer_creds_for_audit);
         if let Err(e) = audit.append(event).await {
             tracing::warn!(error = %e, "agent-removed audit write failed (best-effort)");
         }
@@ -1736,6 +4298,11 @@ pub(crate) async fn rebind_agent_handler(
     }
 
     let request_id = read_request_id(&req);
+
+    // Snapshot peer creds before `req.into_parts()` consumes it.
+    // Story 7.27 AC #1 (review fix).
+    let peer_creds_for_audit: Option<crate::server::PeerCredentials> =
+        req.extensions().get::<crate::server::PeerCredentials>().copied();
 
     // Rate-limit concurrent agent CRUD (same shape as register/remove).
     let _permit = match state.agent_crud_semaphore.clone().try_acquire_owned() {
@@ -2001,6 +4568,7 @@ pub(crate) async fn rebind_agent_handler(
             "old_policy_name": old_policy_name,
             "new_policy_name": payload.policy_name,
         });
+        enrich_audit_extra_with_peer_creds(&mut event.extra, peer_creds_for_audit);
         if let Err(e) = audit.append(event).await {
             tracing::warn!(error = %e, "agent-rebound audit write failed (best-effort)");
         }
@@ -2240,6 +4808,7 @@ pub(crate) fn router(
     cli_overrides: Arc<crate::config::CliOverrides>,
     proxy_stub_branch_active: Arc<AtomicBool>,
     vault_dir: PathBuf,
+    vault: Arc<permitlayer_vault::Vault>,
     control_token: Arc<crate::lifecycle::control_token::ControlToken>,
 ) -> Router {
     // The caller owns the `Arc<Zeroizing<_>>` and shares the same
@@ -2253,6 +4822,7 @@ pub(crate) fn router(
         policy_set,
         policies_dir,
         reload_mutex,
+        policy_edit_mutex: Arc::new(tokio::sync::Mutex::new(())),
         agent_registry,
         agent_store,
         agent_lookup_key,
@@ -2266,6 +4836,11 @@ pub(crate) fn router(
         cli_overrides,
         proxy_stub_branch_active,
         vault_dir,
+        vault,
+        credentials_seal_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        credentials_seal_semaphore: Arc::new(tokio::sync::Semaphore::new(
+            CREDENTIALS_SEAL_MAX_CONCURRENT,
+        )),
         control_token,
     };
     Router::new()
@@ -2275,6 +4850,11 @@ pub(crate) fn router(
         .route("/v1/control/reload", post(reload_handler))
         .route("/v1/control/agent/register", post(register_agent_handler))
         .route("/v1/control/agent/list", get(list_agents_handler))
+        .route("/v1/control/agent/{name}/policy_name", get(agent_policy_name_handler))
+        .route("/v1/control/credentials/{service}/meta", get(credentials_meta_handler))
+        .route("/v1/control/credentials/seal", post(credentials_seal_handler))
+        .route("/v1/control/credentials/{service}/verify", post(credentials_verify_handler))
+        .route("/v1/control/policy/{policy_name}/scopes", post(policy_scopes_handler))
         .route("/v1/control/agent/remove", post(remove_agent_handler))
         .route("/v1/control/agent/rebind", post(rebind_agent_handler))
         .route("/v1/control/connections", get(connections_handler))
@@ -2364,6 +4944,15 @@ mod tests {
         )
     }
 
+    /// Story 7.30: throw-away `Arc<Vault>` for tests that don't
+    /// exercise credentials-seal / credentials-verify. The vault holds
+    /// a deterministic 32-byte key + `key_id = 0`; `Vault::new` is
+    /// a pure constructor so no I/O happens here.
+    fn test_vault() -> Arc<permitlayer_vault::Vault> {
+        let key = zeroize::Zeroizing::new([0x55u8; permitlayer_keystore::MASTER_KEY_LEN]);
+        Arc::new(permitlayer_vault::Vault::new(key, 0))
+    }
+
     /// Construct a ControlToken with deterministic bytes so test
     /// helpers can produce request headers that match. Production
     /// callers must always go through `ControlToken::read_or_mint`.
@@ -2392,7 +4981,7 @@ mod tests {
         // exercise the agent control endpoints construct their own
         // registry; everything else is fine with the default empty.
         let agent_registry = Arc::new(AgentRegistry::new(vec![]));
-        let (ato, cs, co, stub, vault) = test_reload_wiring();
+        let (ato, cs, co, stub, vault_dir) = test_reload_wiring();
         router(
             kill_switch,
             None,
@@ -2414,7 +5003,8 @@ mod tests {
             cs,
             co,
             stub,
-            vault,
+            vault_dir,
+            test_vault(),
             test_control_token(),
         )
     }
@@ -2429,7 +5019,7 @@ mod tests {
         let policies_dir = tempfile::tempdir().unwrap().keep();
         let reload_mutex = Arc::new(std::sync::Mutex::new(()));
         let agent_registry = Arc::new(AgentRegistry::new(vec![]));
-        let (ato, cs, co, stub, vault) = test_reload_wiring();
+        let (ato, cs, co, stub, vault_dir) = test_reload_wiring();
         router(
             kill_switch,
             Some(audit_store),
@@ -2451,7 +5041,8 @@ mod tests {
             cs,
             co,
             stub,
-            vault,
+            vault_dir,
+            test_vault(),
             test_control_token(),
         )
     }
@@ -2469,7 +5060,7 @@ mod tests {
         let policies_dir = tempfile::tempdir().unwrap().keep();
         let reload_mutex = Arc::new(std::sync::Mutex::new(()));
         let agent_registry = Arc::new(AgentRegistry::new(vec![]));
-        let (ato, cs, co, stub, vault) = test_reload_wiring();
+        let (ato, cs, co, stub, vault_dir) = test_reload_wiring();
         router(
             kill_switch,
             None,
@@ -2486,7 +5077,8 @@ mod tests {
             cs,
             co,
             stub,
-            vault,
+            vault_dir,
+            test_vault(),
             test_control_token(),
         )
     }
@@ -2669,7 +5261,7 @@ mod tests {
         let policies_dir = tempfile::tempdir().unwrap().keep();
         let reload_mutex = Arc::new(std::sync::Mutex::new(()));
         let agent_registry = Arc::new(AgentRegistry::new(vec![]));
-        let (ato, cs, co, stub, vault) = test_reload_wiring();
+        let (ato, cs, co, stub, vault_dir) = test_reload_wiring();
         router(
             kill_switch,
             None,
@@ -2686,7 +5278,8 @@ mod tests {
             cs,
             co,
             stub,
-            vault,
+            vault_dir,
+            test_vault(),
             test_control_token(),
         )
     }
@@ -3718,5 +6311,1212 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let json = body_json(resp).await;
         assert_eq!(json["error"]["code"], "forbidden_not_loopback");
+    }
+
+    // ── Story 7.30 Task 2: GET /v1/control/agent/{name}/policy_name ──
+
+    /// In-memory `AgentIdentityStore` for the agent-policy-name handler
+    /// tests. Holds a fixed map of agent records; only `get`/`list` are
+    /// meaningful — other trait methods are no-ops (the read-only
+    /// handler under test never calls them).
+    #[derive(Clone, Default)]
+    struct InMemoryAgentStore {
+        agents: std::collections::HashMap<String, permitlayer_core::agent::AgentIdentity>,
+    }
+
+    impl InMemoryAgentStore {
+        fn with_agent(name: &str, policy_name: &str) -> Self {
+            let identity = permitlayer_core::agent::AgentIdentity::new(
+                name.to_owned(),
+                policy_name.to_owned(),
+                "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".to_owned(),
+                "0".repeat(64),
+                chrono::Utc::now(),
+                None,
+            )
+            .unwrap();
+            let mut agents = std::collections::HashMap::new();
+            agents.insert(name.to_owned(), identity);
+            Self { agents }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl permitlayer_core::store::AgentIdentityStore for InMemoryAgentStore {
+        async fn put(
+            &self,
+            _identity: permitlayer_core::agent::AgentIdentity,
+        ) -> Result<(), permitlayer_core::store::StoreError> {
+            Ok(())
+        }
+        async fn get(
+            &self,
+            name: &str,
+        ) -> Result<
+            Option<permitlayer_core::agent::AgentIdentity>,
+            permitlayer_core::store::StoreError,
+        > {
+            Ok(self.agents.get(name).cloned())
+        }
+        async fn list(
+            &self,
+        ) -> Result<Vec<permitlayer_core::agent::AgentIdentity>, permitlayer_core::store::StoreError>
+        {
+            Ok(self.agents.values().cloned().collect())
+        }
+        async fn remove(&self, _name: &str) -> Result<bool, permitlayer_core::store::StoreError> {
+            Ok(false)
+        }
+        async fn touch_last_seen(
+            &self,
+            _identity: permitlayer_core::agent::AgentIdentity,
+        ) -> Result<(), permitlayer_core::store::StoreError> {
+            Ok(())
+        }
+        async fn update_lookup_key_and_token(
+            &self,
+            _name: &str,
+            _new_lookup_key_hex: String,
+            _new_token_hash: String,
+        ) -> Result<bool, permitlayer_core::store::StoreError> {
+            Ok(false)
+        }
+        async fn update_policy(
+            &self,
+            _name: &str,
+            _new_policy_name: String,
+        ) -> Result<bool, permitlayer_core::store::StoreError> {
+            Ok(false)
+        }
+    }
+
+    /// Build a router wired with a caller-supplied `Option<Arc<dyn
+    /// AgentIdentityStore>>`. Used by Story 7.30 endpoint tests; `None`
+    /// exercises the `agent.store_unavailable` 503 branch.
+    ///
+    /// Round-1 review P21: callers may pass `known_policies` to seed
+    /// `state.policy_set` with empty stub policies. Tests that want
+    /// to exercise the dangling-policy-binding 422 branch pass `&[]`;
+    /// tests that need the happy path stage the agent's policy name
+    /// here.
+    fn build_with_agent_store(
+        kill_switch: Arc<KillSwitch>,
+        agent_store: Option<Arc<dyn permitlayer_core::store::AgentIdentityStore>>,
+        known_policies: &[&str],
+    ) -> AgentStoreHarness {
+        // Round-1 review P23: hold the TempDir in the returned
+        // harness so the policies_dir survives the request (the
+        // router stores its path) but is cleaned up when the test's
+        // local binding drops — instead of `.keep()`'ing it which
+        // leaks per-test directories under `$TMPDIR`.
+        let policies_dir_tempdir = tempfile::tempdir().unwrap();
+        let policies_dir = policies_dir_tempdir.path().to_path_buf();
+        let policy_set = if known_policies.is_empty() {
+            Arc::new(ArcSwap::from_pointee(PolicySet::empty()))
+        } else {
+            for name in known_policies {
+                stage_minimal_policy(&policies_dir, name, &["gmail.readonly"]);
+            }
+            let compiled = permitlayer_core::policy::PolicySet::compile_from_dir(&policies_dir)
+                .expect("test policy set must compile");
+            Arc::new(ArcSwap::from_pointee(compiled))
+        };
+        let reload_mutex = Arc::new(std::sync::Mutex::new(()));
+        let agent_registry = Arc::new(AgentRegistry::new(vec![]));
+        let (ato, cs, co, stub, vault_dir) = test_reload_wiring();
+        let router = router(
+            kill_switch,
+            None,
+            policy_set,
+            policies_dir,
+            reload_mutex,
+            agent_registry,
+            agent_store,
+            Arc::new(zeroize::Zeroizing::new([0x42u8; LOOKUP_KEY_BYTES])),
+            test_approval_service(),
+            test_conn_tracker(),
+            test_plugin_registry(),
+            ato,
+            cs,
+            co,
+            stub,
+            vault_dir,
+            test_vault(),
+            test_control_token(),
+        );
+        AgentStoreHarness { router, _policies_dir: policies_dir_tempdir }
+    }
+
+    /// Returned by `build_with_agent_store`. Holds the TempDir for
+    /// the staged policies_dir so it survives as long as the test's
+    /// binding; deref to `Router` for the oneshot-style call sites.
+    struct AgentStoreHarness {
+        router: Router,
+        /// Underscored to suppress dead-code lint — the lifetime is
+        /// the load-bearing function, not the field access.
+        _policies_dir: tempfile::TempDir,
+    }
+
+    impl AgentStoreHarness {
+        async fn oneshot(self, req: Request<Body>) -> Result<Response, std::convert::Infallible> {
+            <Router as tower::ServiceExt<Request<Body>>>::oneshot(self.router, req).await
+        }
+    }
+
+    #[tokio::test]
+    async fn agent_policy_name_handler_returns_policy_for_existing_agent() {
+        let switch = Arc::new(KillSwitch::new());
+        let store: Arc<dyn permitlayer_core::store::AgentIdentityStore> =
+            Arc::new(InMemoryAgentStore::with_agent("claude-desktop", "gmail-read-only"));
+        // Round-1 review P21: stage the agent's policy so the
+        // dangling-binding cross-check passes.
+        let app = build_with_agent_store(Arc::clone(&switch), Some(store), &["gmail-read-only"]);
+
+        let resp = app
+            .oneshot(req_with_peer(
+                Method::GET,
+                "/v1/control/agent/claude-desktop/policy_name",
+                loopback_v4(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["name"], "claude-desktop");
+        assert_eq!(json["policy_name"], "gmail-read-only");
+    }
+
+    #[tokio::test]
+    async fn agent_policy_name_handler_returns_404_for_missing_agent() {
+        let switch = Arc::new(KillSwitch::new());
+        let store: Arc<dyn permitlayer_core::store::AgentIdentityStore> =
+            Arc::new(InMemoryAgentStore::with_agent("claude-desktop", "gmail-read-only"));
+        let app = build_with_agent_store(Arc::clone(&switch), Some(store), &["gmail-read-only"]);
+
+        let resp = app
+            .oneshot(req_with_peer(
+                Method::GET,
+                "/v1/control/agent/openclaw-test/policy_name",
+                loopback_v4(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "agent.not_found");
+    }
+
+    #[tokio::test]
+    async fn agent_policy_name_handler_returns_503_when_store_unavailable() {
+        let switch = Arc::new(KillSwitch::new());
+        let app = build_with_agent_store(Arc::clone(&switch), None, &[]);
+
+        let resp = app
+            .oneshot(req_with_peer(
+                Method::GET,
+                "/v1/control/agent/claude-desktop/policy_name",
+                loopback_v4(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "agent.store_unavailable");
+    }
+
+    #[tokio::test]
+    async fn agent_policy_name_handler_rejects_invalid_name() {
+        let switch = Arc::new(KillSwitch::new());
+        let store: Arc<dyn permitlayer_core::store::AgentIdentityStore> =
+            Arc::new(InMemoryAgentStore::default());
+        let app = build_with_agent_store(Arc::clone(&switch), Some(store), &[]);
+
+        // `..` is not a valid agent name (path traversal guard).
+        let resp = app
+            .oneshot(req_with_peer(
+                Method::GET,
+                "/v1/control/agent/..%2Fetc/policy_name",
+                loopback_v4(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "agent.invalid_name");
+    }
+
+    /// Round-1 review P21: agent's policy_name is no longer in the
+    /// active policy set (operator removed the file + reloaded).
+    /// Handler returns 422 with operator-actionable remediation.
+    #[tokio::test]
+    async fn agent_policy_name_handler_returns_422_for_dangling_policy_binding() {
+        let switch = Arc::new(KillSwitch::new());
+        let store: Arc<dyn permitlayer_core::store::AgentIdentityStore> =
+            Arc::new(InMemoryAgentStore::with_agent("claude-desktop", "removed-policy"));
+        // Stage a DIFFERENT policy in the active set; the agent's
+        // binding to "removed-policy" is dangling.
+        let app = build_with_agent_store(Arc::clone(&switch), Some(store), &["gmail-read-only"]);
+
+        let resp = app
+            .oneshot(req_with_peer(
+                Method::GET,
+                "/v1/control/agent/claude-desktop/policy_name",
+                loopback_v4(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "agent.dangling_policy_binding");
+        let message = json["message"].as_str().unwrap_or_default();
+        assert!(message.contains("agentsso agent rebind"), "remediation hint missing: {message}");
+    }
+
+    // ── Story 7.30 Task 3: GET /v1/control/credentials/{service}/meta ──
+
+    /// Build a router with `state.vault_dir` pinned to a caller-supplied
+    /// path. Used by Story 7.30 credentials-meta tests that need to
+    /// stage a meta JSON fixture on disk.
+    fn build_with_vault_dir(kill_switch: Arc<KillSwitch>, vault_dir: std::path::PathBuf) -> Router {
+        let policy_set = Arc::new(ArcSwap::from_pointee(PolicySet::empty()));
+        // Round-3 review P77: hold the TempDir for the router's
+        // lifetime via `.keep()`. The prior pattern
+        // `tempfile::tempdir().unwrap().path().to_path_buf()` dropped
+        // the TempDir at end of let-binding, leaving a dangling
+        // PathBuf to a removed directory — fine for handlers that
+        // never touch policies_dir, but a footgun for any future
+        // test using the helper that does. `.keep()` is consistent
+        // with sibling test helpers in this file (e.g.
+        // build_with_policies_dir).
+        let policies_dir = tempfile::tempdir().unwrap().keep();
+        let reload_mutex = Arc::new(std::sync::Mutex::new(()));
+        let agent_registry = Arc::new(AgentRegistry::new(vec![]));
+        let (ato, cs, co, stub, _placeholder_vault_dir) = test_reload_wiring();
+        router(
+            kill_switch,
+            None,
+            policy_set,
+            policies_dir,
+            reload_mutex,
+            agent_registry,
+            None,
+            Arc::new(zeroize::Zeroizing::new([0x42u8; LOOKUP_KEY_BYTES])),
+            test_approval_service(),
+            test_conn_tracker(),
+            test_plugin_registry(),
+            ato,
+            cs,
+            co,
+            stub,
+            vault_dir,
+            test_vault(),
+            test_control_token(),
+        )
+    }
+
+    #[tokio::test]
+    async fn credentials_meta_handler_returns_exists_true_with_meta_for_present_credential() {
+        let switch = Arc::new(KillSwitch::new());
+        let vault_dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            vault_dir.path().join("gmail-meta.json"),
+            r#"{"client_type":"byo","client_source":"/abs/cs.json","connected_at":"2026-05-12T12:00:00Z","scopes":["https://mail.google.com/"]}"#,
+        )
+        .unwrap();
+        let app = build_with_vault_dir(Arc::clone(&switch), vault_dir.path().to_path_buf());
+
+        let resp = app
+            .oneshot(req_with_peer(
+                Method::GET,
+                "/v1/control/credentials/gmail/meta",
+                loopback_v4(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["exists"], true);
+        assert_eq!(json["meta"]["client_type"], "byo");
+        assert_eq!(json["meta"]["scopes"][0], "https://mail.google.com/");
+    }
+
+    #[tokio::test]
+    async fn credentials_meta_handler_returns_exists_false_when_meta_missing() {
+        let switch = Arc::new(KillSwitch::new());
+        let vault_dir = tempfile::tempdir().unwrap();
+        let app = build_with_vault_dir(Arc::clone(&switch), vault_dir.path().to_path_buf());
+
+        let resp = app
+            .oneshot(req_with_peer(
+                Method::GET,
+                "/v1/control/credentials/gmail/meta",
+                loopback_v4(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["exists"], false);
+        assert!(json.get("meta").is_none_or(serde_json::Value::is_null));
+    }
+
+    #[tokio::test]
+    async fn credentials_meta_handler_rejects_unknown_service() {
+        let switch = Arc::new(KillSwitch::new());
+        let vault_dir = tempfile::tempdir().unwrap();
+        let app = build_with_vault_dir(Arc::clone(&switch), vault_dir.path().to_path_buf());
+
+        let resp = app
+            .oneshot(req_with_peer(
+                Method::GET,
+                "/v1/control/credentials/slack/meta",
+                loopback_v4(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "credentials.unknown_service");
+    }
+
+    #[tokio::test]
+    async fn credentials_meta_handler_returns_500_on_parse_failure() {
+        let switch = Arc::new(KillSwitch::new());
+        let vault_dir = tempfile::tempdir().unwrap();
+        std::fs::write(vault_dir.path().join("gmail-meta.json"), b"this is not json").unwrap();
+        let app = build_with_vault_dir(Arc::clone(&switch), vault_dir.path().to_path_buf());
+
+        let resp = app
+            .oneshot(req_with_peer(
+                Method::GET,
+                "/v1/control/credentials/gmail/meta",
+                loopback_v4(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "credentials.meta_parse_failed");
+    }
+
+    // ── Story 7.30 Task 4: POST /v1/control/credentials/seal ─────────
+
+    /// Wiring for seal-handler tests: builds a router with a fixed
+    /// agent registry (single agent `"test-agent"` → policy `"test-policy"`),
+    /// a real `tempdir/vault` directory for `state.vault_dir`, an
+    /// optional audit store, and a real `Arc<Vault>` (so seal() can
+    /// produce envelope bytes). Returns the router + the `home` tempdir
+    /// (so tests can read the resulting on-disk files), keeping the
+    /// tempdir alive for the test scope.
+    fn build_with_seal_wiring(
+        agent_name: &str,
+        audit_store: Option<Arc<dyn permitlayer_core::store::AuditStore>>,
+    ) -> (Router, tempfile::TempDir, Arc<KillSwitch>) {
+        let switch = Arc::new(KillSwitch::new());
+        let home_tmp = tempfile::tempdir().unwrap();
+        let home = home_tmp.path();
+        let vault_dir_path = home.join("vault");
+        std::fs::create_dir_all(&vault_dir_path).unwrap();
+
+        let identity = permitlayer_core::agent::AgentIdentity::new(
+            agent_name.to_owned(),
+            "test-policy".to_owned(),
+            "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".to_owned(),
+            "0".repeat(64),
+            chrono::Utc::now(),
+            None,
+        )
+        .unwrap();
+        let agent_registry = Arc::new(AgentRegistry::new(vec![identity]));
+
+        let policy_set = Arc::new(ArcSwap::from_pointee(PolicySet::empty()));
+        // Round-3 review P77: hold the TempDir for the router's
+        // lifetime via `.keep()`. Seal/verify endpoints don't read
+        // `state.policies_dir`, but the prior pattern left a dangling
+        // PathBuf — fix the foundation rather than rely on the
+        // handlers staying policies_dir-free.
+        let policies_dir = tempfile::tempdir().unwrap().keep();
+        let reload_mutex = Arc::new(std::sync::Mutex::new(()));
+        let (ato, cs, co, stub, _placeholder_vault_dir) = test_reload_wiring();
+
+        let router = router(
+            Arc::clone(&switch),
+            audit_store,
+            policy_set,
+            policies_dir,
+            reload_mutex,
+            agent_registry,
+            None,
+            Arc::new(zeroize::Zeroizing::new([0x42u8; LOOKUP_KEY_BYTES])),
+            test_approval_service(),
+            test_conn_tracker(),
+            test_plugin_registry(),
+            ato,
+            cs,
+            co,
+            stub,
+            vault_dir_path,
+            test_vault(),
+            test_control_token(),
+        );
+        (router, home_tmp, switch)
+    }
+
+    /// Build a seal-handler request with the canonical valid body. Override
+    /// individual fields via closure mutation before serialization.
+    fn seal_request_body(
+        service: &str,
+        agent: &str,
+        if_exists: &str,
+        with_refresh: bool,
+    ) -> serde_json::Value {
+        let mut body = serde_json::json!({
+            "service": service,
+            "agent": agent,
+            "access_token": "ya29.test-access-token-bytes",
+            "granted_scopes": ["https://mail.google.com/"],
+            "client_type": "byo",
+            "client_source": "/abs/cs.json",
+            "expires_in_secs": 3599,
+            "if_exists": if_exists,
+        });
+        if with_refresh {
+            body["refresh_token"] = serde_json::json!("1//test-refresh-token-bytes");
+        }
+        body
+    }
+
+    fn post_seal_request(body: serde_json::Value) -> Request<Body> {
+        let mut r = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/control/credentials/seal")
+            .header("content-type", "application/json")
+            .header("x-agentsso-control", test_control_token_header())
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        r.extensions_mut().insert(ConnectInfo(loopback_v4()));
+        r
+    }
+
+    #[tokio::test]
+    async fn credentials_seal_handler_seals_fresh_credential() {
+        let (app, home_tmp, _) = build_with_seal_wiring("test-agent", None);
+        let body = seal_request_body("gmail", "test-agent", "replace", true);
+        let resp = app.oneshot(post_seal_request(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["sealed"], true);
+        assert_eq!(json["replaced_previous"], false);
+        assert_eq!(json["meta"]["client_type"], "byo");
+
+        // On-disk artifacts.
+        let vault_dir = home_tmp.path().join("vault");
+        assert!(vault_dir.join("gmail.sealed").is_file());
+        assert!(vault_dir.join("gmail-refresh.sealed").is_file());
+        assert!(vault_dir.join("gmail-meta.json").is_file());
+    }
+
+    #[tokio::test]
+    async fn credentials_seal_handler_replaces_previous_on_replace() {
+        let (app, home_tmp, switch) = build_with_seal_wiring("test-agent", None);
+        // First seal.
+        let body = seal_request_body("gmail", "test-agent", "replace", false);
+        let resp = app.oneshot(post_seal_request(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Second seal (replace).
+        let (app2, _home2, _) = (
+            build_with_seal_wiring_with_existing_home(
+                "test-agent",
+                home_tmp.path().to_path_buf(),
+                None,
+            ),
+            home_tmp,
+            switch,
+        );
+        let body = seal_request_body("gmail", "test-agent", "replace", false);
+        let resp = app2.oneshot(post_seal_request(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["sealed"], true);
+        assert_eq!(json["replaced_previous"], true);
+    }
+
+    /// Variant of `build_with_seal_wiring` that reuses an existing
+    /// `home` directory. Used by the `replace` test which needs to
+    /// observe state across two sequential handler invocations.
+    fn build_with_seal_wiring_with_existing_home(
+        agent_name: &str,
+        home: std::path::PathBuf,
+        audit_store: Option<Arc<dyn permitlayer_core::store::AuditStore>>,
+    ) -> Router {
+        let switch = Arc::new(KillSwitch::new());
+        let vault_dir_path = home.join("vault");
+        std::fs::create_dir_all(&vault_dir_path).unwrap();
+
+        let identity = permitlayer_core::agent::AgentIdentity::new(
+            agent_name.to_owned(),
+            "test-policy".to_owned(),
+            "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".to_owned(),
+            "0".repeat(64),
+            chrono::Utc::now(),
+            None,
+        )
+        .unwrap();
+        let agent_registry = Arc::new(AgentRegistry::new(vec![identity]));
+
+        let policy_set = Arc::new(ArcSwap::from_pointee(PolicySet::empty()));
+        // Round-3 review P77: hold the TempDir for the router's
+        // lifetime via `.keep()`. See sibling helper.
+        let policies_dir = tempfile::tempdir().unwrap().keep();
+        let reload_mutex = Arc::new(std::sync::Mutex::new(()));
+        let (ato, cs, co, stub, _placeholder_vault_dir) = test_reload_wiring();
+
+        router(
+            Arc::clone(&switch),
+            audit_store,
+            policy_set,
+            policies_dir,
+            reload_mutex,
+            agent_registry,
+            None,
+            Arc::new(zeroize::Zeroizing::new([0x42u8; LOOKUP_KEY_BYTES])),
+            test_approval_service(),
+            test_conn_tracker(),
+            test_plugin_registry(),
+            ato,
+            cs,
+            co,
+            stub,
+            vault_dir_path,
+            test_vault(),
+            test_control_token(),
+        )
+    }
+
+    #[tokio::test]
+    async fn credentials_seal_handler_skips_when_if_exists_skip_and_present() {
+        let (app, home_tmp, _) = build_with_seal_wiring("test-agent", None);
+        // First seal establishes the credential.
+        let body = seal_request_body("gmail", "test-agent", "replace", false);
+        let resp = app.oneshot(post_seal_request(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Second seal with if_exists=skip.
+        let app2 = build_with_seal_wiring_with_existing_home(
+            "test-agent",
+            home_tmp.path().to_path_buf(),
+            None,
+        );
+        let body = seal_request_body("gmail", "test-agent", "skip", false);
+        let resp = app2.oneshot(post_seal_request(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["sealed"], false);
+        assert_eq!(json["replaced_previous"], false);
+    }
+
+    #[tokio::test]
+    async fn credentials_seal_handler_returns_409_when_if_exists_error_and_present() {
+        let (app, home_tmp, _) = build_with_seal_wiring("test-agent", None);
+        let body = seal_request_body("gmail", "test-agent", "replace", false);
+        let resp = app.oneshot(post_seal_request(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let app2 = build_with_seal_wiring_with_existing_home(
+            "test-agent",
+            home_tmp.path().to_path_buf(),
+            None,
+        );
+        let body = seal_request_body("gmail", "test-agent", "error", false);
+        let resp = app2.oneshot(post_seal_request(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "credentials.already_exists");
+    }
+
+    #[tokio::test]
+    async fn credentials_seal_handler_returns_422_for_unknown_agent() {
+        let (app, _home_tmp, _) = build_with_seal_wiring("test-agent", None);
+        let body = seal_request_body("gmail", "no-such-agent", "replace", false);
+        let resp = app.oneshot(post_seal_request(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "credentials.unknown_agent");
+    }
+
+    #[tokio::test]
+    async fn credentials_seal_handler_returns_422_for_unknown_service() {
+        let (app, _home_tmp, _) = build_with_seal_wiring("test-agent", None);
+        let body = seal_request_body("slack", "test-agent", "replace", false);
+        let resp = app.oneshot(post_seal_request(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "credentials.unknown_service");
+    }
+
+    #[tokio::test]
+    async fn credentials_seal_handler_emits_audit_event_with_expected_shape() {
+        let home_tmp = tempfile::tempdir().unwrap();
+        let store = build_audit_store(home_tmp.path());
+
+        // First seal — fresh credential, `replaced_previous: false`.
+        let app1 = build_with_seal_wiring_with_existing_home(
+            "test-agent",
+            home_tmp.path().to_path_buf(),
+            Some(Arc::clone(&store)),
+        );
+        let body = seal_request_body("gmail", "test-agent", "replace", true);
+        let resp = app1.oneshot(post_seal_request(body)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        // Round-1 review P15: second seal — replaces the first, so
+        // `replaced_previous: true` AND the audit log carries TWO
+        // `credentials-sealed` events with distinct replaced_previous
+        // values.
+        let app2 = build_with_seal_wiring_with_existing_home(
+            "test-agent",
+            home_tmp.path().to_path_buf(),
+            Some(Arc::clone(&store)),
+        );
+        let body2 = seal_request_body("gmail", "test-agent", "replace", true);
+        let resp2 = app2.oneshot(post_seal_request(body2)).await.unwrap();
+        assert_eq!(resp2.status(), StatusCode::OK);
+
+        let events = read_audit_events(home_tmp.path());
+        let seal_events: Vec<_> =
+            events.iter().filter(|e| e.event_type == "credentials-sealed").collect();
+        assert_eq!(seal_events.len(), 2, "expected one event per seal call");
+
+        // First (fresh) seal — replaced_previous=false.
+        let first = seal_events[0];
+        assert_eq!(first.outcome, "ok");
+        assert_eq!(first.extra["service"], "gmail");
+        assert_eq!(first.extra["agent"], "test-agent");
+        assert_eq!(first.extra["client_type"], "byo");
+        assert_eq!(first.extra["client_source"], "/abs/cs.json");
+        assert_eq!(first.extra["replaced_previous"], false);
+        assert_eq!(first.extra["had_refresh_token"], true);
+        assert_eq!(first.extra["scopes"][0], "https://mail.google.com/");
+
+        // Second (replace) seal — replaced_previous=true.
+        let second = seal_events[1];
+        assert_eq!(second.outcome, "ok");
+        assert_eq!(second.extra["replaced_previous"], true);
+    }
+
+    #[tokio::test]
+    async fn credentials_seal_handler_rejects_bad_json() {
+        let (app, _home_tmp, _) = build_with_seal_wiring("test-agent", None);
+        let mut r = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/control/credentials/seal")
+            .header("content-type", "application/json")
+            .header("x-agentsso-control", test_control_token_header())
+            .body(Body::from(b"not json".to_vec()))
+            .unwrap();
+        r.extensions_mut().insert(ConnectInfo(loopback_v4()));
+        let resp = app.oneshot(r).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "credentials.bad_request");
+    }
+
+    // ── Story 7.30 Task 5: POST /v1/control/credentials/{service}/verify
+
+    fn post_verify_request(service: &str, agent: &str) -> Request<Body> {
+        let body = serde_json::json!({ "agent": agent });
+        let mut r = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/v1/control/credentials/{service}/verify"))
+            .header("content-type", "application/json")
+            .header("x-agentsso-control", test_control_token_header())
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        r.extensions_mut().insert(ConnectInfo(loopback_v4()));
+        r
+    }
+
+    #[tokio::test]
+    async fn credentials_verify_handler_returns_404_when_credential_missing() {
+        let (app, _home_tmp, _) = build_with_seal_wiring("test-agent", None);
+        let resp = app.oneshot(post_verify_request("gmail", "test-agent")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "credentials.not_found");
+    }
+
+    #[tokio::test]
+    async fn credentials_verify_handler_rejects_unknown_service() {
+        let (app, _home_tmp, _) = build_with_seal_wiring("test-agent", None);
+        let resp = app.oneshot(post_verify_request("slack", "test-agent")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "credentials.unknown_service");
+    }
+
+    #[tokio::test]
+    async fn credentials_verify_handler_rejects_bad_json() {
+        let (app, _home_tmp, _) = build_with_seal_wiring("test-agent", None);
+        let mut r = Request::builder()
+            .method(Method::POST)
+            .uri("/v1/control/credentials/gmail/verify")
+            .header("content-type", "application/json")
+            .header("x-agentsso-control", test_control_token_header())
+            .body(Body::from(b"not json".to_vec()))
+            .unwrap();
+        r.extensions_mut().insert(ConnectInfo(loopback_v4()));
+        let resp = app.oneshot(r).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "credentials.bad_request");
+    }
+
+    /// Corrupt-envelope path: write garbage bytes that fail at the
+    /// envelope decoder. `CredentialFsStore::get` surfaces this as
+    /// `StoreError::CorruptEnvelope` BEFORE the vault gets a chance
+    /// to unseal — the daemon returns `credentials.store_io_failed`.
+    /// Round-1 review P14: tightened from the previous "either
+    /// store_io_failed or unseal_failed" loose match to pin the
+    /// specific code that the corrupt-envelope path produces.
+    #[tokio::test]
+    async fn credentials_verify_handler_returns_500_on_corrupt_envelope() {
+        let home_tmp = tempfile::tempdir().unwrap();
+        let vault_dir = home_tmp.path().join("vault");
+        std::fs::create_dir_all(&vault_dir).unwrap();
+        std::fs::write(vault_dir.join("gmail.sealed"), b"not-a-real-sealed-envelope").unwrap();
+
+        let app = build_with_seal_wiring_with_existing_home(
+            "test-agent",
+            home_tmp.path().to_path_buf(),
+            None,
+        );
+        let resp = app.oneshot(post_verify_request("gmail", "test-agent")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json = body_json(resp).await;
+        assert_eq!(
+            json["code"], "credentials.store_io_failed",
+            "corrupt envelope should surface as store_io_failed (envelope decoder failure), \
+             not unseal_failed (AEAD failure)",
+        );
+    }
+
+    /// Key-drift path: stage a structurally-valid sealed envelope
+    /// produced under one Vault key, then run verify with a Vault
+    /// holding a different key. The envelope parses cleanly so
+    /// `CredentialFsStore::get` returns Ok, but `Vault::unseal`
+    /// produces an AEAD tag mismatch — daemon returns
+    /// `credentials.unseal_failed`. Round-1 review P14: distinct
+    /// test from the corrupt-envelope path so each code branch is
+    /// pinned independently.
+    #[tokio::test]
+    async fn credentials_verify_handler_returns_500_on_key_drift() {
+        let home_tmp = tempfile::tempdir().unwrap();
+        let vault_dir = home_tmp.path().join("vault");
+        std::fs::create_dir_all(&vault_dir).unwrap();
+
+        // Seal a real envelope under a "wrong" key (all 0xAA).
+        let wrong_key = zeroize::Zeroizing::new([0xAAu8; permitlayer_keystore::MASTER_KEY_LEN]);
+        let wrong_vault = permitlayer_vault::Vault::new(wrong_key, 0);
+        let token = permitlayer_credential::OAuthToken::from_trusted_bytes(b"ya29.fake".to_vec());
+        let sealed = wrong_vault.seal("gmail", &token).expect("wrong-vault seal");
+
+        // Write the sealed envelope to disk via the real store so
+        // the bytes are in the format `CredentialFsStore::get`
+        // expects.
+        let store_for_seal =
+            permitlayer_core::store::fs::CredentialFsStore::new(home_tmp.path().to_path_buf())
+                .expect("store init");
+        permitlayer_core::store::CredentialStore::put(&store_for_seal, "gmail", sealed)
+            .await
+            .expect("put sealed");
+
+        // Build the handler with the canonical test_vault (key
+        // `[0x55u8; ...]`) — different from the 0xAA we sealed
+        // under, so unseal will AEAD-fail.
+        let app = build_with_seal_wiring_with_existing_home(
+            "test-agent",
+            home_tmp.path().to_path_buf(),
+            None,
+        );
+        let resp = app.oneshot(post_verify_request("gmail", "test-agent")).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json = body_json(resp).await;
+        assert_eq!(
+            json["code"], "credentials.unseal_failed",
+            "key drift should surface as unseal_failed (AEAD tag mismatch), \
+             not store_io_failed (envelope decoder)",
+        );
+        // P20 recovery hint: confirm operator gets the re-run hint.
+        let message = json["message"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("agentsso connect"),
+            "unseal-fail message should suggest re-running agentsso connect; got: {message}",
+        );
+    }
+
+    #[test]
+    fn verify_reason_kebab_label_covers_known_variants() {
+        use permitlayer_oauth::error::VerifyReason;
+        assert_eq!(
+            verify_reason_kebab_label(&VerifyReason::ServiceDisabled {
+                service: "calendar.googleapis.com".to_owned(),
+                project: None,
+                also_billing_disabled: false,
+            }),
+            "service-disabled"
+        );
+        assert_eq!(
+            verify_reason_kebab_label(&VerifyReason::BillingDisabled { project: None }),
+            "billing-disabled"
+        );
+        assert_eq!(
+            verify_reason_kebab_label(&VerifyReason::ScopeInsufficient {
+                missing_scopes: vec![],
+                also_service_disabled: None,
+                also_billing_disabled: false,
+            }),
+            "scope-insufficient"
+        );
+        assert_eq!(verify_reason_kebab_label(&VerifyReason::Other), "other");
+    }
+
+    #[test]
+    fn verify_reason_remediation_url_renders_console_url_for_service_disabled() {
+        use permitlayer_oauth::error::VerifyReason;
+        let url = verify_reason_remediation_url(&VerifyReason::ServiceDisabled {
+            service: "calendar.googleapis.com".to_owned(),
+            project: Some("my-project".to_owned()),
+            also_billing_disabled: false,
+        })
+        .unwrap();
+        assert_eq!(
+            url,
+            "https://console.cloud.google.com/apis/library/calendar.googleapis.com?project=my-project"
+        );
+        // None for `ScopeInsufficient` (operator must re-consent, no URL applies).
+        assert!(
+            verify_reason_remediation_url(&VerifyReason::ScopeInsufficient {
+                missing_scopes: vec![],
+                also_service_disabled: None,
+                also_billing_disabled: false,
+            })
+            .is_none()
+        );
+    }
+
+    // ── Story 7.30 Task 6: POST /v1/control/policy/{name}/scopes ─────
+
+    /// Build a router with `state.policies_dir` pinned to a caller-
+    /// supplied path, plus an optional audit store. Used by the
+    /// policy-scopes-endpoint tests which need to stage a policy file
+    /// on disk and (in the audit-shape test) observe the
+    /// `policy-scopes-added` event.
+    fn build_with_policies_dir(
+        policies_dir: std::path::PathBuf,
+        audit_store: Option<Arc<dyn permitlayer_core::store::AuditStore>>,
+    ) -> Router {
+        let switch = Arc::new(KillSwitch::new());
+        let policy_set = Arc::new(ArcSwap::from_pointee(PolicySet::empty()));
+        let reload_mutex = Arc::new(std::sync::Mutex::new(()));
+        let agent_registry = Arc::new(AgentRegistry::new(vec![]));
+        let (ato, cs, co, stub, vault_dir) = test_reload_wiring();
+        router(
+            switch,
+            audit_store,
+            policy_set,
+            policies_dir,
+            reload_mutex,
+            agent_registry,
+            None,
+            Arc::new(zeroize::Zeroizing::new([0x42u8; LOOKUP_KEY_BYTES])),
+            test_approval_service(),
+            test_conn_tracker(),
+            test_plugin_registry(),
+            ato,
+            cs,
+            co,
+            stub,
+            vault_dir,
+            test_vault(),
+            test_control_token(),
+        )
+    }
+
+    fn stage_minimal_policy(policies_dir: &std::path::Path, name: &str, scopes: &[&str]) {
+        let scopes_toml: String =
+            scopes.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(", ");
+        let body = format!(
+            "[[policies]]\nname = \"{name}\"\nscopes = [{scopes_toml}]\nresources = [\"*\"]\napproval-mode = \"auto\"\nauto-approve-reads = true\n"
+        );
+        std::fs::write(policies_dir.join(format!("{name}.toml")), body).unwrap();
+    }
+
+    fn stage_multi_policy_default(policies_dir: &std::path::Path, gmail_scopes: &[&str]) {
+        let scopes_toml: String =
+            gmail_scopes.iter().map(|s| format!("\"{s}\"")).collect::<Vec<_>>().join(", ");
+        let body = format!(
+            r#"[[policies]]
+name = "gmail-read-only"
+scopes = [{scopes_toml}]
+resources = ["*"]
+approval-mode = "auto"
+auto-approve-reads = true
+
+[[policies]]
+name = "calendar-prompt-on-write"
+scopes = ["calendar.readonly", "calendar.events"]
+resources = ["primary"]
+approval-mode = "prompt"
+auto-approve-reads = true
+
+[[policies.rules]]
+id = "allow-calendar-reads"
+scopes = ["calendar.readonly"]
+action = "allow"
+
+[[policies]]
+name = "drive-research-scope-restricted"
+scopes = ["drive.readonly", "drive.metadata"]
+resources = ["research-shared"]
+approval-mode = "auto"
+auto-approve-reads = true
+"#,
+        );
+        std::fs::write(policies_dir.join("default.toml"), body).unwrap();
+    }
+
+    fn post_policy_scopes(policy_name: &str, short_names: &[&str]) -> Request<Body> {
+        let body = serde_json::json!({ "short_names": short_names });
+        let mut r = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/v1/control/policy/{policy_name}/scopes"))
+            .header("content-type", "application/json")
+            .header("x-agentsso-control", test_control_token_header())
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        r.extensions_mut().insert(ConnectInfo(loopback_v4()));
+        r
+    }
+
+    #[tokio::test]
+    async fn policy_scopes_handler_multi_policy_default_toml_noops_for_seeded_gmail() {
+        let home_tmp = tempfile::tempdir().unwrap();
+        let store = build_audit_store(home_tmp.path());
+
+        let policies_dir = tempfile::tempdir().unwrap();
+        stage_multi_policy_default(policies_dir.path(), &["gmail.readonly", "gmail.metadata"]);
+        let default_path = policies_dir.path().join("default.toml");
+        let before = std::fs::read(&default_path).unwrap();
+
+        let app =
+            build_with_policies_dir(policies_dir.path().to_path_buf(), Some(Arc::clone(&store)));
+        let resp =
+            app.oneshot(post_policy_scopes("gmail-read-only", &["gmail.readonly"])).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["policy_name"], "gmail-read-only");
+        assert_eq!(json["added"].as_array().unwrap().len(), 0);
+        assert_eq!(json["reloaded"], false);
+        assert!(!policies_dir.path().join("gmail-read-only.toml").exists());
+        assert_eq!(std::fs::read(&default_path).unwrap(), before);
+
+        let events = read_audit_events(home_tmp.path());
+        let scope_events: Vec<_> =
+            events.iter().filter(|e| e.event_type == "policy-scopes-added").collect();
+        assert_eq!(scope_events.len(), 0, "seeded-gmail no-op must not emit add audit");
+    }
+
+    #[tokio::test]
+    async fn policy_scopes_handler_merges_into_default_toml_when_scope_absent() {
+        let policies_dir = tempfile::tempdir().unwrap();
+        stage_multi_policy_default(policies_dir.path(), &["gmail.readonly"]);
+
+        let app = build_with_policies_dir(policies_dir.path().to_path_buf(), None);
+        let resp =
+            app.oneshot(post_policy_scopes("gmail-read-only", &["gmail.metadata"])).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["policy_name"], "gmail-read-only");
+        assert_eq!(json["added"][0], "gmail.metadata");
+        assert_eq!(json["reloaded"], true);
+        assert!(!policies_dir.path().join("gmail-read-only.toml").exists());
+
+        let text = std::fs::read_to_string(policies_dir.path().join("default.toml")).unwrap();
+        let parsed: permitlayer_core::policy::schema::TomlPolicyFile =
+            toml::from_str(&text).unwrap();
+        let gmail = parsed.policies.iter().find(|p| p.name == "gmail-read-only").unwrap();
+        assert_eq!(gmail.scopes, vec!["gmail.metadata", "gmail.readonly"]);
+        let calendar =
+            parsed.policies.iter().find(|p| p.name == "calendar-prompt-on-write").unwrap();
+        assert_eq!(calendar.resources, vec!["primary"]);
+        assert_eq!(calendar.rules.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn policy_scopes_handler_duplicate_name_returns_500_and_audit() {
+        let home_tmp = tempfile::tempdir().unwrap();
+        let store = build_audit_store(home_tmp.path());
+
+        let policies_dir = tempfile::tempdir().unwrap();
+        stage_minimal_policy(policies_dir.path(), "gmail-read-only", &["gmail.readonly"]);
+        let duplicate = r#"[[policies]]
+name = "gmail-read-only"
+scopes = ["gmail.readonly"]
+resources = ["*"]
+approval-mode = "auto"
+auto-approve-reads = true
+"#;
+        std::fs::write(policies_dir.path().join("duplicate.toml"), duplicate).unwrap();
+
+        let app =
+            build_with_policies_dir(policies_dir.path().to_path_buf(), Some(Arc::clone(&store)));
+        let resp =
+            app.oneshot(post_policy_scopes("gmail-read-only", &["gmail.metadata"])).await.unwrap();
+
+        assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "policy.duplicate_name");
+
+        let events = read_audit_events(home_tmp.path());
+        let denied: Vec<_> =
+            events.iter().filter(|e| e.event_type == "policy-scopes-denied").collect();
+        assert_eq!(denied.len(), 1);
+        assert_eq!(denied[0].extra["error_code"], "policy.duplicate_name");
+    }
+
+    #[tokio::test]
+    async fn policy_scopes_handler_merges_new_scopes() {
+        let home_tmp = tempfile::tempdir().unwrap();
+        let store = build_audit_store(home_tmp.path());
+
+        let policies_dir = tempfile::tempdir().unwrap();
+        stage_minimal_policy(policies_dir.path(), "gmail-read-only", &["gmail.readonly"]);
+
+        let app =
+            build_with_policies_dir(policies_dir.path().to_path_buf(), Some(Arc::clone(&store)));
+        let resp =
+            app.oneshot(post_policy_scopes("gmail-read-only", &["gmail.metadata"])).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["policy_name"], "gmail-read-only");
+        assert_eq!(json["before"][0], "gmail.readonly");
+        assert_eq!(json["added"][0], "gmail.metadata");
+        assert_eq!(json["after"].as_array().unwrap().len(), 2);
+        assert_eq!(json["reloaded"], true);
+
+        // Round-1 review P22: pin the reload audit event's diff
+        // shape so a regression that confuses "added" vs "modified"
+        // (e.g., loading an already-empty PolicySet vs. starting
+        // from the previous-edit state) fails this assertion.
+        // `build_with_policies_dir` starts with `PolicySet::empty()`
+        // so the test policy is "added" to the live set on reload.
+        let events = read_audit_events(home_tmp.path());
+        let reload_events: Vec<_> =
+            events.iter().filter(|e| e.event_type == "policy-reloaded").collect();
+        assert_eq!(reload_events.len(), 1, "exactly one reload audit event expected");
+        let event = reload_events[0];
+        assert_eq!(event.outcome, "ok");
+        let added = event.extra["added"].as_array().expect("added array");
+        let modified = event.extra["modified"].as_array().expect("modified array");
+        let removed = event.extra["removed"].as_array().expect("removed array");
+        assert!(
+            added.iter().any(|v| v == "gmail-read-only"),
+            "policy 'gmail-read-only' should appear in `added` (PolicySet was empty pre-reload); \
+             got added={added:?}, modified={modified:?}, removed={removed:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_scopes_handler_no_op_when_scopes_already_present() {
+        let policies_dir = tempfile::tempdir().unwrap();
+        stage_minimal_policy(
+            policies_dir.path(),
+            "gmail-read-only",
+            &["gmail.readonly", "gmail.metadata"],
+        );
+
+        let app = build_with_policies_dir(policies_dir.path().to_path_buf(), None);
+        let resp =
+            app.oneshot(post_policy_scopes("gmail-read-only", &["gmail.metadata"])).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["added"].as_array().unwrap().len(), 0);
+        assert_eq!(json["reloaded"], false);
+    }
+
+    #[tokio::test]
+    async fn policy_scopes_handler_returns_404_when_policy_file_missing() {
+        let policies_dir = tempfile::tempdir().unwrap();
+        let app = build_with_policies_dir(policies_dir.path().to_path_buf(), None);
+        let resp =
+            app.oneshot(post_policy_scopes("does-not-exist", &["gmail.metadata"])).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "policy.not_found");
+    }
+
+    #[tokio::test]
+    async fn policy_scopes_handler_rejects_invalid_policy_name() {
+        let policies_dir = tempfile::tempdir().unwrap();
+        let app = build_with_policies_dir(policies_dir.path().to_path_buf(), None);
+        // `..` path traversal: server-side check rejects before fs touch.
+        let resp = app.oneshot(post_policy_scopes("..%2Fetc", &["gmail.metadata"])).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "policy.invalid_name");
+    }
+
+    #[tokio::test]
+    async fn policy_scopes_handler_emits_audit_event_on_merge() {
+        let home_tmp = tempfile::tempdir().unwrap();
+        let store = build_audit_store(home_tmp.path());
+
+        let policies_dir = tempfile::tempdir().unwrap();
+        stage_minimal_policy(policies_dir.path(), "gmail-read-only", &["gmail.readonly"]);
+
+        let app =
+            build_with_policies_dir(policies_dir.path().to_path_buf(), Some(Arc::clone(&store)));
+        let resp =
+            app.oneshot(post_policy_scopes("gmail-read-only", &["gmail.metadata"])).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let events = read_audit_events(home_tmp.path());
+        let scope_events: Vec<_> =
+            events.iter().filter(|e| e.event_type == "policy-scopes-added").collect();
+        assert_eq!(scope_events.len(), 1);
+        let event = scope_events[0];
+        assert_eq!(event.outcome, "ok");
+        assert_eq!(event.extra["policy_name"], "gmail-read-only");
+        assert_eq!(event.extra["before"][0], "gmail.readonly");
+        assert_eq!(event.extra["added"][0], "gmail.metadata");
+        let after = event.extra["after"].as_array().unwrap();
+        assert_eq!(after.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn policy_scopes_handler_no_op_skips_audit_event() {
+        let home_tmp = tempfile::tempdir().unwrap();
+        let store = build_audit_store(home_tmp.path());
+
+        let policies_dir = tempfile::tempdir().unwrap();
+        stage_minimal_policy(
+            policies_dir.path(),
+            "gmail-read-only",
+            &["gmail.readonly", "gmail.metadata"],
+        );
+
+        let app =
+            build_with_policies_dir(policies_dir.path().to_path_buf(), Some(Arc::clone(&store)));
+        let resp =
+            app.oneshot(post_policy_scopes("gmail-read-only", &["gmail.metadata"])).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let events = read_audit_events(home_tmp.path());
+        let scope_events: Vec<_> =
+            events.iter().filter(|e| e.event_type == "policy-scopes-added").collect();
+        assert_eq!(scope_events.len(), 0, "no-op merge must not emit audit event");
     }
 }

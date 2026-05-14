@@ -453,7 +453,7 @@ pub struct PolicySetDiff {
 /// - paths without a filename (defensive; `read_dir` never yields these)
 /// - dotfiles (`.foo.toml`, `.#foo.toml` Emacs lockfiles, etc.)
 /// - any file whose extension, lowercased, is not exactly `toml`
-fn is_candidate_policy_file(path: &Path) -> bool {
+pub(crate) fn is_candidate_policy_file(path: &Path) -> bool {
     let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
         return false;
     };

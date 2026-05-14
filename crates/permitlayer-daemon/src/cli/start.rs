@@ -78,6 +78,11 @@ struct AppState {
     /// metadata in a fresh sandboxed context. Subsequent request
     /// dispatch (a future story) re-uses the same runtime for
     /// per-call `with_host_api` execution.
+    // Only read by `debug_plugin_echo_handler` (`#[cfg(debug_assertions)]`).
+    // Release builds drop the consumer; the field's `Arc` is still
+    // built + dropped at boot. `#[allow(dead_code)]` keeps the
+    // release-clippy gate green without #[cfg]-splitting the struct.
+    #[allow(dead_code)]
     pub(crate) plugin_runtime: Arc<permitlayer_plugins::PluginRuntime>,
     /// Story 6.3: plugin registry populated by `loader::load_all`
     /// at boot. Built-in connectors (Gmail, Calendar, Drive) always
@@ -637,13 +642,12 @@ async fn try_build_proxy_service(
     scrub_engine: Option<&Arc<permitlayer_core::scrub::ScrubEngine>>,
     audit_store: Option<&Arc<dyn permitlayer_core::store::AuditStore>>,
     master_key: &zeroize::Zeroizing<[u8; permitlayer_keystore::MASTER_KEY_LEN]>,
-    active_key_id: u8,
+    vault: Arc<permitlayer_vault::Vault>,
 ) -> Option<Arc<permitlayer_proxy::ProxyService>> {
     use hkdf::Hkdf;
     use permitlayer_core::store::fs::CredentialFsStore;
     use permitlayer_proxy::token::ScopedTokenIssuer;
     use permitlayer_proxy::upstream::UpstreamClient;
-    use permitlayer_vault::Vault;
     use sha2::Sha256;
     use zeroize::Zeroizing;
 
@@ -722,20 +726,10 @@ async fn try_build_proxy_service(
         }
     };
 
-    // `Vault::new` consumes the master key by value, so we clone the
-    // bytes into a fresh `Zeroizing` buffer. This is the one place
-    // where the key bytes exist in two buffers simultaneously (the
-    // caller's bootstrap buffer + the vault's internal buffer); both
-    // are zeroized on drop.
-    let mut vault_key = Zeroizing::new([0u8; permitlayer_keystore::MASTER_KEY_LEN]);
-    vault_key.copy_from_slice(master_key.as_slice());
-    // Story 7.6a AC #12: `key_id` for the live proxy Vault is the
-    // active key_id walked from the vault on boot
-    // (`max(envelope.key_id)`, defaulting to 0 on empty vault). Every
-    // refresh-rotation seal stamps this value on the new envelope.
-    // Story 7.6b will increment per rotation; for 7.6a it's `0` until
-    // a rotation event happens.
-    let vault = Arc::new(Vault::new(vault_key, active_key_id));
+    // Story 7.30 Task 1: `Vault` is now constructed unconditionally at
+    // boot (see `run()` around the `compute_active_key_id` site) and
+    // shared via `Arc` between the proxy service and the control-plane
+    // `ControlState.vault` field. Both sides see the same active_key_id.
     let token_issuer = Arc::new(ScopedTokenIssuer::new(signing_key));
 
     let upstream_client = match UpstreamClient::new() {
@@ -1448,73 +1442,6 @@ pub(crate) enum StartError {
         /// unreadable / marker phase recorded.
         reason: String,
     },
-
-    /// Story 7.22: the macOS keychain returned `BackendUnavailable
-    /// -25308` (codesign-bound ACL invalidated by the binary swap)
-    /// AND no codesign trust anchor was found at
-    /// `<home>/keystore/codesign-trust-anchor.req`. The daemon
-    /// cannot auto-recover without a stored Designated Requirement
-    /// to verify the new binary against — this is the
-    /// rc.16→rc.17 first-crossover corner where the operator
-    /// upgraded over SSH-with-no-TTY before the rc.17 trust-anchor
-    /// capture had a chance to run.
-    ///
-    /// Operator remediation: run `agentsso start` once interactively
-    /// (TTY-attached) so the passphrase fallback engages and the
-    /// trust anchor capture runs, OR remove the brew-upgraded
-    /// install, downgrade to rc.17, and re-upgrade.
-    #[error(
-        "keychain ACL invalidated and no codesign trust anchor on disk — \
-         cannot auto-recover headlessly"
-    )]
-    AclBreakNoTrustAnchor,
-
-    /// Story 7.22: the running binary's codesign Designated
-    /// Requirement does NOT match the stored anchor at
-    /// `<home>/keystore/codesign-trust-anchor.req`. This is a
-    /// security-relevant rejection — the new binary was either
-    /// signed by a different identity or has had its codesign chain
-    /// changed. The auto-rekey path REFUSES to proceed; the
-    /// operator must explicitly re-trust before the daemon will
-    /// boot under this binary.
-    ///
-    /// Until Story 7.24 lands (`agentsso doctor` for manual re-
-    /// trust), the workaround is to remove the trust anchor file
-    /// manually, run `agentsso start` once on a TTY (engaging
-    /// passphrase fallback so the new binary can capture its own
-    /// anchor), then re-enable autostart.
-    #[error("codesign Designated Requirement mismatch — refusing to auto-recover")]
-    AclBreakDrMismatch {
-        /// The stored DR string (truncated to 80 chars in banner
-        /// rendering to avoid leaking Team ID into shared logs).
-        stored_dr: String,
-    },
-
-    /// Story 7.22: codesign Designated Requirement verification
-    /// failed for a non-mismatch reason — e.g., the running binary
-    /// is completely unsigned (`errSecCSUnsigned`), the stored DR
-    /// could not be parsed, or the SecCode FFI returned an
-    /// unexpected OSStatus. Distinct from `AclBreakDrMismatch` so
-    /// operators can triage.
-    #[error("codesign verification failed during auto-recovery: {source}")]
-    CodesignVerifyFailed {
-        #[source]
-        source: permitlayer_keystore::CodesignError,
-    },
-
-    /// Story 7.22: the codesign verification gate passed but the
-    /// vault rekey itself failed — typically a vault I/O error or
-    /// envelope reseal fault. The marker file remains on disk so
-    /// the next boot resumes the rotation idempotently (see Story
-    /// 7.6b crash-resume contract).
-    #[error("auto-rekey failed at phase {phase}: {source}")]
-    AutoRekeyFailed {
-        /// Which phase of the rotation state machine failed
-        /// (see `rotate_key::marker::KeystorePhase`).
-        phase: String,
-        #[source]
-        source: Box<dyn std::error::Error + Send + Sync>,
-    },
 }
 
 /// Append a structured-cause tail to a keystore-error banner ONLY for
@@ -1578,15 +1505,6 @@ impl StartError {
             // Distinct from 3/4/5 because the operator's remediation
             // is unique: re-run `agentsso rotate-key` to finish.
             Self::VaultRotationIncomplete { .. } | Self::VaultStateUnverifiable { .. } => 6,
-            // Exit 7 — Story 7.22: ACL-break auto-recovery required
-            // but failed (no trust anchor, DR mismatch, codesign
-            // verification error, or rekey itself failed). Distinct
-            // remediation from 6: operator runs interactive
-            // recovery, NOT `agentsso rotate-key`.
-            Self::AclBreakNoTrustAnchor
-            | Self::AclBreakDrMismatch { .. }
-            | Self::CodesignVerifyFailed { .. }
-            | Self::AutoRekeyFailed { .. } => 7,
         }
     }
 
@@ -1623,13 +1541,11 @@ impl StartError {
                  request would return 401 and the vault cannot decrypt credentials.\n\
                  \n\
                  common causes:\n\
-                 - on macOS: the login keychain refused access. After\n\
-                   `brew upgrade agentsso`, the new binary's codesign hash no\n\
-                   longer matches the previously-authorized ACL on the existing\n\
-                   master-key entry — the daemon should have fallen back to the\n\
-                   passphrase prompt, so seeing this banner means either fallback\n\
-                   is disabled or the failure was a non-ACL platform error\n\
-                   (e.g., locked keychain → unlock and retry).\n\
+                 - on macOS: the System.keychain master-key entry could not be\n\
+                   read. The daemon must run as root (LaunchDaemon context) to\n\
+                   reach System.keychain; if invoked outside the daemon, ensure\n\
+                   the operator account has admin rights and the keychain is\n\
+                   unlocked.\n\
                  - on linux: the secret-service daemon is not running\n\
                    (install `libsecret` / `gnome-keyring-daemon` and start a session)\n\
                  - on fresh CI containers: no keyring backend available —\n\
@@ -1641,22 +1557,54 @@ impl StartError {
                 banner
             }
             Self::MasterKeyCall { source } => {
+                // Story 7.26 AC #1 step 3 (corrupted-bytes refuse-to-start):
+                // when the keychain item exists but its bytes don't
+                // decode to a 32-byte key (hex-encoding contract
+                // violated), surface the rc.22 System.keychain
+                // remediation pointer specifically. The generic
+                // banner below assumes a missing/locked entry on
+                // login.keychain and would mislead the operator.
+                if matches!(source, permitlayer_keystore::KeyStoreError::MalformedMasterKey { .. })
+                {
+                    let mut banner = "error: the OS keychain holds a master-key entry with corrupted contents.\n\
+                     \n\
+                     the daemon refuses to start when the stored bytes do not\n\
+                     decode to a valid 32-byte key — silently re-minting would\n\
+                     orphan whatever vault data the prior key encrypted.\n\
+                     \n\
+                     recovery:\n\
+                     - on macOS (rc.22+, System.keychain):\n  \
+                       sudo security delete-generic-password \\\n  \
+                         -s dev.permitlayer.master-key \\\n  \
+                         /Library/Keychains/System.keychain\n  \
+                       sudo agentsso service uninstall && sudo agentsso service install\n  \
+                       (the vault directory will be re-initialized; any\n  \
+                       credentials encrypted by the corrupted key are not\n  \
+                       recoverable.)\n\
+                     - on linux/windows (legacy login keystore):\n  \
+                       remove the io.permitlayer.master-key entry via\n  \
+                       secret-tool / cmdkey, then re-run `agentsso start`.\n\
+                     \n\
+                     run with `AGENTSSO_LOG__LEVEL=debug` for the underlying error.\n"
+                        .to_owned();
+                    append_structured_keystore_tail(&mut banner, source);
+                    return banner;
+                }
                 let mut banner = "error: failed to provision the vault master key.\n\
                  \n\
                  the daemon cannot boot without a master key — every authenticated\n\
                  request would return 401 and the vault cannot decrypt credentials.\n\
                  \n\
                  common causes:\n\
-                 - on macOS: the login keychain is locked — unlock it and retry.\n\
-                   After `brew upgrade agentsso`, the new binary's codesign hash\n\
-                   invalidates the keychain ACL on the existing master-key entry;\n\
-                   on a TTY-attached session (interactive terminal, SSH with TTY)\n\
-                   the daemon should have dropped to a passphrase prompt. If you\n\
-                   see this banner instead, you are likely running under launchd\n\
-                   (`brew services start agentsso`), `ssh -T`, or another\n\
-                   non-interactive context where the prompt cannot be displayed.\n\
-                   See README \"Recovery after `brew upgrade agentsso`\" for\n\
-                   recovery steps.\n\
+                 - on macOS (rc.22+): the daemon writes the master key to\n\
+                   System.keychain under `dev.permitlayer.master-key`; on first\n\
+                   boot it expects root privileges (run via `sudo agentsso\n\
+                   service install` rather than `agentsso start` directly).\n\
+                 - on macOS (rc.21 and earlier): the login keychain is locked —\n\
+                   unlock it and retry. After `brew upgrade agentsso`, the new\n\
+                   binary's codesign hash invalidates the keychain ACL on the\n\
+                   existing master-key entry; on a TTY-attached session the\n\
+                   daemon should have dropped to a passphrase prompt.\n\
                  - on linux: the secret-service daemon is not running\n\
                    (install `libsecret` / `gnome-keyring-daemon` and start a session)\n\
                  - on fresh CI containers: no keyring backend available —\n\
@@ -1783,95 +1731,7 @@ impl StartError {
                  - if the vault directory is unreadable, fix the filesystem perms\n\
                    (`chmod 0700 ~/.agentsso/vault/`) and try again.\n"
             ),
-            // Story 7.22: ACL-break recovery banners (exit code 7).
-            Self::AclBreakNoTrustAnchor => {
-                "error: macOS keychain ACL invalidated by binary swap, but no\n\
-                 codesign trust anchor exists on disk to verify the new binary.\n\
-                 \n\
-                 this typically happens when an operator upgrades from rc.16 (or\n\
-                 earlier) directly to rc.17+ over SSH with no controlling terminal —\n\
-                 rc.17's trust-anchor capture step never ran on the previous boot.\n\
-                 \n\
-                 remediation (one-time):\n\
-                 - run `agentsso start` once from an interactive terminal (or\n\
-                   TTY-attached SSH session). This engages the passphrase prompt;\n\
-                   enter your passphrase, and rc.17's first-boot capture writes\n\
-                   the trust anchor to `~/.agentsso/keystore/codesign-trust-anchor.req`.\n\
-                 - then `agentsso autostart enable` works headlessly thereafter.\n"
-                    .to_owned()
-            }
-            Self::AclBreakDrMismatch { stored_dr } => {
-                let truncated = truncate_dr_for_banner(stored_dr);
-                format!(
-                    "error: codesign Designated Requirement mismatch.\n\
-                     \n\
-                     the running binary's codesign signature does NOT match the\n\
-                     trust anchor captured by a previous successful boot. the\n\
-                     auto-recovery path refuses to proceed because the new binary\n\
-                     was either:\n\
-                     - signed by a different identity than the previous binary, or\n\
-                     - completely unsigned / re-signed with adhoc credentials that\n\
-                       differ from the captured anchor.\n\
-                     \n\
-                     this is a security-relevant rejection — auto-recovering would\n\
-                     give the new binary access to the previous binary's vault.\n\
-                     \n\
-                     stored DR (truncated): {truncated}\n\
-                     \n\
-                     remediation (manual re-trust required):\n\
-                     - if this is a legitimate upgrade by the same publisher,\n\
-                       remove `~/.agentsso/keystore/codesign-trust-anchor.req`\n\
-                       and run `agentsso start` once interactively to re-capture\n\
-                       the anchor under the new binary's identity.\n\
-                     - if this binary was NOT installed by you, do NOT remove\n\
-                       the anchor — investigate first.\n"
-                )
-            }
-            Self::CodesignVerifyFailed { source } => format!(
-                "error: codesign verification failed during auto-recovery: {source}\n\
-                 \n\
-                 the macOS Security framework returned an unexpected error when\n\
-                 verifying the running binary's signature against the stored\n\
-                 trust anchor. common causes:\n\
-                 - running binary is completely unsigned (`errSecCSUnsigned`)\n\
-                 - stored anchor file is corrupted (cannot be parsed)\n\
-                 - macOS Security framework returned an unexpected OSStatus\n\
-                 \n\
-                 remediation:\n\
-                 - reinstall agentsso from the official release channel.\n\
-                 - if the problem persists, file a bug with this banner attached.\n"
-            ),
-            Self::AutoRekeyFailed { phase, source } => format!(
-                "error: auto-recovery vault rekey failed at phase {phase}: {source}\n\
-                 \n\
-                 the codesign verification gate passed (the new binary's identity\n\
-                 matches the trust anchor), but the vault rekey itself failed\n\
-                 partway. the rotation-state marker remains on disk so the next\n\
-                 boot will resume the rotation idempotently.\n\
-                 \n\
-                 remediation:\n\
-                 - re-run `agentsso start` to resume the rekey (safe — staged dual-\n\
-                   slot keystore guarantees recovery).\n\
-                 - if the failure recurs, file a bug with this banner attached and\n\
-                   the daemon's autostart.log tail.\n"
-            ),
         }
-    }
-}
-
-/// Story 7.22: trim a stored Designated Requirement for inclusion in
-/// an operator-facing banner. DR strings can be long (`anchor apple
-/// generic and certificate leaf[subject.OU] = "TEAM12345" and
-/// identifier "io.permitlayer.daemon"`) and a CI artifact / shared
-/// log capturing the full string would publish the operator's Apple
-/// Team ID. Truncate at 80 chars + ellipsis.
-fn truncate_dr_for_banner(dr: &str) -> String {
-    const MAX: usize = 80;
-    if dr.chars().count() <= MAX {
-        dr.to_owned()
-    } else {
-        let truncated: String = dr.chars().take(MAX).collect();
-        format!("{truncated}…")
     }
 }
 
@@ -2007,211 +1867,14 @@ pub(crate) async fn ensure_master_key_bootstrapped(
         }
     }
 
-    // Story 7.22 test seam: `AGENTSSO_TEST_FORCE_ACL_BREAK_ON_BOOT`
-    // synthesizes the `AclBreakNeedsRekey` sentinel WITHOUT touching
-    // the real OS keychain. Lets integration tests drive the
-    // `handle_acl_break_recovery` dispatch and assert
-    // `StartError::AclBreakNoTrustAnchor` /
-    // `StartError::AclBreakDrMismatch` / `StartError::AutoRekeyFailed`
-    // exit-code-7 outcomes deterministically. Compiled out of release
-    // builds via `cfg(feature = "test-seam")`.
-    #[cfg(feature = "test-seam")]
-    if std::env::var("AGENTSSO_TEST_FORCE_ACL_BREAK_ON_BOOT").is_ok() {
-        tracing::warn!(
-            "AGENTSSO_TEST_FORCE_ACL_BREAK_ON_BOOT is set — synthesizing the \
-             ACL-break sentinel for the test harness. This env var is only \
-             honored when agentsso is built with the `test-seam` Cargo feature."
-        );
-        // Intentionally do NOT call `capture_trust_anchor_on_first_boot`
-        // here: that would write the running binary's DR as the anchor,
-        // which would mask the `AclBreakNoTrustAnchor` test path. Tests
-        // that need a pre-existing anchor write it themselves before
-        // spawning the daemon.
-        let synthetic = permitlayer_keystore::KeyStoreError::AclBreakNeedsRekey {
-            native: Box::new(permitlayer_keystore::KeyStoreError::BackendUnavailable {
-                backend: "test-forced-acl-break",
-                source: Box::new(std::io::Error::other(
-                    "synthetic OSStatus -25308 from AGENTSSO_TEST_FORCE_ACL_BREAK_ON_BOOT",
-                )),
-            }),
-        };
-        return handle_acl_break_recovery(config, synthetic).await;
-    }
-
-    // Story 7.22: the daemon boot path is the ONLY caller in the
-    // codebase that opts into `AclBreakRecoveryMode::Auto`. On
-    // macOS keychain-ACL invalidation (post `brew upgrade agentsso`
-    // or any binary swap), the wrapper short-circuits with
-    // `KeyStoreError::AclBreakNeedsRekey` BEFORE engaging the
-    // passphrase prompt — and the dispatch below catches that
-    // sentinel and routes to `handle_acl_break_recovery` for
-    // codesign-verified vault rekey.
     let keystore_config = permitlayer_keystore::KeystoreConfig {
         fallback: permitlayer_keystore::FallbackMode::Auto,
         home: config.paths.home.clone(),
-        acl_break_recovery: permitlayer_keystore::AclBreakRecoveryMode::Auto,
     };
     let keystore = permitlayer_keystore::default_keystore(&keystore_config)
         .map_err(|source| StartError::KeystoreConstruction { source })?;
 
-    // Story 7.22 first-boot TOFU (Task 2.4-2.5): unconditionally
-    // capture the running binary's Designated Requirement on first
-    // rc.17+ boot — BEFORE asking the keystore for the master key.
-    // Capture point is `SecCodeCopySelf`, NOT a successful native
-    // keystore call: the capture must succeed even on the
-    // rc.16→rc.17 first-crossover where native already fails -25308
-    // (Codex Finding 10). `write_trust_anchor` is no-clobber, so
-    // subsequent boots short-circuit on `Some(_)` and don't
-    // overwrite a captured anchor.
-    #[cfg(target_os = "macos")]
-    capture_trust_anchor_on_first_boot(&config.paths.home);
-
-    match bootstrap_from_keystore(&*keystore).await {
-        Ok(key) => Ok(key),
-        Err(StartError::MasterKeyCall { source }) if source.is_acl_break_needs_rekey() => {
-            // Story 7.22 Task 3: route the sentinel into the
-            // codesign-verified auto-rekey flow. Returns the new
-            // master key on success or a structured StartError
-            // (exit code 7) if codesign verification fails or the
-            // rekey itself errors.
-            handle_acl_break_recovery(config, source).await
-        }
-        Err(other) => Err(other),
-    }
-}
-
-/// Story 7.22 Task 3.3: handle the
-/// [`permitlayer_keystore::KeyStoreError::AclBreakNeedsRekey`] sentinel
-/// raised by the boot-time keystore wrapper.
-///
-/// Sequence:
-/// 1. Read `<home>/keystore/codesign-trust-anchor.req`. If absent →
-///    [`StartError::AclBreakNoTrustAnchor`].
-/// 2. Verify the running binary's Designated Requirement against the
-///    stored anchor via [`permitlayer_keystore::verify_self_against`].
-///    On mismatch → [`StartError::AclBreakDrMismatch`]; on
-///    `CodesignError::Unsigned` (release builds) →
-///    [`StartError::CodesignVerifyFailed`]; on any other codesign
-///    error → [`StartError::CodesignVerifyFailed`].
-/// 3. Verification passed → invoke
-///    [`crate::cli::auto_rekey::run`] (Task 4) which calls
-///    `run_rotation(home, …, RotationMode::AutoRecover, vault_lock)`.
-///    Returns the new master key on success or
-///    [`StartError::AutoRekeyFailed`] on failure.
-///
-/// All four error variants map to exit code 7. On
-/// `AclBreakDrMismatch`, the rendered banner truncates the stored DR
-/// to 80 characters to avoid leaking the operator's Apple Team ID
-/// into shared logs / CI artifacts.
-async fn handle_acl_break_recovery(
-    config: &DaemonConfig,
-    native_err: permitlayer_keystore::KeyStoreError,
-) -> Result<zeroize::Zeroizing<[u8; permitlayer_keystore::MASTER_KEY_LEN]>, StartError> {
-    let home = &config.paths.home;
-
-    tracing::warn!(
-        error = %native_err,
-        "macOS keychain ACL invalidated by binary swap; entering auto-recovery flow"
-    );
-
-    // Step 1: read trust anchor.
-    let stored_dr = match permitlayer_keystore::read_trust_anchor(home) {
-        Ok(Some(dr)) => dr,
-        Ok(None) => {
-            tracing::error!("no codesign trust anchor on disk — cannot auto-recover headlessly");
-            return Err(StartError::AclBreakNoTrustAnchor);
-        }
-        Err(e) => {
-            tracing::error!(
-                error = %e,
-                "codesign trust anchor file is corrupted or unreadable; \
-                 refusing to auto-recover"
-            );
-            return Err(StartError::AclBreakNoTrustAnchor);
-        }
-    };
-
-    // Step 2: verify self against stored DR.
-    if let Err(e) = permitlayer_keystore::verify_self_against(&stored_dr) {
-        match e {
-            permitlayer_keystore::CodesignError::RequirementMismatch { .. } => {
-                tracing::error!(
-                    stored_dr = %stored_dr,
-                    "codesign Designated Requirement mismatch — refusing to auto-recover"
-                );
-                return Err(StartError::AclBreakDrMismatch { stored_dr });
-            }
-            other => {
-                tracing::error!(
-                    error = %other,
-                    "codesign verification failed during auto-recovery"
-                );
-                return Err(StartError::CodesignVerifyFailed { source: other });
-            }
-        }
-    }
-
-    tracing::info!(
-        "codesign Designated Requirement verified against stored anchor; \
-         dispatching to auto-recovery rekey"
-    );
-
-    // Step 3: invoke the AutoRecover rekey (Task 4).
-    crate::cli::auto_rekey::run(home).await
-}
-
-/// Story 7.22 Task 2.4-2.5 + 3.1: Best-effort first-boot capture of
-/// the running binary's Designated Requirement at
-/// `<home>/keystore/codesign-trust-anchor.req`.
-///
-/// Idempotent: `write_trust_anchor` is no-clobber, so calling this on
-/// every boot only writes once. Failures are logged but never
-/// fatal — the daemon must not refuse to boot just because the TOFU
-/// capture step couldn't run. If the anchor isn't on disk by the
-/// time an ACL break happens, `handle_acl_break_recovery` returns
-/// `StartError::AclBreakNoTrustAnchor` and the operator runs an
-/// interactive recovery to re-seed the anchor.
-#[cfg(target_os = "macos")]
-fn capture_trust_anchor_on_first_boot(home: &std::path::Path) {
-    use permitlayer_keystore::{
-        capture_self_designated_requirement, read_trust_anchor, write_trust_anchor,
-    };
-    match read_trust_anchor(home) {
-        Ok(Some(_)) => {
-            tracing::debug!("codesign trust anchor already present — skipping first-boot capture");
-        }
-        Ok(None) => match capture_self_designated_requirement() {
-            Ok(dr) => match write_trust_anchor(home, &dr) {
-                Ok(()) => {
-                    tracing::info!(
-                        "codesign trust anchor captured on first boot (TOFU); future binary \
-                         swaps will be verified against this Designated Requirement"
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        error = %e,
-                        "failed to persist codesign trust anchor on first boot — \
-                         auto-recovery from ACL break will require manual re-trust"
-                    );
-                }
-            },
-            Err(e) => {
-                tracing::warn!(
-                    error = %e,
-                    "failed to capture codesign Designated Requirement on first boot \
-                     (best-effort; daemon continues to boot)"
-                );
-            }
-        },
-        Err(e) => {
-            tracing::warn!(
-                error = %e,
-                "codesign trust anchor file is corrupted or unreadable; \
-                 NOT overwriting (operator may need to remove the file manually)"
-            );
-        }
-    }
+    bootstrap_from_keystore(&*keystore).await
 }
 
 /// Testable core of [`ensure_master_key_bootstrapped`]: given an
@@ -2233,22 +1896,108 @@ fn capture_trust_anchor_on_first_boot(home: &std::path::Path) {
 pub(crate) async fn bootstrap_from_keystore(
     keystore: &dyn permitlayer_keystore::KeyStore,
 ) -> Result<zeroize::Zeroizing<[u8; permitlayer_keystore::MASTER_KEY_LEN]>, StartError> {
-    let key = keystore.master_key().await.map_err(|source| StartError::MasterKeyCall { source })?;
+    let outcome =
+        keystore.master_key().await.map_err(|source| StartError::MasterKeyCall { source })?;
 
     // Zero-key validation: a buggy keystore returning all-zero bytes
     // would produce a deterministic (trivially recoverable) HKDF
     // subkey downstream. Fail-closed at the boundary.
-    if key.as_slice() == [0u8; permitlayer_keystore::MASTER_KEY_LEN] {
+    if outcome.key.as_slice() == [0u8; permitlayer_keystore::MASTER_KEY_LEN] {
         return Err(StartError::MasterKeyCall {
             source: permitlayer_keystore::KeyStoreError::MalformedMasterKey {
                 expected_len: permitlayer_keystore::MASTER_KEY_LEN,
                 actual_len: 0,
+                reason: permitlayer_keystore::MalformedReason::BadLength,
             },
         });
     }
 
+    // Story 7.27 AC #16: stash the first-boot flag on the
+    // process-global `FIRST_BOOT_OBSERVED` so the `run()` site can
+    // emit a typed `master-key-first-boot` audit event once the
+    // audit dispatcher is constructed (which happens after this
+    // function returns). The flag is `false`-by-default and set
+    // `true` exactly once per process; subsequent calls (test
+    // re-entries) leave it alone.
+    if outcome.first_boot {
+        FIRST_BOOT_OBSERVED.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     tracing::info!("master key bootstrapped");
-    Ok(key)
+    Ok(outcome.key.into_inner())
+}
+
+/// Per-process "the master-key bootstrap call observed first-boot
+/// semantics" flag. Set by [`bootstrap_from_keystore`] when the
+/// keystore reports `MasterKeyOutcome::first_boot == true`; read by
+/// the audit-dispatcher emit site in [`run()`].
+///
+/// Story 7.27 AC #16: chose a static `AtomicBool` over (a) plumbing
+/// `first_boot: bool` through `ensure_master_key_bootstrapped`'s 5
+/// call sites (test seams + production) and (b) a parallel return-
+/// value tuple (`(key, bool)`) because the flag is process-global
+/// (set exactly once per daemon lifetime, regardless of which test
+/// seam fired the keystore call) and the receive site is a single
+/// place in `run()`. The signature-change blast radius would have
+/// been disproportionate to the single bit of information.
+pub(crate) static FIRST_BOOT_OBSERVED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Reset the `FIRST_BOOT_OBSERVED` flag — for unit tests that need a
+/// clean baseline across `bootstrap_from_keystore` invocations in
+/// the same process. Tests that exercise the boot path inline
+/// observe pollution from prior tests; calling this in `#[test]`
+/// setup gives a deterministic starting state.
+///
+/// Story 7.27 Round-2 review fix: closes a latent test-flakiness
+/// vector. Not exposed outside the crate.
+#[cfg(test)]
+#[allow(dead_code)] // Test seam: callers will be added when boot-path tests are stabilized.
+pub(crate) fn reset_first_boot_observed() {
+    FIRST_BOOT_OBSERVED.store(false, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Compute the first 8 hex characters of `SHA-256(master_key)` for
+/// audit-event fingerprinting. Matches the macOS keystore's
+/// `tracing::info!` fingerprint format so operators can grep-
+/// correlate the operations log with the audit log. Never emits the
+/// master-key bytes themselves.
+///
+/// Story 7.27 Round-2 review fix: domain-separated HMAC-SHA256 keyed
+/// by `permitlayer_keystore::FINGERPRINT_DOMAIN_SEP` (only on
+/// macOS where the keystore-side counterpart lives — Linux/Windows
+/// fall back to the original raw `SHA-256(key)[..4]` until those
+/// platforms get their own fingerprint contract in 7.18/7.19). The
+/// HMAC variant removes the trivial-candidate-verification oracle
+/// while preserving cross-boot correlation (operators grep both
+/// logs by fingerprint to confirm the same key across daemon
+/// restarts).
+pub(crate) fn master_key_fingerprint_first8(
+    key: &zeroize::Zeroizing<[u8; permitlayer_keystore::MASTER_KEY_LEN]>,
+) -> String {
+    #[cfg(target_os = "macos")]
+    {
+        use hmac::{Hmac, Mac};
+        use sha2::Sha256;
+        // HMAC accepts arbitrary key length; the `Err` arm is
+        // structurally unreachable for our fixed-constant domain
+        // separator. `let-else + unreachable!` keeps clippy's
+        // `expect_used` lint quiet without `expect("…")`.
+        let Ok(mut mac) =
+            <Hmac<Sha256> as Mac>::new_from_slice(permitlayer_keystore::FINGERPRINT_DOMAIN_SEP)
+        else {
+            unreachable!("HMAC-SHA256 accepts arbitrary key length");
+        };
+        mac.update(key.as_slice());
+        let tag = mac.finalize().into_bytes();
+        format!("{:02x}{:02x}{:02x}{:02x}", tag[0], tag[1], tag[2], tag[3])
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(key.as_slice());
+        digest.iter().take(4).map(|b| format!("{b:02x}")).collect()
+    }
 }
 
 /// Parse `AGENTSSO_TEST_MASTER_KEY_HEX` into a 32-byte master key if
@@ -2652,6 +2401,14 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     // see one extra info line; production scripts ignore unknown
     // stdout. Flush is explicit because Windows pipes are line-buffered
     // and the test harness blocks on this line before continuing.
+    //
+    // **PROTOCOL CHANNEL** (Story 7.27 review fix annotation): this
+    // writeln is NOT a tracing log; it is a deliberate stdout-protocol
+    // sync channel between the daemon and integration test fixtures.
+    // The matching `AGENTSSO_CONTROL_SOCK=...` line at the UDS bind
+    // site (below) follows the same contract. DO NOT replace either
+    // with `tracing::info!` without coordinating a workspace-wide
+    // fixture migration first.
     let bound_addr = listener.local_addr().map_err(|source| {
         tracing::error!(addr = %bind_addr, "failed to read local_addr after bind: {source}");
         StartError::BindFailed { addr: bind_addr, source }
@@ -2776,6 +2533,47 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         );
     })?;
 
+    // Story 7.27 AC #16: emit a typed `master-key-first-boot` audit
+    // event when the bootstrap call observed `first_boot == true`
+    // from the keystore. The flag is process-global (set inside
+    // `bootstrap_from_keystore`); this is the first place after
+    // dispatcher construction where we can fire a typed event. On
+    // macOS the keystore-side `tracing::info!` already emitted the
+    // same fact to the operations log layer; the audit-event side
+    // is for the tamper-evident compliance log.
+    if FIRST_BOOT_OBSERVED.load(std::sync::atomic::Ordering::SeqCst) {
+        let fingerprint = master_key_fingerprint_first8(&master_key);
+        // Story 7.27 Round-2 review fix: surface a per-platform
+        // backend name in the audit payload. Linux: secret-service
+        // (libsecret over D-Bus); Windows: cred-man (Credential
+        // Manager). The pre-fix "default" was operationally
+        // meaningless on non-macOS hosts.
+        let keychain_target = if cfg!(target_os = "macos") {
+            "System"
+        } else if cfg!(target_os = "linux") {
+            "secret-service"
+        } else if cfg!(target_os = "windows") {
+            "cred-man"
+        } else {
+            "unknown"
+        };
+        let service_id = permitlayer_keystore::MASTER_KEY_SERVICE;
+        let mut event = permitlayer_core::audit::event::AuditEvent::new(
+            "daemon".to_owned(),
+            "keystore".to_owned(),
+            "n/a".to_owned(),
+            "master-key".to_owned(),
+            "ok".to_owned(),
+            "master-key-first-boot".to_owned(),
+        );
+        event.extra = serde_json::json!({
+            "fingerprint": fingerprint,
+            "keychain_target": keychain_target,
+            "service_id": service_id,
+        });
+        audit_dispatcher.dispatch(event).await;
+    }
+
     // Story 7.6a AC #12: walk the vault and compute the active
     // `key_id` as `max(envelope.key_id over all .sealed files)`,
     // defaulting to `0` for an empty vault. The proxy service's
@@ -2786,6 +2584,29 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     // been no rotation event yet.
     let active_key_id = compute_active_key_id(&config.paths.home.join("vault"));
     tracing::info!(active_key_id, "vault bootstrap: discovered active key_id");
+
+    // Story 7.30 Task 1 (AC #10/#11): construct the `Arc<Vault>` here,
+    // unconditionally, AFTER `compute_active_key_id` so the key_id is
+    // correct, and BEFORE `try_build_proxy_service` so both the proxy
+    // (refresh path) and `ControlState` (new credentials-seal /
+    // credentials-verify handlers) share the same `Arc`. `Vault::new`
+    // is a pure constructor (no I/O) and `compute_active_key_id`
+    // returns `0` on an empty vault, so this is safe even on a fresh
+    // install with no sealed credentials yet.
+    //
+    // `Vault::new` consumes the master key by value, so we clone the
+    // bytes into a fresh `Zeroizing` buffer. This is the one place
+    // where the key bytes exist in two buffers simultaneously (the
+    // caller's bootstrap buffer + the vault's internal buffer); both
+    // are zeroized on drop. (Restored from the pre-Task-1 version of
+    // `try_build_proxy_service` per round-1 review P11 — the safety
+    // rationale is operator-relevant and shouldn't drift out of the
+    // codebase even though the construction site moved.)
+    let vault = {
+        let mut vault_key = zeroize::Zeroizing::new([0u8; permitlayer_keystore::MASTER_KEY_LEN]);
+        vault_key.copy_from_slice(master_key.as_slice());
+        Arc::new(permitlayer_vault::Vault::new(vault_key, active_key_id))
+    };
 
     // 7b'. Build the agent identity store + registry + HMAC lookup
     // subkey (Story 4.4). Always gets a real master-key-derived
@@ -2848,7 +2669,7 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         scrub_engine.as_ref(),
         audit_store.as_ref(),
         &master_key,
-        active_key_id,
+        Arc::clone(&vault),
     )
     .await;
     let proxy_stub_branch_active =
@@ -3085,7 +2906,21 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         }
         // rest_router is Router<()> (stateless — captures Arc<ProxyService> in closures).
         // Merge it before applying .with_state(state) so axum can coerce it.
+        //
+        // `mut` is only needed in debug builds where the
+        // plugin-echo route below reassigns. Release builds compile
+        // out the reassignment, so the `mut` is cfg-gated to keep
+        // `cargo clippy --release` clean. (Pre-7.27 latent warning
+        // caught by the rc.22 release-clippy gate.)
+        #[cfg(debug_assertions)]
         let mut router = Router::new()
+            .route("/health", get(health_handler))
+            .route("/v1/health", get(health_handler))
+            .nest_service("/mcp", gmail_mcp)
+            .nest_service("/mcp/calendar", calendar_mcp)
+            .nest_service("/mcp/drive", drive_mcp);
+        #[cfg(not(debug_assertions))]
+        let router = Router::new()
             .route("/health", get(health_handler))
             .route("/v1/health", get(health_handler))
             .nest_service("/mcp", gmail_mcp)
@@ -3143,6 +2978,7 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         Arc::clone(&cli_overrides),
         Arc::clone(&proxy_stub_branch_active),
         vault_dir_for_reload,
+        Arc::clone(&vault),
         Arc::clone(&control_token),
     );
     // `agent_lookup_key` (the local binding) is moved into control::router
@@ -3150,6 +2986,47 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     // reference. Moving avoids holding a redundant Arc for the rest of
     // `run()`; the subkey bytes are reachable through the middleware
     // closure and through `ControlState` for the daemon's lifetime.
+    //
+    // Story 7.27 AC #2 (split-listener): on macOS, the control router
+    // moves to its own UDS listener at
+    // `paths::control_socket_path()`; the TCP listener at
+    // `127.0.0.1:3820` serves only the MCP + REST routes (preserves
+    // OpenClaw / Claude Desktop / Cursor compatibility because MCP
+    // Streamable HTTP requires HTTP-over-TCP). On Linux + Windows
+    // the rc.21 single-listener model is preserved (those redesigns
+    // are 7.18 + 7.19).
+    #[cfg(target_os = "macos")]
+    let control_router_for_uds = {
+        // Story 7.27 AC #2: `/health` + `/v1/health` are duplicated
+        // on both listeners so operators can liveness-probe either
+        // transport. The health routes are merged AFTER the auth
+        // layer is applied to control_router so they stay unauth'd,
+        // mirroring how `control_router` itself is carved out of
+        // KillSwitchLayer.
+        //
+        // We use a minimal stateless health handler here (rather
+        // than reusing the full `health_handler` from the TCP path)
+        // because the latter takes `State<AppState>` while
+        // control_router takes `State<ControlState>` — merging two
+        // routers with different state types is not supported by
+        // axum's Router::merge. The control-plane liveness probe
+        // only needs to confirm "the daemon is up + the UDS
+        // listener is alive"; richer health info (bind_addr,
+        // active_connections, version) is on the TCP /health.
+        async fn uds_health_handler() -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "status": "ok",
+                "transport": "uds",
+            }))
+        }
+        let health_router = Router::<()>::new()
+            .route("/health", get(uds_health_handler))
+            .route("/v1/health", get(uds_health_handler));
+        control_router.merge(health_router).layer(axum::middleware::from_fn(
+            crate::server::control_listener::record_peer_credentials_layer,
+        ))
+    };
+    #[cfg(not(target_os = "macos"))]
     let app = app.merge(control_router);
 
     tracing::info!(addr = %bind_addr, pid = std::process::id(), "daemon ready");
@@ -3162,8 +3039,22 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     // drain runs AFTER axum finishes (or after axum's 25s fires), which
     // means no new requests can dispatch audit events after the drain
     // starts (axum has stopped accepting connections).
-    let drain_notify = Arc::new(tokio::sync::Notify::new());
-    let drain_notify_clone = Arc::clone(&drain_notify);
+    // Story 7.27 Round-3 review fix (R3-C3-P2): switched from
+    // `tokio::sync::Notify` + `notify_waiters()` to
+    // `tokio::sync::watch::<bool>` because `Notify` is edge-
+    // triggered — `notify_waiters()` only wakes ALREADY-registered
+    // waiters, and the drain-deadline futures (`graceful_fut_uds`,
+    // `drain_deadline_tcp`, `drain_deadline_uds`) only register
+    // their `.notified()` waiter lazily on first poll inside the
+    // `tokio::select!` / `tokio::join!`. If the shutdown signal
+    // raced ahead of `axum::serve`'s first poll on these futures,
+    // `notify_waiters()` would wake zero waiters and the drain
+    // deadlines would block forever. `watch::channel(false)` is
+    // level-triggered: subscribers added after `send(true)` still
+    // observe the true value via `changed()`/`borrow()`. Three
+    // independent `receiver.clone()`s feed the three waiters.
+    let (drain_tx, drain_rx) = tokio::sync::watch::channel(false);
+    let drain_tx_for_graceful = drain_tx.clone();
     let sweep_shutdown_for_graceful = Arc::clone(&sweep_shutdown);
     let graceful_fut = async move {
         shutdown_fut.await;
@@ -3171,30 +3062,186 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         // BEFORE notifying the axum drain, so the sweep loop can
         // exit cleanly while in-flight requests still complete.
         sweep_shutdown_for_graceful.notify_one();
-        drain_notify_clone.notify_one();
+        // Broadcast the drain signal. `watch::send` ignores errors
+        // when there are no receivers (all dropped before signal),
+        // which is fine for shutdown.
+        let _ = drain_tx_for_graceful.send(true);
     };
     // `into_make_service_with_connect_info::<SocketAddr>()` enables the
     // `ConnectInfo<SocketAddr>` extractor used by the control-plane handlers
     // for their loopback-only guard. It is a drop-in replacement for plain
     // `into_make_service()` at the serve level — pre-existing handlers that
     // don't extract `ConnectInfo` are unaffected.
+    //
+    // Story 7.27 AC #2 (split-listener, macOS): a second
+    // `axum::serve` instance binds a UDS at
+    // `paths::control_socket_path()` and serves `control_router_for_uds`
+    // with `ConnectInfo<PeerCredentials>` so handlers (or future
+    // middleware) can attest the caller's kernel UID. Both serve
+    // futures run concurrently via `tokio::try_join!`; either failing
+    // is fatal, but neither's *completion* cancels the other's drain
+    // (the prior `tokio::select!` impl silently dropped in-flight
+    // audit events on the surviving listener — see review fix in
+    // shutdown sequence at section 11).
+    #[cfg(target_os = "macos")]
+    let control_serve_fut = {
+        use crate::server::control_listener::{
+            UdsConnectInfo, bind_control_listener, bind_control_listener_no_perms,
+        };
+        // Invariant: PidFile MUST be acquired before this UDS bind
+        // sequence. Two concurrent `agentsso start` invocations
+        // would otherwise both reach the bind step (their PidFile
+        // races would be moot since AF_UNIX bind is atomic on
+        // EADDRINUSE — but the loser would have already chowned
+        // the winner's socket via `apply_control_socket_perms`).
+        // PidFile acquisition (`PidFile::acquire`) at ~line 2481
+        // is the global lock; the closure-borrow below keeps the
+        // `pid_file` binding live across this scope so the
+        // ordering is visually + compiler-enforced.
+        // Story 7.27 review fix.
+        let _ = &pid_file;
+        // Honor the `AGENTSSO_PATHS__HOME` test override (same
+        // discipline as `agentsso_home()` in cli/mod.rs). Under
+        // override, `control.sock` lives at
+        // `<override>/run/control.sock` and we skip the root-owned
+        // chown step (tests don't run as root + the
+        // `permitlayer-clients` group doesn't exist on dev boxes
+        // that haven't run `service install`).
+        let home_override = permitlayer_core::paths::home_override();
+        let sock_path = permitlayer_core::paths::control_socket_path(home_override.as_deref());
+        // Best-effort: ensure the runtime parent dir exists. `service
+        // install` creates `/var/run/permitlayer/` as root:wheel
+        // 0755; under an override the parent may not exist yet —
+        // create permissively (operator-owned dir in that case).
+        if let Some(parent) = sock_path.parent() {
+            std::fs::create_dir_all(parent)
+                .map_err(|source| StartError::BindFailed { addr: bind_addr, source })?;
+        }
+        let uds_listener = if home_override.is_some() {
+            // Test/dev path: bind without chown (no root, no group).
+            bind_control_listener_no_perms(&sock_path)
+                .map_err(|source| StartError::BindFailed { addr: bind_addr, source })?
+        } else {
+            // Production path: requires root + `permitlayer-clients`
+            // group. The typed "missing group" error from
+            // `bind_control_listener` tells operators to run
+            // `sudo agentsso service install` first.
+            bind_control_listener(&sock_path, "permitlayer-clients")
+                .map_err(|source| StartError::BindFailed { addr: bind_addr, source })?
+        };
+        tracing::info!(
+            path = %sock_path.display(),
+            "control plane UDS listener bound (mode 0660 root:permitlayer-clients)"
+        );
+        // Mirror the TCP listener's `AGENTSSO_BOUND_ADDR` stdout
+        // emit for test harnesses that need to discover the UDS
+        // path. Preserves the existing line so existing scripts
+        // continue to grep `AGENTSSO_BOUND_ADDR`.
+        {
+            use std::io::Write;
+            let mut stdout = std::io::stdout().lock();
+            let _ = writeln!(stdout, "AGENTSSO_CONTROL_SOCK={}", sock_path.display());
+            let _ = stdout.flush();
+        }
+        // Per-listener graceful-shutdown trigger. The single
+        // `drain_tx` from above signals both axum serves via
+        // independent `watch::Receiver` clones.
+        let mut drain_rx_uds = drain_rx.clone();
+        let graceful_fut_uds = async move {
+            // `watch::Receiver::changed()` returns when the value
+            // changes from `false` to `true`. If the sender already
+            // moved to `true` before we polled, `changed()` still
+            // returns `Ok(())` immediately — level-triggered.
+            let _ = drain_rx_uds.changed().await;
+        };
+        axum::serve(
+            uds_listener,
+            control_router_for_uds.into_make_service_with_connect_info::<UdsConnectInfo>(),
+        )
+        .with_graceful_shutdown(graceful_fut_uds)
+    };
     let serve_fut = axum::serve(listener, app.into_make_service_with_connect_info::<SocketAddr>())
         .with_graceful_shutdown(graceful_fut);
     // 25 seconds reserved for axum connection draining; the remaining
     // 5 seconds are reserved for the audit dispatcher drain below.
     const AXUM_DRAIN_BUDGET: Duration = Duration::from_secs(25);
     const AUDIT_DRAIN_BUDGET: Duration = Duration::from_secs(5);
-    let drain_deadline = async {
-        drain_notify.notified().await;
-        tokio::time::sleep(AXUM_DRAIN_BUDGET).await;
-        tracing::warn!(
-            "axum shutdown drain budget exceeded ({}s), dropping remaining connections",
-            AXUM_DRAIN_BUDGET.as_secs()
-        );
+    // Story 7.27 review fix: each listener honors the SHARED 25s
+    // shutdown budget via its own per-listener select, then we
+    // try_join both. Prior implementation used a single
+    // `tokio::select!` over BOTH serve futures + drain_deadline,
+    // which cancelled the other listener mid-flight when ANY arm
+    // completed — silently dropping in-flight audit events on the
+    // surviving listener during graceful shutdown.
+    let drain_deadline_tcp = {
+        let mut dn = drain_rx.clone();
+        async move {
+            let _ = dn.changed().await;
+            tokio::time::sleep(AXUM_DRAIN_BUDGET).await;
+            tracing::warn!(
+                "axum (TCP) shutdown drain budget exceeded ({}s), dropping remaining connections",
+                AXUM_DRAIN_BUDGET.as_secs()
+            );
+        }
     };
-    tokio::select! {
-        result = serve_fut => { result.map_err(|source| StartError::ServeFailed { source })?; }
-        () = drain_deadline => {}
+    let tcp_task: std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), StartError>> + Send>,
+    > = Box::pin(async move {
+        tokio::select! {
+            result = serve_fut => result.map_err(|source| StartError::ServeFailed { source }),
+            () = drain_deadline_tcp => Ok(()),
+        }
+    });
+
+    #[cfg(target_os = "macos")]
+    {
+        let drain_deadline_uds = {
+            let mut dn = drain_rx.clone();
+            async move {
+                let _ = dn.changed().await;
+                tokio::time::sleep(AXUM_DRAIN_BUDGET).await;
+                tracing::warn!(
+                    "axum (UDS) shutdown drain budget exceeded ({}s), dropping remaining connections",
+                    AXUM_DRAIN_BUDGET.as_secs()
+                );
+            }
+        };
+        let uds_task: std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(), StartError>> + Send>,
+        > = Box::pin(async move {
+            tokio::select! {
+                result = control_serve_fut => result.map_err(|source| StartError::ServeFailed { source }),
+                () = drain_deadline_uds => Ok(()),
+            }
+        });
+        // Story 7.27 Round-2 review fix (P1): use `tokio::join!`
+        // (not `try_join!`) so an error in one listener does NOT
+        // cancel the other mid-drain. `try_join!` documented
+        // contract is "drops the other future on Err" — which
+        // re-introduces exactly the in-flight-cancellation bug
+        // the per-listener-select shape was designed to avoid.
+        // With `join!`, both listeners run to completion (their
+        // own selects honor the 25s drain deadline); we then
+        // inspect both results and surface the first error.
+        let (tcp_result, uds_result) = tokio::join!(tcp_task, uds_task);
+        // Round-3 review fix (R3-C3-P10): when both listeners fail
+        // with different errors, `tcp_result?` short-circuits and
+        // the UDS error is dropped on the floor. Log both results
+        // explicitly first so operators see the full picture even
+        // when only one becomes the process exit error.
+        if tcp_result.is_err() || uds_result.is_err() {
+            tracing::warn!(
+                tcp_result = ?tcp_result,
+                uds_result = ?uds_result,
+                "split-listener shutdown returned errors on one or both listeners"
+            );
+        }
+        tcp_result?;
+        uds_result?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        tcp_task.await?;
     }
 
     // 11. Shutdown sequence.
@@ -3647,7 +3694,9 @@ mod tests {
 
     #[async_trait]
     impl KeyStore for FakeKeyStore {
-        async fn master_key(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyStoreError> {
+        async fn master_key(
+            &self,
+        ) -> Result<permitlayer_keystore::MasterKeyOutcome, KeyStoreError> {
             *self.call_count.lock().unwrap() += 1;
 
             // Take the error slot if it's set — one-shot.
@@ -3659,8 +3708,9 @@ mod tests {
             // invent one (using a deterministic pattern so tests can
             // assert on specific bytes) and persist it.
             let mut slot = self.stored.lock().unwrap();
+            let first_boot = slot.is_none();
             let key = slot.get_or_insert([0x42u8; MASTER_KEY_LEN]);
-            Ok(Zeroizing::new(*key))
+            Ok(permitlayer_keystore::MasterKeyOutcome::new(Zeroizing::new(*key), first_boot))
         }
 
         async fn set_master_key(&self, key: &[u8; MASTER_KEY_LEN]) -> Result<(), KeyStoreError> {
@@ -3783,6 +3833,7 @@ mod tests {
         let keystore = FakeKeyStore::failing(KeyStoreError::MalformedMasterKey {
             expected_len: 32,
             actual_len: 16,
+            reason: permitlayer_keystore::MalformedReason::BadLength,
         });
         let result = bootstrap_from_keystore(&keystore).await;
         assert!(matches!(

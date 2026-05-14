@@ -149,18 +149,6 @@ pub trait AgentIdentityStore: Send + Sync {
     /// than relying on convention. A generic `put_overwrite` would be
     /// a footgun for any future caller who reaches for "I just need
     /// to update some fields" and accidentally clobbers others.
-    ///
-    /// **Story 7.22 — auto-recovery rotation boundary.** The
-    /// AutoRecover variant of master-key rotation (triggered by a
-    /// detected macOS keychain-ACL break post binary swap) must
-    /// preserve every operator's existing bearer token across the
-    /// rekey — operators with MCP-client configs would all break if
-    /// auto-recovery silently re-minted tokens. AutoRecover therefore
-    /// deliberately violates this method's two-field invariant by
-    /// updating `lookup_key_hex` ONLY, via the sibling
-    /// [`Self::update_lookup_key_only`] method. Both methods exist
-    /// side-by-side to express the boundary cleanly: operator
-    /// rotation calls this method, auto-recovery calls the sibling.
     async fn update_lookup_key_and_token(
         &self,
         name: &str,
@@ -179,28 +167,6 @@ pub trait AgentIdentityStore: Send + Sync {
     /// - validate `name` via `agent::validate_agent_name` and surface
     ///   [`StoreError::InvalidAgentName`] on failure
     /// - mirror `put`'s atomic-write discipline (tempfile → fsync →
-    ///   rename → fsync parent dir; mode `0o600` on Unix in `0o700`
-    ///   parent dir)
-    /// - return `Ok(false)` if no agent with that name exists
-    /// - return `Ok(true)` on a successful rewrite
-    /// - preserve every other field byte-for-byte (`name`,
-    ///   `policy_name`, `token_hash`, `created_at`, `last_seen_at`)
-    ///
-    /// **Why a dedicated 1-field method:** auto-recovery MUST NOT
-    /// touch `token_hash` — operators would find their MCP-client
-    /// configs broken after every brew upgrade. The typed signature
-    /// makes that invariant a compiler-checked property and clearly
-    /// names the intentional boundary against
-    /// [`Self::update_lookup_key_and_token`] (which mutates both).
-    /// Any future caller who reaches for this method MUST first
-    /// confirm they are NOT in the operator-rotation flow — operator
-    /// rotation always re-mints tokens.
-    async fn update_lookup_key_only(
-        &self,
-        name: &str,
-        new_lookup_key_hex: String,
-    ) -> Result<bool, StoreError>;
-
     /// Atomically rewrite ONLY the `policy_name` field of an existing
     /// agent. Used by `agentsso agent rebind` (Story 7.11) to extend
     /// or change an agent's policy binding WITHOUT rotating its bearer

@@ -211,7 +211,14 @@ pub struct CannedPromptReader {
 impl CannedPromptReader {
     /// Build a reader pre-seeded with the supplied decisions and no
     /// artificial delay.
+    ///
+    /// Only used by `#[cfg(test)]` callers; release builds compile
+    /// the helper out via dead-code elimination. Allow the lint
+    /// because the struct itself is `pub` (consumed by the test
+    /// module + potentially by future cross-crate integration
+    /// tests).
     #[must_use]
+    #[allow(dead_code)]
     pub fn new(decisions: Vec<PromptReaderDecision>) -> Self {
         Self {
             decisions: Arc::new(Mutex::new(decisions.into_iter().collect())),
@@ -224,6 +231,7 @@ impl CannedPromptReader {
     /// test to force an `ApprovalOutcome::Timeout` through the real
     /// `tokio::time::timeout` path.
     #[must_use]
+    #[allow(dead_code)]
     pub fn with_sleep(decisions: Vec<PromptReaderDecision>, sleep_per_read: Duration) -> Self {
         Self { decisions: Arc::new(Mutex::new(decisions.into_iter().collect())), sleep_per_read }
     }

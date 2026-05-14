@@ -42,12 +42,19 @@ impl LinuxKeyStore {
 
 #[async_trait::async_trait]
 impl KeyStore for LinuxKeyStore {
-    async fn master_key(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyStoreError> {
-        tokio::task::spawn_blocking(|| {
+    async fn master_key(&self) -> Result<crate::MasterKeyOutcome, KeyStoreError> {
+        // Story 7.27 AC #16: only macOS distinguishes first-boot vs
+        // existing-key in rc.22 (System.keychain has a read-before-
+        // write gate). Linux's `keyring_shared` helper internally
+        // fetch-or-creates but doesn't surface the distinction —
+        // reporting `first_boot: false` unconditionally is the
+        // honest answer until 7.18 redesigns the Linux backend.
+        let key = tokio::task::spawn_blocking(|| {
             shared::fetch_or_create_master_key_at_account(BACKEND, MASTER_KEY_ACCOUNT)
         })
         .await
-        .map_err(|e| shared::join_err(BACKEND, e))?
+        .map_err(|e| shared::join_err(BACKEND, e))??;
+        Ok(crate::MasterKeyOutcome::new(key, false))
     }
 
     async fn set_master_key(&self, key: &[u8; MASTER_KEY_LEN]) -> Result<(), KeyStoreError> {

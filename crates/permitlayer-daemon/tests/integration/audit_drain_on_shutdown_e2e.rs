@@ -84,7 +84,8 @@ fn audit_drain_on_shutdown_preserves_all_blocked_events() {
     // endpoint is POST /v1/control/kill (non-idempotent; returns 200
     // on first activation, 409 on subsequent if already active).
     let ctl = crate::common::read_test_control_token(home.path());
-    let (status, body) = crate::common::http_request_with_headers(
+    let (status, body) = crate::common::http_request_control(
+        home.path(),
         port,
         "POST",
         "/v1/control/kill",

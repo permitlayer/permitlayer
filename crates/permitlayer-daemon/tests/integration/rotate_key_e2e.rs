@@ -469,12 +469,12 @@ fn auth_round_trip_against_running_daemon() {
 fn register_agent(port: u16, home: &std::path::Path, name: &str, policy: &str) -> String {
     let body = format!(r#"{{"name":"{name}","policy_name":"{policy}"}}"#);
     let ctl = crate::common::read_test_control_token(home);
-    let (status, resp_body) = http_request(
+    let (status, resp_body) = crate::common::http_post_control(
+        home,
         port,
-        "POST",
         "/v1/control/agent/register",
-        &[("X-Agentsso-Control", ctl.as_str())],
-        Some(&body),
+        &body,
+        &[("X-Agentsso-Control", ctl.as_str()), ("Content-Type", "application/json")],
     );
     assert_eq!(
         status, 200,

@@ -71,8 +71,8 @@ use zeroize::Zeroizing;
 use crate::error::KeyStoreError;
 use crate::passphrase::PassphraseKeyStore;
 use crate::{
-    AclBreakRecoveryMode, DeleteOutcome, FallbackMode, KeyStore, KeyStoreKind, MASTER_KEY_LEN,
-    is_backend_unavailable, log_fallback_runtime,
+    DeleteOutcome, FallbackMode, KeyStore, KeyStoreKind, MASTER_KEY_LEN, is_backend_unavailable,
+    log_fallback_runtime,
 };
 
 /// Closure type for constructing the fallback keystore. Production
@@ -88,14 +88,6 @@ pub(crate) struct FallbackKeyStore {
     native: Box<dyn KeyStore>,
     home: PathBuf,
     fallback_mode: FallbackMode,
-    /// Story 7.22: when `Auto`, the FIRST `BackendUnavailable` from the
-    /// native backend short-circuits with
-    /// [`KeyStoreError::AclBreakNeedsRekey`] BEFORE engaging the
-    /// passphrase fallback. The daemon's boot path catches the
-    /// sentinel and dispatches to the codesign-verified auto-rekey
-    /// flow. Default `Disabled` for non-boot CLI paths preserves the
-    /// existing passphrase-prompt fallback unchanged.
-    acl_break_recovery: AclBreakRecoveryMode,
     fallback: OnceCell<Arc<dyn KeyStore>>,
     construct_fallback: ConstructFallback,
 }
@@ -114,7 +106,6 @@ impl FallbackKeyStore {
     pub(crate) fn production(
         home: PathBuf,
         fallback_mode: FallbackMode,
-        acl_break_recovery: AclBreakRecoveryMode,
         native: Box<dyn KeyStore>,
     ) -> Result<Self, KeyStoreError> {
         let fallback: OnceCell<Arc<dyn KeyStore>> = OnceCell::new();
@@ -122,7 +113,6 @@ impl FallbackKeyStore {
             native,
             home,
             fallback_mode,
-            acl_break_recovery,
             fallback,
             construct_fallback: Arc::new(|h: &Path| {
                 PassphraseKeyStore::from_prompt(h).map(|ks| Arc::new(ks) as Arc<dyn KeyStore>)
@@ -141,38 +131,11 @@ impl FallbackKeyStore {
         construct_fallback: ConstructFallback,
         passphrase_state_exists: bool,
     ) -> Self {
-        Self::with_constructor_and_recovery(
-            home,
-            fallback_mode,
-            AclBreakRecoveryMode::Disabled,
-            native,
-            construct_fallback,
-            passphrase_state_exists,
-        )
-    }
-
-    /// Test constructor that exposes the [`AclBreakRecoveryMode`]
-    /// switch. Used by the Story 7.22 sentinel-routing tests.
-    #[cfg(test)]
-    pub(crate) fn with_constructor_and_recovery(
-        home: PathBuf,
-        fallback_mode: FallbackMode,
-        acl_break_recovery: AclBreakRecoveryMode,
-        native: Box<dyn KeyStore>,
-        construct_fallback: ConstructFallback,
-        passphrase_state_exists: bool,
-    ) -> Self {
         let fallback: OnceCell<Arc<dyn KeyStore>> = OnceCell::new();
-        if passphrase_state_exists {
-            // Run the synthetic constructor to install the fallback.
-            // In tests this is the same closure used for runtime
-            // engagement, so the marker test exercises the same code
-            // path.
-            if let Ok(fb) = (construct_fallback)(&home) {
-                let _ = fallback.set(fb);
-            }
+        if passphrase_state_exists && let Ok(fb) = (construct_fallback)(&home) {
+            let _ = fallback.set(fb);
         }
-        Self { native, home, fallback_mode, acl_break_recovery, fallback, construct_fallback }
+        Self { native, home, fallback_mode, fallback, construct_fallback }
     }
 
     /// Engage the fallback (or return the existing one) if `e` is a
@@ -185,31 +148,12 @@ impl FallbackKeyStore {
     /// were called outside, both racing callers would invoke
     /// `from_prompt` (and write `passphrase.state` twice).
     ///
-    /// Story 7.22: when `acl_break_recovery: Auto` AND `native_err` is
-    /// `BackendUnavailable` (the macOS keychain ACL break post binary
-    /// swap), this method does NOT engage the passphrase fallback —
-    /// it returns the [`KeyStoreError::AclBreakNeedsRekey`] sentinel
-    /// up to the caller, which the daemon's boot path catches and
-    /// routes to the codesign-verified auto-rekey flow. With
-    /// `acl_break_recovery: Disabled` (the default for non-boot CLI
-    /// paths) the existing passphrase fallback engages unchanged.
     async fn try_engage_fallback(
         &self,
         native_err: &KeyStoreError,
     ) -> Result<Option<&Arc<dyn KeyStore>>, KeyStoreError> {
         if self.fallback_mode != FallbackMode::Auto || !is_backend_unavailable(native_err) {
             return Ok(None);
-        }
-        // Story 7.22: short-circuit the passphrase fallback only when
-        // the wrapper was explicitly constructed for boot-time auto-
-        // recovery. The default (`Disabled`) preserves the existing
-        // behavior for the five non-boot CLI call sites
-        // (connect/credentials/rotate-key/uninstall/keystore-clear-
-        // previous), which still engage the passphrase prompt as before.
-        if self.acl_break_recovery == AclBreakRecoveryMode::Auto {
-            return Err(KeyStoreError::AclBreakNeedsRekey {
-                native: Box::new(native_err.clone_for_chain()),
-            });
         }
         log_fallback_runtime(native_err);
         let installed = self
@@ -229,12 +173,12 @@ impl FallbackKeyStore {
 
 #[async_trait]
 impl KeyStore for FallbackKeyStore {
-    async fn master_key(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyStoreError> {
+    async fn master_key(&self) -> Result<crate::MasterKeyOutcome, KeyStoreError> {
         if let Some(fb) = self.fallback.get() {
             return fb.master_key().await;
         }
         match self.native.master_key().await {
-            Ok(bytes) => Ok(bytes),
+            Ok(outcome) => Ok(outcome),
             Err(native_err) => match self.try_engage_fallback(&native_err).await? {
                 Some(fb) => fb.master_key().await,
                 None => Err(native_err),
@@ -366,7 +310,7 @@ mod fallback_tests {
 
     #[async_trait]
     impl KeyStore for ErroringNative {
-        async fn master_key(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyStoreError> {
+        async fn master_key(&self) -> Result<crate::MasterKeyOutcome, KeyStoreError> {
             self.master_key_calls.fetch_add(1, Ordering::SeqCst);
             Err(self.take_error())
         }
@@ -400,8 +344,8 @@ mod fallback_tests {
 
     #[async_trait]
     impl KeyStore for SyntheticFallback {
-        async fn master_key(&self) -> Result<Zeroizing<[u8; MASTER_KEY_LEN]>, KeyStoreError> {
-            Ok(Zeroizing::new([0xAA; MASTER_KEY_LEN]))
+        async fn master_key(&self) -> Result<crate::MasterKeyOutcome, KeyStoreError> {
+            Ok(crate::MasterKeyOutcome::new(Zeroizing::new([0xAA; MASTER_KEY_LEN]), false))
         }
         async fn set_master_key(&self, _: &[u8; MASTER_KEY_LEN]) -> Result<(), KeyStoreError> {
             Err(KeyStoreError::PassphraseAdapterImmutable)
@@ -462,7 +406,7 @@ mod fallback_tests {
             false,
         );
         let key = wrapper.master_key().await.expect("fallback must engage");
-        assert_eq!(*key, [0xAA; MASTER_KEY_LEN]);
+        assert_eq!(**key.key, [0xAA; MASTER_KEY_LEN]);
     }
 
     /// Test #2: native returns PlatformError; wrapper does NOT engage
@@ -505,9 +449,9 @@ mod fallback_tests {
         );
         let key1 = wrapper.master_key().await.expect("first call engages fallback");
         let key2 = wrapper.master_key().await.expect("second call routes to engaged fallback");
-        assert_eq!(*key1, *key2);
+        assert_eq!(*key1.key, *key2.key);
         // Synthetic fallback always returns 0xAA.
-        assert_eq!(*key1, [0xAA; MASTER_KEY_LEN]);
+        assert_eq!(**key1.key, [0xAA; MASTER_KEY_LEN]);
     }
 
     /// Test #4: after fallback engages on master_key, set_master_key
@@ -589,7 +533,7 @@ mod fallback_tests {
         // First call should NOT touch native — fallback is already
         // installed. Synthetic fallback returns 0xAA.
         let key = wrapper.master_key().await.expect("eager fallback engages");
-        assert_eq!(*key, [0xAA; MASTER_KEY_LEN]);
+        assert_eq!(**key.key, [0xAA; MASTER_KEY_LEN]);
     }
 
     /// Test #8: concurrent first-failure constructs fallback ONCE.
@@ -644,78 +588,6 @@ mod fallback_tests {
             1,
             "construct_fallback closure MUST run exactly once even under racing first-failures"
         );
-    }
-
-    /// Story 7.22 Test A: with `AclBreakRecoveryMode::Auto`, a
-    /// `BackendUnavailable -25308` from the native backend short-
-    /// circuits with `KeyStoreError::AclBreakNeedsRekey` and does NOT
-    /// engage the passphrase fallback. The daemon boot path catches
-    /// this sentinel and dispatches to the codesign-verified auto-
-    /// rekey flow.
-    #[tokio::test]
-    async fn acl_break_recovery_auto_returns_sentinel_instead_of_engaging_passphrase() {
-        let dir = TempDir::new().unwrap();
-        let native_sentinel = "OSSTATUS_-25308_ACL_BREAK_SENTINEL";
-        let native = Box::new(ErroringNative::new(KeyStoreError::BackendUnavailable {
-            backend: "apple",
-            source: Box::new(std::io::Error::other(native_sentinel)),
-        }));
-        let counter = Arc::new(AtomicU32::new(0));
-        let wrapper = FallbackKeyStore::with_constructor_and_recovery(
-            dir.path().to_path_buf(),
-            FallbackMode::Auto,
-            AclBreakRecoveryMode::Auto,
-            native,
-            make_counting_constructor(counter.clone()),
-            false,
-        );
-        match wrapper.master_key().await {
-            Err(KeyStoreError::AclBreakNeedsRekey { native: native_chain }) => {
-                let displayed = native_chain.to_string();
-                assert!(
-                    displayed.contains(native_sentinel),
-                    "AclBreakNeedsRekey native chain must surface the underlying \
-                     OSStatus — got {displayed:?}"
-                );
-            }
-            other => panic!(
-                "expected AclBreakNeedsRekey sentinel under AclBreakRecoveryMode::Auto, \
-                 got {other:?}"
-            ),
-        }
-        assert_eq!(
-            counter.load(Ordering::SeqCst),
-            0,
-            "AclBreakRecoveryMode::Auto MUST NOT construct the passphrase fallback — \
-             the daemon boot path owns recovery"
-        );
-    }
-
-    /// Story 7.22 Test B: with `AclBreakRecoveryMode::Disabled` (the
-    /// default for all non-boot CLI paths), a `BackendUnavailable
-    /// -25308` from the native backend engages the passphrase
-    /// fallback exactly as before. Pins the no-regression invariant
-    /// that `agentsso credentials refresh`, `agentsso connect`, etc.
-    /// still get the passphrase prompt on a TTY-attached session
-    /// with a broken ACL.
-    #[tokio::test]
-    async fn acl_break_recovery_disabled_falls_through_to_passphrase_prompt() {
-        let dir = TempDir::new().unwrap();
-        let native = Box::new(ErroringNative::new(KeyStoreError::BackendUnavailable {
-            backend: "apple",
-            source: Box::new(std::io::Error::other("OSStatus -25308")),
-        }));
-        let wrapper = FallbackKeyStore::with_constructor_and_recovery(
-            dir.path().to_path_buf(),
-            FallbackMode::Auto,
-            AclBreakRecoveryMode::Disabled,
-            native,
-            make_synthetic_constructor(),
-            false,
-        );
-        // Existing behavior: passphrase fallback engages, returns 0xAA.
-        let key = wrapper.master_key().await.expect("passphrase fallback must engage");
-        assert_eq!(*key, [0xAA; MASTER_KEY_LEN]);
     }
 
     /// Test #9: fallback construction failure chains BOTH errors.

@@ -69,6 +69,26 @@ where
             scope = "unknown",
             method = %req.method(),
             path = %req.uri().path(),
+            // Story 7.27 Round-2 review fix (P1): declare
+            // `peer_uid` / `peer_gid` as `Empty` so the
+            // UDS-side `record_peer_credentials_layer` (in
+            // `permitlayer-daemon::server::control_listener`)
+            // can populate them via `Span::current().record(...)`.
+            // `record()` is a documented no-op for fields not
+            // declared in the span macro — pre-fix, the layer's
+            // calls were silently dropping the kernel-attested
+            // peer identity from the tracing surface.
+            //
+            // Round-3 review verification (R3-C5-P5): the recorder
+            // site is `permitlayer-daemon::server::control.rs:647`
+            // (`require_control_token`), called against the span
+            // created BY THIS MACRO. The daemon's control router
+            // applies `permitlayer_proxy::middleware::RequestTraceLayer::new()`
+            // (verified at `server/control.rs:2737`), so the
+            // recorder writes into the proxy-crate-defined span.
+            // Wiring is correct; the declaration belongs here.
+            peer_uid = tracing::field::Empty,
+            peer_gid = tracing::field::Empty,
         );
 
         // Swap self.inner with a clone so the polled-ready instance is the

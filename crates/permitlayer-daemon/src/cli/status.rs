@@ -242,13 +242,59 @@ pub(crate) struct ConnectionsResponse {
 /// bind address is misconfigured to a non-loopback interface) is
 /// surfaced as the daemon's actual error, not as a `serde_json`
 /// "missing field" deserialization failure.
+/// Resolve a `ControlEndpoint` from a bare `SocketAddr` (the legacy
+/// shape this CLI path uses — it doesn't have a `DaemonConfig` in
+/// scope). On macOS, the TCP `addr` is discarded and the UDS path is
+/// used; elsewhere, TCP is preserved. Mirrors
+/// `crate::cli::kill::resolve_control_endpoint(&DaemonConfig)` but
+/// for the `SocketAddr`-only call sites that exist in `status.rs`.
+/// Story 7.27 Round-2 review fix (P2): centralizes the transport
+/// split so future rule changes don't need to be applied in two
+/// places.
+///
+/// Round-3 review note (R3-C5-P4): this is a transitional duplicate
+/// of `crate::cli::kill::resolve_control_endpoint(&DaemonConfig)` —
+/// they differ only in input type (SocketAddr vs DaemonConfig).
+/// Consolidating requires either threading `DaemonConfig` through
+/// the status-path callers OR teaching `kill::resolve_control_endpoint`
+/// to accept `Option<&DaemonConfig>` (or a `bind_addr: SocketAddr`
+/// directly). Both are larger refactors than fit in Round-3 scope.
+/// Track as a 7.28 cleanup item — the duplication is a drift hazard
+/// the moment Linux/Windows TCP migration happens, but in 7.27 the
+/// two helpers agree.
+fn resolve_control_endpoint_from_addr(addr: SocketAddr) -> crate::cli::kill::ControlEndpoint {
+    #[cfg(target_os = "macos")]
+    {
+        let _ = addr;
+        let home_override = permitlayer_core::paths::home_override();
+        crate::cli::kill::ControlEndpoint::Uds(permitlayer_core::paths::control_socket_path(
+            home_override.as_deref(),
+        ))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        crate::cli::kill::ControlEndpoint::Tcp(addr)
+    }
+}
+
 async fn fetch_connections(
     addr: SocketAddr,
     control_token: Option<&str>,
 ) -> anyhow::Result<ConnectionsResponse> {
-    let (status, body) =
-        crate::cli::kill::http_get_with_status(addr, "/v1/control/connections", control_token)
-            .await?;
+    // Story 7.27 Round-2 review fix (P2): use the centralized
+    // `resolve_control_endpoint_from_addr` helper so the same
+    // transport-split logic lives in one place. The fn-signature
+    // takes `SocketAddr` (legacy callers don't have a `DaemonConfig`
+    // here); centralizing the macOS/non-macOS branch removes the
+    // drift risk that two slightly-different inline forms would
+    // create if future rules (e.g., TOML `paths.home`) are added.
+    let endpoint = resolve_control_endpoint_from_addr(addr);
+    let (status, body) = crate::cli::kill::http_get_with_status_via(
+        &endpoint,
+        "/v1/control/connections",
+        control_token,
+    )
+    .await?;
     if !(200..300).contains(&status) {
         // Try to extract the daemon's structured error code; fall
         // back to the raw body if unparseable. The control plane's

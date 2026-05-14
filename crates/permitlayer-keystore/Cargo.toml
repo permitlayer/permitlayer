@@ -24,6 +24,11 @@ async-trait.workspace = true
 zeroize.workspace = true
 tempfile.workspace = true
 subtle.workspace = true
+# Story 7.26: structured boot-event logging from
+# `MacKeyStore::master_key()` (existing/first-boot detection +
+# fingerprint surface). The daemon-side caller correlates these
+# `tracing` events into `MasterKeyFirstBoot` audit-log records.
+tracing.workspace = true
 
 # macOS-only: downcast `keyring::Error::PlatformFailure`'s boxed source
 # to inspect the OSStatus and route ACL denials (-25308 / -25293) to
@@ -31,19 +36,11 @@ subtle.workspace = true
 # instead of hard-failing the keystore probe. Pinned to v3 to match the
 # version keyring 3.6 boxes (downcast checks type identity, so v2 in
 # our dep tree would silently miss).
-#
-# Story 7.22: also used by `codesign_macos` for self-codesign verification
-# (`SecCode::for_self` + `check_validity` against a TOFU-captured
-# Designated Requirement). The safe `os::macos::code_signing` module
-# covers `SecCode` and `SecRequirement` but does NOT yet wrap
-# `SecCodeCopySigningInformation` — that's reached via the raw FFI in
-# `security-framework-sys` plus a `core-foundation` `CFDictionary`
-# traversal to extract `kSecCodeInfoDesignatedRequirement`.
 [target.'cfg(target_os = "macos")'.dependencies]
 security-framework = "3"
-security-framework-sys = "2.17"
-core-foundation = "0.10"
-core-foundation-sys = "0.8"
+# `nix::fcntl::Flock` for the inter-process master-key mint
+# serialization lock in `macos::acquire_mint_lock`.
+nix = { version = "0.29", features = ["fs", "user"] }
 
 # Unix-only: errno constants used by `passphrase::is_no_tty_error` to
 # detect rpassword's no-controlling-terminal failure shape (ENXIO /

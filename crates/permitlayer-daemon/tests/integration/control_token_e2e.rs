@@ -159,6 +159,16 @@ fn control_command_fails_with_wrong_token() {
 /// daemon-owner's `control.token` (via the operator's `sudo cat` or
 /// equivalent in real life) and exports it as `AGENTSSO_CONTROL_TOKEN`.
 /// Should work.
+///
+/// Story 7.27: on macOS the CLI now derives the UDS socket path from
+/// `AGENTSSO_PATHS__HOME` (`<home>/run/control.sock`), so a CLI under
+/// a different home looks at a socket that doesn't exist — the
+/// "different home, same daemon" pattern this test was built for
+/// is no longer expressible via `HOME`. The real cross-user story
+/// in rc.22 is operator-as-self talking to root-owned daemon via
+/// `/var/run/permitlayer/control.sock`. Skip on macOS; Linux still
+/// uses TCP for control routes, so the legacy semantics hold there.
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn control_command_works_cross_home_via_env_var() {
     let home_daemon = tempfile::tempdir().unwrap();
@@ -171,8 +181,7 @@ fn control_command_works_cross_home_via_env_var() {
     assert!(wait_for_health(daemon.port), "daemon should boot");
     let bind_addr = format!("127.0.0.1:{}", daemon.port);
 
-    // Read the daemon-owner's token (the operator would do this via
-    // `sudo cat /home/<svc-user>/.agentsso/control.token`).
+    // Read the daemon-owner's token.
     let token = read_test_control_token(home_daemon.path());
 
     let home_caller = tempfile::tempdir().unwrap();

@@ -11,7 +11,9 @@
 use anyhow::Result;
 use serde::Deserialize;
 
-use crate::cli::kill::{http_post_empty_json, load_daemon_config_or_default_with_warn};
+use crate::cli::kill::{
+    http_post_empty_json_via, load_daemon_config_or_default_with_warn, resolve_control_endpoint,
+};
 use crate::lifecycle::pid::PidFile;
 
 /// Deserialization target for the JSON body of a successful
@@ -51,9 +53,10 @@ pub async fn run() -> Result<()> {
     // mode handles the genuine "no daemon" case (and the SIGHUP
     // fallback below handles backward-compat with pre-Story-4.2 daemons).
 
-    let bind_addr = config.http.bind_addr;
+    let endpoint = resolve_control_endpoint(&config);
+    let _bind_addr = config.http.bind_addr;
     let token = crate::cli::kill::read_control_token(&home);
-    match http_post_empty_json(bind_addr, "/v1/control/reload", token.as_deref()).await {
+    match http_post_empty_json_via(&endpoint, "/v1/control/reload", token.as_deref()).await {
         Ok(body) => handle_reload_response(&body)?,
         Err(_) => {
             // Control endpoint unavailable — fall back to SIGHUP.
@@ -61,7 +64,7 @@ pub async fn run() -> Result<()> {
             // Story 4.2 (no /v1/control/reload endpoint) and also
             // covers connection-refused when the daemon is starting up.
             tracing::debug!(
-                addr = %bind_addr,
+                endpoint = %endpoint,
                 "control endpoint unavailable, falling back to SIGHUP"
             );
             send_sighup_fallback(&home)?;

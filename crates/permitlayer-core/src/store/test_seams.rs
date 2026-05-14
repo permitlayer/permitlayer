@@ -68,18 +68,6 @@ impl AgentIdentityStore for MockAgentStore {
         Ok(false)
     }
 
-    async fn update_lookup_key_only(
-        &self,
-        _name: &str,
-        _new_lookup_key_hex: String,
-    ) -> Result<bool, StoreError> {
-        // Mock returns `Ok(false)` ("no such agent") because `get`
-        // always returns `None`. Tests that exercise the Story 7.22
-        // auto-recovery rotation should use the real
-        // `AgentIdentityFsStore`.
-        Ok(false)
-    }
-
     async fn update_policy(
         &self,
         _name: &str,
