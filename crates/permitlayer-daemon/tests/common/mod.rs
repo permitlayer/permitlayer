@@ -296,11 +296,54 @@ pub fn start_daemon(config: DaemonTestConfig) -> DaemonHandle {
         (config.port, None)
     };
 
+    #[cfg(target_os = "macos")]
+    wait_for_control_socket(&mut child, &config.home, Duration::from_secs(30));
+
     DaemonHandle {
         child: Some(child),
         port: resolved_port,
         home: config.home.clone(),
         captured_stdout,
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn wait_for_control_socket(child: &mut Child, home: &Path, timeout: Duration) {
+    use std::os::unix::fs::FileTypeExt;
+
+    let sock_path = home.join("run").join("control.sock");
+    let deadline = Instant::now() + timeout;
+
+    loop {
+        if let Ok(metadata) = std::fs::metadata(&sock_path)
+            && metadata.file_type().is_socket()
+        {
+            return;
+        }
+
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    let _ = pipe.read_to_string(&mut stderr);
+                }
+                panic!(
+                    "daemon exited with {status} before control socket appeared at {}. stderr={stderr}",
+                    sock_path.display()
+                );
+            }
+            Ok(None) => {}
+            Err(e) => panic!("failed to poll daemon while waiting for control socket: {e}"),
+        }
+
+        if Instant::now() >= deadline {
+            panic!(
+                "timed out after {timeout:?} waiting for control socket at {}",
+                sock_path.display()
+            );
+        }
+
+        std::thread::sleep(Duration::from_millis(50));
     }
 }
 
