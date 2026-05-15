@@ -214,14 +214,17 @@ download_release() {
     ARTIFACT_NAME="${PKG_NAME}-${TARGET}.tar.xz"
     DOWNLOAD_URL="https://github.com/${REPO_OWNER}/${REPO_NAME}/releases/download/v${VERSION}/${ARTIFACT_NAME}"
     SIG_URL="${DOWNLOAD_URL}.minisig"
+    SHA_URL="${DOWNLOAD_URL}.sha256"
 
     TMPDIR_DL="$(mktemp -d)"
     trap 'rm -rf "$TMPDIR_DL"' EXIT
 
     ARCHIVE_PATH="${TMPDIR_DL}/${ARTIFACT_NAME}"
     SIG_PATH="${TMPDIR_DL}/${ARTIFACT_NAME}.minisig"
+    SHA_PATH="${TMPDIR_DL}/${ARTIFACT_NAME}.sha256"
 
     SIG_LOG="${TMPDIR_DL}/curl-sig.log"
+    SHA_LOG="${TMPDIR_DL}/curl-sha256.log"
     ARCHIVE_LOG="${TMPDIR_DL}/curl-archive.log"
 
     # Fetch the signature first so we can fail fast if it's missing in
@@ -275,6 +278,13 @@ download_release() {
         err "no signature file available for ${ARTIFACT_NAME} and non-interactive mode is in use. Re-run with \`--allow-unsigned\` to bypass (not recommended) or install interactively."
     fi
 
+    if ! curl -fsSL --connect-timeout 10 --max-time 30 \
+            --retry 30 --retry-delay 5 --retry-all-errors \
+            --retry-max-time 180 \
+            -o "$SHA_PATH" "$SHA_URL" 2>"$SHA_LOG"; then
+        SHA_PATH=""
+    fi
+
     # Same retry shape + diagnostic-output discipline for the archive.
     # Previously this had NO retry flags at all (rc.11 got lucky — the
     # .minisig races first and gates failure, but a future propagation
@@ -307,8 +317,22 @@ download_release() {
 
 verify_signature() {
     if [ -z "$SIG_PATH" ] || [ ! -f "$SIG_PATH" ]; then
+        if _verify_checksum; then
+            warn "no signature file available; verified sha256 checksum only"
+            SIG_DISPLAY="sha256"
+            return
+        fi
         _no_sig_warning
         return
+    fi
+
+    if ! command -v minisign >/dev/null 2>&1; then
+        if _verify_checksum; then
+            warn "minisign not found; verified sha256 checksum only"
+            SIG_DISPLAY="sha256"
+            return
+        fi
+        err "minisign not found and sha256 verification failed. install minisign with: brew install minisign"
     fi
 
     _attempt=1
@@ -336,26 +360,11 @@ verify_signature() {
 }
 
 _verify_signature_once() {
-    if command -v minisign >/dev/null 2>&1; then
-        if minisign -Vm "$ARCHIVE_PATH" -P "$PUBKEY" >/dev/null 2>&1; then
-            SIG_DISPLAY="ed25519"
-            return 0
-        fi
-        SIG_DISPLAY="failed"
-        return 1
+    if minisign -Vm "$ARCHIVE_PATH" -P "$PUBKEY" >/dev/null 2>&1; then
+        SIG_DISPLAY="ed25519"
+        return 0
     fi
-
-    # Fallback: try openssl ed25519 verification (available on macOS 13+, modern Linux)
-    if command -v openssl >/dev/null 2>&1; then
-        if _verify_openssl; then
-            SIG_DISPLAY="ed25519 (openssl)"
-            return 0
-        fi
-        SIG_DISPLAY="failed"
-        return 1
-    fi
-
-    SIG_DISPLAY="no-verifier"
+    SIG_DISPLAY="failed"
     return 1
 }
 
@@ -391,41 +400,39 @@ _redownload_release_pair() {
     mv "$_archive_next" "$ARCHIVE_PATH"
 }
 
-# Verify ed25519 signature using openssl.
-# Minisign signature format: line 1 = untrusted comment, line 2 = base64(2-byte algo + 8-byte keyid + 64-byte sig)
-# Minisign pubkey format: base64(2-byte algo + 8-byte keyid + 32-byte ed25519 pubkey)
-_verify_openssl() {
-    _sig_dir="$(mktemp -d)"
+_verify_checksum() {
+    if [ -z "${SHA_PATH:-}" ] || [ ! -f "$SHA_PATH" ]; then
+        return 1
+    fi
 
-    # Extract raw ed25519 public key (skip 10-byte header: 2 algo + 8 keyid)
-    printf '%s' "$PUBKEY" | base64 -d 2>/dev/null | tail -c 32 > "${_sig_dir}/pubkey.raw" || { rm -rf "$_sig_dir"; return 1; }
+    _expected="$(awk -v name="$ARTIFACT_NAME" '
+        $1 ~ /^[0-9a-fA-F]{64}$/ {
+            if (NF == 1 || $2 == name || $2 == "*" name) {
+                print tolower($1)
+                exit
+            }
+        }
+    ' "$SHA_PATH")"
+    if [ -z "$_expected" ]; then
+        return 1
+    fi
 
-    # Extract raw ed25519 signature from .minisig (line 2, skip 10-byte header)
-    _sig_line="$(sed -n '2p' "$SIG_PATH")"
-    printf '%s' "$_sig_line" | base64 -d 2>/dev/null | tail -c 64 > "${_sig_dir}/sig.raw" || { rm -rf "$_sig_dir"; return 1; }
+    if command -v sha256sum >/dev/null 2>&1; then
+        _actual="$(sha256sum "$ARCHIVE_PATH" | awk '{print tolower($1)}')"
+    elif command -v shasum >/dev/null 2>&1; then
+        _actual="$(shasum -a 256 "$ARCHIVE_PATH" | awk '{print tolower($1)}')"
+    else
+        return 1
+    fi
 
-    # Convert raw pubkey to PEM format for openssl
-    # Ed25519 public key DER prefix: 302a300506032b6570032100 (12 bytes) + 32-byte key
-    printf '\x30\x2a\x30\x05\x06\x03\x2b\x65\x70\x03\x21\x00' > "${_sig_dir}/pubkey.der"
-    cat "${_sig_dir}/pubkey.raw" >> "${_sig_dir}/pubkey.der"
-    openssl pkey -inform DER -pubin -in "${_sig_dir}/pubkey.der" -out "${_sig_dir}/pubkey.pem" 2>/dev/null \
-        || { rm -rf "$_sig_dir"; return 1; }
-
-    # Verify signature
-    _result=0
-    openssl pkeyutl -verify -pubin -inkey "${_sig_dir}/pubkey.pem" \
-        -rawin -in "$ARCHIVE_PATH" -sigfile "${_sig_dir}/sig.raw" >/dev/null 2>&1 \
-        || _result=1
-
-    rm -rf "$_sig_dir"
-    return "$_result"
+    [ "$_actual" = "$_expected" ]
 }
 
 _no_sig_warning() {
     if [ -z "$SIG_PATH" ] || [ ! -f "$SIG_PATH" ]; then
         warn "no signature file available for this release"
     else
-        warn "minisign not found and openssl unavailable — cannot verify signature. install minisign with: brew install minisign"
+        warn "minisign not found — cannot verify signature. install minisign with: brew install minisign"
     fi
 
     SIG_DISPLAY="not verified"

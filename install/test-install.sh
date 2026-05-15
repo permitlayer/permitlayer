@@ -427,6 +427,35 @@ test_artifact_name() {
     )
 }
 
+# --- Test: Checksum fallback when minisign unavailable ------------------------
+
+test_checksum_fallback() {
+    (
+        source_install
+
+        _tmpdir="$(mktemp -d)"
+        trap 'rm -rf "$_tmpdir"' EXIT
+
+        ARTIFACT_NAME="test.bin"
+        ARCHIVE_PATH="${_tmpdir}/${ARTIFACT_NAME}"
+        SHA_PATH="${ARCHIVE_PATH}.sha256"
+        SIG_PATH=""
+        SIG_DISPLAY=""
+
+        echo "test binary for checksum fallback" > "$ARCHIVE_PATH"
+        _digest="$(shasum -a 256 "$ARCHIVE_PATH" | awk '{print $1}')"
+        printf '%s  %s\n' "$_digest" "$ARTIFACT_NAME" > "$SHA_PATH"
+
+        verify_signature
+
+        if [ "$SIG_DISPLAY" = "sha256" ]; then
+            pass "checksum fallback: sha256 accepted without minisig"
+        else
+            fail "checksum fallback: expected sha256, got $SIG_DISPLAY"
+        fi
+    )
+}
+
 # --- Test: Mascot glyph output -----------------------------------------------
 
 test_mascot_glyph() {
@@ -464,6 +493,7 @@ main() {
     test_version_equals_flag
     test_sig_verify_valid
     test_sig_verify_invalid
+    test_checksum_fallback
     test_artifact_name
     test_mascot_glyph
 
