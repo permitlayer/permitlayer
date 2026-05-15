@@ -311,28 +311,84 @@ verify_signature() {
         return
     fi
 
-    # Try minisign first
+    _attempt=1
+    while [ "$_attempt" -le 6 ]; do
+        if _verify_signature_once; then
+            return
+        fi
+
+        if [ "$SIG_DISPLAY" = "no-verifier" ]; then
+            _no_sig_warning
+            return
+        fi
+
+        if [ "$_attempt" -lt 6 ]; then
+            warn "signature verification failed; retrying download to rule out release CDN propagation mismatch (${_attempt}/5)"
+            sleep 5
+            if _redownload_release_pair; then
+                _attempt=$((_attempt + 1))
+                continue
+            fi
+        fi
+
+        err "signature verification failed. The downloaded binary may be corrupted or tampered with."
+    done
+}
+
+_verify_signature_once() {
     if command -v minisign >/dev/null 2>&1; then
         if minisign -Vm "$ARCHIVE_PATH" -P "$PUBKEY" >/dev/null 2>&1; then
             SIG_DISPLAY="ed25519"
-            return
-        else
-            err "signature verification failed. The downloaded binary may be corrupted or tampered with."
+            return 0
         fi
+        SIG_DISPLAY="failed"
+        return 1
     fi
 
     # Fallback: try openssl ed25519 verification (available on macOS 13+, modern Linux)
     if command -v openssl >/dev/null 2>&1; then
         if _verify_openssl; then
             SIG_DISPLAY="ed25519 (openssl)"
-            return
-        else
-            err "signature verification failed. The downloaded binary may be corrupted or tampered with."
+            return 0
         fi
+        SIG_DISPLAY="failed"
+        return 1
     fi
 
-    # Last resort: warn and ask for consent
-    _no_sig_warning
+    SIG_DISPLAY="no-verifier"
+    return 1
+}
+
+_redownload_release_pair() {
+    _sig_next="${SIG_PATH}.retry"
+    _archive_next="${ARCHIVE_PATH}.retry"
+    _sig_retry_log="${SIG_LOG}.retry"
+    _archive_retry_log="${ARCHIVE_LOG}.retry"
+
+    rm -f "$_sig_next" "$_archive_next" "$_sig_retry_log" "$_archive_retry_log"
+
+    if ! curl -fsSL --connect-timeout 10 --max-time 30 \
+            --retry 3 --retry-delay 5 --retry-all-errors \
+            --retry-max-time 30 \
+            -o "$_sig_next" "$SIG_URL" 2>"$_sig_retry_log"; then
+        if [ -s "$_sig_retry_log" ]; then
+            cat "$_sig_retry_log" >&2
+        fi
+        return 1
+    fi
+
+    if ! curl -fsSL --connect-timeout 10 --max-time 120 \
+            --retry 3 --retry-delay 5 --retry-all-errors \
+            --retry-max-time 30 \
+            -o "$_archive_next" "$DOWNLOAD_URL" 2>"$_archive_retry_log"; then
+        if [ -s "$_archive_retry_log" ]; then
+            cat "$_archive_retry_log" >&2
+        fi
+        return 1
+    fi
+
+    mv "$_sig_next" "$SIG_PATH"
+    mv "$_archive_next" "$ARCHIVE_PATH"
 }
 
 # Verify ed25519 signature using openssl.
