@@ -129,6 +129,16 @@ impl From<super::schema::TomlApprovalMode> for ApprovalMode {
     }
 }
 
+impl From<ApprovalMode> for super::schema::TomlApprovalMode {
+    fn from(v: ApprovalMode) -> Self {
+        match v {
+            ApprovalMode::Auto => Self::Auto,
+            ApprovalMode::Prompt => Self::Prompt,
+            ApprovalMode::Deny => Self::Deny,
+        }
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {

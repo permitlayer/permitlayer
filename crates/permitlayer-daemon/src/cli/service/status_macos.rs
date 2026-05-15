@@ -11,8 +11,9 @@ use std::time::Duration;
 use anyhow::Result;
 use tokio::time::timeout;
 
-const DAEMON_LABEL: &str = "dev.permitlayer.daemon";
-const PLIST_PATH: &str = "/Library/LaunchDaemons/dev.permitlayer.daemon.plist";
+use super::{DAEMON_LABEL, LAUNCHD_PLIST_PATH};
+
+const PLIST_PATH: &str = LAUNCHD_PLIST_PATH;
 
 pub async fn run() -> Result<()> {
     let installed = Path::new(PLIST_PATH).exists();

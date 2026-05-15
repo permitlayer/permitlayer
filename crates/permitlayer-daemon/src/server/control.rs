@@ -76,7 +76,10 @@ use permitlayer_core::killswitch::{
     ActivationSummary, DeactivationSummary, KillReason, KillSwitch,
 };
 use permitlayer_core::policy::PolicySet;
+use permitlayer_core::policy::schema::TomlPolicyFile;
 use permitlayer_core::store::{AgentIdentityStore, CredentialStore};
+
+use crate::cli::start::ProxyActivationContext;
 
 /// Lightweight state for the control router.
 ///
@@ -176,23 +179,13 @@ pub(crate) struct ControlState {
     /// daemon config from the HTTP reload path. Mirrors the argument
     /// already threaded into `spawn_reload_watcher`.
     pub cli_overrides: Arc<crate::config::CliOverrides>,
-    /// Story 8.7 AC #4: boot-time flag that is `true` when the daemon
-    /// wired the 501-stub router branch at startup (no vault present).
-    /// Set once at boot (before `spawn_reload_watcher` so an early
-    /// SIGHUP can't observe a stale `false`). On every reload the
-    /// handler checks whether `vault_dir` has since been created and,
-    /// if so, emits a `tracing::warn!` + `config-reload-stub-detected`
-    /// audit event — then CAS's the flag `true → false` so subsequent
-    /// reloads short-circuit.
-    ///
-    /// **Once-per-daemon-lifetime** (decision 2:B of Story 8.7 review):
-    /// the flag is only ever cleared by `detect_stub_and_warn` after a
-    /// successful fire, never flipped back to `true`. The underlying
-    /// invariant — "the axum router was wired for 501 stubs and can't
-    /// be hot-swapped at runtime" — requires a full daemon restart to
-    /// change, so repeating the diagnostic after the first fire would
-    /// be pure audit-log noise.
+    /// Story 7.32: boot-time flag that is `true` when the daemon wired
+    /// empty proxy route slots at startup. SIGHUP clears it only after
+    /// successfully activating a real `ProxyService`; HTTP reload still
+    /// uses it for a diagnostic when credentials appear but activation
+    /// has not happened.
     pub proxy_stub_branch_active: Arc<AtomicBool>,
+    pub proxy_activation: ProxyActivationContext,
     /// Story 8.7 AC #4: vault directory path to consult when the
     /// stub-active flag fires. Typically `{config.paths.home}/vault`.
     pub vault_dir: PathBuf,
@@ -1159,6 +1152,8 @@ pub(crate) struct ReloadResponse {
     pub unchanged: usize,
     pub removed: usize,
     pub agents_loaded: usize,
+    /// Absolute path scanned for policy files (Story 7.34 AC #5).
+    pub policy_scan_path: String,
 }
 
 /// Response body for `POST /v1/control/reload` on failure.
@@ -1180,6 +1175,10 @@ pub(crate) struct ReloadErrorResponse {
 pub(crate) struct ReloadResponseExtras {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config_reload_error: Option<String>,
+    /// Warning when the scanned policy directory exists but contains
+    /// no candidate policy files (Story 7.34 AC #5).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy_scan_empty_warning: Option<String>,
 }
 
 /// `POST /v1/control/reload` — re-read policy files, compile a new
@@ -1282,21 +1281,11 @@ pub(crate) async fn reload_handler(
     })
     .await;
 
-    // Story 8.7 review decision 1:A — detect_stub_and_warn fires
-    // UNCONDITIONALLY at the tail, not only in the policy-reload
-    // success arm. Keeps SIGHUP and HTTP reload behaviorally
-    // equivalent per Task 3.5. The helper is idempotent per daemon
-    // lifetime via CAS on `proxy_stub_branch_active` (decision 2:B).
-    let stub_audit_store = state.audit_store.clone();
-    let stub_vault_dir = state.vault_dir.clone();
-    let stub_flag = Arc::clone(&state.proxy_stub_branch_active);
-    super::sighup::detect_stub_and_warn(
-        &stub_vault_dir,
-        stub_audit_store.as_ref(),
-        &stub_flag,
-        request_id,
-    )
-    .await;
+    // Story 7.32: HTTP reload now shares the SIGHUP activation path.
+    // If credentials appeared after a stub-only boot, promote the
+    // swappable route slots to a real ProxyService; warn only when a
+    // rebuild was attempted and still failed.
+    activate_proxy_routes_if_ready(&state, request_id, "control-reload").await;
 
     match result {
         Ok(Ok(diff)) => {
@@ -1334,6 +1323,18 @@ pub(crate) async fn reload_handler(
             // reload error (if any) in the 200 response body so the
             // operator knows the policy reload succeeded while the
             // config edit was dropped.
+            let policy_scan_path = state.policies_dir.display().to_string();
+            let policy_scan_empty_warning = if state.policies_dir.exists()
+                && state.policies_dir.is_dir()
+                && diff.policies_loaded == 0
+            {
+                Some(format!(
+                    "policy directory {} exists but contains no candidate policy files",
+                    policy_scan_path
+                ))
+            } else {
+                None
+            };
             let body = ReloadResponse {
                 status: "ok",
                 policies_loaded: diff.policies_loaded,
@@ -1342,8 +1343,9 @@ pub(crate) async fn reload_handler(
                 unchanged: diff.unchanged.len(),
                 removed: diff.removed.len(),
                 agents_loaded,
+                policy_scan_path,
             };
-            let extras = ReloadResponseExtras { config_reload_error };
+            let extras = ReloadResponseExtras { config_reload_error, policy_scan_empty_warning };
             (StatusCode::OK, Json(merge_reload_response(body, extras))).into_response()
         }
         Ok(Err(e)) => {
@@ -1365,6 +1367,64 @@ pub(crate) async fn reload_handler(
             )
                 .into_response()
         }
+    }
+}
+
+async fn activate_proxy_routes_if_ready(
+    state: &ControlState,
+    request_id: Option<String>,
+    surface: &'static str,
+) -> bool {
+    if !state.proxy_stub_branch_active.load(Ordering::Relaxed) {
+        return false;
+    }
+
+    match crate::cli::start::vault_has_sealed_credentials(&state.vault_dir) {
+        Ok(false) => return false,
+        Ok(true) => {}
+        Err(e) => {
+            tracing::debug!(
+                vault_dir = %state.vault_dir.display(),
+                error = %e,
+                surface,
+                "proxy activation: vault credential probe failed; attempting rebuild"
+            );
+        }
+    }
+
+    let cfg = state.config_state.load_full();
+    let proxy = crate::cli::start::try_build_proxy_service(
+        &cfg,
+        state.proxy_activation.scrub_engine.as_ref(),
+        state.proxy_activation.audit_store.as_ref(),
+        &state.proxy_activation.master_key,
+        Arc::clone(&state.proxy_activation.vault),
+    )
+    .await;
+
+    if let Some(proxy) = proxy {
+        if state
+            .proxy_stub_branch_active
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return false;
+        }
+        state.proxy_activation.routes.activate(proxy);
+        tracing::info!(
+            surface,
+            "proxy service activated via reload -- MCP and REST routes now live"
+        );
+        true
+    } else {
+        super::sighup::detect_stub_and_warn(
+            &state.vault_dir,
+            state.audit_store.as_ref(),
+            &state.proxy_stub_branch_active,
+            request_id,
+        )
+        .await;
+        false
     }
 }
 
@@ -1412,6 +1472,8 @@ pub(crate) struct RegisterAgentResponse {
     pub policy_name: String,
     pub bearer_token: String,
     pub created_at: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub peer_uid: Option<u32>,
     /// Story 7.27 AC #8: when the request came over the UDS
     /// control listener, the daemon writes the plaintext bearer
     /// token to `<home>/.agentsso/agent-bearer.token`. If that
@@ -1488,6 +1550,17 @@ pub(crate) struct RebindAgentRequest {
 pub(crate) struct RebindAgentResponse {
     pub status: &'static str,
     pub agent: AgentSummary,
+}
+
+/// Response body for `POST /v1/control/agent/{name}/rotate` (Story 7.34).
+///
+/// Includes the new plaintext bearer token — the operator MUST copy it
+/// immediately because it cannot be retrieved later.
+#[derive(Debug, serde::Serialize)]
+pub(crate) struct RotateAgentResponse {
+    pub status: &'static str,
+    pub name: String,
+    pub bearer_token: String,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1950,6 +2023,7 @@ pub(crate) async fn register_agent_handler(
         policy_name: payload.policy_name,
         bearer_token,
         created_at: format_audit_timestamp(created_at),
+        peer_uid: _peer_creds_for_audit.map(|creds| creds.uid),
         bearer_token_file,
     };
     (StatusCode::OK, Json(body)).into_response()
@@ -3946,6 +4020,7 @@ pub(crate) async fn policy_scopes_handler(
         reloaded,
         "policy scope merge complete",
     );
+    activate_proxy_routes_if_ready(&state, Some(request_id.clone()), "policy-scopes").await;
 
     (
         StatusCode::OK,
@@ -4619,6 +4694,244 @@ pub(crate) async fn rebind_agent_handler(
     (StatusCode::OK, Json(RebindAgentResponse { status: "ok", agent })).into_response()
 }
 
+/// `POST /v1/control/agent/{name}/rotate` — atomically mint a new
+/// bearer token for an existing agent and invalidate the old one
+/// (Story 7.34 AC #4).
+///
+/// Loopback-only, audit-emitting. The old bearer is invalidated only
+/// after the new one is durably persisted via
+/// `AgentIdentityStore::update_lookup_key_and_token`.
+pub(crate) async fn rotate_agent_handler(
+    State(state): State<ControlState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(name): Path<String>,
+    req: axum::extract::Request,
+) -> Response {
+    if let Err(e) = require_loopback(peer) {
+        return e.into_response();
+    }
+
+    let request_id = read_request_id(&req);
+
+    #[cfg(target_os = "macos")]
+    let peer_creds_for_register: Option<crate::server::PeerCredentials> =
+        req.extensions().get::<crate::server::PeerCredentials>().copied();
+    let peer_creds_for_audit: Option<crate::server::PeerCredentials> = {
+        #[cfg(target_os = "macos")]
+        {
+            peer_creds_for_register
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            None
+        }
+    };
+
+    // Rate-limit concurrent agent CRUD.
+    let _permit = match state.agent_crud_semaphore.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return agent_error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "agent.rate_limited",
+                format!(
+                    "too many concurrent agent CRUD operations in flight \
+                     (max {AGENT_CRUD_MAX_CONCURRENT}); retry shortly"
+                ),
+                Some(request_id.clone()),
+            );
+        }
+    };
+
+    // 1. Validate agent name.
+    if let Err(e) = validate_agent_name(&name) {
+        return agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "agent.invalid_name",
+            format!("{e}"),
+            Some(request_id.clone()),
+        );
+    }
+
+    // 2. Verify the agent exists and capture its current policy so the
+    //    response can echo it back.
+    let Some(store) = state.agent_store.clone() else {
+        return agent_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "agent.store_unavailable",
+            "agent identity store is unavailable".to_owned(),
+            Some(request_id.clone()),
+        );
+    };
+
+    let existing = match store.get(&name).await {
+        Ok(Some(id)) => id,
+        Ok(None) => {
+            return agent_error_response(
+                StatusCode::NOT_FOUND,
+                "agent.not_found",
+                format!("agent '{}' was not registered", name),
+                Some(request_id.clone()),
+            );
+        }
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "agent.lookup_failed",
+                format!("{e}"),
+                Some(request_id.clone()),
+            );
+        }
+    };
+
+    // 3. Generate new plaintext token + derived material.
+    let raw_bytes = generate_bearer_token_bytes();
+    let plaintext_body = base64_url_no_pad(&raw_bytes);
+    let bearer_token = format!("{BEARER_TOKEN_PREFIX}{name}_{plaintext_body}");
+    let token_bytes = bearer_token.as_bytes().to_vec();
+    let token_hash = match tokio::task::spawn_blocking(move || hash_token(&token_bytes)).await {
+        Ok(Ok(hash)) => hash,
+        Ok(Err(e)) => {
+            tracing::error!(error = %e, "Argon2id hash_token failed during rotate");
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "agent.internal",
+                "failed to hash bearer token".to_owned(),
+                Some(request_id.clone()),
+            );
+        }
+        Err(e) => {
+            tracing::error!(error = %e, "spawn_blocking for hash_token panicked during rotate");
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "agent.internal",
+                "internal error hashing bearer token".to_owned(),
+                Some(request_id.clone()),
+            );
+        }
+    };
+    let lookup_key = compute_lookup_key(&state.agent_lookup_key, name.as_bytes());
+    let lookup_key_hex = lookup_key_to_hex(&lookup_key);
+
+    // 4. Atomically persist the new token + lookup key, invalidating
+    //    the old bearer in one store write.
+    match store.update_lookup_key_and_token(&name, lookup_key_hex, token_hash).await {
+        Ok(true) => { /* fall through */ }
+        Ok(false) => {
+            // Race: agent removed between get and update.
+            return agent_error_response(
+                StatusCode::NOT_FOUND,
+                "agent.not_found",
+                format!("agent '{}' was not registered", name),
+                Some(request_id.clone()),
+            );
+        }
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "agent.persist_failed",
+                format!("{e}"),
+                Some(request_id.clone()),
+            );
+        }
+    }
+
+    // 5. Atomic registry swap so the new token is live and the old one
+    //    stops working.
+    let reload_result = {
+        let _reload_lock = state.agent_registry_reload_lock.lock().await;
+        store.list().await.map(|agents| state.agent_registry.replace_with(agents))
+    };
+    if let Err(e) = reload_result {
+        tracing::error!(
+            error = %e,
+            agent_name = %name,
+            "agent registry reload after rotate failed — on-disk token is updated but in-memory snapshot is stale; run `agentsso reload`",
+        );
+        return agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "agent.registry_reload_failed",
+            "agent token was rewritten on disk but registry reload failed; run `agentsso reload`"
+                .to_owned(),
+            Some(request_id.clone()),
+        );
+    }
+
+    // 6. Audit event (best-effort).
+    if let Some(audit) = &state.audit_store {
+        let mut event = AuditEvent::with_request_id(
+            request_id.clone(),
+            name.clone(),
+            "permitlayer".to_owned(),
+            "-".to_owned(),
+            "agent-rotate".to_owned(),
+            "ok".to_owned(),
+            "agent-rotated".to_owned(),
+        );
+        event.extra = serde_json::json!({
+            "policy_name": existing.policy_name,
+        });
+        enrich_audit_extra_with_peer_creds(&mut event.extra, peer_creds_for_audit);
+        if let Err(e) = audit.append(event).await {
+            tracing::warn!(error = %e, "agent-rotated audit write failed (best-effort)");
+        }
+    }
+
+    tracing::info!(
+        target: "control",
+        request_id = %request_id,
+        agent_name = %name,
+        "agent rotated via control endpoint (old bearer invalidated)"
+    );
+
+    // 7. On macOS, write the plaintext bearer token to the peer's home
+    //    directory (same pattern as register_agent_handler).
+    #[cfg(target_os = "macos")]
+    let _bearer_token_file = {
+        if let Some(creds) = peer_creds_for_register {
+            let token_bytes: zeroize::Zeroizing<Vec<u8>> =
+                zeroize::Zeroizing::new(bearer_token.clone().into_bytes());
+            let state_dir = permitlayer_core::paths::daemon_state_dir(
+                permitlayer_core::paths::home_override().as_deref(),
+            );
+            match crate::server::agent_token::write_bearer_token_to_user_home(
+                &token_bytes,
+                creds.uid,
+                creds.gid,
+                &state_dir,
+            )
+            .await
+            {
+                Ok(outcome) => {
+                    tracing::info!(
+                        target: "control",
+                        request_id = %request_id,
+                        peer_uid = creds.uid,
+                        target = %outcome.target_path.display(),
+                        replace_existing = outcome.replace_existing,
+                        "bearer-token written to per-user file after rotate"
+                    );
+                    Some(outcome)
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: "control",
+                        request_id = %request_id,
+                        peer_uid = creds.uid,
+                        error = %e,
+                        "bearer-token write after rotate failed (best-effort)"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
+    (StatusCode::OK, Json(RotateAgentResponse { status: "ok", name, bearer_token })).into_response()
+}
+
 /// Story 7.11 review-round-1 P6: emit `agent-rebind-denied` audit
 /// event on rebind failure paths so compliance/forensics sees attempts
 /// (even unsuccessful ones). Best-effort — audit failure is logged but
@@ -4739,6 +5052,98 @@ pub(crate) struct ConnectorsResponse {
     pub daemon_version: &'static str,
 }
 
+/// Response body for `GET /v1/control/policies` (Story 7.34 AC #3).
+#[derive(Debug, Serialize)]
+pub(crate) struct ListPoliciesResponse {
+    pub status: &'static str,
+    pub policies: Vec<PolicyListEntry>,
+}
+
+/// One entry in the `GET /v1/control/policies` list.
+#[derive(Debug, Serialize)]
+pub(crate) struct PolicyListEntry {
+    pub name: String,
+    pub origin: String,
+    pub scopes: Vec<String>,
+}
+
+/// `GET /v1/control/policies/{name}` — return the resolved policy as
+/// TOML (Story 7.34 AC #1).
+///
+/// Loopback-only, read-only, no audit event.
+pub(crate) async fn show_policy_handler(
+    State(state): State<ControlState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(name): Path<String>,
+    req: axum::extract::Request,
+) -> Response {
+    if let Err(e) = require_loopback(peer) {
+        return e.into_response();
+    }
+    let request_id = read_request_id(&req);
+
+    let snapshot = state.policy_set.load();
+    let Some(policy) = snapshot.get(&name) else {
+        return agent_error_response(
+            StatusCode::NOT_FOUND,
+            "policy.not_found",
+            format!("policy '{name}' is not loaded"),
+            Some(request_id),
+        );
+    };
+
+    let toml_policy = policy.to_toml_policy();
+    let file = TomlPolicyFile { policies: vec![toml_policy] };
+    let toml_text = match toml::to_string_pretty(&file) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::error!(error = %e, policy_name = %name, "TOML serialization failed in show_policy_handler");
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "policy.serialize_failed",
+                format!("failed to serialize policy '{name}' to TOML: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+
+    (StatusCode::OK, [("content-type", "text/plain; charset=utf-8")], toml_text).into_response()
+}
+
+/// `GET /v1/control/policies` — return every loaded policy name,
+/// source file, and scopes (Story 7.34 AC #3).
+///
+/// Loopback-only, read-only, no audit event.
+pub(crate) async fn list_policies_handler(
+    State(state): State<ControlState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: axum::extract::Request,
+) -> Response {
+    if let Err(e) = require_loopback(peer) {
+        return e.into_response();
+    }
+    let _request_id = read_request_id(&req);
+
+    let snapshot = state.policy_set.load();
+    let mut policies: Vec<PolicyListEntry> = snapshot
+        .policy_names()
+        .into_iter()
+        .filter_map(|name| {
+            let policy = snapshot.get(&name)?;
+            let origin = snapshot
+                .origin(&name)
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            let mut scopes: Vec<String> = policy.scope_allowlist.iter().cloned().collect();
+            scopes.sort();
+            Some(PolicyListEntry { name, origin, scopes })
+        })
+        .collect();
+    policies.sort_by(|a, b| a.name.cmp(&b.name));
+
+    (StatusCode::OK, Json(ListPoliciesResponse { status: "ok", policies })).into_response()
+}
+
 /// `GET /v1/control/connectors` — return the daemon's plugin
 /// registry as JSON.
 ///
@@ -4807,6 +5212,7 @@ pub(crate) fn router(
     config_state: Arc<ArcSwap<crate::config::DaemonConfig>>,
     cli_overrides: Arc<crate::config::CliOverrides>,
     proxy_stub_branch_active: Arc<AtomicBool>,
+    proxy_activation: ProxyActivationContext,
     vault_dir: PathBuf,
     vault: Arc<permitlayer_vault::Vault>,
     control_token: Arc<crate::lifecycle::control_token::ControlToken>,
@@ -4835,6 +5241,7 @@ pub(crate) fn router(
         config_state,
         cli_overrides,
         proxy_stub_branch_active,
+        proxy_activation,
         vault_dir,
         vault,
         credentials_seal_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
@@ -4855,8 +5262,11 @@ pub(crate) fn router(
         .route("/v1/control/credentials/seal", post(credentials_seal_handler))
         .route("/v1/control/credentials/{service}/verify", post(credentials_verify_handler))
         .route("/v1/control/policy/{policy_name}/scopes", post(policy_scopes_handler))
+        .route("/v1/control/policies/{name}", get(show_policy_handler))
+        .route("/v1/control/policies", get(list_policies_handler))
         .route("/v1/control/agent/remove", post(remove_agent_handler))
         .route("/v1/control/agent/rebind", post(rebind_agent_handler))
+        .route("/v1/control/agent/{name}/rotate", post(rotate_agent_handler))
         .route("/v1/control/connections", get(connections_handler))
         .route("/v1/control/connectors", get(connectors_handler))
         .route("/v1/control/whoami", get(whoami_handler))
@@ -4953,6 +5363,18 @@ mod tests {
         Arc::new(permitlayer_vault::Vault::new(key, 0))
     }
 
+    fn test_proxy_activation() -> ProxyActivationContext {
+        ProxyActivationContext {
+            scrub_engine: None,
+            audit_store: None,
+            master_key: Arc::new(zeroize::Zeroizing::new(
+                [0x55u8; permitlayer_keystore::MASTER_KEY_LEN],
+            )),
+            vault: test_vault(),
+            routes: crate::cli::start::ProxyRouteSlots::new(None),
+        }
+    }
+
     /// Construct a ControlToken with deterministic bytes so test
     /// helpers can produce request headers that match. Production
     /// callers must always go through `ControlToken::read_or_mint`.
@@ -5003,6 +5425,7 @@ mod tests {
             cs,
             co,
             stub,
+            test_proxy_activation(),
             vault_dir,
             test_vault(),
             test_control_token(),
@@ -5041,6 +5464,7 @@ mod tests {
             cs,
             co,
             stub,
+            test_proxy_activation(),
             vault_dir,
             test_vault(),
             test_control_token(),
@@ -5077,6 +5501,7 @@ mod tests {
             cs,
             co,
             stub,
+            test_proxy_activation(),
             vault_dir,
             test_vault(),
             test_control_token(),
@@ -5278,6 +5703,7 @@ mod tests {
             cs,
             co,
             stub,
+            test_proxy_activation(),
             vault_dir,
             test_vault(),
             test_control_token(),
@@ -6440,6 +6866,7 @@ mod tests {
             cs,
             co,
             stub,
+            test_proxy_activation(),
             vault_dir,
             test_vault(),
             test_control_token(),
@@ -6608,6 +7035,7 @@ mod tests {
             cs,
             co,
             stub,
+            test_proxy_activation(),
             vault_dir,
             test_vault(),
             test_control_token(),
@@ -6755,6 +7183,7 @@ mod tests {
             cs,
             co,
             stub,
+            test_proxy_activation(),
             vault_dir_path,
             test_vault(),
             test_control_token(),
@@ -6888,6 +7317,7 @@ mod tests {
             cs,
             co,
             stub,
+            test_proxy_activation(),
             vault_dir_path,
             test_vault(),
             test_control_token(),
@@ -7237,6 +7667,7 @@ mod tests {
             cs,
             co,
             stub,
+            test_proxy_activation(),
             vault_dir,
             test_vault(),
             test_control_token(),
@@ -7518,5 +7949,320 @@ auto-approve-reads = true
         let scope_events: Vec<_> =
             events.iter().filter(|e| e.event_type == "policy-scopes-added").collect();
         assert_eq!(scope_events.len(), 0, "no-op merge must not emit audit event");
+    }
+
+    // ── Story 7.34 Task 1: GET /v1/control/policies/{name} ───────────
+
+    async fn body_string(resp: Response) -> String {
+        let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+        String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    fn build_with_loaded_policies(policies_dir: std::path::PathBuf) -> Router {
+        let compiled = permitlayer_core::policy::PolicySet::compile_from_dir(&policies_dir)
+            .expect("test policy set must compile");
+        let policy_set = Arc::new(ArcSwap::from_pointee(compiled));
+        let reload_mutex = Arc::new(std::sync::Mutex::new(()));
+        let agent_registry = Arc::new(AgentRegistry::new(vec![]));
+        let (ato, cs, co, stub, vault_dir) = test_reload_wiring();
+        router(
+            Arc::new(KillSwitch::new()),
+            None,
+            policy_set,
+            policies_dir,
+            reload_mutex,
+            agent_registry,
+            None,
+            Arc::new(zeroize::Zeroizing::new([0x42u8; LOOKUP_KEY_BYTES])),
+            test_approval_service(),
+            test_conn_tracker(),
+            test_plugin_registry(),
+            ato,
+            cs,
+            co,
+            stub,
+            test_proxy_activation(),
+            vault_dir,
+            test_vault(),
+            test_control_token(),
+        )
+    }
+
+    #[tokio::test]
+    async fn show_policy_handler_returns_toml_for_existing_policy() {
+        let policies_dir = tempfile::tempdir().unwrap();
+        stage_minimal_policy(policies_dir.path(), "gmail-read-only", &["gmail.readonly"]);
+        let app = build_with_loaded_policies(policies_dir.path().to_path_buf());
+
+        let resp = app
+            .oneshot(req_with_peer(
+                Method::GET,
+                "/v1/control/policies/gmail-read-only",
+                loopback_v4(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let ct = resp.headers().get("content-type").unwrap().to_str().unwrap();
+        assert!(ct.contains("text/plain"), "expected text/plain, got {ct}");
+        let body = body_string(resp).await;
+        assert!(body.contains("name = \"gmail-read-only\""), "TOML should contain policy name");
+        assert!(body.contains("scopes = [\"gmail.readonly\"]"), "TOML should contain scopes");
+
+        // Round-trip: the emitted TOML parses back into a TomlPolicyFile.
+        let parsed: permitlayer_core::policy::schema::TomlPolicyFile =
+            toml::from_str(&body).expect("show_policy_handler TOML must round-trip");
+        assert_eq!(parsed.policies.len(), 1);
+        assert_eq!(parsed.policies[0].name, "gmail-read-only");
+    }
+
+    #[tokio::test]
+    async fn show_policy_handler_returns_404_for_missing_policy() {
+        let policies_dir = tempfile::tempdir().unwrap();
+        let app = build_with_loaded_policies(policies_dir.path().to_path_buf());
+
+        let resp = app
+            .oneshot(req_with_peer(
+                Method::GET,
+                "/v1/control/policies/does-not-exist",
+                loopback_v4(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "policy.not_found");
+    }
+
+    // ── Story 7.34 Task 1: GET /v1/control/policies ──────────────────
+
+    #[tokio::test]
+    async fn list_policies_handler_returns_sorted_policies_with_origins_and_scopes() {
+        let policies_dir = tempfile::tempdir().unwrap();
+        stage_multi_policy_default(policies_dir.path(), &["gmail.readonly", "gmail.metadata"]);
+        let app = build_with_loaded_policies(policies_dir.path().to_path_buf());
+
+        let resp = app
+            .oneshot(req_with_peer(Method::GET, "/v1/control/policies", loopback_v4()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["status"], "ok");
+        let policies = json["policies"].as_array().unwrap();
+        assert_eq!(policies.len(), 3, "expected 3 policies from default.toml");
+        // Sorted alphabetically
+        assert_eq!(policies[0]["name"], "calendar-prompt-on-write");
+        assert_eq!(
+            policies[0]["scopes"],
+            serde_json::json!(["calendar.events", "calendar.readonly"])
+        );
+        assert!(
+            policies[0]["origin"].as_str().unwrap().contains("default.toml"),
+            "origin should contain default.toml"
+        );
+        assert_eq!(policies[1]["name"], "drive-research-scope-restricted");
+        assert_eq!(policies[2]["name"], "gmail-read-only");
+    }
+
+    #[tokio::test]
+    async fn list_policies_handler_returns_empty_list_when_no_policies() {
+        let policies_dir = tempfile::tempdir().unwrap();
+        let app = build_with_loaded_policies(policies_dir.path().to_path_buf());
+
+        let resp = app
+            .oneshot(req_with_peer(Method::GET, "/v1/control/policies", loopback_v4()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["status"], "ok");
+        let policies = json["policies"].as_array().unwrap();
+        assert_eq!(policies.len(), 0);
+    }
+
+    // ── Story 7.34 Task 2: POST /v1/control/agent/{name}/rotate ──────
+
+    /// Agent store that returns `Ok(true)` for `update_lookup_key_and_token`
+    /// so the rotate handler can reach the happy path.
+    #[derive(Clone, Default)]
+    struct RotatableAgentStore {
+        agents: std::collections::HashMap<String, permitlayer_core::agent::AgentIdentity>,
+    }
+
+    impl RotatableAgentStore {
+        fn with_agent(name: &str, policy_name: &str) -> Self {
+            let identity = permitlayer_core::agent::AgentIdentity::new(
+                name.to_owned(),
+                policy_name.to_owned(),
+                "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".to_owned(),
+                "0".repeat(64),
+                chrono::Utc::now(),
+                None,
+            )
+            .unwrap();
+            let mut agents = std::collections::HashMap::new();
+            agents.insert(name.to_owned(), identity);
+            Self { agents }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl permitlayer_core::store::AgentIdentityStore for RotatableAgentStore {
+        async fn put(
+            &self,
+            _identity: permitlayer_core::agent::AgentIdentity,
+        ) -> Result<(), permitlayer_core::store::StoreError> {
+            Ok(())
+        }
+        async fn get(
+            &self,
+            name: &str,
+        ) -> Result<
+            Option<permitlayer_core::agent::AgentIdentity>,
+            permitlayer_core::store::StoreError,
+        > {
+            Ok(self.agents.get(name).cloned())
+        }
+        async fn list(
+            &self,
+        ) -> Result<Vec<permitlayer_core::agent::AgentIdentity>, permitlayer_core::store::StoreError>
+        {
+            Ok(self.agents.values().cloned().collect())
+        }
+        async fn remove(&self, _name: &str) -> Result<bool, permitlayer_core::store::StoreError> {
+            Ok(false)
+        }
+        async fn touch_last_seen(
+            &self,
+            _identity: permitlayer_core::agent::AgentIdentity,
+        ) -> Result<(), permitlayer_core::store::StoreError> {
+            Ok(())
+        }
+        async fn update_lookup_key_and_token(
+            &self,
+            name: &str,
+            _new_lookup_key_hex: String,
+            _new_token_hash: String,
+        ) -> Result<bool, permitlayer_core::store::StoreError> {
+            Ok(self.agents.contains_key(name))
+        }
+        async fn update_policy(
+            &self,
+            _name: &str,
+            _new_policy_name: String,
+        ) -> Result<bool, permitlayer_core::store::StoreError> {
+            Ok(false)
+        }
+    }
+
+    fn build_with_rotatable_agent_store(
+        store: Arc<RotatableAgentStore>,
+    ) -> (Router, Arc<RotatableAgentStore>) {
+        let switch = Arc::new(KillSwitch::new());
+        let policy_set = Arc::new(ArcSwap::from_pointee(PolicySet::empty()));
+        let policies_dir = tempfile::tempdir().unwrap().keep();
+        let reload_mutex = Arc::new(std::sync::Mutex::new(()));
+        let agent_registry = Arc::new(AgentRegistry::new(vec![]));
+        let (ato, cs, co, stub, vault_dir) = test_reload_wiring();
+        let router = router(
+            switch,
+            None,
+            policy_set,
+            policies_dir,
+            reload_mutex,
+            agent_registry,
+            Some(store.clone()),
+            Arc::new(zeroize::Zeroizing::new([0x42u8; LOOKUP_KEY_BYTES])),
+            test_approval_service(),
+            test_conn_tracker(),
+            test_plugin_registry(),
+            ato,
+            cs,
+            co,
+            stub,
+            test_proxy_activation(),
+            vault_dir,
+            test_vault(),
+            test_control_token(),
+        );
+        (router, store)
+    }
+
+    #[tokio::test]
+    async fn rotate_agent_handler_returns_new_bearer_for_existing_agent() {
+        let store = Arc::new(RotatableAgentStore::with_agent("test-agent", "test-policy"));
+        let (app, _store) = build_with_rotatable_agent_store(store);
+
+        let resp = app
+            .oneshot(req_with_peer(
+                Method::POST,
+                "/v1/control/agent/test-agent/rotate",
+                loopback_v4(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["status"], "ok");
+        assert_eq!(json["name"], "test-agent");
+        let bearer = json["bearer_token"].as_str().unwrap();
+        assert!(
+            bearer.starts_with("agt_v2_test-agent_"),
+            "bearer_token should start with agt_v2_test-agent_, got {bearer}"
+        );
+    }
+
+    #[tokio::test]
+    async fn rotate_agent_handler_returns_404_for_missing_agent() {
+        let store = Arc::new(RotatableAgentStore::default());
+        let (app, _store) = build_with_rotatable_agent_store(store);
+
+        let resp = app
+            .oneshot(req_with_peer(
+                Method::POST,
+                "/v1/control/agent/missing-agent/rotate",
+                loopback_v4(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "agent.not_found");
+    }
+
+    #[tokio::test]
+    async fn rotate_agent_handler_returns_503_when_store_unavailable() {
+        let app = build(Arc::new(KillSwitch::new()));
+
+        let resp = app
+            .oneshot(req_with_peer(
+                Method::POST,
+                "/v1/control/agent/test-agent/rotate",
+                loopback_v4(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "agent.store_unavailable");
+    }
+
+    #[tokio::test]
+    async fn rotate_agent_handler_rejects_invalid_name() {
+        let store = Arc::new(RotatableAgentStore::with_agent("test-agent", "test-policy"));
+        let (app, _store) = build_with_rotatable_agent_store(store);
+
+        let resp = app
+            .oneshot(req_with_peer(
+                Method::POST,
+                "/v1/control/agent/..%2Fetc/rotate",
+                loopback_v4(),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "agent.invalid_name");
     }
 }

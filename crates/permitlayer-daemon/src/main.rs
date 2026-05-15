@@ -51,6 +51,8 @@ enum Commands {
     Connect(cli::connect::ConnectArgs),
     /// Manage stored credentials
     Credentials(cli::credentials::CredentialsArgs),
+    /// Inspect and validate loaded policies (Story 7.34)
+    Policy(cli::policy::PolicyArgs),
     /// Manage user-facing configuration
     Config(cli::config::ConfigArgs),
     /// Tail the audit log live (historical query ships in Story 5.2)
@@ -257,6 +259,7 @@ async fn main() -> ExitCode {
             credentials_refresh_to_exit_code(cli::credentials::run(args).await)
         }
         Some(Commands::Config(args)) => anyhow_to_exit_code(cli::config::run(args)),
+        Some(Commands::Policy(args)) => anyhow_to_exit_code(cli::policy::run(args).await),
         Some(Commands::Audit(args)) => anyhow_to_exit_code(cli::audit::run(args).await),
         Some(Commands::Logs(args)) => anyhow_to_exit_code(cli::logs::run(args).await),
         Some(Commands::Scrub(args)) => anyhow_to_exit_code(cli::scrub::run(args)),

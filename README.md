@@ -52,8 +52,9 @@ taken effect yet — log out and back in.
 `agentsso agent register <name> --policy <policy-name>` mints a
 per-user bearer token at `~/.agentsso/agent-bearer.token` (mode 0600).
 MCP clients (OpenClaw / Claude Desktop / Cursor) read that token and
-connect to the daemon at `http://127.0.0.1:3820/mcp` with transport
-`streamable-http`.
+connect to the daemon with transport `streamable-http`. Gmail uses
+`http://127.0.0.1:3820/mcp/gmail`; Calendar and Drive use
+`/mcp/calendar` and `/mcp/drive`.
 
 Running the daemon and end-user under different OS accounts? See
 [Running the daemon and the agent under different OS users](#running-the-daemon-and-the-agent-under-different-os-users)
@@ -138,8 +139,10 @@ keeps tokens scoped to your Google account, not a shared app.
    `connect` composes credential sealing + policy update + agent rebind in
    one idempotent command.
 
-5. **Point your MCP client** at `http://127.0.0.1:3820/mcp` with
+5. **Point your MCP client** at `http://127.0.0.1:3820/mcp/gmail` with
    transport `streamable-http`, using the bearer token from step 2.
+   Bare `/mcp` is not a route; Calendar and Drive are available at
+   `/mcp/calendar` and `/mcp/drive`.
 
 6. **Inspect activity**:
 

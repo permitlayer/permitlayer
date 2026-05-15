@@ -177,6 +177,35 @@ pub(crate) fn connect_exit_code(code: &str) -> i32 {
     }
 }
 
+fn default_scope_for_snippet(
+    policy_resp: &super::connect_uds::PolicyScopesResponse,
+    requested_short_names: &[&str],
+) -> Option<String> {
+    fn first_matching_policy_scope(policy_scopes: &[String], requested: &[&str]) -> Option<String> {
+        policy_scopes.iter().find(|scope| requested.contains(&scope.as_str())).cloned()
+    }
+
+    first_matching_policy_scope(&policy_resp.after, requested_short_names)
+        .or_else(|| first_matching_policy_scope(&policy_resp.before, requested_short_names))
+}
+
+fn connect_root_guard_for(
+    service: &str,
+    agent: &str,
+    allow_root: bool,
+    effective_uid: u32,
+    sudo_user: Option<&str>,
+) -> anyhow::Result<()> {
+    let connect_hint = format!("agentsso connect {service} --agent {agent}");
+    crate::cli::root_guard::ensure_not_sudo_root_shell_with(
+        "connect",
+        &connect_hint,
+        allow_root,
+        effective_uid,
+        sudo_user,
+    )
+}
+
 /// Build a silent CLI error tagged with the right exit-code marker for
 /// the given operator-facing error code. The `error_block` rendering is
 /// the caller's responsibility; this helper attaches ONLY the typed
@@ -431,6 +460,12 @@ pub struct ConnectArgs {
     /// principals; see `cli::openclaw` module docs).
     #[arg(long = "mcp-config-out", value_name = "PATH")]
     pub mcp_config_out: Option<PathBuf>,
+
+    /// Allow connect from an effective-root shell with SUDO_USER set.
+    /// Intended only for CI and embedded installs; normal operators should
+    /// run this command from their user shell.
+    #[arg(long)]
+    pub allow_root: bool,
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -446,6 +481,14 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
         crate::telemetry::init_tracing("info", None, 30).context("tracing init failed")?;
 
     let service = args.service.trim().to_lowercase();
+    #[cfg(unix)]
+    connect_root_guard_for(
+        &service,
+        &args.agent,
+        args.allow_root,
+        nix::unistd::geteuid().as_raw(),
+        std::env::var("SUDO_USER").ok().as_deref(),
+    )?;
 
     // Step 1a — service allowlist.
     if !SUPPORTED_SERVICES.contains(&service.as_str()) {
@@ -513,6 +556,11 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
     probe_daemon_kill_state_or_exit().await?;
 
     let home = super::agentsso_home()?;
+    // Story 7.33 review fix: load the daemon config so policy
+    // remediation points at the daemon's configured paths.home rather
+    // than the CLI's env/platform default.
+    let daemon_config = crate::cli::kill::load_daemon_config_or_default_with_warn("connect");
+    let daemon_home = daemon_config.paths.home.clone();
     let theme = Theme::load(&home);
     let color_support = ColorSupport::detect();
     tracing::info!(
@@ -1134,6 +1182,7 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
     let policy_outcome =
         super::connect_uds::post_policy_scopes(&control_handle, &agent_policy_name, &scopes_req)
             .await;
+    let policies_dir = crate::cli::agent::policies_dir_remediation(&daemon_home);
     let policy_resp = match policy_outcome {
         Ok(super::connect_uds::ControlOutcome::Ok(resp)) => resp,
         Ok(super::connect_uds::ControlOutcome::Err { status_code, body }) => {
@@ -1158,10 +1207,11 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
                     &format!(
                         "agentsso reload   # if the daemon's in-memory \
                          policy set drifted from disk\n\
-                         # else: inspect /Library/Application Support/permitlayer/policies/ \
+                         # else: inspect {policies_dir} \
                          (root-only; policies may live inside default.toml) for the underlying issue;\n\
                          # the daemon's tracing log carries the parse/IO error detail.\n\
                          # Scopes requested in this run: {scopes}",
+                        policies_dir = policies_dir,
                         scopes = short_names.join(", "),
                     ),
                     None,
@@ -1190,6 +1240,24 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
             return Err(silent_err_for_code(
                 "connect.policy_edit_failed",
                 "policy edit transport failure",
+            ));
+        }
+    };
+    let default_scope = match default_scope_for_snippet(&policy_resp, &short_names) {
+        Some(scope) => scope,
+        None => {
+            eprint!(
+                "{}",
+                render::error_block(
+                    "connect.policy_scope_missing",
+                    &format!("policy '{agent_policy_name}' has no allowlisted scope for {service}"),
+                    "edit the daemon policy file to include at least one scope, then run `agentsso reload` and retry",
+                    None,
+                )
+            );
+            return Err(silent_err_for_code(
+                "connect.policy_scope_missing",
+                "policy has no usable default scope",
             ));
         }
     };
@@ -1264,20 +1332,24 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
             // — rebind will keep failing; the right next step is to
             // re-register the agent.
             let err_str = e.to_string();
-            let remediation: &str = if err_str.starts_with("agent.not_found") {
+            let remediation: String = if err_str.starts_with("agent.not_found") {
                 "agentsso agent register <name> --policy <policy>   # agent was removed; \
                  register fresh"
+                    .to_owned()
             } else if err_str.starts_with("agent.unknown_policy") {
-                "edit ~/.agentsso/policies/ then `agentsso reload`   # policy missing"
+                format!(
+                    "{}   # policy missing",
+                    crate::cli::agent::policies_dir_remediation(&daemon_config.paths.home)
+                )
             } else {
-                "agentsso agent rebind <name> --policy <policy>   # diagnose, then retry"
+                "agentsso agent rebind <name> --policy <policy>   # diagnose, then retry".to_owned()
             };
             eprint!(
                 "{}",
                 render::error_block(
                     "connect.rebind_failed",
                     &format!("failed to rebind agent '{}': {e}", args.agent),
-                    remediation,
+                    &remediation,
                     None,
                 )
             );
@@ -1292,7 +1364,7 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
     // to stdout AND optionally write to --mcp-config-out. Connect
     // does NOT auto-merge into the end user's ~/.openclaw config —
     // see cli::openclaw module docs for the admin/user-split rationale.
-    emit_openclaw_snippet(&args, &service, interactive, &theme).await?;
+    emit_openclaw_snippet(&args, &service, interactive, &theme, &default_scope).await?;
 
     // ── Step 8 — summary ───────────────────────────────────────────
     if interactive {
@@ -1827,6 +1899,7 @@ async fn emit_openclaw_snippet(
     service: &str,
     interactive: bool,
     theme: &Theme,
+    default_scope: &str,
 ) -> anyhow::Result<()> {
     const PROMPT_TIMEOUT_SECS: u64 = 300;
 
@@ -1918,7 +1991,7 @@ async fn emit_openclaw_snippet(
         eprintln!();
     }
 
-    let snippet = super::openclaw::build_snippet(service, &bearer_token, bind_addr);
+    let snippet = super::openclaw::build_snippet(service, &bearer_token, bind_addr, default_scope);
 
     if let Err(e) = super::openclaw::emit_snippet(&snippet, args.mcp_config_out.as_deref(), service)
     {
@@ -1939,6 +2012,7 @@ async fn emit_openclaw_snippet(
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
+    use crate::cli::connect_uds;
     use clap::Parser;
 
     /// Test-only wrapper exposing `ConnectArgs` to clap so we can
@@ -1967,6 +2041,7 @@ mod tests {
         assert!(args.oauth_client.is_none());
         assert!(!args.headless);
         assert!(!args.non_interactive);
+        assert!(!args.allow_root);
         assert!(args.bearer_token.is_none());
         assert!(args.mcp_config_out.is_none());
     }
@@ -2011,6 +2086,36 @@ mod tests {
         let TestCmd::Connect(args) = cli.cmd;
         assert_eq!(args.bearer_token.as_deref(), Some("agt_v2_me_xxx"));
         assert_eq!(args.mcp_config_out.as_deref(), Some(Path::new("/tmp/snippet.json")));
+    }
+
+    #[test]
+    fn clap_parses_allow_root() {
+        let cli =
+            parse(&["agentsso", "connect", "gmail", "--agent", "me", "--allow-root"]).unwrap();
+        let TestCmd::Connect(args) = cli.cmd;
+        assert!(args.allow_root);
+    }
+
+    // Story 7.33 review fix: command-level guard coverage. The root-guard
+    // helper tests in root_guard.rs pass even if the connect run() call
+    // site stops invoking the guard. This test pins the composition of
+    // ConnectArgs + the guard so a future refactor can't drop the call.
+    #[test]
+    fn connect_guard_refuses_root_shell_before_daemon_contact() {
+        let result = connect_root_guard_for("gmail", "me", false, 0, Some("testuser"));
+        assert!(
+            result.is_err(),
+            "connect_root_guard_for must refuse root+SUDO_USER before any daemon contact"
+        );
+    }
+
+    #[test]
+    fn connect_guard_allows_root_when_explicitly_requested() {
+        let result = connect_root_guard_for("gmail", "me", true, 0, Some("testuser"));
+        assert!(
+            result.is_ok(),
+            "connect_root_guard_for must allow root when --allow-root is passed"
+        );
     }
 
     #[test]
@@ -2071,5 +2176,49 @@ mod tests {
     fn connect_exit_code_unknown_codes_default_to_3() {
         assert_eq!(connect_exit_code("connect.future_unknown"), 3);
         assert_eq!(connect_exit_code("agent.duplicate_name"), 3);
+    }
+
+    #[test]
+    fn default_scope_for_snippet_picks_first_requested_scope_in_policy_order() {
+        let resp = connect_uds::PolicyScopesResponse {
+            policy_name: "calendar-read".to_owned(),
+            before: vec!["calendar.readonly".to_owned(), "calendar.events".to_owned()],
+            added: Vec::new(),
+            after: vec!["calendar.readonly".to_owned(), "calendar.events".to_owned()],
+            reloaded: false,
+        };
+
+        assert_eq!(
+            default_scope_for_snippet(&resp, &["calendar.events", "calendar.readonly"]),
+            Some("calendar.readonly".to_owned())
+        );
+    }
+
+    #[test]
+    fn default_scope_for_snippet_ignores_unrelated_policy_scopes_and_empty_policy() {
+        let resp = connect_uds::PolicyScopesResponse {
+            policy_name: "calendar-read".to_owned(),
+            before: Vec::new(),
+            added: vec!["calendar.readonly".to_owned()],
+            after: vec!["calendar.readonly".to_owned(), "calendar.events".to_owned()],
+            reloaded: true,
+        };
+
+        assert_eq!(
+            default_scope_for_snippet(&resp, &["calendar.events", "calendar.readonly"]),
+            Some("calendar.readonly".to_owned())
+        );
+        assert_eq!(default_scope_for_snippet(&resp, &["drive.readonly"]), None);
+
+        let empty_resp = connect_uds::PolicyScopesResponse {
+            policy_name: "gmail-read".to_owned(),
+            before: Vec::new(),
+            added: Vec::new(),
+            after: Vec::new(),
+            reloaded: true,
+        };
+
+        assert_eq!(default_scope_for_snippet(&empty_resp, &["gmail.readonly"]), None);
+        assert_eq!(default_scope_for_snippet(&empty_resp, &[]), None);
     }
 }

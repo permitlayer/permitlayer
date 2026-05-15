@@ -2,9 +2,10 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use arc_swap::ArcSwap;
-use axum::extract::State;
+use arc_swap::{ArcSwap, ArcSwapOption};
+use axum::extract::{Path, Request, State};
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 #[cfg(debug_assertions)]
 use axum::routing::post;
 use axum::routing::{any, get};
@@ -16,7 +17,9 @@ use permitlayer_core::killswitch::KillSwitch;
 use permitlayer_core::policy::PolicyCompileError;
 use permitlayer_core::store::AgentIdentityStore;
 use permitlayer_core::store::fs::AgentIdentityFsStore;
+use permitlayer_proxy::error::{AgentId, ProxyError, RequestId};
 use permitlayer_proxy::middleware::{PolicySet, assemble_middleware};
+use permitlayer_proxy::request::ProxyRequest;
 
 use crate::config::{CliOverrides, DaemonConfig, HttpOverrides, LogOverrides};
 use crate::lifecycle::pid::PidFile;
@@ -32,6 +35,42 @@ pub struct StartArgs {
     /// Override log level
     #[arg(long)]
     pub log_level: Option<String>,
+    /// Allow foreground startup even when the macOS LaunchDaemon plist exists.
+    /// Intended for local debugging only; installed services should be
+    /// restarted through launchd.
+    #[arg(long)]
+    pub allow_foreground: bool,
+}
+
+fn foreground_start_managed_by_launchd(allow_foreground: bool) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // When launchd starts the service directly, it sets LAUNCHD_SOCKET.
+        // We must NOT refuse foreground start in that context — the refusal
+        // is only for manual operator invocations like `sudo agentsso start`.
+        let launched_by_launchd = std::env::var("LAUNCHD_SOCKET").is_ok();
+        foreground_start_collision(
+            allow_foreground,
+            nix::unistd::geteuid().is_root(),
+            std::path::Path::new(crate::cli::service::LAUNCHD_PLIST_PATH).exists(),
+            launched_by_launchd,
+        )
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = allow_foreground;
+        false
+    }
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn foreground_start_collision(
+    allow_foreground: bool,
+    effective_root: bool,
+    plist_exists: bool,
+    launched_by_launchd: bool,
+) -> bool {
+    !allow_foreground && effective_root && plist_exists && !launched_by_launchd
 }
 
 // -- App state shared with handlers --
@@ -213,9 +252,234 @@ async fn health_handler(State(state): State<AppState>) -> Json<HealthResponse> {
     })
 }
 
-/// Placeholder: returns 501 Not Implemented.
-async fn not_implemented_handler() -> StatusCode {
-    StatusCode::NOT_IMPLEMENTED
+pub(crate) const AVAILABLE_ROUTES: &[&str] =
+    &["/health", "/mcp/gmail", "/mcp/calendar", "/mcp/drive"];
+
+#[derive(Serialize)]
+struct RouteErrorEnvelope {
+    error: RouteErrorBody,
+}
+
+#[derive(Serialize)]
+struct RouteErrorBody {
+    code: &'static str,
+    message: String,
+    request_id: String,
+    available_routes: &'static [&'static str],
+}
+
+fn request_id_from(request: &Request) -> String {
+    request
+        .extensions()
+        .get::<RequestId>()
+        .map(|r| r.0.clone())
+        .unwrap_or_else(|| ulid::Ulid::new().to_string())
+}
+
+fn route_error_response(
+    status: StatusCode,
+    code: &'static str,
+    message: impl Into<String>,
+    request: &Request,
+) -> Response {
+    (
+        status,
+        Json(RouteErrorEnvelope {
+            error: RouteErrorBody {
+                code,
+                message: message.into(),
+                request_id: request_id_from(request),
+                available_routes: AVAILABLE_ROUTES,
+            },
+        }),
+    )
+        .into_response()
+}
+
+async fn not_implemented_handler(request: Request) -> Response {
+    route_error_response(
+        StatusCode::NOT_IMPLEMENTED,
+        "route.not_implemented",
+        "this route is present but the proxy service is not active yet",
+        &request,
+    )
+}
+
+async fn route_not_found_handler(request: Request) -> Response {
+    route_error_response(
+        StatusCode::NOT_FOUND,
+        "route.not_found",
+        format!("no route for {}", request.uri().path()),
+        &request,
+    )
+}
+
+#[derive(Clone)]
+pub(crate) struct ProxyRouteSlots {
+    proxy: Arc<ArcSwapOption<permitlayer_proxy::ProxyService>>,
+    gmail_mcp: Arc<ArcSwapOption<permitlayer_proxy::transport::mcp::GmailMcpService>>,
+    calendar_mcp: Arc<ArcSwapOption<permitlayer_proxy::transport::mcp::CalendarMcpService>>,
+    drive_mcp: Arc<ArcSwapOption<permitlayer_proxy::transport::mcp::DriveMcpService>>,
+}
+
+impl ProxyRouteSlots {
+    pub(crate) fn new(proxy: Option<&Arc<permitlayer_proxy::ProxyService>>) -> Self {
+        let slots = Self {
+            proxy: Arc::new(ArcSwapOption::from(None::<Arc<permitlayer_proxy::ProxyService>>)),
+            gmail_mcp: Arc::new(ArcSwapOption::from(
+                None::<Arc<permitlayer_proxy::transport::mcp::GmailMcpService>>,
+            )),
+            calendar_mcp: Arc::new(ArcSwapOption::from(
+                None::<Arc<permitlayer_proxy::transport::mcp::CalendarMcpService>>,
+            )),
+            drive_mcp: Arc::new(ArcSwapOption::from(
+                None::<Arc<permitlayer_proxy::transport::mcp::DriveMcpService>>,
+            )),
+        };
+        if let Some(proxy) = proxy {
+            slots.activate(Arc::clone(proxy));
+        }
+        slots
+    }
+
+    pub(crate) fn activate(&self, proxy: Arc<permitlayer_proxy::ProxyService>) {
+        let gmail = permitlayer_proxy::transport::mcp::mcp_service(Arc::clone(&proxy));
+        let calendar = permitlayer_proxy::transport::mcp::calendar_mcp_service(Arc::clone(&proxy));
+        let drive = permitlayer_proxy::transport::mcp::drive_mcp_service(Arc::clone(&proxy));
+
+        self.gmail_mcp.store(Some(Arc::new(gmail)));
+        self.calendar_mcp.store(Some(Arc::new(calendar)));
+        self.drive_mcp.store(Some(Arc::new(drive)));
+        self.proxy.store(Some(proxy));
+    }
+}
+
+#[derive(Clone)]
+pub(crate) struct ProxyActivationContext {
+    pub scrub_engine: Option<Arc<permitlayer_core::scrub::ScrubEngine>>,
+    pub audit_store: Option<Arc<dyn permitlayer_core::store::AuditStore>>,
+    pub master_key: Arc<zeroize::Zeroizing<[u8; permitlayer_keystore::MASTER_KEY_LEN]>>,
+    pub vault: Arc<permitlayer_vault::Vault>,
+    pub routes: ProxyRouteSlots,
+}
+
+async fn dynamic_gmail_mcp_handler(
+    slot: Arc<ArcSwapOption<permitlayer_proxy::transport::mcp::GmailMcpService>>,
+    request: Request,
+) -> Response {
+    match slot.load_full() {
+        Some(service) => service.handle(request).await.into_response(),
+        None => not_implemented_handler(request).await,
+    }
+}
+
+async fn dynamic_calendar_mcp_handler(
+    slot: Arc<ArcSwapOption<permitlayer_proxy::transport::mcp::CalendarMcpService>>,
+    request: Request,
+) -> Response {
+    match slot.load_full() {
+        Some(service) => service.handle(request).await.into_response(),
+        None => not_implemented_handler(request).await,
+    }
+}
+
+async fn dynamic_drive_mcp_handler(
+    slot: Arc<ArcSwapOption<permitlayer_proxy::transport::mcp::DriveMcpService>>,
+    request: Request,
+) -> Response {
+    match slot.load_full() {
+        Some(service) => service.handle(request).await.into_response(),
+        None => not_implemented_handler(request).await,
+    }
+}
+
+async fn dynamic_proxy_handler(
+    slot: Arc<ArcSwapOption<permitlayer_proxy::ProxyService>>,
+    Path((svc, raw_path)): Path<(String, String)>,
+    request: Request,
+) -> Response {
+    let Some(service) = slot.load_full() else {
+        return not_implemented_handler(request).await;
+    };
+
+    if permitlayer_core::store::validate_service_name(&svc).is_err() {
+        return ProxyError::NotFound { path: format!("/v1/tools/{svc}") }
+            .into_response_with_request_id(None);
+    }
+
+    let resource = raw_path.strip_prefix('/').unwrap_or(&raw_path).to_owned();
+    // Story 7.33 review fix: preserve query strings for upstream dispatch.
+    // `resource` stays clean (for policy matching); `path` carries the query.
+    let mut path = resource.clone();
+    if let Some(query) = request.uri().query() {
+        path.push('?');
+        path.push_str(query);
+    }
+    let request_id =
+        request.extensions().get::<RequestId>().map(|r| r.0.clone()).unwrap_or_default();
+
+    let agent_id = match request.extensions().get::<AgentId>() {
+        Some(a) => a.0.clone(),
+        None => {
+            tracing::warn!(
+                request_id = %request_id,
+                "AgentId extension missing on /v1/tools/* request — refusing"
+            );
+            return ProxyError::AuthMissingAgentId.into_response_with_request_id(Some(request_id));
+        }
+    };
+
+    let scope = match request.headers().get("x-agentsso-scope") {
+        Some(v) => match v.to_str() {
+            Ok(s) => s.to_owned(),
+            Err(_) => {
+                tracing::warn!(
+                    request_id = %request_id,
+                    "x-agentsso-scope header present but not valid UTF-8; rejecting as missing"
+                );
+                return ProxyError::MissingScopeHeader
+                    .into_response_with_request_id(Some(request_id.clone()));
+            }
+        },
+        None => {
+            return ProxyError::MissingScopeHeader
+                .into_response_with_request_id(Some(request_id.clone()));
+        }
+    };
+
+    if scope.bytes().any(|b| b < 0x20) {
+        return ProxyError::Internal {
+            message: "x-agentsso-scope header contains invalid characters".to_owned(),
+        }
+        .into_response_with_request_id(Some(request_id.clone()));
+    }
+
+    let method = request.method().clone();
+    let headers = request.headers().clone();
+    let body = match axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            return ProxyError::Internal { message: format!("failed to read request body: {e}") }
+                .into_response_with_request_id(Some(request_id));
+        }
+    };
+
+    let proxy_req = ProxyRequest {
+        service: svc,
+        scope,
+        resource,
+        method,
+        path,
+        headers,
+        body,
+        agent_id,
+        request_id: request_id.clone(),
+    };
+
+    match service.handle(proxy_req).await {
+        Ok(resp) => resp.into_response(),
+        Err(err) => err.into_response_with_request_id(Some(request_id)),
+    }
 }
 
 /// Story 6.2 / AC #30: debug-only handler for `/v1/debug/plugin-echo`.
@@ -637,7 +901,7 @@ pub(crate) fn compute_min_max_key_id(
     Ok(min_key_id.map(|min| (min, max_key_id)))
 }
 
-async fn try_build_proxy_service(
+pub(crate) async fn try_build_proxy_service(
     config: &DaemonConfig,
     scrub_engine: Option<&Arc<permitlayer_core::scrub::ScrubEngine>>,
     audit_store: Option<&Arc<dyn permitlayer_core::store::AuditStore>>,
@@ -676,22 +940,8 @@ async fn try_build_proxy_service(
     //      proxy. Silently treating an I/O error as "no credentials"
     //      would surface a misleading "run setup" hint when the real
     //      issue is a vault that exists but is unreadable.
-    let vault_has_credentials = match std::fs::read_dir(&vault_dir) {
-        Ok(rd) => rd.filter_map(Result::ok).any(|entry| {
-            // Story 7.3 P63: reject non-regular files in the walk.
-            let meta = match entry.metadata() {
-                Ok(m) => m,
-                Err(_) => return false,
-            };
-            if !meta.file_type().is_file() {
-                return false;
-            }
-            entry
-                .file_name()
-                .to_str()
-                .is_some_and(|n| n.ends_with(".sealed") && !n.contains(".sealed.tmp."))
-        }),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+    let vault_has_credentials = match vault_has_sealed_credentials(&vault_dir) {
+        Ok(found) => found,
         Err(e) => {
             tracing::error!(
                 error = %e,
@@ -749,6 +999,27 @@ async fn try_build_proxy_service(
         Arc::clone(scrub_engine),
         config.paths.home.join("vault"),
     )))
+}
+
+pub(crate) fn vault_has_sealed_credentials(vault_dir: &std::path::Path) -> std::io::Result<bool> {
+    match std::fs::read_dir(vault_dir) {
+        Ok(rd) => Ok(rd.filter_map(Result::ok).any(|entry| {
+            // Story 7.3 P63: reject non-regular files in the walk.
+            let meta = match entry.metadata() {
+                Ok(m) => m,
+                Err(_) => return false,
+            };
+            if !meta.file_type().is_file() {
+                return false;
+            }
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|n| n.ends_with(".sealed") && !n.contains(".sealed.tmp."))
+        })),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 /// Build the shared `Arc<ScrubEngine>` + `Option<Arc<dyn AuditStore>>`
@@ -1277,8 +1548,8 @@ pub(crate) enum StartError {
     #[error("config load failed: {0}")]
     ConfigLoad(String),
 
-    /// The `~/.agentsso/policies` directory could not be created or is
-    /// not readable.
+    /// The daemon policy directory could not be created or is not
+    /// readable.
     #[error("failed to prepare policies directory {path}: {source}")]
     PoliciesDir {
         path: std::path::PathBuf,
@@ -1319,6 +1590,11 @@ pub(crate) enum StartError {
     #[error("daemon is already running (pid {pid})")]
     DaemonAlreadyRunning { pid: u32 },
 
+    /// macOS LaunchDaemon is installed; foreground `agentsso start`
+    /// would create a second daemon outside launchd supervision.
+    #[error("daemon is managed by launchd")]
+    LaunchdManagedForegroundStart,
+
     /// PID file could not be acquired for reasons other than "already
     /// running" (filesystem permissions, IO error).
     #[error("failed to acquire PID file: {0}")]
@@ -1327,8 +1603,8 @@ pub(crate) enum StartError {
     /// Plan B (operator-token auth): could not read or mint the
     /// `<home>/control.token` file at startup. Causes: filesystem
     /// permissions, malformed existing file, mode-other-than-0o600.
-    #[error("failed to bootstrap control token: {0}")]
-    ControlTokenBootstrap(String),
+    #[error("failed to bootstrap control token: {message}")]
+    ControlTokenBootstrap { message: String, path: std::path::PathBuf },
 
     /// Story 7.6a AC #3: vault-level advisory lock is held by another
     /// process — typically `agentsso rotate-key` mid-flight, an
@@ -1491,8 +1767,9 @@ impl StartError {
             | Self::PluginLoadFailed { .. } => 2,
             // Exit 3 — another process holds a coordination resource.
             Self::DaemonAlreadyRunning { .. }
+            | Self::LaunchdManagedForegroundStart
             | Self::PidFileAcquire(_)
-            | Self::ControlTokenBootstrap(_)
+            | Self::ControlTokenBootstrap { .. }
             | Self::DaemonStartVaultBusy { .. } => 3,
             // Exit 4 — filesystem-level failure on a coordination
             // resource (Story 7.6a round-1 review patch).
@@ -1623,15 +1900,24 @@ impl StartError {
             Self::DaemonAlreadyRunning { pid } => {
                 format!("error: daemon is already running (pid {pid})\n")
             }
+            Self::LaunchdManagedForegroundStart => {
+                "daemon is managed by launchd; use 'sudo launchctl kickstart -k system/dev.permitlayer.daemon' instead\n"
+                    .to_owned()
+            }
             Self::PidFileAcquire(msg) => format!("error: failed to acquire PID file: {msg}\n"),
-            Self::ControlTokenBootstrap(msg) => format!(
-                "error: failed to bootstrap control token: {msg}\n\
+            Self::ControlTokenBootstrap { message, path } => format!(
+                "error: failed to bootstrap control token: {message}\n\
                  \n\
-                 the daemon could not read or mint ~/.agentsso/control.token. \
+                 the daemon could not read or mint {}. \
                  common causes:\n\
                  - the file exists but has the wrong mode (must be 0o600)\n\
                  - the file exists but is malformed (delete it and the daemon will mint fresh)\n\
-                 - filesystem permissions on ~/.agentsso/ block writing\n",
+                 - filesystem permissions on {} block writing\n",
+                path.display(),
+                path.parent()
+                    .map(std::path::Path::display)
+                    .map(|display| display.to_string())
+                    .unwrap_or_else(|| path.display().to_string())
             ),
             Self::DaemonStartVaultBusy { holder_pid, holder_command } => {
                 let holder_text = match (holder_pid, holder_command.as_deref()) {
@@ -2108,6 +2394,10 @@ fn build_shared_services(
 }
 
 pub async fn run(args: StartArgs) -> Result<(), StartError> {
+    if foreground_start_managed_by_launchd(args.allow_foreground) {
+        return Err(StartError::LaunchdManagedForegroundStart);
+    }
+
     // 1. Build CLI overrides from args.
     let cli_overrides = CliOverrides {
         http: args.bind_addr.map(|a| HttpOverrides { bind_addr: a }),
@@ -2168,7 +2458,8 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
             Ok(t) => t,
             Err(e) => {
                 tracing::error!(error = ?e, "control token bootstrap failed — refusing to boot");
-                return Err(StartError::ControlTokenBootstrap(e.to_string()));
+                let path = crate::lifecycle::control_token::ControlToken::path(&config.paths.home);
+                return Err(StartError::ControlTokenBootstrap { message: e.to_string(), path });
             }
         };
 
@@ -2432,10 +2723,11 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     // 7. Build shared middleware state.
     let kill_switch = Arc::new(KillSwitch::new());
 
-    // 7a. Compile policies from ~/.agentsso/policies/ (seeding default.toml
-    // on first run). Fail-fast per FR15: any compile error exits non-zero
-    // with a multi-line diagnostic naming the offending file and line.
-    let policies_dir = config.paths.home.join("policies");
+    // 7a. Compile policies from the daemon policy directory (seeding
+    // default.toml on first run). Fail-fast per FR15: any compile error
+    // exits non-zero with a multi-line diagnostic naming the offending
+    // file and line.
+    let policies_dir = permitlayer_core::paths::policies_dir(Some(&config.paths.home));
     ensure_policies_dir(&policies_dir)
         .map_err(|source| StartError::PoliciesDir { path: policies_dir.clone(), source })?;
     let compiled_policies = permitlayer_core::policy::PolicySet::compile_from_dir(&policies_dir)
@@ -2674,6 +2966,14 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     .await;
     let proxy_stub_branch_active =
         Arc::new(std::sync::atomic::AtomicBool::new(proxy_service.is_none()));
+    let proxy_route_slots = ProxyRouteSlots::new(proxy_service.as_ref());
+    let proxy_activation = ProxyActivationContext {
+        scrub_engine: scrub_engine.as_ref().map(Arc::clone),
+        audit_store: audit_store.as_ref().map(Arc::clone),
+        master_key: Arc::new(master_key.clone()),
+        vault: Arc::clone(&vault),
+        routes: proxy_route_slots.clone(),
+    };
     let vault_dir_for_reload = config.paths.home.join("vault");
 
     // 7e. Spawn the SIGHUP reload watcher — handles config, policy,
@@ -2693,6 +2993,7 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         Arc::clone(&approval_timeout_atomic),
         Arc::clone(&proxy_stub_branch_active),
         vault_dir_for_reload.clone(),
+        proxy_activation.clone(),
     );
 
     // 7f. Story 5.5: in-process per-agent connection tracker.
@@ -2887,67 +3188,105 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     // front (line ~1695) from `proxy_service.is_none()` so the flag is
     // already in its correct state by the time the SIGHUP watcher was
     // spawned. No additional flip required here.
-    let app = if let Some(proxy) = proxy_service {
-        // Wire real MCP + REST routes.
-        let gmail_mcp = permitlayer_proxy::transport::mcp::mcp_service(Arc::clone(&proxy));
-        let calendar_mcp =
-            permitlayer_proxy::transport::mcp::calendar_mcp_service(Arc::clone(&proxy));
-        let drive_mcp = permitlayer_proxy::transport::mcp::drive_mcp_service(Arc::clone(&proxy));
-        let rest_router = proxy.into_router();
-
-        tracing::info!("proxy service initialized — MCP and REST routes active");
-        // NFR31: CASA Tier 2+ required for restricted-scope services before public release.
-        const CASA_REQUIRED_SERVICES: &[&str] = &["gmail", "drive"];
-        for svc in CASA_REQUIRED_SERVICES {
-            tracing::info!(
-                service = svc,
-                "connector uses restricted scopes — CASA LoV required before public release"
-            );
+    let app = {
+        if proxy_service.is_some() {
+            tracing::info!("proxy service initialized — MCP and REST routes active");
+            // NFR31: CASA Tier 2+ required for restricted-scope services before public release.
+            const CASA_REQUIRED_SERVICES: &[&str] = &["gmail", "drive"];
+            for svc in CASA_REQUIRED_SERVICES {
+                tracing::info!(
+                    service = svc,
+                    "connector uses restricted scopes — CASA LoV required before public release"
+                );
+            }
+        } else {
+            // No credentials yet — the swappable route slots start empty
+            // and serve 501 until SIGHUP can activate them after connect
+            // seals the first credential.
+            tracing::info!("proxy service not available — tool routes will serve 501");
         }
-        // rest_router is Router<()> (stateless — captures Arc<ProxyService> in closures).
-        // Merge it before applying .with_state(state) so axum can coerce it.
+
+        // Route handlers read from ArcSwap slots so a SIGHUP reload can
+        // activate the real proxy after credentials are sealed without
+        // restarting the listener.
         //
-        // `mut` is only needed in debug builds where the
-        // plugin-echo route below reassigns. Release builds compile
-        // out the reassignment, so the `mut` is cfg-gated to keep
-        // `cargo clippy --release` clean. (Pre-7.27 latent warning
-        // caught by the rc.22 release-clippy gate.)
+        // Story 7.33 review fix: split public routes (health + 404 fallback)
+        // out of the middleware chain so unauthenticated unknown paths hit
+        // the JSON 404 body instead of AuthLayer's 401.
         #[cfg(debug_assertions)]
-        let mut router = Router::new()
+        let gmail_slot = Arc::clone(&proxy_route_slots.gmail_mcp);
+        #[cfg(debug_assertions)]
+        let calendar_slot = Arc::clone(&proxy_route_slots.calendar_mcp);
+        #[cfg(debug_assertions)]
+        let drive_slot = Arc::clone(&proxy_route_slots.drive_mcp);
+        #[cfg(debug_assertions)]
+        let proxy_slot = Arc::clone(&proxy_route_slots.proxy);
+        #[cfg(debug_assertions)]
+        let mut protected = Router::new()
             .route("/health", get(health_handler))
             .route("/v1/health", get(health_handler))
-            .nest_service("/mcp", gmail_mcp)
-            .nest_service("/mcp/calendar", calendar_mcp)
-            .nest_service("/mcp/drive", drive_mcp);
+            .route(
+                "/mcp/gmail",
+                any(move |req| dynamic_gmail_mcp_handler(Arc::clone(&gmail_slot), req)),
+            )
+            .route(
+                "/mcp/calendar",
+                any(move |req| dynamic_calendar_mcp_handler(Arc::clone(&calendar_slot), req)),
+            )
+            .route(
+                "/mcp/drive",
+                any(move |req| dynamic_drive_mcp_handler(Arc::clone(&drive_slot), req)),
+            )
+            .route(
+                "/v1/tools/{service}/{*path}",
+                any(move |path, req| dynamic_proxy_handler(Arc::clone(&proxy_slot), path, req)),
+            );
         #[cfg(not(debug_assertions))]
-        let router = Router::new()
+        let gmail_slot = Arc::clone(&proxy_route_slots.gmail_mcp);
+        #[cfg(not(debug_assertions))]
+        let calendar_slot = Arc::clone(&proxy_route_slots.calendar_mcp);
+        #[cfg(not(debug_assertions))]
+        let drive_slot = Arc::clone(&proxy_route_slots.drive_mcp);
+        #[cfg(not(debug_assertions))]
+        let proxy_slot = Arc::clone(&proxy_route_slots.proxy);
+        #[cfg(not(debug_assertions))]
+        let protected = Router::new()
             .route("/health", get(health_handler))
             .route("/v1/health", get(health_handler))
-            .nest_service("/mcp", gmail_mcp)
-            .nest_service("/mcp/calendar", calendar_mcp)
-            .nest_service("/mcp/drive", drive_mcp);
+            .route(
+                "/mcp/gmail",
+                any(move |req| dynamic_gmail_mcp_handler(Arc::clone(&gmail_slot), req)),
+            )
+            .route(
+                "/mcp/calendar",
+                any(move |req| dynamic_calendar_mcp_handler(Arc::clone(&calendar_slot), req)),
+            )
+            .route(
+                "/mcp/drive",
+                any(move |req| dynamic_drive_mcp_handler(Arc::clone(&drive_slot), req)),
+            )
+            .route(
+                "/v1/tools/{service}/{*path}",
+                any(move |path, req| dynamic_proxy_handler(Arc::clone(&proxy_slot), path, req)),
+            );
 
         // Story 6.2 / AC #30: debug-only plugin-eval endpoint.
         // ONLY registered in debug builds — release binaries
         // never expose a plugin-eval surface.
         #[cfg(debug_assertions)]
         {
-            router = router.route("/v1/debug/plugin-echo", post(debug_plugin_echo_handler));
+            protected = protected.route("/v1/debug/plugin-echo", post(debug_plugin_echo_handler));
         }
 
-        router.with_state(state).merge(rest_router).layer(middleware)
-    } else {
-        // No credentials yet — serve 501 stubs.
-        tracing::info!("proxy service not available — tool routes will serve 501");
-        Router::new()
-            .route("/health", get(health_handler))
-            .route("/v1/health", get(health_handler))
-            .route("/mcp", get(not_implemented_handler).post(not_implemented_handler))
-            .route("/mcp/calendar", get(not_implemented_handler).post(not_implemented_handler))
-            .route("/mcp/drive", get(not_implemented_handler).post(not_implemented_handler))
-            .route("/v1/tools/{service}/{*path}", any(not_implemented_handler))
-            .with_state(state)
-            .layer(middleware)
+        let protected = protected.with_state(state.clone()).layer(middleware);
+
+        // Public fallback bypasses the auth middleware so unauthenticated
+        // unknown paths get JSON 404 instead of 401. Health routes stay on
+        // the protected router so KillSwitchLayer still applies (AuthLayer
+        // already bypasses them via is_operational_path).
+        let public = Router::new().fallback(route_not_found_handler).with_state(state);
+
+        protected.merge(public)
     };
 
     // 9a. Merge the control router AFTER `.layer(middleware)` is applied to
@@ -2977,6 +3316,7 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         Arc::clone(&config_state),
         Arc::clone(&cli_overrides),
         Arc::clone(&proxy_stub_branch_active),
+        proxy_activation,
         vault_dir_for_reload,
         Arc::clone(&vault),
         Arc::clone(&control_token),
@@ -3271,7 +3611,8 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     Ok(())
 }
 
-/// Policy file seeded on first run if `~/.agentsso/policies/` does not exist.
+/// Policy file seeded on first run if the daemon policy directory does
+/// not exist.
 ///
 /// Bundled at compile time via `include_str!` from a path inside the
 /// daemon crate — NOT from the workspace `test-fixtures/` directory.
@@ -3530,6 +3871,7 @@ fn render_policy_error(err: &PolicyCompileError) -> String {
 mod tests {
     use super::*;
     use async_trait::async_trait;
+    use axum::body::Body;
     use permitlayer_keystore::{DeleteOutcome, KeyStore, KeyStoreError, MASTER_KEY_LEN};
     use std::sync::Mutex;
     use zeroize::Zeroizing;
@@ -3538,6 +3880,73 @@ mod tests {
 
     use permitlayer_core::store::fs::credential_fs::encode_envelope;
     use permitlayer_credential::{KeyId, SealedCredential};
+
+    #[test]
+    fn start_refuses_when_launchdaemon_plist_present_unless_allowed() {
+        // Manual sudo foreground start + plist present → refuse
+        assert!(foreground_start_collision(false, true, true, false));
+        // --allow-foreground overrides
+        assert!(!foreground_start_collision(true, true, true, false));
+        // Not root → allow
+        assert!(!foreground_start_collision(false, false, true, false));
+        // No plist → allow
+        assert!(!foreground_start_collision(false, true, false, false));
+        // Launchd-managed start (LAUNCHD_SOCKET set) → allow even as root + plist
+        assert!(!foreground_start_collision(false, true, true, true));
+    }
+
+    #[test]
+    fn launchd_managed_foreground_banner_matches_remediation() {
+        let banner = StartError::LaunchdManagedForegroundStart.render_banner();
+        assert_eq!(
+            banner,
+            "daemon is managed by launchd; use 'sudo launchctl kickstart -k system/dev.permitlayer.daemon' instead\n"
+        );
+        assert_ne!(StartError::LaunchdManagedForegroundStart.exit_code(), 0);
+    }
+
+    #[tokio::test]
+    async fn route_error_response_contains_json_body_and_routes() {
+        let req = Request::builder().uri("/mcp/gmail").body(Body::empty()).unwrap();
+        let response = not_implemented_handler(req).await;
+        assert_eq!(response.status(), StatusCode::NOT_IMPLEMENTED);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "route.not_implemented");
+        assert!(json["error"]["request_id"].as_str().is_some_and(|id| id.len() == 26));
+        assert_eq!(json["error"]["available_routes"][0], "/health");
+        assert!(
+            json["error"]["available_routes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|route| route == "/mcp/gmail")
+        );
+    }
+
+    #[tokio::test]
+    async fn route_not_found_response_uses_route_not_found_code() {
+        let req = Request::builder().uri("/mcp").body(Body::empty()).unwrap();
+        let response = route_not_found_handler(req).await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let body = axum::body::to_bytes(response.into_body(), 64 * 1024).await.unwrap();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"]["code"], "route.not_found");
+        assert!(json["error"]["message"].as_str().unwrap().contains("/mcp"));
+    }
+
+    #[test]
+    fn control_token_error_uses_actual_path() {
+        let token_path =
+            std::path::PathBuf::from("/Library/Application Support/permitlayer/control.token");
+        let banner = StartError::ControlTokenBootstrap {
+            message: format!("I/O error on control token file at {}", token_path.display()),
+            path: token_path.clone(),
+        }
+        .render_banner();
+        assert!(banner.contains(&token_path.display().to_string()));
+        assert!(!banner.contains("~/.agentsso/control.token"));
+    }
 
     fn fake_sealed_v2(key_id: u8) -> Vec<u8> {
         let sealed = SealedCredential::from_trusted_bytes(

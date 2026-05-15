@@ -10,12 +10,11 @@ use std::process::Command;
 use anyhow::Result;
 use nix::unistd::Uid;
 
-use super::UninstallArgs;
+use super::{DAEMON_LABEL, LAUNCHD_PLIST_PATH, UninstallArgs};
 use crate::cli::silent_cli_error;
 use crate::design::render::error_block;
 
-const DAEMON_LABEL: &str = "dev.permitlayer.daemon";
-const PLIST_PATH: &str = "/Library/LaunchDaemons/dev.permitlayer.daemon.plist";
+const PLIST_PATH: &str = LAUNCHD_PLIST_PATH;
 const PRIVILEGED_HELPER_PATH: &str = "/Library/PrivilegedHelperTools/agentsso";
 const CLIENTS_GROUP: &str = "permitlayer-clients";
 

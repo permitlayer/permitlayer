@@ -663,7 +663,7 @@ fn test_middleware_ordering() {
     let (mut child, port) = start_daemon(home.path());
     assert!(wait_for_health(port, Duration::from_secs(30)));
 
-    let routes = ["/health", "/v1/health", "/mcp", "/v1/tools/test/test"];
+    let routes = ["/health", "/v1/health", "/mcp/gmail", "/v1/tools/test/test"];
 
     for route in &routes {
         let raw = send_http_request(

@@ -58,6 +58,10 @@ pub enum AgentCommand {
     /// Calendar — without re-pasting a new token into your MCP-client
     /// config.
     Rebind(RebindArgs),
+    /// Atomically rotate an agent's bearer token. The old bearer is
+    /// invalidated immediately after the new token is durably persisted.
+    /// The new plaintext bearer is displayed once on stdout (Story 7.34).
+    Rotate(RotateArgs),
 }
 
 #[derive(Args)]
@@ -65,8 +69,8 @@ pub struct RegisterArgs {
     /// Agent name. Lowercase alphanumeric + hyphen, 2–64 chars, no
     /// leading or trailing hyphen.
     pub name: String,
-    /// Policy to bind the agent to. Must already exist in
-    /// `~/.agentsso/policies/`.
+    /// Policy to bind the agent to. Must already exist in the daemon
+    /// policy directory.
     #[arg(long)]
     pub policy: String,
     /// Output the response as compact JSON to stdout. Mutually exclusive
@@ -89,6 +93,11 @@ pub struct RegisterArgs {
     /// (Story 7.13) which writes 0o644 by design.
     #[arg(long, value_name = "PATH")]
     pub token_out: Option<PathBuf>,
+    /// Allow registration from an effective-root shell with SUDO_USER set.
+    /// Intended only for CI and embedded installs; normal operators should
+    /// run this command from their user shell.
+    #[arg(long)]
+    pub allow_root: bool,
 }
 
 #[derive(Args)]
@@ -100,10 +109,23 @@ pub struct RemoveArgs {
 pub struct RebindArgs {
     /// Name of the agent to rebind.
     pub name: String,
-    /// Policy to rebind the agent to. Must already exist in
-    /// `~/.agentsso/policies/`.
+    /// Policy to rebind the agent to. Must already exist in the daemon
+    /// policy directory.
     #[arg(long)]
     pub policy: String,
+}
+
+#[derive(Args)]
+pub struct RotateArgs {
+    /// Name of the agent to rotate.
+    pub name: String,
+    /// Write only the bearer token bytes (no decoration, no trailing
+    /// newline) to this path with mode 0o600.
+    #[arg(long, value_name = "PATH")]
+    pub token_out: Option<PathBuf>,
+    /// Allow rotation from an effective-root shell with SUDO_USER set.
+    #[arg(long)]
+    pub allow_root: bool,
 }
 
 pub async fn run(args: AgentArgs) -> Result<()> {
@@ -112,7 +134,28 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         AgentCommand::List => list_agents().await,
         AgentCommand::Remove(a) => remove_agent(a).await,
         AgentCommand::Rebind(a) => rebind_agent(a).await,
+        AgentCommand::Rotate(a) => rotate_agent(a).await,
     }
+}
+
+pub(crate) fn policies_dir_remediation(home: &std::path::Path) -> String {
+    let policies_dir = permitlayer_core::paths::policies_dir(Some(home));
+    format!("edit {} then `agentsso reload`", policies_dir.display())
+}
+
+fn register_root_guard_for(
+    args: &RegisterArgs,
+    effective_uid: u32,
+    sudo_user: Option<&str>,
+) -> Result<()> {
+    let register_hint = format!("agentsso agent register {} --policy {}", args.name, args.policy);
+    crate::cli::root_guard::ensure_not_sudo_root_shell_with(
+        "register agent",
+        &register_hint,
+        args.allow_root,
+        effective_uid,
+        sudo_user,
+    )
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -131,6 +174,8 @@ struct RegisterResponseJson {
     name: String,
     policy_name: String,
     bearer_token: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer_uid: Option<u32>,
 }
 
 /// Story 7.17 Task 1.5: typed JSON-render shape for `--json` error responses.
@@ -144,7 +189,15 @@ struct RegisterErrorJson {
 }
 
 async fn register_agent(args: RegisterArgs) -> Result<()> {
+    #[cfg(unix)]
+    register_root_guard_for(
+        &args,
+        nix::unistd::geteuid().as_raw(),
+        std::env::var("SUDO_USER").ok().as_deref(),
+    )?;
+
     let config = load_daemon_config_or_default_with_warn("agent register");
+    let home = config.paths.home.clone();
 
     // No PID-file pre-check here. The daemon may be running under a
     // different OS user (intentional architecture: vault-holder runs as
@@ -216,9 +269,7 @@ async fn register_agent(args: RegisterArgs) -> Result<()> {
         } else {
             let suggested = match code.as_str() {
                 "agent.duplicate_name" => format!("agentsso agent remove {}", args.name),
-                "agent.unknown_policy" => {
-                    "edit ~/.agentsso/policies/ then `agentsso reload`".to_owned()
-                }
+                "agent.unknown_policy" => policies_dir_remediation(&home),
                 // Story 1.15 removed `agent.no_master_key` — the master
                 // key is now eagerly bootstrapped at daemon start, so
                 // this code can no longer be emitted by the daemon.
@@ -245,6 +296,7 @@ async fn register_agent(args: RegisterArgs) -> Result<()> {
     let name = parsed["name"].as_str().unwrap_or(&args.name).to_owned();
     let policy_name = parsed["policy_name"].as_str().unwrap_or(&args.policy).to_owned();
     let token = parsed["bearer_token"].as_str().unwrap_or("").to_owned();
+    let peer_uid = parsed["peer_uid"].as_u64().and_then(|uid| u32::try_from(uid).ok());
 
     if token.is_empty() {
         eprint!("{}", error_block_protocol_error());
@@ -255,9 +307,9 @@ async fn register_agent(args: RegisterArgs) -> Result<()> {
     // extraction. All three paths consume the same source values — there
     // is no parallel-parse drift between them.
     if args.json {
-        render_register_json(&name, &policy_name, &token);
+        render_register_json(&name, &policy_name, &token, peer_uid);
     } else if let Some(path) = args.token_out.as_deref() {
-        if let Err(e) = render_register_token_file(&name, &policy_name, &token, path) {
+        if let Err(e) = render_register_token_file(&name, &policy_name, &token, peer_uid, path) {
             tracing::debug!(error = %e, path = %path.display(), "--token-out write failed");
             let kind = e.kind();
             let (code, msg, remediation) = match kind {
@@ -284,18 +336,18 @@ async fn register_agent(args: RegisterArgs) -> Result<()> {
             std::process::exit(4);
         }
     } else {
-        render_register_success(&name, &policy_name, &token);
+        render_register_success(&name, &policy_name, &token, peer_uid);
     }
     Ok(())
 }
 
-fn render_register_success(name: &str, policy_name: &str, token: &str) {
+fn render_register_success(name: &str, policy_name: &str, token: &str, peer_uid: Option<u32>) {
     // The output is intentionally plain — operators screenshot this
     // line to share with teammates, and ANSI codes hurt the share.
     // Use a single triple-clickable line for the token so it's easy
     // to copy without picking up adjacent whitespace.
     println!();
-    println!("✓ agent '{name}' registered → policy '{policy_name}'");
+    println!("✓ agent '{name}' registered → policy '{policy_name}'{}", owner_suffix(peer_uid));
     println!();
     println!("  bearer token (shown once, save it now):");
     println!();
@@ -316,12 +368,13 @@ fn render_register_success(name: &str, policy_name: &str, token: &str) {
 /// detail — line-oriented pipelines (`while read line; do jq … <<<"$line"; done`)
 /// and JSONL collectors (Vector, Fluent Bit) tolerate one record per line
 /// only.
-fn render_register_json(name: &str, policy_name: &str, token: &str) {
+fn render_register_json(name: &str, policy_name: &str, token: &str, peer_uid: Option<u32>) {
     let payload = RegisterResponseJson {
         status: "ok",
         name: name.to_owned(),
         policy_name: policy_name.to_owned(),
         bearer_token: token.to_owned(),
+        peer_uid,
     };
     match serde_json::to_string(&payload) {
         Ok(s) => println!("{s}"),
@@ -347,6 +400,7 @@ fn render_register_token_file(
     name: &str,
     policy_name: &str,
     token: &str,
+    peer_uid: Option<u32>,
     path: &std::path::Path,
 ) -> std::io::Result<()> {
     crate::cli::atomic_write::write_atomic_with_mode(path, token.as_bytes(), 0o600)?;
@@ -354,10 +408,33 @@ fn render_register_token_file(
     // confirm the policy bound at register-time without re-querying the
     // daemon.
     println!();
-    println!("✓ agent '{name}' registered → policy '{policy_name}'");
+    println!("✓ agent '{name}' registered → policy '{policy_name}'{}", owner_suffix(peer_uid));
     println!("  bearer token written to {} (mode 0o600)", path.display());
     println!();
     Ok(())
+}
+
+fn owner_suffix(peer_uid: Option<u32>) -> String {
+    let Some(uid) = peer_uid else {
+        return String::new();
+    };
+    match username_for_uid(uid) {
+        Some(name) => format!(" (owner: uid={uid} {name})"),
+        None => format!(" (owner: uid={uid})"),
+    }
+}
+
+#[cfg(unix)]
+fn username_for_uid(uid: u32) -> Option<String> {
+    nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+        .ok()
+        .flatten()
+        .map(|user| user.name)
+}
+
+#[cfg(not(unix))]
+fn username_for_uid(_uid: u32) -> Option<String> {
+    None
 }
 
 async fn list_agents() -> Result<()> {
@@ -610,9 +687,7 @@ async fn rebind_agent(args: RebindArgs) -> Result<()> {
         let code = parsed["code"].as_str().unwrap_or("agent.unknown_error").to_owned();
         let message = parsed["message"].as_str().unwrap_or("(no message provided)").to_owned();
         let suggested = match code.as_str() {
-            "agent.unknown_policy" => {
-                "edit ~/.agentsso/policies/ then `agentsso reload`".to_owned()
-            }
+            "agent.unknown_policy" => policies_dir_remediation(&home),
             "agent.not_found" => format!(
                 "register the agent first: agentsso agent register {} --policy={}",
                 args.name, args.policy
@@ -669,6 +744,122 @@ async fn rebind_agent(args: RebindArgs) -> Result<()> {
     println!("✓ agent '{name}' rebound → policy '{policy_name}'");
     println!("  (bearer token unchanged — your MCP-client config does NOT need to be updated)");
     println!();
+
+    Ok(())
+}
+
+/// `agentsso agent rotate <name>` — atomically mint a new bearer token
+/// and invalidate the old one (Story 7.34).
+async fn rotate_agent(args: RotateArgs) -> Result<()> {
+    #[cfg(unix)]
+    {
+        let rotate_hint = format!("agentsso agent rotate {}", args.name);
+        crate::cli::root_guard::ensure_not_sudo_root_shell_with(
+            "rotate agent",
+            &rotate_hint,
+            args.allow_root,
+            nix::unistd::geteuid().as_raw(),
+            std::env::var("SUDO_USER").ok().as_deref(),
+        )?;
+    }
+
+    let config = load_daemon_config_or_default_with_warn("agent rotate");
+    let home = config.paths.home.clone();
+
+    let body = serde_json::json!({ "name": args.name }).to_string();
+    let endpoint = resolve_control_endpoint(&config);
+    let token = crate::cli::kill::read_control_token(&home);
+    let url = format!("/v1/control/agent/{}/rotate", args.name);
+    let response = match http_post_json_via(&endpoint, &url, &body, token.as_deref()).await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::debug!(error = %e, endpoint = %endpoint, "agent rotate request failed");
+            eprint!("{}", error_block_daemon_unreachable_endpoint("agent rotate", &endpoint));
+            std::process::exit(3);
+        }
+    };
+
+    let parsed: serde_json::Value = match serde_json::from_str(&response) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(error = %e, body = %response, "unexpected agent rotate response");
+            eprint!("{}", error_block_protocol_error());
+            std::process::exit(3);
+        }
+    };
+
+    let status = parsed["status"].as_str();
+    if status == Some("error") {
+        let code = parsed["code"].as_str().unwrap_or("agent.unknown_error").to_owned();
+        let message = parsed["message"].as_str().unwrap_or("(no message provided)").to_owned();
+        let suggested = match code.as_str() {
+            "agent.not_found" => format!(
+                "register the agent first: agentsso agent register {} --policy=<policy>",
+                args.name
+            ),
+            "agent.rate_limited" => "wait briefly and retry".to_owned(),
+            _ => "see message above".to_owned(),
+        };
+        eprint!("{}", error_block(&code, &message, &suggested, None));
+        std::process::exit(agent_control_exit_code(&code));
+    } else if status != Some("ok") {
+        tracing::debug!(body = %response, "unexpected agent rotate response: status was neither 'ok' nor 'error'");
+        eprint!("{}", error_block_protocol_error());
+        std::process::exit(3);
+    }
+
+    let name = parsed["name"].as_str().unwrap_or(&args.name).to_owned();
+    let bearer_token = parsed["bearer_token"].as_str().unwrap_or("").to_owned();
+    if bearer_token.is_empty() {
+        eprint!("{}", error_block_protocol_error());
+        std::process::exit(3);
+    }
+
+    if let Some(path) = args.token_out.as_deref() {
+        if let Err(e) =
+            crate::cli::atomic_write::write_atomic_with_mode(path, bearer_token.as_bytes(), 0o600)
+        {
+            tracing::debug!(error = %e, path = %path.display(), "rotate --token-out write failed");
+            let kind = e.kind();
+            let (code, msg, remediation) = match kind {
+                std::io::ErrorKind::NotFound => (
+                    "agent.token_out_parent_missing",
+                    format!("parent directory does not exist: {}", path.display()),
+                    "create the parent directory or pick a different path".to_owned(),
+                ),
+                std::io::ErrorKind::InvalidInput => (
+                    "agent.token_out_invalid_path",
+                    format!("refusing to write token: {e}"),
+                    "remove the existing symlink or pick a different path".to_owned(),
+                ),
+                _ => (
+                    "agent.token_out_write_failed",
+                    format!("could not write bearer token to {}: {e}", path.display()),
+                    "check the parent directory's permissions and disk space".to_owned(),
+                ),
+            };
+            eprint!("{}", error_block(code, &msg, &remediation, None));
+            std::process::exit(4);
+        }
+        println!();
+        println!("✓ agent '{name}' rotated — old bearer invalidated");
+        println!("  new bearer token written to {} (mode 0o600)", path.display());
+        println!();
+    } else {
+        println!();
+        println!("✓ agent '{name}' rotated — old bearer invalidated");
+        println!();
+        println!("  new bearer token (shown once, save it now):");
+        println!();
+        println!("    {bearer_token}");
+        println!();
+        println!("  set this on your agent's HTTP requests:");
+        println!();
+        println!("    Authorization: Bearer {bearer_token}");
+        println!();
+        println!("  this token will not be shown again.");
+        println!();
+    }
 
     Ok(())
 }
@@ -744,6 +935,7 @@ mod tests {
             AgentCommand::Register(r) => {
                 assert_eq!(r.name, "email-triage");
                 assert_eq!(r.policy, "email-read-only");
+                assert!(!r.allow_root);
             }
             _ => panic!("expected Register variant"),
         }
@@ -858,6 +1050,7 @@ mod tests {
             AgentCommand::Register(r) => {
                 assert!(r.json);
                 assert!(r.token_out.is_none());
+                assert!(!r.allow_root);
             }
             _ => panic!("expected Register variant"),
         }
@@ -876,6 +1069,7 @@ mod tests {
             AgentCommand::Register(r) => {
                 assert!(!r.json);
                 assert_eq!(r.token_out.as_deref(), Some(std::path::Path::new("/tmp/agent.tok")));
+                assert!(!r.allow_root);
             }
             _ => panic!("expected Register variant"),
         }
@@ -896,6 +1090,57 @@ mod tests {
     }
 
     #[test]
+    fn register_args_allow_root_flag_parses() {
+        let parsed = CliWrapper::parse_from([
+            "agent",
+            "register",
+            "ci-test",
+            "--policy=default",
+            "--allow-root",
+        ]);
+        match parsed.cmd {
+            AgentCommand::Register(r) => assert!(r.allow_root),
+            _ => panic!("expected Register variant"),
+        }
+    }
+
+    // Story 7.33 review fix: command-level guard coverage. The root-guard
+    // helper tests in root_guard.rs pass even if the register_agent call
+    // site stops invoking the guard. This test pins the composition of
+    // RegisterArgs + the guard so a future refactor can't drop the call.
+    #[test]
+    fn register_guard_refuses_root_shell_before_daemon_contact() {
+        let args = RegisterArgs {
+            name: "ci-test".to_owned(),
+            policy: "default".to_owned(),
+            json: false,
+            token_out: None,
+            allow_root: false,
+        };
+        let result = register_root_guard_for(&args, 0, Some("testuser"));
+        assert!(
+            result.is_err(),
+            "register_root_guard_for must refuse root+SUDO_USER before any daemon contact"
+        );
+    }
+
+    #[test]
+    fn register_guard_allows_root_when_explicitly_requested() {
+        let args = RegisterArgs {
+            name: "ci-test".to_owned(),
+            policy: "default".to_owned(),
+            json: false,
+            token_out: None,
+            allow_root: true,
+        };
+        let result = register_root_guard_for(&args, 0, Some("testuser"));
+        assert!(
+            result.is_ok(),
+            "register_root_guard_for must allow root when --allow-root is passed"
+        );
+    }
+
+    #[test]
     fn register_response_json_serializes_compact_single_line() {
         // Story 7.17 Task 1.7: assert the wire shape pipelines depend on.
         let payload = RegisterResponseJson {
@@ -903,6 +1148,7 @@ mod tests {
             name: "ci-test".to_owned(),
             policy_name: "default".to_owned(),
             bearer_token: "agt_v2_abc".to_owned(),
+            peer_uid: Some(501),
         };
         let s = serde_json::to_string(&payload).unwrap();
         // Single-line: no embedded newlines.
@@ -916,6 +1162,27 @@ mod tests {
         assert_eq!(parsed["name"], "ci-test");
         assert_eq!(parsed["policy_name"], "default");
         assert_eq!(parsed["bearer_token"], "agt_v2_abc");
+        assert_eq!(parsed["peer_uid"], 501);
+    }
+
+    #[test]
+    fn register_response_json_omits_peer_uid_when_absent() {
+        let payload = RegisterResponseJson {
+            status: "ok",
+            name: "ci-test".to_owned(),
+            policy_name: "default".to_owned(),
+            bearer_token: "agt_v2_abc".to_owned(),
+            peer_uid: None,
+        };
+        let s = serde_json::to_string(&payload).unwrap();
+        assert!(!s.contains("peer_uid"), "peer_uid should stay additive and optional: {s}");
+    }
+
+    #[test]
+    fn owner_suffix_falls_back_to_uid_when_username_lookup_fails() {
+        if username_for_uid(u32::MAX).is_none() {
+            assert_eq!(owner_suffix(Some(u32::MAX)), format!(" (owner: uid={})", u32::MAX));
+        }
     }
 
     #[test]

@@ -170,18 +170,20 @@ see [Troubleshooting](#troubleshooting).
 
 ## Point your MCP client at agentsso
 
-MCP clients connect to `http://127.0.0.1:3820/mcp` with transport
-`streamable-http` and authenticate via the bearer token from
-`~/.agentsso/agent-bearer.token`. The exact config syntax depends on
-your client:
+MCP clients connect with transport `streamable-http` and authenticate
+via the bearer token from `~/.agentsso/agent-bearer.token`. Gmail uses
+`http://127.0.0.1:3820/mcp/gmail`; Calendar and Drive use
+`http://127.0.0.1:3820/mcp/calendar` and
+`http://127.0.0.1:3820/mcp/drive`. Bare `/mcp` is not a route.
+The exact config syntax depends on your client:
 
 - **OpenClaw**: in your `~/.openclaw/config.json`, set the MCP
   server's `transport` to `streamable-http` and `url` to
-  `http://127.0.0.1:3820/mcp`. Read the bearer token via shell
+  `http://127.0.0.1:3820/mcp/gmail`. Read the bearer token via shell
   substitution or paste it directly.
 - **Claude Desktop**: in the MCP servers section of the desktop
   app's settings, add a `streamable-http` transport pointed at
-  `http://127.0.0.1:3820/mcp`.
+  `http://127.0.0.1:3820/mcp/gmail`.
 - **Cursor**: same pattern — `streamable-http` transport at port
   3820.
 

@@ -503,7 +503,7 @@ fn main_endpoints_still_blocked_while_killed() {
         200
     );
 
-    for path in ["/health", "/v1/health", "/mcp"] {
+    for path in ["/health", "/v1/health", "/mcp/gmail"] {
         let raw = send_http_request(
             port,
             &format!("GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nConnection: close\r\n\r\n"),

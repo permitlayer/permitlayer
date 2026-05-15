@@ -261,6 +261,8 @@ fn derive_service_from_path(path: &str) -> &'static str {
         "calendar"
     } else if match_segment(path, "/v1/tools/drive") {
         "drive"
+    } else if match_segment(path, "/mcp/gmail") {
+        "gmail"
     } else if match_segment(path, "/mcp/calendar") {
         "calendar"
     } else if match_segment(path, "/mcp/drive") {
@@ -479,6 +481,8 @@ mod tests {
     fn derive_service_from_path_mcp_gmail_default() {
         assert_eq!(derive_service_from_path("/mcp"), "gmail");
         assert_eq!(derive_service_from_path("/mcp/"), "gmail");
+        assert_eq!(derive_service_from_path("/mcp/gmail"), "gmail");
+        assert_eq!(derive_service_from_path("/mcp/gmail/some-method"), "gmail");
     }
 
     #[test]

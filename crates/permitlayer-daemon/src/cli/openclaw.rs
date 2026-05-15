@@ -31,7 +31,10 @@
 //! {
 //!   "transport": "streamable-http",
 //!   "url": "http://127.0.0.1:3820/mcp/<service>",
-//!   "headers": { "Authorization": "Bearer <token>" }
+//!   "headers": {
+//!     "Authorization": "Bearer <token>",
+//!     "x-agentsso-scope": "<default-scope>"
+//!   }
 //! }
 //! ```
 //!
@@ -53,12 +56,14 @@ pub(crate) fn build_snippet(
     service: &str,
     bearer_token: &str,
     addr: SocketAddr,
+    default_scope: &str,
 ) -> serde_json::Value {
     serde_json::json!({
         "transport": "streamable-http",
         "url": format!("http://{}/mcp/{}", addr, service),
         "headers": {
             "Authorization": format!("Bearer {}", bearer_token),
+            "x-agentsso-scope": default_scope,
         },
     })
 }
@@ -187,28 +192,42 @@ mod tests {
     #[test]
     fn snippet_has_streamable_http_transport() {
         let addr: SocketAddr = "127.0.0.1:3820".parse().unwrap();
-        let snippet = build_snippet("gmail", "agt_v2_test_xxx", addr);
+        let snippet = build_snippet("gmail", "agt_v2_test_xxx", addr, "gmail.readonly");
         assert_eq!(snippet["transport"], "streamable-http");
     }
 
     #[test]
     fn snippet_url_includes_service_path() {
         let addr: SocketAddr = "127.0.0.1:3820".parse().unwrap();
-        let snippet = build_snippet("calendar", "agt_v2_test_xxx", addr);
+        let snippet = build_snippet("calendar", "agt_v2_test_xxx", addr, "calendar.readonly");
         assert_eq!(snippet["url"], "http://127.0.0.1:3820/mcp/calendar");
     }
 
     #[test]
     fn snippet_authorization_header_uses_bearer_prefix() {
         let addr: SocketAddr = "127.0.0.1:3820".parse().unwrap();
-        let snippet = build_snippet("drive", "agt_v2_alice_secret", addr);
+        let snippet = build_snippet("drive", "agt_v2_alice_secret", addr, "drive.file");
         assert_eq!(snippet["headers"]["Authorization"], "Bearer agt_v2_alice_secret");
+    }
+
+    #[test]
+    fn snippet_includes_scope_header() {
+        let addr: SocketAddr = "127.0.0.1:3820".parse().unwrap();
+        let snippet = build_snippet("gmail", "agt_v2_alice_secret", addr, "gmail.readonly");
+        assert_eq!(snippet["headers"]["x-agentsso-scope"], "gmail.readonly");
+    }
+
+    #[test]
+    fn snippet_uses_passed_first_policy_scope() {
+        let addr: SocketAddr = "127.0.0.1:3820".parse().unwrap();
+        let snippet = build_snippet("calendar", "agt_v2_alice_secret", addr, "calendar.readonly");
+        assert_eq!(snippet["headers"]["x-agentsso-scope"], "calendar.readonly");
     }
 
     #[test]
     fn snippet_round_trips_through_serde_json() {
         let addr: SocketAddr = "127.0.0.1:3820".parse().unwrap();
-        let snippet = build_snippet("gmail", "tok", addr);
+        let snippet = build_snippet("gmail", "tok", addr, "gmail.readonly");
         let s = serde_json::to_string(&snippet).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed["transport"], "streamable-http");

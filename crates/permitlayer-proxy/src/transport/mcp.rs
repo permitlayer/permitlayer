@@ -444,6 +444,11 @@ impl rmcp::ServerHandler for GmailMcpServer {
     }
 }
 
+pub type GmailMcpService = rmcp::transport::streamable_http_server::tower::StreamableHttpService<
+    GmailMcpServer,
+    rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
+>;
+
 /// Build an MCP service for the Gmail connector.
 ///
 /// Tool method bodies extract the bearer-authenticated agent identity
@@ -453,13 +458,8 @@ impl rmcp::ServerHandler for GmailMcpServer {
 ///
 /// The returned service implements `tower::Service<Request<Body>>`
 /// and can be mounted into axum via
-/// `Router::new().nest_service("/mcp", service)`.
-pub fn mcp_service(
-    proxy_service: Arc<ProxyService>,
-) -> rmcp::transport::streamable_http_server::tower::StreamableHttpService<
-    GmailMcpServer,
-    rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
-> {
+/// `Router::new().nest_service("/mcp/gmail", service)`.
+pub fn mcp_service(proxy_service: Arc<ProxyService>) -> GmailMcpService {
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager,
         tower::{StreamableHttpServerConfig, StreamableHttpService},
@@ -733,14 +733,14 @@ impl rmcp::ServerHandler for CalendarMcpServer {
     }
 }
 
-/// Build an MCP service for the Calendar connector. See [`mcp_service`]
-/// for the agent-identity propagation rationale.
-pub fn calendar_mcp_service(
-    proxy_service: Arc<ProxyService>,
-) -> rmcp::transport::streamable_http_server::tower::StreamableHttpService<
+pub type CalendarMcpService = rmcp::transport::streamable_http_server::tower::StreamableHttpService<
     CalendarMcpServer,
     rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
-> {
+>;
+
+/// Build an MCP service for the Calendar connector. See [`mcp_service`]
+/// for the agent-identity propagation rationale.
+pub fn calendar_mcp_service(proxy_service: Arc<ProxyService>) -> CalendarMcpService {
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager,
         tower::{StreamableHttpServerConfig, StreamableHttpService},
@@ -1014,14 +1014,14 @@ impl rmcp::ServerHandler for DriveMcpServer {
     }
 }
 
-/// Build an MCP service for the Drive connector. See [`mcp_service`]
-/// for the agent-identity propagation rationale.
-pub fn drive_mcp_service(
-    proxy_service: Arc<ProxyService>,
-) -> rmcp::transport::streamable_http_server::tower::StreamableHttpService<
+pub type DriveMcpService = rmcp::transport::streamable_http_server::tower::StreamableHttpService<
     DriveMcpServer,
     rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
-> {
+>;
+
+/// Build an MCP service for the Drive connector. See [`mcp_service`]
+/// for the agent-identity propagation rationale.
+pub fn drive_mcp_service(proxy_service: Arc<ProxyService>) -> DriveMcpService {
     use rmcp::transport::streamable_http_server::{
         session::local::LocalSessionManager,
         tower::{StreamableHttpServerConfig, StreamableHttpService},

@@ -446,7 +446,10 @@ impl ProxyError {
                      to bind this agent's bearer token to a policy."
                         .to_owned()
                 } else {
-                    format!("Edit ~/.agentsso/policies/{policy_name}.toml")
+                    let home_override = permitlayer_core::paths::home_override();
+                    let policies_dir =
+                        permitlayer_core::paths::policies_dir(home_override.as_deref());
+                    format!("Edit {}/{policy_name}.toml", policies_dir.display())
                 };
                 (None, None, Some(remediation), None)
             }
@@ -702,9 +705,10 @@ mod tests {
         assert_eq!(json["error"]["denied_scope"], "gmail.modify");
         assert!(json["error"]["denied_resource"].is_null());
         assert_eq!(json["error"]["request_id"], "01TESTPV");
-        // Remediation should point at the policy file.
+        // Remediation should point at the daemon policy file.
         let remediation = json["error"]["remediation"].as_str().unwrap();
         assert!(remediation.contains("gmail-read-only.toml"));
+        assert!(!remediation.contains("~/.agentsso/policies"));
     }
 
     #[tokio::test]

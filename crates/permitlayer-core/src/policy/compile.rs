@@ -57,6 +57,11 @@ pub struct PolicySet {
     /// pre-hashed lookup structure AC #3 calls for — O(1) contains
     /// checks in the hot path with no allocation when the lookup hits.
     policies: HashMap<String, CompiledPolicy>,
+    /// Map from policy name → the file path it was compiled from.
+    /// Populated by `compile_from_dir` and `compile_from_str` so the
+    /// control plane can answer `policy list` with real source paths.
+    /// Story 7.34 AC #3.
+    origins: HashMap<String, PathBuf>,
 }
 
 /// One policy in the compiled IR.
@@ -106,6 +111,35 @@ impl CompiledPolicy {
         }
         scope.ends_with(".readonly") || scope.ends_with(".metadata")
     }
+
+    /// Serialize back to the TOML schema representation.
+    ///
+    /// Story 7.34 AC #1: `policy show` needs to emit the resolved
+    /// in-memory policy as TOML. Reverse-mapping preserves every field
+    /// the parser normalised, including defaults.
+    #[must_use]
+    pub fn to_toml_policy(&self) -> super::schema::TomlPolicy {
+        let mut scopes: Vec<String> = self.scope_allowlist.iter().cloned().collect();
+        scopes.sort();
+        let resources = match &self.resource_allowlist {
+            ResourceMatcher::All => vec!["*".to_owned()],
+            ResourceMatcher::Allowlist(set) => {
+                let mut v: Vec<String> = set.iter().cloned().collect();
+                v.sort();
+                v
+            }
+        };
+        let rules: Vec<super::schema::TomlRule> =
+            self.compiled_rules.iter().map(|r| r.to_toml_rule()).collect();
+        super::schema::TomlPolicy {
+            name: self.name.clone(),
+            scopes,
+            resources,
+            approval_mode: self.approval_mode.into(),
+            rules,
+            auto_approve_reads: self.auto_approve_reads,
+        }
+    }
 }
 
 /// One rule in the compiled IR.
@@ -121,6 +155,34 @@ pub struct CompiledRule {
     pub resource_overrides: Option<ResourceMatcher>,
     /// What happens when this rule matches.
     pub action: RuleAction,
+}
+
+impl CompiledRule {
+    /// Serialize back to the TOML schema representation.
+    ///
+    /// Story 7.34 AC #1: `policy show` needs to emit the resolved
+    /// in-memory policy as TOML. Reverse-mapping preserves every field
+    /// the parser normalised.
+    #[must_use]
+    pub fn to_toml_rule(&self) -> super::schema::TomlRule {
+        super::schema::TomlRule {
+            id: self.id.clone(),
+            scopes: self.scope_overrides.as_ref().map(|s| {
+                let mut v: Vec<String> = s.iter().cloned().collect();
+                v.sort();
+                v
+            }),
+            resources: self.resource_overrides.as_ref().map(|r| match r {
+                ResourceMatcher::All => vec!["*".to_owned()],
+                ResourceMatcher::Allowlist(set) => {
+                    let mut v: Vec<String> = set.iter().cloned().collect();
+                    v.sort();
+                    v
+                }
+            }),
+            action: self.action.into(),
+        }
+    }
 }
 
 /// Rule-level action. 1:1 with `schema::TomlRuleAction` but lives
@@ -141,6 +203,16 @@ impl From<TomlRuleAction> for RuleAction {
             TomlRuleAction::Allow => Self::Allow,
             TomlRuleAction::Prompt => Self::Prompt,
             TomlRuleAction::Deny => Self::Deny,
+        }
+    }
+}
+
+impl From<RuleAction> for TomlRuleAction {
+    fn from(v: RuleAction) -> Self {
+        match v {
+            RuleAction::Allow => Self::Allow,
+            RuleAction::Prompt => Self::Prompt,
+            RuleAction::Deny => Self::Deny,
         }
     }
 }
@@ -214,6 +286,16 @@ impl PolicySet {
         self.policies.get(name)
     }
 
+    /// Look up the origin path for a policy by name.
+    ///
+    /// Story 7.34 AC #3: the control plane needs to report which file
+    /// each policy came from. Returns `None` when the policy is not in
+    /// the set or when the set was built without origin tracking.
+    #[must_use]
+    pub fn origin(&self, name: &str) -> Option<&PathBuf> {
+        self.origins.get(name)
+    }
+
     /// Compile every `*.toml` file in `dir` into a single `PolicySet`.
     ///
     /// Files are processed in alphabetical order so error output is
@@ -285,6 +367,7 @@ impl PolicySet {
             }
         }
 
+        set.origins = origin_for_name;
         Ok(set)
     }
 
@@ -315,7 +398,9 @@ impl PolicySet {
                 });
             }
             let compiled = compile_one(raw, origin)?;
-            set.policies.insert(compiled.name.clone(), compiled);
+            let name = compiled.name.clone();
+            set.policies.insert(name.clone(), compiled);
+            set.origins.insert(name, origin.to_path_buf());
         }
         Ok(set)
     }
@@ -1947,5 +2032,83 @@ mod tests {
             matches!(err, PolicyCompileError::BomDetected { .. }),
             "expected BomDetected error from compile_from_str, got: {err:?}"
         );
+    }
+
+    // Story 7.34: origin tracking and reverse serialization tests.
+
+    #[test]
+    fn compile_from_str_tracks_origin() {
+        let origin = std::path::Path::new("/test/a.toml");
+        let set = PolicySet::compile_from_str(GMAIL_READ_ONLY, origin).unwrap();
+        assert_eq!(set.origin("gmail-read-only"), Some(&origin.to_path_buf()));
+    }
+
+    #[test]
+    fn compile_from_str_multi_policy_tracks_each_origin() {
+        let src = r#"
+            [[policies]]
+            name = "p1"
+            scopes = ["a"]
+            resources = ["*"]
+            approval-mode = "auto"
+
+            [[policies]]
+            name = "p2"
+            scopes = ["b"]
+            resources = ["*"]
+            approval-mode = "auto"
+        "#;
+        let origin = std::path::Path::new("/test/default.toml");
+        let set = PolicySet::compile_from_str(src, origin).unwrap();
+        assert_eq!(set.origin("p1"), Some(&origin.to_path_buf()));
+        assert_eq!(set.origin("p2"), Some(&origin.to_path_buf()));
+    }
+
+    #[test]
+    fn to_toml_policy_round_trip() {
+        let origin = std::path::Path::new("/test/a.toml");
+        let set = PolicySet::compile_from_str(GMAIL_READ_ONLY, origin).unwrap();
+        let compiled = set.get("gmail-read-only").unwrap();
+        let toml = compiled.to_toml_policy();
+        assert_eq!(toml.name, "gmail-read-only");
+        assert_eq!(toml.scopes, vec!["gmail.metadata", "gmail.readonly"]);
+        assert_eq!(toml.resources, vec!["*"]);
+        assert_eq!(toml.approval_mode, super::super::schema::TomlApprovalMode::Auto);
+        assert!(!toml.auto_approve_reads);
+    }
+
+    #[test]
+    fn to_toml_policy_with_rules_round_trip() {
+        let src = r#"
+            [[policies]]
+            name = "calendar-prompt"
+            scopes = ["calendar.readonly", "calendar.events"]
+            resources = ["primary"]
+            approval-mode = "prompt"
+            auto-approve-reads = true
+
+            [[policies.rules]]
+            id = "allow-reads"
+            scopes = ["calendar.readonly"]
+            action = "allow"
+
+            [[policies.rules]]
+            id = "deny-deletes"
+            action = "deny"
+        "#;
+        let set = PolicySet::compile_from_str(src, &p("c")).unwrap();
+        let compiled = set.get("calendar-prompt").unwrap();
+        let toml = compiled.to_toml_policy();
+        assert_eq!(toml.name, "calendar-prompt");
+        assert_eq!(toml.approval_mode, super::super::schema::TomlApprovalMode::Prompt);
+        assert!(toml.auto_approve_reads);
+        assert_eq!(toml.rules.len(), 2);
+        assert_eq!(toml.rules[0].id, "allow-reads");
+        assert_eq!(toml.rules[0].scopes, Some(vec!["calendar.readonly".to_owned()]));
+        assert_eq!(toml.rules[0].action, super::super::schema::TomlRuleAction::Allow);
+        assert_eq!(toml.rules[1].id, "deny-deletes");
+        assert_eq!(toml.rules[1].scopes, None);
+        assert_eq!(toml.rules[1].resources, None);
+        assert_eq!(toml.rules[1].action, super::super::schema::TomlRuleAction::Deny);
     }
 }

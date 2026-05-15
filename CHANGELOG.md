@@ -24,7 +24,12 @@ is required when a method is dropped in a major bump.
 
 ## [Unreleased]
 
-_No unreleased host-API changes yet._
+### Changed
+
+- **agentsso MCP routing for rc.24:** Gmail MCP clients must use
+  `http://127.0.0.1:3820/mcp/gmail`; bare `/mcp` is no longer a
+  route. Calendar remains `/mcp/calendar`, and Drive remains
+  `/mcp/drive`.
 
 ## [1.0.0-rc.1] - 2026-04-18
 

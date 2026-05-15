@@ -271,10 +271,24 @@ approval-mode = "prompt"
 auto-approve-reads = true
 "#;
 
+const POLICY_GMAIL_READONLY_TOML: &str = r#"
+[[policies]]
+name = "gmail-read-only"
+scopes = ["gmail.readonly"]
+resources = ["*"]
+approval-mode = "auto"
+"#;
+
 fn seed_prompt_policy(home: &std::path::Path) {
     let policies_dir = home.join("policies");
     std::fs::create_dir_all(&policies_dir).unwrap();
     std::fs::write(policies_dir.join("prompt.toml"), POLICY_PROMPT_TOML).unwrap();
+}
+
+fn seed_gmail_readonly_policy(home: &std::path::Path) {
+    let policies_dir = home.join("policies");
+    std::fs::create_dir_all(&policies_dir).unwrap();
+    std::fs::write(policies_dir.join("gmail.toml"), POLICY_GMAIL_READONLY_TOML).unwrap();
 }
 
 fn seed_prompt_with_reads_policy(home: &std::path::Path) {
@@ -315,6 +329,47 @@ fn register_agent(port: u16, home: &std::path::Path, name: &str, policy: &str) -
     assert_eq!(status, 200, "register should succeed: {resp_body}");
     let parsed: serde_json::Value = serde_json::from_str(&resp_body).unwrap();
     parsed["bearer_token"].as_str().unwrap().to_owned()
+}
+
+fn seal_gmail_credential(port: u16, home: &std::path::Path, agent: &str) {
+    let ctl = crate::common::read_test_control_token(home);
+    let body = serde_json::json!({
+        "service": "gmail",
+        "agent": agent,
+        "access_token": "ya29.test-access-token",
+        "refresh_token": "1//test-refresh-token",
+        "granted_scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
+        "client_type": "byo",
+        "client_source": "/tmp/test-oauth-client.json",
+        "expires_in_secs": 3600,
+        "if_exists": "replace"
+    })
+    .to_string();
+    let (status, resp_body) = crate::common::http_post_control(
+        home,
+        port,
+        "/v1/control/credentials/seal",
+        &body,
+        &[("X-Agentsso-Control", ctl.as_str()), ("Content-Type", "application/json")],
+    );
+    assert_eq!(status, 200, "credential seal should succeed: {resp_body}");
+}
+
+fn mcp_initialize_request() -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {
+                "name": "approval-prompt-e2e",
+                "version": "0.1.0"
+            }
+        }
+    })
+    .to_string()
 }
 
 /// Poll the audit directory for a JSON line matching `predicate`.
@@ -1006,19 +1061,15 @@ fn approval_timeout_updates_via_sighup_without_restart() {
     );
 }
 
-/// Story 8.7 AC #4. End-to-end proof that
-/// `POST /v1/control/reload` writes a `config-reload-stub-detected`
-/// audit event when the daemon booted in the 501-stub branch
-/// (vault/ didn't exist) but the vault directory now exists.
+/// Story 7.32 regression guard: an empty post-boot vault directory is
+/// not enough to warn operators anymore. Boot creates vault/ as part
+/// of normal daemon setup; only a sealed credential should trigger a
+/// proxy rebuild attempt.
 ///
-/// The vault directory being present on reload is enough — the
-/// router was wired with 501 stubs at boot and can't be hot-swapped,
-/// so the warn + audit event is the operator-facing signal to
-/// restart. The test doesn't assert on the tracing warn (log-capture
-/// across subprocess boundaries is brittle) — only on the audit
-/// event, which is the durable signal.
+/// The old Story 8.7 behavior warned on directory existence alone,
+/// which turned fresh installs into noisy "restart daemon" diagnostics.
 #[test]
-fn sighup_warns_on_stale_stub_branch_after_vault_appears() {
+fn reload_does_not_warn_on_empty_post_boot_vault() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("config")).unwrap();
     // Deliberately do NOT create `vault/` — forces the daemon into
@@ -1029,8 +1080,8 @@ fn sighup_warns_on_stale_stub_branch_after_vault_appears() {
     assert!(wait_for_health(port, Duration::from_secs(5)));
     assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
-    // Create `vault/` after boot to simulate the operator running
-    // `agentsso setup <svc>` between boot and the reload.
+    // Create an empty `vault/` after boot. This is not sufficient for
+    // proxy activation and should not emit the stale-stub diagnostic.
     std::fs::create_dir_all(home.path().join("vault")).unwrap();
 
     let ctl_for_reload = crate::common::read_test_control_token(home.path());
@@ -1044,15 +1095,112 @@ fn sighup_warns_on_stale_stub_branch_after_vault_appears() {
     assert_eq!(status, 200, "reload should succeed: {body}");
 
     let audit_dir = home.path().join("audit");
-    assert_audit_event_or_dump(
+    let event = wait_for_audit_event(
         &audit_dir,
         |e| {
             e["event_type"] == "config-reload-stub-detected"
                 && e["extra"]["vault_present"] == true
                 && e["extra"]["proxy_service_active"] == false
-                && e["extra"]["remediation"] == "restart daemon"
         },
-        Duration::from_secs(60),
-        "expected config-reload-stub-detected audit event after reload with vault/ present",
+        Duration::from_secs(1),
+    );
+    assert!(event.is_none(), "empty post-boot vault should not emit stale-stub audit: {event:?}");
+}
+
+#[test]
+fn mcp_initialize_succeeds_after_credential_seal_without_restart() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join("config")).unwrap();
+    seed_gmail_readonly_policy(home.path());
+    assert!(!home.path().join("vault").exists(), "test must boot through the stub-only proxy path");
+
+    let (_daemon, port, daemon_pid) = start_daemon_with_env_zero_port(home.path(), &[]);
+    assert!(wait_for_health(port, Duration::from_secs(5)));
+    assert_daemon_pid_matches(port, home.path(), daemon_pid);
+
+    let bearer = register_agent(port, home.path(), "openclaw", "gmail-read-only");
+    let auth_header = format!("Bearer {bearer}");
+    let init_body = mcp_initialize_request();
+    let headers = [
+        ("authorization", auth_header.as_str()),
+        ("x-agentsso-scope", "gmail.readonly"),
+        ("accept", "application/json, text/event-stream"),
+    ];
+
+    let (stub_status, stub_body) = http_post(port, "/mcp/gmail", &init_body, &headers);
+    assert_eq!(
+        stub_status, 501,
+        "before credentials are sealed, /mcp/gmail should still be the stub route: {stub_body}"
+    );
+    let stub_json: serde_json::Value =
+        serde_json::from_str(&stub_body).expect("stub response body should be JSON");
+    assert_eq!(stub_json["error"]["code"], "route.not_implemented");
+    assert!(
+        stub_json["error"]["available_routes"]
+            .as_array()
+            .expect("available_routes should be an array")
+            .iter()
+            .any(|route| route == "/mcp/gmail"),
+        "stub response should list the post-7.32 Gmail route: {stub_body}"
+    );
+
+    seal_gmail_credential(port, home.path(), "openclaw");
+
+    let ctl_for_reload = crate::common::read_test_control_token(home.path());
+    let (reload_status, reload_body) = crate::common::http_post_control(
+        home.path(),
+        port,
+        "/v1/control/reload",
+        "",
+        &[("X-Agentsso-Control", ctl_for_reload.as_str()), ("Content-Type", "application/json")],
+    );
+    assert_eq!(reload_status, 200, "reload should activate proxy routes: {reload_body}");
+    assert_daemon_pid_matches(port, home.path(), daemon_pid);
+
+    let (mcp_status, mcp_body) = http_post(port, "/mcp/gmail", &init_body, &headers);
+    assert_eq!(
+        mcp_status, 200,
+        "after credential seal + reload, /mcp/gmail initialize should succeed without restart: {mcp_body}"
+    );
+    assert!(
+        mcp_body.contains("protocolVersion") && mcp_body.contains("serverInfo"),
+        "initialize response should include MCP server info: {mcp_body}"
+    );
+}
+
+#[test]
+fn unknown_route_returns_json_body() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join("config")).unwrap();
+    seed_gmail_readonly_policy(home.path());
+
+    let (_daemon, port, daemon_pid) = start_daemon_with_env_zero_port(home.path(), &[]);
+    assert!(wait_for_health(port, Duration::from_secs(5)));
+    assert_daemon_pid_matches(port, home.path(), daemon_pid);
+
+    let bearer = register_agent(port, home.path(), "openclaw", "gmail-read-only");
+    let auth_header = format!("Bearer {bearer}");
+    let headers = [
+        ("authorization", auth_header.as_str()),
+        ("x-agentsso-scope", "gmail.readonly"),
+        ("accept", "application/json, text/event-stream"),
+        ("content-type", "application/json"),
+    ];
+    let (status, body) = http_post(port, "/mcp", "{}", &headers);
+    assert_eq!(status, 404, "bare /mcp should be a JSON 404 after 7.32: {body}");
+    let json: serde_json::Value =
+        serde_json::from_str(&body).expect("unknown route response body should be JSON");
+    assert_eq!(json["error"]["code"], "route.not_found");
+    assert!(
+        json["error"]["request_id"].as_str().is_some_and(|id| id.len() == 26),
+        "404 route response should include a ULID request_id: {body}"
+    );
+    assert!(
+        json["error"]["available_routes"]
+            .as_array()
+            .expect("available_routes should be an array")
+            .iter()
+            .any(|route| route == "/mcp/gmail"),
+        "404 route response should list available MCP routes: {body}"
     );
 }

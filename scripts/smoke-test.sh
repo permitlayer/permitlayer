@@ -17,6 +17,9 @@ BASE_URL="http://localhost:3820"
 PASS=0
 FAIL=0
 SKIP_MCP=false
+TOKEN_FILE="${AGENTSSO_BEARER_TOKEN_FILE:-$HOME/.agentsso/agent-bearer.token}"
+BEARER_TOKEN="${AGENTSSO_BEARER_TOKEN:-}"
+MCP_SCOPE="${AGENTSSO_MCP_SCOPE:-gmail.readonly}"
 
 for arg in "$@"; do
   case "$arg" in
@@ -107,10 +110,22 @@ else
 
     echo "-- mcp --"
 
+    if [ -z "$BEARER_TOKEN" ] && [ -f "$TOKEN_FILE" ]; then
+      BEARER_TOKEN=$(tr -d '\r\n' < "$TOKEN_FILE")
+    fi
+    if [ -z "$BEARER_TOKEN" ]; then
+      fail "MCP auth token" "set AGENTSSO_BEARER_TOKEN or create $TOKEN_FILE"
+      echo
+      echo "=== results: $PASS passed, $FAIL failed ==="
+      exit 1
+    fi
+
     # Initialize MCP session.
-    init_response=$(curl -s -X POST "$BASE_URL/mcp" \
+    init_response=$(curl -s -X POST "$BASE_URL/mcp/gmail" \
       -H "Content-Type: application/json" \
       -H "Accept: application/json, text/event-stream" \
+      -H "Authorization: Bearer $BEARER_TOKEN" \
+      -H "x-agentsso-scope: $MCP_SCOPE" \
       -d '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-03-26","capabilities":{},"clientInfo":{"name":"smoke-test","version":"0.1.0"}}}' \
       -D /tmp/smoke-mcp-headers 2>/dev/null)
 
@@ -121,25 +136,31 @@ else
 
     if [ -n "$SESSION" ]; then
       # Send initialized notification.
-      curl -s -X POST "$BASE_URL/mcp" \
+      curl -s -X POST "$BASE_URL/mcp/gmail" \
         -H "Content-Type: application/json" \
         -H "Accept: application/json, text/event-stream" \
+        -H "Authorization: Bearer $BEARER_TOKEN" \
+        -H "x-agentsso-scope: $MCP_SCOPE" \
         -H "Mcp-Session-Id: $SESSION" \
         -d '{"jsonrpc":"2.0","method":"notifications/initialized"}' >/dev/null 2>&1
 
       # List tools.
-      tools_response=$(curl -s -X POST "$BASE_URL/mcp" \
+      tools_response=$(curl -s -X POST "$BASE_URL/mcp/gmail" \
         -H "Content-Type: application/json" \
         -H "Accept: application/json, text/event-stream" \
+        -H "Authorization: Bearer $BEARER_TOKEN" \
+        -H "x-agentsso-scope: $MCP_SCOPE" \
         -H "Mcp-Session-Id: $SESSION" \
         -d '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' 2>/dev/null)
 
       if echo "$tools_response" | grep -q "gmail.search"; then pass "MCP tools/list (5 gmail tools)"; else fail "MCP tools/list" "$tools_response"; fi
 
       # Search inbox.
-      search_response=$(curl -s -X POST "$BASE_URL/mcp" \
+      search_response=$(curl -s -X POST "$BASE_URL/mcp/gmail" \
         -H "Content-Type: application/json" \
         -H "Accept: application/json, text/event-stream" \
+        -H "Authorization: Bearer $BEARER_TOKEN" \
+        -H "x-agentsso-scope: $MCP_SCOPE" \
         -H "Mcp-Session-Id: $SESSION" \
         -d '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"gmail.search","arguments":{"query":"in:inbox","max_results":2}}}' 2>/dev/null)
 
@@ -170,9 +191,11 @@ for line in sys.stdin:
         break
 " 2>/dev/null)
       if [ -n "$msg_id" ]; then
-        get_response=$(curl -s -X POST "$BASE_URL/mcp" \
+        get_response=$(curl -s -X POST "$BASE_URL/mcp/gmail" \
           -H "Content-Type: application/json" \
           -H "Accept: application/json, text/event-stream" \
+          -H "Authorization: Bearer $BEARER_TOKEN" \
+          -H "x-agentsso-scope: $MCP_SCOPE" \
           -H "Mcp-Session-Id: $SESSION" \
           -d "{\"jsonrpc\":\"2.0\",\"id\":4,\"method\":\"tools/call\",\"params\":{\"name\":\"gmail.messages.get\",\"arguments\":{\"id\":\"$msg_id\",\"format\":\"metadata\"}}}" 2>/dev/null)
 

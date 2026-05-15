@@ -11,17 +11,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result};
 use nix::unistd::{Gid, Uid, User, chown};
 
-use super::InstallArgs;
+use super::{DAEMON_LABEL, InstallArgs, LAUNCHD_PLIST_PATH};
 use crate::cli::silent_cli_error;
 use crate::design::render::error_block;
 
-/// macOS LaunchDaemon plist label. Rename from rc.21
-/// `dev.agentsso.daemon` is part of the breaking change.
-const DAEMON_LABEL: &str = "dev.permitlayer.daemon";
-
 /// LaunchDaemon plist path (root-owned, mode 0644 per Apple
 /// convention).
-const PLIST_PATH: &str = "/Library/LaunchDaemons/dev.permitlayer.daemon.plist";
+const PLIST_PATH: &str = LAUNCHD_PLIST_PATH;
 
 /// Privileged-helper binary install location.
 const PRIVILEGED_HELPER_PATH: &str = "/Library/PrivilegedHelperTools/agentsso";
@@ -1138,7 +1134,7 @@ fn write_launchdaemon_plist(operator_uid: u32, operator_username: &str) -> Resul
 <dict>
   <key>Label</key><string>{DAEMON_LABEL}</string>
   <key>ProgramArguments</key>
-    <array><string>{PRIVILEGED_HELPER_PATH}</string><string>start</string></array>
+    <array><string>{PRIVILEGED_HELPER_PATH}</string><string>start</string><string>--allow-foreground</string></array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
   <key>StandardOutPath</key><string>/Library/Logs/permitlayer/daemon.log</string>
@@ -1328,6 +1324,8 @@ mod tests {
 <plist version="1.0">
 <dict>
   <key>Label</key><string>{DAEMON_LABEL}</string>
+  <key>ProgramArguments</key>
+    <array><string>{PRIVILEGED_HELPER_PATH}</string><string>start</string><string>--allow-foreground</string></array>
   <key>SessionCreate</key><true/>
 </dict>
 </plist>
@@ -1335,6 +1333,7 @@ mod tests {
         );
         assert!(body.contains("dev.permitlayer.daemon"));
         assert!(body.contains("SessionCreate"));
+        assert!(body.contains("--allow-foreground"));
     }
 
     #[test]

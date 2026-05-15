@@ -9,8 +9,11 @@ use permitlayer_core::agent::AgentRegistry;
 use permitlayer_core::audit::event::AuditEvent;
 use permitlayer_core::policy::{PolicyCompileError, PolicySet, PolicySetDiff};
 
+use crate::cli::start::ProxyActivationContext;
 #[cfg(unix)]
-use crate::cli::start::clamp_approval_timeout_seconds;
+use crate::cli::start::{
+    clamp_approval_timeout_seconds, try_build_proxy_service, vault_has_sealed_credentials,
+};
 use crate::config::{CliOverrides, DaemonConfig};
 
 /// Spawn a background task that listens for SIGHUP, re-reads configuration
@@ -48,6 +51,7 @@ pub fn spawn_reload_watcher(
     // detector to check whether `agentsso setup` has since created
     // the directory.
     vault_dir: PathBuf,
+    proxy_activation: ProxyActivationContext,
 ) -> watch::Receiver<()> {
     let (tx, rx) = watch::channel(());
     tokio::spawn(async move {
@@ -64,6 +68,7 @@ pub fn spawn_reload_watcher(
             approval_timeout_atomic,
             proxy_stub_branch_active,
             vault_dir,
+            proxy_activation,
             tx,
         )
         .await;
@@ -86,6 +91,7 @@ async fn reload_loop(
     approval_timeout_atomic: Arc<AtomicU64>,
     proxy_stub_branch_active: Arc<AtomicBool>,
     vault_dir: PathBuf,
+    proxy_activation: ProxyActivationContext,
     tx: watch::Sender<()>,
 ) {
     #[cfg(unix)]
@@ -231,16 +237,83 @@ async fn reload_loop(
                 Err(e) => tracing::warn!(error = %e, "reload: log retention sweep failed"),
             }
 
-            // 5. Story 8.7 AC #4: detect the boot-time 501-stub branch
-            // still being active but `{paths.home}/vault/` now exists,
-            // and emit a structured operator-facing warning + audit
-            // event telling the operator to restart the daemon.
-            // Fires at most once per daemon lifetime via CAS on the
-            // flag (decision 2:B). SIGHUP has no request context, so
-            // `request_id` is `None` — `detect_stub_and_warn` falls
-            // back to a synthesized ULID.
-            detect_stub_and_warn(&vault_dir, audit_store.as_ref(), &proxy_stub_branch_active, None)
-                .await;
+            // 5. Story 7.32: if the daemon booted into the 501-stub
+            // branch and connect has since sealed credentials, activate
+            // the real proxy routes in place. Empty vault directories
+            // short-circuit quietly; they are created at boot and are
+            // not enough to prove setup/connect has run.
+            if proxy_stub_branch_active.load(Ordering::Relaxed) {
+                match vault_has_sealed_credentials(&vault_dir) {
+                    Ok(false) => {}
+                    Ok(true) => {
+                        let cfg = config_state.load_full();
+                        let proxy = try_build_proxy_service(
+                            &cfg,
+                            proxy_activation.scrub_engine.as_ref(),
+                            proxy_activation.audit_store.as_ref(),
+                            &proxy_activation.master_key,
+                            Arc::clone(&proxy_activation.vault),
+                        )
+                        .await;
+                        if let Some(proxy) = proxy {
+                            let won = proxy_stub_branch_active
+                                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+                                .is_ok();
+                            if won {
+                                proxy_activation.routes.activate(proxy);
+                                tracing::info!(
+                                    "proxy service activated via reload -- MCP and REST routes now live"
+                                );
+                            }
+                            any_success = true;
+                        } else {
+                            detect_stub_and_warn(
+                                &vault_dir,
+                                audit_store.as_ref(),
+                                &proxy_stub_branch_active,
+                                None,
+                            )
+                            .await;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!(
+                            vault_dir = %vault_dir.display(),
+                            error = %e,
+                            "proxy activation: vault credential probe failed; falling through to rebuild diagnostic"
+                        );
+                        let cfg = config_state.load_full();
+                        let proxy = try_build_proxy_service(
+                            &cfg,
+                            proxy_activation.scrub_engine.as_ref(),
+                            proxy_activation.audit_store.as_ref(),
+                            &proxy_activation.master_key,
+                            Arc::clone(&proxy_activation.vault),
+                        )
+                        .await;
+                        if let Some(proxy) = proxy {
+                            let won = proxy_stub_branch_active
+                                .compare_exchange(true, false, Ordering::AcqRel, Ordering::Relaxed)
+                                .is_ok();
+                            if won {
+                                proxy_activation.routes.activate(proxy);
+                                tracing::info!(
+                                    "proxy service activated via reload -- MCP and REST routes now live"
+                                );
+                            }
+                            any_success = true;
+                        } else {
+                            detect_stub_and_warn(
+                                &vault_dir,
+                                audit_store.as_ref(),
+                                &proxy_stub_branch_active,
+                                None,
+                            )
+                            .await;
+                        }
+                    }
+                }
+            }
 
             // Only notify downstream watchers if at least one reload succeeded.
             if any_success {
@@ -264,6 +337,7 @@ async fn reload_loop(
             approval_timeout_atomic,
             proxy_stub_branch_active,
             vault_dir,
+            proxy_activation,
             tx,
         );
         std::future::pending::<()>().await;
@@ -273,35 +347,26 @@ async fn reload_loop(
 /// Emit a structured operator-facing warning and best-effort audit
 /// event when the daemon booted with `proxy_service: None` (so the
 /// axum router is wired to 501 stubs) but `{paths.home}/vault/` now
-/// exists — meaning the operator has since run `agentsso setup <svc>`
-/// and is wondering why `agentsso reload` isn't activating the proxy
-/// routes. The honest answer is "the router was chosen at boot and
-/// can't be hot-swapped; restart the daemon."
+/// exists — meaning the operator may have since run `agentsso connect
+/// <svc>` and is wondering why proxy routes are still unavailable.
+/// Story 7.32 gives SIGHUP a real activation path; this diagnostic is
+/// now the fallback for reload surfaces that cannot activate or for a
+/// rebuild that still fails.
 ///
-/// # Dedup (Story 8.7 review decision 2:B)
+/// # Call sites
 ///
-/// Fires **at most once per daemon lifetime**. After the first
-/// successful fire, `stub_active` is CAS'd from `true → false` so
-/// every subsequent reload short-circuits at the guard. Rationale:
-/// the stub-detection event is forensically interesting on first
-/// observation; repeating it on every unrelated reload (policy edits,
-/// approval-timeout edits, log-rotation) would spam audit logs and
-/// dilute signal.
-///
-/// # Unconditional call-site (Story 8.7 review decision 1:A)
-///
-/// Both `reload_handler` (HTTP) and the SIGHUP `reload_loop` invoke
-/// this helper UNCONDITIONALLY at the tail of their reload flows —
-/// not gated on policy-reload success. Keeps the two surfaces
-/// behaviorally equivalent per Task 3.5.
+/// SIGHUP and HTTP reload first try Story 7.32 hot-activation when
+/// sealed credentials exist. They invoke this helper only if that
+/// rebuild fails. Empty vault directories short-circuit before this
+/// helper so fresh installs stay quiet.
 ///
 /// # Parameters
 ///
 /// - `vault_dir` — typically `{config.paths.home}/vault`.
 /// - `audit_store` — `None` skips the audit write; the `warn!` still fires.
 /// - `stub_active` — shared `Arc<AtomicBool>` flipped to `true` at boot
-///   iff the daemon took the 501-stub router branch. Flipped back to
-///   `false` by this helper after a successful fire (one-shot dedup).
+///   iff the daemon took the 501-stub router branch. This helper does
+///   not clear it; only successful hot-activation does.
 /// - `request_id` — `Some(id)` when called from `reload_handler`
 ///   (axum extension), `None` from the SIGHUP loop (no request
 ///   context). `None` falls back to a synthesized ULID so every audit
@@ -332,16 +397,11 @@ pub(crate) async fn detect_stub_and_warn(
             return false;
         }
     }
-    // CAS-dedup: flip the flag `true → false`. If we lose the race,
-    // another caller already fired the diagnostic — short-circuit.
-    if stub_active.compare_exchange(true, false, Ordering::Relaxed, Ordering::Relaxed).is_err() {
-        return false;
-    }
     tracing::warn!(
         vault_dir = %vault_dir.display(),
         "proxy routes are serving 501 stubs because no vault existed at boot; \
-         restart the daemon (agentsso stop && agentsso start) to activate the \
-         proxy now that vault/ is present"
+         proxy activation via reload was not possible; inspect earlier \
+         proxy-service rebuild logs and restart the daemon if needed"
     );
     if let Some(store) = audit_store {
         let event_request_id = request_id.unwrap_or_else(|| ulid::Ulid::new().to_string());
@@ -358,7 +418,7 @@ pub(crate) async fn detect_stub_and_warn(
             "action": "reload",
             "vault_present": true,
             "proxy_service_active": false,
-            "remediation": "restart daemon",
+            "remediation": "inspect rebuild logs; restart daemon if needed",
         });
         if let Err(e) = store.append(event).await {
             tracing::warn!("failed to write config-reload-stub-detected audit event: {e}");

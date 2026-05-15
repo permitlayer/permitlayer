@@ -187,6 +187,29 @@ fn register_json_emits_compact_single_line_with_bearer_that_authenticates() {
     drop(daemon);
 }
 
+#[cfg(target_os = "macos")]
+#[test]
+fn register_success_includes_peer_uid() {
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join("config")).unwrap();
+    seed_policy(home.path());
+
+    let daemon = start_daemon(home.path());
+    let port = daemon.port;
+    assert!(wait_for_health(port), "daemon did not boot");
+
+    let bind_addr = format!("127.0.0.1:{port}");
+    let (code, stdout, stderr) =
+        run_register(home.path(), &bind_addr, "openclaw", "policy-readonly", &[]);
+    assert_eq!(code, 0, "register should exit 0; stderr={stderr}");
+    assert!(
+        stdout.contains("owner: uid="),
+        "register success should include the daemon-recorded peer uid: {stdout}"
+    );
+
+    drop(daemon);
+}
+
 #[test]
 fn register_token_out_writes_owner_only_file_with_no_trailing_newline() {
     let home = tempfile::tempdir().unwrap();

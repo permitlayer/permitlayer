@@ -33,6 +33,12 @@ struct ReloadResponseView {
     removed: usize,
     #[serde(default)]
     agents_loaded: usize,
+    #[serde(default)]
+    policy_scan_path: String,
+    #[serde(default)]
+    policy_scan_empty_warning: Option<String>,
+    #[serde(default)]
+    config_reload_error: Option<String>,
 }
 
 /// Deserialization target for the JSON body of a failed
@@ -83,7 +89,7 @@ fn handle_reload_response(body: &str) -> Result<()> {
     // Try the success shape first.
     if let Ok(resp) = serde_json::from_str::<ReloadResponseView>(body) {
         println!(
-            "\u{2713} {} policies, {} agents loaded \u{00b7} {} policy added, {} modified, {} unchanged, {} removed",
+            "\u{2713} {} policies, {} agents loaded \u{00b7} {} added, {} modified, {} unchanged, {} removed",
             resp.policies_loaded,
             resp.agents_loaded,
             resp.added,
@@ -91,6 +97,15 @@ fn handle_reload_response(body: &str) -> Result<()> {
             resp.unchanged,
             resp.removed
         );
+        if !resp.policy_scan_path.is_empty() {
+            println!("  scanned: {}", resp.policy_scan_path);
+        }
+        if let Some(warn) = resp.policy_scan_empty_warning {
+            eprintln!("  warning: {warn}");
+        }
+        if let Some(err) = resp.config_reload_error {
+            eprintln!("  warning: config reload failed — {err}");
+        }
         return Ok(());
     }
 

@@ -96,7 +96,7 @@ fn build_stub_router(kill_switch: Arc<KillSwitch>) -> Router {
     Router::new()
         .route("/health", get(health_handler))
         .route("/v1/health", get(health_handler))
-        .route("/mcp", get(not_implemented_handler).post(not_implemented_handler))
+        .route("/mcp/gmail", get(not_implemented_handler).post(not_implemented_handler))
         .route("/mcp/calendar", get(not_implemented_handler).post(not_implemented_handler))
         .route("/mcp/drive", get(not_implemented_handler).post(not_implemented_handler))
         .route("/v1/tools/{service}/{*path}", any(not_implemented_handler))
@@ -171,7 +171,7 @@ async fn kill_active_blocks_v1_health() {
 
 #[tokio::test]
 async fn kill_active_blocks_mcp_stub() {
-    // Kill active + POST /mcp (which would return 501 normally
+    // Kill active + POST /mcp/gmail (which would return 501 normally
     // because no ProxyService is configured) → still 403
     // daemon_killed. Proves the kill switch fires BEFORE the
     // terminal handler, even when the terminal is a 501 stub.
@@ -179,7 +179,7 @@ async fn kill_active_blocks_mcp_stub() {
     switch.activate(KillReason::UserInitiated);
     let router = build_stub_router(Arc::clone(&switch));
 
-    let resp = router.oneshot(post_req("/mcp")).await.unwrap();
+    let resp = router.oneshot(post_req("/mcp/gmail")).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     let json = body_json(resp).await;
     assert_daemon_killed_body(&json);
@@ -239,7 +239,7 @@ async fn kill_active_identical_body_across_endpoints() {
     let probes = [
         ("GET /health", fetch(Arc::clone(&switch), req("/health")).await),
         ("GET /v1/health", fetch(Arc::clone(&switch), req("/v1/health")).await),
-        ("POST /mcp", fetch(Arc::clone(&switch), post_req("/mcp")).await),
+        ("POST /mcp/gmail", fetch(Arc::clone(&switch), post_req("/mcp/gmail")).await),
         (
             "GET /v1/tools/gmail/messages",
             fetch(Arc::clone(&switch), req("/v1/tools/gmail/messages")).await,

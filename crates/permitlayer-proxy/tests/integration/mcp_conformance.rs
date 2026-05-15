@@ -134,7 +134,7 @@ async fn start_mcp_server_with_agent(
     // without AgentId (auth.missing_agent_id), so we stand in for
     // AuthLayer here. Layered BEFORE nest_service so the extension
     // lives on the inbound request that rmcp captures into Parts.
-    let app = Router::new().nest_service("/mcp", mcp).layer(axum::middleware::from_fn(
+    let app = Router::new().nest_service("/mcp/gmail", mcp).layer(axum::middleware::from_fn(
         move |mut req: axum::extract::Request, next: axum::middleware::Next| async move {
             req.extensions_mut().insert(AgentId(agent_name.to_owned()));
             next.run(req).await
@@ -184,9 +184,11 @@ async fn mcp_initialize_handshake_succeeds() {
     });
 
     let resp = client
-        .post(format!("{base_url}/mcp"))
+        .post(format!("{base_url}/mcp/gmail"))
         .header("Content-Type", "application/json")
         .header("Accept", "application/json, text/event-stream")
+        .header("Authorization", "Bearer test")
+        .header("x-agentsso-scope", "gmail.readonly")
         .json(&init_request)
         .send()
         .await
@@ -202,6 +204,48 @@ async fn mcp_initialize_handshake_succeeds() {
         body.contains("permitlayer"),
         "response should contain server name 'permitlayer', got: {body}"
     );
+
+    handle.abort();
+}
+
+#[tokio::test]
+async fn bare_mcp_returns_404() {
+    let mut upstream = mockito::Server::new_async().await;
+    let _mock = upstream
+        .mock("GET", "/users/me/messages")
+        .with_status(200)
+        .with_body(r#"{"messages":[]}"#)
+        .create_async()
+        .await;
+
+    let (base_url, handle) = start_mcp_server(&format!("{}/", upstream.url())).await;
+    let client = reqwest::Client::new();
+    let init_request = serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26",
+            "capabilities": {},
+            "clientInfo": {
+                "name": "test-client",
+                "version": "1.0.0"
+            }
+        }
+    });
+
+    let resp = client
+        .post(format!("{base_url}/mcp"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .header("Authorization", "Bearer test")
+        .header("x-agentsso-scope", "gmail.readonly")
+        .json(&init_request)
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), reqwest::StatusCode::NOT_FOUND);
 
     handle.abort();
 }
@@ -235,7 +279,7 @@ async fn mcp_tools_list_returns_five_tools() {
     });
 
     let init_resp = client
-        .post(format!("{base_url}/mcp"))
+        .post(format!("{base_url}/mcp/gmail"))
         .header("Content-Type", "application/json")
         .header("Accept", "application/json, text/event-stream")
         .json(&init_request)
@@ -256,7 +300,7 @@ async fn mcp_tools_list_returns_five_tools() {
     });
 
     let mut initialized_req = client
-        .post(format!("{base_url}/mcp"))
+        .post(format!("{base_url}/mcp/gmail"))
         .header("Content-Type", "application/json")
         .header("Accept", "application/json, text/event-stream");
     if let Some(ref sid) = session_id {
@@ -272,7 +316,7 @@ async fn mcp_tools_list_returns_five_tools() {
     });
 
     let mut tools_req = client
-        .post(format!("{base_url}/mcp"))
+        .post(format!("{base_url}/mcp/gmail"))
         .header("Content-Type", "application/json")
         .header("Accept", "application/json, text/event-stream");
     if let Some(ref sid) = session_id {
@@ -331,7 +375,7 @@ async fn mcp_tools_call_gmail_messages_list_returns_valid_response() {
     });
 
     let init_resp = client
-        .post(format!("{base_url}/mcp"))
+        .post(format!("{base_url}/mcp/gmail"))
         .header("Content-Type", "application/json")
         .header("Accept", "application/json, text/event-stream")
         .json(&init_request)
@@ -348,7 +392,7 @@ async fn mcp_tools_call_gmail_messages_list_returns_valid_response() {
         "method": "notifications/initialized"
     });
     let mut req = client
-        .post(format!("{base_url}/mcp"))
+        .post(format!("{base_url}/mcp/gmail"))
         .header("Content-Type", "application/json")
         .header("Accept", "application/json, text/event-stream");
     if let Some(ref sid) = session_id {
@@ -368,7 +412,7 @@ async fn mcp_tools_call_gmail_messages_list_returns_valid_response() {
     });
 
     let mut call_req = client
-        .post(format!("{base_url}/mcp"))
+        .post(format!("{base_url}/mcp/gmail"))
         .header("Content-Type", "application/json")
         .header("Accept", "application/json, text/event-stream");
     if let Some(ref sid) = session_id {
@@ -425,7 +469,7 @@ async fn mcp_tool_call_attributes_audit_event_to_real_agent() {
         }
     });
     let init_resp = client
-        .post(format!("{base_url}/mcp"))
+        .post(format!("{base_url}/mcp/gmail"))
         .header("Content-Type", "application/json")
         .header("Accept", "application/json, text/event-stream")
         .json(&init_request)
@@ -441,7 +485,7 @@ async fn mcp_tool_call_attributes_audit_event_to_real_agent() {
         "method": "notifications/initialized"
     });
     let mut req = client
-        .post(format!("{base_url}/mcp"))
+        .post(format!("{base_url}/mcp/gmail"))
         .header("Content-Type", "application/json")
         .header("Accept", "application/json, text/event-stream");
     if let Some(ref sid) = session_id {
@@ -458,7 +502,7 @@ async fn mcp_tool_call_attributes_audit_event_to_real_agent() {
         "params": { "name": "gmail.messages.list", "arguments": {} }
     });
     let mut call_req = client
-        .post(format!("{base_url}/mcp"))
+        .post(format!("{base_url}/mcp/gmail"))
         .header("Content-Type", "application/json")
         .header("Accept", "application/json, text/event-stream");
     if let Some(ref sid) = session_id {

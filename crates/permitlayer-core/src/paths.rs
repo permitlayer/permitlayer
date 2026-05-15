@@ -219,6 +219,11 @@ pub fn agents_dir(home_override: Option<&Path>) -> PathBuf {
     daemon_state_dir(home_override).join("agents")
 }
 
+/// Policies directory — daemon-managed policy TOML files.
+pub fn policies_dir(home_override: Option<&Path>) -> PathBuf {
+    daemon_state_dir(home_override).join("policies")
+}
+
 /// Plugins directory — drop-in plugin loader.
 pub fn plugins_dir(home_override: Option<&Path>) -> PathBuf {
     daemon_state_dir(home_override).join("plugins")
@@ -255,6 +260,7 @@ mod tests {
         let run = daemon_runtime_dir(Some(tmp));
         let vault = vault_dir(Some(tmp));
         let agents = agents_dir(Some(tmp));
+        let policies = policies_dir(Some(tmp));
         let plugins = plugins_dir(Some(tmp));
         let audit = audit_log_path(Some(tmp));
         let sock = control_socket_path(Some(tmp));
@@ -264,6 +270,7 @@ mod tests {
         assert_eq!(run, tmp.join("run"));
         assert_eq!(vault, tmp.join("vault"));
         assert_eq!(agents, tmp.join("agents"));
+        assert_eq!(policies, tmp.join("policies"));
         assert_eq!(plugins, tmp.join("plugins"));
         assert_eq!(audit, tmp.join("logs").join("audit.log"));
         assert_eq!(sock, tmp.join("run").join("control.sock"));
