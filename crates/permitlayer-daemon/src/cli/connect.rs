@@ -189,6 +189,7 @@ fn default_scope_for_snippet(
         .or_else(|| first_matching_policy_scope(&policy_resp.before, requested_short_names))
 }
 
+#[cfg(unix)]
 fn connect_root_guard_for(
     service: &str,
     agent: &str,
@@ -2100,6 +2101,7 @@ mod tests {
     // helper tests in root_guard.rs pass even if the connect run() call
     // site stops invoking the guard. This test pins the composition of
     // ConnectArgs + the guard so a future refactor can't drop the call.
+    #[cfg(unix)]
     #[test]
     fn connect_guard_refuses_root_shell_before_daemon_contact() {
         let result = connect_root_guard_for("gmail", "me", false, 0, Some("testuser"));
@@ -2109,6 +2111,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn connect_guard_allows_root_when_explicitly_requested() {
         let result = connect_root_guard_for("gmail", "me", true, 0, Some("testuser"));

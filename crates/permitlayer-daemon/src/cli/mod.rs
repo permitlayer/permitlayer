@@ -18,6 +18,7 @@ pub mod openclaw;
 pub mod policy;
 pub mod reload;
 pub mod resume;
+#[cfg(unix)]
 pub mod root_guard;
 pub mod rotate_key;
 pub mod scrub;

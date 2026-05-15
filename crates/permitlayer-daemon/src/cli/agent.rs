@@ -143,6 +143,7 @@ pub(crate) fn policies_dir_remediation(home: &std::path::Path) -> String {
     format!("edit {} then `agentsso reload`", policies_dir.display())
 }
 
+#[cfg(unix)]
 fn register_root_guard_for(
     args: &RegisterArgs,
     effective_uid: u32,
@@ -1143,6 +1144,7 @@ mod tests {
     // helper tests in root_guard.rs pass even if the register_agent call
     // site stops invoking the guard. This test pins the composition of
     // RegisterArgs + the guard so a future refactor can't drop the call.
+    #[cfg(unix)]
     #[test]
     fn register_guard_refuses_root_shell_before_daemon_contact() {
         let args = RegisterArgs {
@@ -1159,6 +1161,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn register_guard_allows_root_when_explicitly_requested() {
         let args = RegisterArgs {

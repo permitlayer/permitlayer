@@ -89,6 +89,9 @@ concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  GH_REPO: ${{ github.repository }}
+
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
@@ -1245,7 +1248,7 @@ jobs:
           # standalone release asset, so the releases/download URL
           # 404s with an HTML page that `sh` then tries to execute as
           # `Not Found` → exit 127. Surfaced in run 25194276163.).
-          curl -sSL "https://raw.githubusercontent.com/permitlayer/permitlayer/${TAG}/install/install.sh" | sh
+          curl -sSL "https://raw.githubusercontent.com/permitlayer/permitlayer/${TAG}/install/install.sh" | sh -s -- --version "${TAG#v}"
           # install.sh defaults to ~/.local/bin; add to PATH for
           # subsequent steps.
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
@@ -1409,7 +1412,7 @@ jobs:
           set -euo pipefail
           # Same release-asset → raw.githubusercontent fix as the
           # ubuntu smoke step.
-          curl -sSL "https://raw.githubusercontent.com/permitlayer/permitlayer/${TAG}/install/install.sh" | sh
+          curl -sSL "https://raw.githubusercontent.com/permitlayer/permitlayer/${TAG}/install/install.sh" | sh -s -- --version "${TAG#v}"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Run daemon + Inspector conformance
         run: |

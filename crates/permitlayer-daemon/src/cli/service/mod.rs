@@ -26,9 +26,11 @@ use clap::{Args, Subcommand};
 
 /// macOS LaunchDaemon label used by `agentsso service install` and
 /// foreground-start collision diagnostics.
+#[cfg(target_os = "macos")]
 pub(crate) const DAEMON_LABEL: &str = "dev.permitlayer.daemon";
 
 /// macOS LaunchDaemon plist path installed by `agentsso service install`.
+#[cfg(target_os = "macos")]
 pub(crate) const LAUNCHD_PLIST_PATH: &str = "/Library/LaunchDaemons/dev.permitlayer.daemon.plist";
 
 #[derive(Args, Debug)]
