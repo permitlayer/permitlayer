@@ -296,7 +296,16 @@ async fn register_agent(args: RegisterArgs) -> Result<()> {
     let name = parsed["name"].as_str().unwrap_or(&args.name).to_owned();
     let policy_name = parsed["policy_name"].as_str().unwrap_or(&args.policy).to_owned();
     let token = parsed["bearer_token"].as_str().unwrap_or("").to_owned();
-    let peer_uid = parsed["peer_uid"].as_u64().and_then(|uid| u32::try_from(uid).ok());
+    let peer_uid = match parsed["peer_uid"].as_u64() {
+        Some(uid) => match u32::try_from(uid) {
+            Ok(u) => Some(u),
+            Err(_) => {
+                tracing::warn!(peer_uid = %uid, "daemon returned peer_uid outside u32 range; truncating");
+                None
+            }
+        },
+        None => None,
+    };
 
     if token.is_empty() {
         eprint!("{}", error_block_protocol_error());
@@ -309,7 +318,9 @@ async fn register_agent(args: RegisterArgs) -> Result<()> {
     if args.json {
         render_register_json(&name, &policy_name, &token, peer_uid);
     } else if let Some(path) = args.token_out.as_deref() {
-        if let Err(e) = render_register_token_file(&name, &policy_name, &token, peer_uid, path) {
+        if let Err(e) =
+            render_register_token_file(&name, &policy_name, &token, peer_uid, path).await
+        {
             tracing::debug!(error = %e, path = %path.display(), "--token-out write failed");
             let kind = e.kind();
             let (code, msg, remediation) = match kind {
@@ -336,18 +347,26 @@ async fn register_agent(args: RegisterArgs) -> Result<()> {
             std::process::exit(4);
         }
     } else {
-        render_register_success(&name, &policy_name, &token, peer_uid);
+        render_register_success(&name, &policy_name, &token, peer_uid).await;
     }
     Ok(())
 }
 
-fn render_register_success(name: &str, policy_name: &str, token: &str, peer_uid: Option<u32>) {
+async fn render_register_success(
+    name: &str,
+    policy_name: &str,
+    token: &str,
+    peer_uid: Option<u32>,
+) {
     // The output is intentionally plain — operators screenshot this
     // line to share with teammates, and ANSI codes hurt the share.
     // Use a single triple-clickable line for the token so it's easy
     // to copy without picking up adjacent whitespace.
     println!();
-    println!("✓ agent '{name}' registered → policy '{policy_name}'{}", owner_suffix(peer_uid));
+    println!(
+        "✓ agent '{name}' registered → policy '{policy_name}'{}",
+        owner_suffix(peer_uid).await
+    );
     println!();
     println!("  bearer token (shown once, save it now):");
     println!();
@@ -396,7 +415,7 @@ fn render_register_json(name: &str, policy_name: &str, token: &str, peer_uid: Op
 /// Stdout receives a confirmation line with the path but **never** the
 /// token bytes — the file is the canonical retrieval path and stdout
 /// could land in a log file via `tee` or shell redirect.
-fn render_register_token_file(
+async fn render_register_token_file(
     name: &str,
     policy_name: &str,
     token: &str,
@@ -408,32 +427,40 @@ fn render_register_token_file(
     // confirm the policy bound at register-time without re-querying the
     // daemon.
     println!();
-    println!("✓ agent '{name}' registered → policy '{policy_name}'{}", owner_suffix(peer_uid));
+    println!(
+        "✓ agent '{name}' registered → policy '{policy_name}'{}",
+        owner_suffix(peer_uid).await
+    );
     println!("  bearer token written to {} (mode 0o600)", path.display());
     println!();
     Ok(())
 }
 
-fn owner_suffix(peer_uid: Option<u32>) -> String {
+async fn owner_suffix(peer_uid: Option<u32>) -> String {
     let Some(uid) = peer_uid else {
         return String::new();
     };
-    match username_for_uid(uid) {
+    match username_for_uid(uid).await {
         Some(name) => format!(" (owner: uid={uid} {name})"),
         None => format!(" (owner: uid={uid})"),
     }
 }
 
 #[cfg(unix)]
-fn username_for_uid(uid: u32) -> Option<String> {
-    nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
-        .ok()
-        .flatten()
-        .map(|user| user.name)
+async fn username_for_uid(uid: u32) -> Option<String> {
+    tokio::task::spawn_blocking(move || {
+        nix::unistd::User::from_uid(nix::unistd::Uid::from_raw(uid))
+            .ok()
+            .flatten()
+            .map(|user| user.name)
+    })
+    .await
+    .ok()
+    .flatten()
 }
 
 #[cfg(not(unix))]
-fn username_for_uid(_uid: u32) -> Option<String> {
+async fn username_for_uid(_uid: u32) -> Option<String> {
     None
 }
 
@@ -814,6 +841,8 @@ async fn rotate_agent(args: RotateArgs) -> Result<()> {
         eprint!("{}", error_block_protocol_error());
         std::process::exit(3);
     }
+    // Story 7.34 review patch: macOS auto-write path (parity with register).
+    let bearer_token_file = parsed["bearer_token_file"].as_str().map(std::path::PathBuf::from);
 
     if let Some(path) = args.token_out.as_deref() {
         if let Err(e) =
@@ -844,6 +873,9 @@ async fn rotate_agent(args: RotateArgs) -> Result<()> {
         println!();
         println!("✓ agent '{name}' rotated — old bearer invalidated");
         println!("  new bearer token written to {} (mode 0o600)", path.display());
+        if let Some(ref f) = bearer_token_file {
+            println!("  also written to {} (macOS auto-write)", f.display());
+        }
         println!();
     } else {
         println!();
@@ -857,6 +889,9 @@ async fn rotate_agent(args: RotateArgs) -> Result<()> {
         println!();
         println!("    Authorization: Bearer {bearer_token}");
         println!();
+        if let Some(ref f) = bearer_token_file {
+            println!("  also written to {} (macOS auto-write)", f.display());
+        }
         println!("  this token will not be shown again.");
         println!();
     }
@@ -1178,10 +1213,10 @@ mod tests {
         assert!(!s.contains("peer_uid"), "peer_uid should stay additive and optional: {s}");
     }
 
-    #[test]
-    fn owner_suffix_falls_back_to_uid_when_username_lookup_fails() {
-        if username_for_uid(u32::MAX).is_none() {
-            assert_eq!(owner_suffix(Some(u32::MAX)), format!(" (owner: uid={})", u32::MAX));
+    #[tokio::test]
+    async fn owner_suffix_falls_back_to_uid_when_username_lookup_fails() {
+        if username_for_uid(u32::MAX).await.is_none() {
+            assert_eq!(owner_suffix(Some(u32::MAX)).await, format!(" (owner: uid={})", u32::MAX));
         }
     }
 

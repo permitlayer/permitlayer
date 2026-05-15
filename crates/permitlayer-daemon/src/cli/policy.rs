@@ -118,6 +118,47 @@ async fn show_policy(args: ShowArgs) -> Result<()> {
 /// `agentsso policy validate <path>` — client-side parse and semantic check.
 fn validate_policy(args: ValidateArgs) -> Result<()> {
     let path = &args.path;
+    // Story 7.34 review patch: reject non-regular files (FIFOs, devices,
+    // symlinks) before blocking on read_to_string.
+    match std::fs::metadata(path) {
+        Ok(meta) if !meta.is_file() => {
+            eprint!(
+                "{}",
+                error_block(
+                    "policy.not_a_regular_file",
+                    &format!("not a regular file: {}", path.display()),
+                    "provide the path to a regular TOML file",
+                    None,
+                )
+            );
+            std::process::exit(2);
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            eprint!(
+                "{}",
+                error_block(
+                    "policy.file_not_found",
+                    &format!("file not found: {}", path.display()),
+                    "check the path",
+                    None,
+                )
+            );
+            std::process::exit(2);
+        }
+        Err(e) => {
+            eprint!(
+                "{}",
+                error_block(
+                    "policy.read_failed",
+                    &format!("could not read {}: {e}", path.display()),
+                    "check the path and permissions",
+                    None,
+                )
+            );
+            std::process::exit(2);
+        }
+    }
     let text = match std::fs::read_to_string(path) {
         Ok(t) => t,
         Err(e) => {
@@ -138,11 +179,7 @@ fn validate_policy(args: ValidateArgs) -> Result<()> {
 
     match permitlayer_core::policy::PolicySet::compile_from_str(&text, path) {
         Ok(set) => {
-            println!(
-                "\u{2713} valid policy file ({} policy{})",
-                set.len(),
-                if set.len() == 1 { "" } else { "ies" }
-            );
+            println!("\u{2713} valid policy file ({} {})", set.len(), policy_count_noun(set.len()));
             Ok(())
         }
         Err(e) => {
@@ -158,6 +195,10 @@ fn validate_policy(args: ValidateArgs) -> Result<()> {
             std::process::exit(2);
         }
     }
+}
+
+fn policy_count_noun(count: usize) -> &'static str {
+    if count == 1 { "policy" } else { "policies" }
 }
 
 /// Deserialization target for JSON error responses from the policy
@@ -238,4 +279,17 @@ async fn list_policies() -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_count_noun_pluralizes_correctly() {
+        assert_eq!(policy_count_noun(0), "policies");
+        assert_eq!(policy_count_noun(1), "policy");
+        assert_eq!(policy_count_noun(2), "policies");
+        assert_eq!(policy_count_noun(3), "policies");
+    }
 }

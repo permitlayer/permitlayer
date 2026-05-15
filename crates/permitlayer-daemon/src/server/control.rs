@@ -215,6 +215,12 @@ pub(crate) struct ControlState {
     /// exhausting the blocking thread pool and starving other control
     /// endpoints that share the runtime.
     pub credentials_seal_semaphore: Arc<tokio::sync::Semaphore>,
+    /// Story 7.34 review patch: per-agent rotation lock. Two concurrent
+    /// `POST /v1/control/agent/{name}/rotate` requests for the same
+    /// agent must serialize so the second request reads the token that
+    /// the first request just wrote, not the stale pre-rotation token.
+    pub per_agent_rotate_locks:
+        Arc<std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Operator authentication token for `/v1/control/*` endpoints.
     /// The middleware layer at the router level (`require_control_token`)
     /// reads `X-Agentsso-Control` from each inbound request and
@@ -1324,9 +1330,28 @@ pub(crate) async fn reload_handler(
             // operator knows the policy reload succeeded while the
             // config edit was dropped.
             let policy_scan_path = state.policies_dir.display().to_string();
+            // Story 7.34 review patch: only warn about an empty directory
+            // when it genuinely contains no `.toml` files — not when files
+            // exist but simply lack `[[policies]]` tables.
+            let has_toml_files = state.policies_dir.exists()
+                && state.policies_dir.is_dir()
+                && std::fs::read_dir(&state.policies_dir)
+                    .ok()
+                    .map(|mut rd| {
+                        rd.any(|e| {
+                            e.ok()
+                                .map(|f| {
+                                    let p = f.path();
+                                    p.extension().map(|ext| ext == "toml").unwrap_or(false)
+                                })
+                                .unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false);
             let policy_scan_empty_warning = if state.policies_dir.exists()
                 && state.policies_dir.is_dir()
                 && diff.policies_loaded == 0
+                && !has_toml_files
             {
                 Some(format!(
                     "policy directory {} exists but contains no candidate policy files",
@@ -1561,6 +1586,10 @@ pub(crate) struct RotateAgentResponse {
     pub status: &'static str,
     pub name: String,
     pub bearer_token: String,
+    /// Path to the per-user bearer-token file written on macOS
+    /// (Story 7.34 review patch: parity with `agent register`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bearer_token_file: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -1908,7 +1937,15 @@ pub(crate) async fn register_agent_handler(
     // retry the token-write step idempotently).
     #[cfg(target_os = "macos")]
     let bearer_token_file: Option<BearerTokenFileWriteResult> = {
-        if let Some(creds) = _peer_creds_for_register {
+        let home_override = permitlayer_core::paths::home_override();
+        if !should_write_per_user_bearer_token(home_override.as_deref()) {
+            tracing::debug!(
+                target: "control",
+                request_id = %request_id,
+                "skipping per-user bearer-token auto-write because AGENTSSO_PATHS__HOME is set"
+            );
+            None
+        } else if let Some(creds) = _peer_creds_for_register {
             // Story 7.27 Round-2 review fix (P2): wrap the
             // bearer-token byte buffer in `Zeroizing` so the
             // plaintext is scrubbed when this scope exits, mirroring
@@ -1917,10 +1954,8 @@ pub(crate) async fn register_agent_handler(
             // until allocator reuse, leaving plaintext token
             // fragments on the heap.
             let token_bytes: zeroize::Zeroizing<Vec<u8>> =
-                zeroize::Zeroizing::new(bearer_token.clone().into_bytes());
-            let state_dir = permitlayer_core::paths::daemon_state_dir(
-                permitlayer_core::paths::home_override().as_deref(),
-            );
+                zeroize::Zeroizing::new(bearer_token.to_string().into_bytes());
+            let state_dir = permitlayer_core::paths::daemon_state_dir(home_override.as_deref());
             match crate::server::agent_token::write_bearer_token_to_user_home(
                 &token_bytes,
                 creds.uid,
@@ -4727,6 +4762,15 @@ pub(crate) async fn rotate_agent_handler(
         }
     };
 
+    // Story 7.34 review patch: serialize rotations per agent so two
+    // concurrent `rotate` calls for the same name cannot race on
+    // read-old-token → mint-new-token → overwrite.
+    let per_agent_lock = {
+        let mut map = state.per_agent_rotate_locks.lock().unwrap_or_else(|e| e.into_inner());
+        map.entry(name.clone()).or_insert_with(|| Arc::new(tokio::sync::Mutex::new(()))).clone()
+    };
+    let _per_agent_guard = per_agent_lock.lock().await;
+
     // Rate-limit concurrent agent CRUD.
     let _permit = match state.agent_crud_semaphore.clone().try_acquire_owned() {
         Ok(p) => p,
@@ -4787,8 +4831,9 @@ pub(crate) async fn rotate_agent_handler(
     // 3. Generate new plaintext token + derived material.
     let raw_bytes = generate_bearer_token_bytes();
     let plaintext_body = base64_url_no_pad(&raw_bytes);
-    let bearer_token = format!("{BEARER_TOKEN_PREFIX}{name}_{plaintext_body}");
-    let token_bytes = bearer_token.as_bytes().to_vec();
+    let bearer_token =
+        zeroize::Zeroizing::new(format!("{BEARER_TOKEN_PREFIX}{name}_{plaintext_body}"));
+    let token_bytes = zeroize::Zeroizing::new(bearer_token.as_bytes().to_vec());
     let token_hash = match tokio::task::spawn_blocking(move || hash_token(&token_bytes)).await {
         Ok(Ok(hash)) => hash,
         Ok(Err(e)) => {
@@ -4887,13 +4932,19 @@ pub(crate) async fn rotate_agent_handler(
     // 7. On macOS, write the plaintext bearer token to the peer's home
     //    directory (same pattern as register_agent_handler).
     #[cfg(target_os = "macos")]
-    let _bearer_token_file = {
-        if let Some(creds) = peer_creds_for_register {
-            let token_bytes: zeroize::Zeroizing<Vec<u8>> =
-                zeroize::Zeroizing::new(bearer_token.clone().into_bytes());
-            let state_dir = permitlayer_core::paths::daemon_state_dir(
-                permitlayer_core::paths::home_override().as_deref(),
+    let bearer_token_file: Option<std::path::PathBuf> = {
+        let home_override = permitlayer_core::paths::home_override();
+        if !should_write_per_user_bearer_token(home_override.as_deref()) {
+            tracing::debug!(
+                target: "control",
+                request_id = %request_id,
+                "skipping per-user bearer-token auto-write after rotate because AGENTSSO_PATHS__HOME is set"
             );
+            None
+        } else if let Some(creds) = peer_creds_for_register {
+            let token_bytes: zeroize::Zeroizing<Vec<u8>> =
+                zeroize::Zeroizing::new(bearer_token.to_string().into_bytes());
+            let state_dir = permitlayer_core::paths::daemon_state_dir(home_override.as_deref());
             match crate::server::agent_token::write_bearer_token_to_user_home(
                 &token_bytes,
                 creds.uid,
@@ -4911,7 +4962,7 @@ pub(crate) async fn rotate_agent_handler(
                         replace_existing = outcome.replace_existing,
                         "bearer-token written to per-user file after rotate"
                     );
-                    Some(outcome)
+                    Some(outcome.target_path)
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -4928,8 +4979,24 @@ pub(crate) async fn rotate_agent_handler(
             None
         }
     };
+    #[cfg(not(target_os = "macos"))]
+    let bearer_token_file: Option<std::path::PathBuf> = None;
 
-    (StatusCode::OK, Json(RotateAgentResponse { status: "ok", name, bearer_token })).into_response()
+    (
+        StatusCode::OK,
+        Json(RotateAgentResponse {
+            status: "ok",
+            name,
+            bearer_token: bearer_token.to_string(),
+            bearer_token_file,
+        }),
+    )
+        .into_response()
+}
+
+#[cfg(target_os = "macos")]
+fn should_write_per_user_bearer_token(home_override: Option<&std::path::Path>) -> bool {
+    home_override.is_none()
 }
 
 /// Story 7.11 review-round-1 P6: emit `agent-rebind-denied` audit
@@ -5248,6 +5315,7 @@ pub(crate) fn router(
         credentials_seal_semaphore: Arc::new(tokio::sync::Semaphore::new(
             CREDENTIALS_SEAL_MAX_CONCURRENT,
         )),
+        per_agent_rotate_locks: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         control_token,
     };
     Router::new()
@@ -8264,5 +8332,73 @@ auto-approve-reads = true
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         let json = body_json(resp).await;
         assert_eq!(json["code"], "agent.invalid_name");
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn per_user_bearer_auto_write_is_disabled_for_home_override() {
+        assert!(should_write_per_user_bearer_token(None));
+        assert!(!should_write_per_user_bearer_token(Some(std::path::Path::new(
+            "/private/tmp/permitlayer-smoke"
+        ))));
+    }
+
+    // ── Story 7.34 review patch: reload path output tests ──────────────
+
+    #[tokio::test]
+    async fn reload_handler_returns_policy_scan_path() {
+        let policies_dir = tempfile::tempdir().unwrap();
+        stage_minimal_policy(policies_dir.path(), "test-policy", &["scope.read"]);
+        let app = build_with_loaded_policies(policies_dir.path().to_path_buf());
+
+        let resp = app
+            .oneshot(req_with_peer(Method::POST, "/v1/control/reload", loopback_v4()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["status"], "ok");
+        let scan_path = json["policy_scan_path"].as_str().unwrap();
+        assert!(
+            scan_path.contains("tmp") || scan_path.contains("temp"),
+            "policy_scan_path should be absolute temp dir, got: {scan_path}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_handler_warns_empty_directory() {
+        let policies_dir = tempfile::tempdir().unwrap();
+        let app = build_with_loaded_policies(policies_dir.path().to_path_buf());
+
+        let resp = app
+            .oneshot(req_with_peer(Method::POST, "/v1/control/reload", loopback_v4()))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        assert_eq!(json["status"], "ok");
+        let warning = json["policy_scan_empty_warning"].as_str().unwrap();
+        assert!(
+            warning.contains("contains no candidate policy files"),
+            "should warn about empty directory: {warning}"
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_handler_no_warning_when_toml_exists() {
+        // If .toml files exist but fail to parse, reload returns 400.
+        // The key invariant is: has_toml_files=true suppresses the
+        // empty-directory warning, so the operator sees the parse error
+        // instead of a misleading "no candidate policy files" message.
+        let policies_dir = tempfile::tempdir().unwrap();
+        std::fs::write(policies_dir.path().join("broken.toml"), "not valid toml [[[").unwrap();
+        let app = build_with_policies_dir(policies_dir.path().to_path_buf(), None);
+
+        let resp = app
+            .oneshot(req_with_peer(Method::POST, "/v1/control/reload", loopback_v4()))
+            .await
+            .unwrap();
+        // Parse error → 400, not 200 with a false empty-dir warning.
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     }
 }
