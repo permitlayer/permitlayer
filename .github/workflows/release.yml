@@ -1419,11 +1419,14 @@ jobs:
       - name: Run daemon + Inspector conformance
         run: |
           set -euo pipefail
-          # Background the daemon; capture its PID so we can clean
-          # up on EXIT regardless of pass/fail.
-          agentsso start --foreground &
-          DAEMON_PID=$!
-          trap 'kill -TERM $DAEMON_PID 2>/dev/null || true; wait $DAEMON_PID 2>/dev/null || true' EXIT
+          # The installer normally starts the daemon. If that changes,
+          # start a foreground daemon and clean up only that child.
+          DAEMON_PID=""
+          if ! curl -fsS http://127.0.0.1:3820/health >/dev/null 2>&1; then
+            agentsso start --allow-foreground &
+            DAEMON_PID=$!
+          fi
+          trap 'if [ -n "$DAEMON_PID" ]; then kill -TERM "$DAEMON_PID" 2>/dev/null || true; wait "$DAEMON_PID" 2>/dev/null || true; fi' EXIT
           # Wait up to 30s for the daemon to bind 127.0.0.1:3820.
           # Story 7.7 P20 — pin IPv4 explicitly. `nc -z localhost`
           # prefers v4 but the resolver order varies; if the daemon
@@ -1452,11 +1455,12 @@ jobs:
           # `mcp-inspector test --conformance` form starts a long-running
           # session with current Inspector builds instead of exiting.
           timeout 120s mcp-inspector \
-            --cli http://127.0.0.1:3820/mcp/gmail \
+            --cli \
             --transport http \
             --method tools/list \
             --header "Authorization: Bearer $TOKEN" \
-            --header "x-agentsso-scope: gmail.readonly"
+            --header "x-agentsso-scope: gmail.readonly" \
+            http://127.0.0.1:3820/mcp/gmail
       - name: Partial-failure issue on error
         if: failure()
         run: |
