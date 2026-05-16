@@ -1450,6 +1450,12 @@ jobs:
             --policy gmail-read-only \
             --token-out "$RUNNER_TEMP/release-inspector.token"
           TOKEN="$(cat "$RUNNER_TEMP/release-inspector.token")"
+          CONTROL_TOKEN="$(cat "$HOME/.agentsso/control.token")"
+          curl -fsS -X POST "http://127.0.0.1:3820/v1/control/credentials/seal" \
+            -H "Content-Type: application/json" \
+            -H "X-Agentsso-Control: $CONTROL_TOKEN" \
+            -d '{"service":"gmail","agent":"release-inspector","access_token":"ya29.release-smoke-access-token","refresh_token":"1//release-smoke-refresh-token","granted_scopes":["https://www.googleapis.com/auth/gmail.readonly"],"client_type":"byo","client_source":"/tmp/release-smoke-oauth-client.json","expires_in_secs":3600,"if_exists":"replace"}'
+          agentsso reload
           export TOKEN
           export PROXY_TARGET="http://127.0.0.1:3820/mcp/gmail"
 
