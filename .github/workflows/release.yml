@@ -1364,6 +1364,7 @@ jobs:
       - host
     if: ${{ always() && needs.host.result == 'success' && !github.event.pull_request }}
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     env:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAG: ${{ needs.plan.outputs.tag }}
@@ -1441,11 +1442,21 @@ jobs:
             echo "::error::daemon did not bind 127.0.0.1:3820 within 30s"
             exit 1
           fi
-          # Run the Inspector conformance pass. The exact CLI shape
-          # may evolve — confirm with `mcp-inspector --help` if this
-          # breaks; capture the working invocation in story
-          # Completion Notes.
-          mcp-inspector test --transport http --url http://127.0.0.1:3820 --conformance
+          agentsso policy validate "$HOME/.agentsso/policies/default.toml"
+          agentsso agent register release-inspector \
+            --policy gmail-read-only \
+            --token-out "$RUNNER_TEMP/release-inspector.token"
+          TOKEN="$(cat "$RUNNER_TEMP/release-inspector.token")"
+
+          # Use Inspector's non-interactive CLI mode. The old
+          # `mcp-inspector test --conformance` form starts a long-running
+          # session with current Inspector builds instead of exiting.
+          timeout 120s mcp-inspector \
+            --cli http://127.0.0.1:3820/mcp/gmail \
+            --transport http \
+            --method tools/list \
+            --header "Authorization: Bearer $TOKEN" \
+            --header "x-agentsso-scope: gmail.readonly"
       - name: Partial-failure issue on error
         if: failure()
         run: |
