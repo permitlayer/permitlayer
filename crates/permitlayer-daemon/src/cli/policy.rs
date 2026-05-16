@@ -246,6 +246,21 @@ async fn list_policies() -> Result<()> {
         }
     };
 
+    // Bug 2: nested control-plane auth errors carry a top-level
+    // `status:"error"` and would otherwise fall into the flat branch
+    // below as a useless `policy.unknown_error` AND exit 2 (operator-
+    // correctable input) for what is actually an auth failure. Surface
+    // them first with the correct exit 3, matching every other
+    // `/v1/control/*` consumer. Genuine `policy.*` errors keep exit 2.
+    if let Some((code, message)) =
+        crate::cli::kill::nested_control_plane_auth_error(&parsed)
+    {
+        eprint!(
+            "{}",
+            error_block(&code, &message, crate::cli::kill::CONTROL_AUTH_REMEDIATION, None)
+        );
+        std::process::exit(3);
+    }
     let status = parsed["status"].as_str();
     if status == Some("error") {
         let code = parsed["code"].as_str().unwrap_or("policy.unknown_error").to_owned();

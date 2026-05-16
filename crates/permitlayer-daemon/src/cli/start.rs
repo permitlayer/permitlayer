@@ -1910,7 +1910,7 @@ impl StartError {
                  \n\
                  the daemon could not read or mint {}. \
                  common causes:\n\
-                 - the file exists but has the wrong mode (must be 0o600)\n\
+                 - the file exists but has an unsafe mode (expected 0o600, or on macOS 0o640 owned by root:permitlayer-clients)\n\
                  - the file exists but is malformed (delete it and the daemon will mint fresh)\n\
                  - filesystem permissions on {} block writing\n",
                 path.display(),

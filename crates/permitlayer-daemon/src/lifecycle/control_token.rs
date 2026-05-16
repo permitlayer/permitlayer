@@ -30,7 +30,12 @@
 //!   the next daemon start). Explicit rotation only.
 //! - **Filesystem mode**: `0o600` on Unix. The owner-only mode is the
 //!   primary security boundary; constant-time compare on the daemon side
-//!   is defense in depth.
+//!   is defense in depth. On macOS the daemon runs as root via
+//!   LaunchDaemon and the unprivileged operator-CLI must read the token
+//!   for cross-user `/v1/control/*` auth (Story 7.27), so the accepted
+//!   end-state there is *also* `0o640` owned by `root:permitlayer-clients`
+//!   — reconciled on every start, not just first mint (see
+//!   `reconcile_macos_cross_user_perms`).
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -64,11 +69,14 @@ pub enum ControlTokenError {
     #[error("control token at {path} is malformed (expected {TOKEN_PREFIX}<base64>)")]
     Malformed { path: PathBuf },
 
-    /// File mode is not 0o600 — only meaningful on Unix where the mode
+    /// File mode is unsafe — only meaningful on Unix where the mode
     /// gate is the actual security boundary. cfg-gated to keep
-    /// Windows builds free of an unused-field warning.
+    /// Windows builds free of an unused-field warning. The accepted-safe
+    /// set is platform-dependent (`0o600` everywhere; macOS also accepts
+    /// `0o640 root:permitlayer-clients`), so the message no longer
+    /// hardcodes a single expected mode.
     #[cfg(unix)]
-    #[error("control token at {path} has unsafe mode {mode:#o} (expected 0o600)")]
+    #[error("control token at {path} has unsafe mode {mode:#o}")]
     UnsafeMode { path: PathBuf, mode: u32 },
 }
 
@@ -149,16 +157,49 @@ impl ControlToken {
             use std::os::unix::fs::MetadataExt;
             let metadata = std::fs::metadata(path)
                 .map_err(|source| ControlTokenError::Io { path: path.to_owned(), source })?;
-            // Lower 9 bits = file mode bits (rwxrwxrwx). Anything other
-            // than 0o600 means another user can read the token; refuse.
+            // Lower 9 bits = file mode bits (rwxrwxrwx).
             let mode = metadata.mode() & 0o777;
-            if mode != 0o600 {
-                return Err(ControlTokenError::UnsafeMode { path: path.to_owned(), mode });
+
+            #[cfg(target_os = "macos")]
+            {
+                // On macOS the cross-user end-state (Story 7.27) is
+                // `0o640 root:permitlayer-clients`, so accept that in
+                // addition to owner-only `0o600`. Anything else
+                // (world/foreign-group readable, etc.) is refused.
+                let group_gid = nix::unistd::Group::from_name("permitlayer-clients")
+                    .ok()
+                    .flatten()
+                    .map(|g| g.gid.as_raw());
+                if !macos_mode_is_safe(mode, metadata.gid(), group_gid) {
+                    return Err(ControlTokenError::UnsafeMode { path: path.to_owned(), mode });
+                }
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                // Anything other than 0o600 means another user can read
+                // the token; refuse.
+                if mode != 0o600 {
+                    return Err(ControlTokenError::UnsafeMode { path: path.to_owned(), mode });
+                }
             }
         }
 
         let _raw = decode_token(trimmed)
             .ok_or_else(|| ControlTokenError::Malformed { path: path.to_owned() })?;
+
+        // Validate-then-reconcile: only after the on-disk mode is
+        // confirmed to be in the accepted-safe set above do we
+        // (idempotently) re-assert the desired cross-user end-state.
+        // Doing this on the read path — not just `mint_and_write` —
+        // is the Story-7.27 regression fix: a daemon restart (reboot,
+        // `launchctl kickstart`, crash) hits `read_existing`, which
+        // otherwise never re-applied the chgrp/chmod, leaving the token
+        // unreadable by the operator-CLI's `permitlayer-clients` group.
+        // Validate-first so a tampered mode hard-fails above instead of
+        // being silently chmod'd back and accepted.
+        #[cfg(target_os = "macos")]
+        reconcile_macos_cross_user_perms(path);
+
         Ok(Self { encoded: Zeroizing::new(trimmed.to_owned()) })
     }
 
@@ -239,143 +280,12 @@ impl ControlToken {
                 .map_err(|source| ControlTokenError::Io { path: path.to_owned(), source })?;
         }
 
-        // Story 7.27 cross-user CLI fix: on macOS the daemon runs as
-        // root via LaunchDaemon, but the operator-CLI (`agentsso
-        // agent register` etc.) runs as the unprivileged operator.
-        // The CLI reads this token to send as `X-Agentsso-Control`;
-        // it can't read a root-owned 0600 file. Re-chmod to 0640 +
-        // chgrp `permitlayer-clients` so operators in that group
-        // (added by `service install`) can read the secret without
-        // gaining write/delete access.
-        //
-        // # Threat model
-        //
-        // **Why is group-readable safe?** The bearer-token check is
-        // a SUPPLEMENTARY signal; the kernel-attested peer UID from
-        // `LOCAL_PEERCRED` on the UDS connection is the PRIMARY
-        // identity gate. Even if a malicious `permitlayer-clients`
-        // member reads `control.token` from disk, they cannot
-        // impersonate the operator over UDS because:
-        //
-        //   1. UDS peer-cred capture (`record_peer_credentials_layer`
-        //      in `server/control_listener.rs`) records the
-        //      kernel-attested peer UID/GID at accept time. The
-        //      attacker connects as themselves; the daemon sees
-        //      THEIR UID, not the operator's.
-        //   2. AC #11 `control.identity_mismatch` detection at
-        //      `server/control.rs::require_control_token` fires a
-        //      WARN audit event when the peer UID ≠
-        //      `PERMITLAYER_OPERATOR_UID` (the operator's UID
-        //      captured at `service install` time and persisted in
-        //      the LaunchDaemon plist `EnvironmentVariables`).
-        //      Audit-log readers can trace the impersonation
-        //      attempt.
-        //   3. UDS connect itself is gated on `permitlayer-clients`
-        //      group membership at the kernel layer (socket mode
-        //      0660 root:permitlayer-clients per AC #5). A non-
-        //      member cannot even open the connection.
-        //
-        // So the operator-CLI cross-user-auth model assumes a
-        // trusted `permitlayer-clients` membership (curated via
-        // `dseditgroup`), where every member is permitted to
-        // operate as themselves — never as anyone else.
-        //
-        // # Fallback behavior
-        //
-        // If `permitlayer-clients` is absent (operator never ran
-        // `service install`), `Group::from_name` returns `Ok(None)`.
-        // Pre-Round-2, this branch silently no-op'd, leaving the
-        // file 0600 root-only — operator-CLI then fails with
-        // `forbidden_missing_control_token` and no log indicating
-        // WHY. Round-2 fix: emit `tracing::warn!` on every fallback
-        // branch so operators can grep `control_token.permitlayer_
-        // clients_group_missing` and follow the remediation. Also
-        // capture chown/chmod errors instead of `let _ =` so
-        // partial-success doesn't masquerade as full success.
+        // Story 7.27 cross-user CLI fix. Applied on the mint path here
+        // and ALSO on the `read_existing` restart path — the helper is
+        // idempotent and the restart-path call is the regression fix
+        // (a bounced daemon hits `read_existing`, not `mint_and_write`).
         #[cfg(target_os = "macos")]
-        if nix::unistd::getuid().is_root() {
-            use std::os::unix::fs::PermissionsExt;
-            match nix::unistd::Group::from_name("permitlayer-clients") {
-                Ok(Some(group)) => {
-                    let chown_result = nix::unistd::chown(
-                        path,
-                        Some(nix::unistd::Uid::from_raw(0)),
-                        Some(nix::unistd::Gid::from_raw(group.gid.as_raw())),
-                    );
-                    if let Err(e) = chown_result {
-                        // Round-3 review fix (R3-C5-P6): force 0o600
-                        // on chgrp failure. The Round-2 warn said
-                        // "file stays at the prior owner" — but if
-                        // a previous boot already chgrp'd to
-                        // `permitlayer-clients`, the file remains
-                        // `0640 :permitlayer-clients` group-readable
-                        // while this code path believes "stays at
-                        // prior owner". Re-narrowing to 0o600
-                        // closes the read surface defensively;
-                        // operators see the warn and know cross-user
-                        // CLI access is broken until they fix the
-                        // group membership.
-                        let mode_after = std::fs::metadata(path).ok().map(|m| {
-                            std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o777
-                        });
-                        let _ =
-                            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-                        tracing::warn!(
-                            target: "control_token",
-                            event = "control_token.chgrp_failed",
-                            path = %path.display(),
-                            error = %e,
-                            prior_mode = ?mode_after.map(|m| format!("0o{m:o}")),
-                            "failed to chgrp control.token to permitlayer-clients; \
-                             re-narrowed to 0o600 to close the read surface (operator-CLI \
-                             cross-user auth will not work until the group membership is \
-                             fixed)"
-                        );
-                    } else if let Err(e) =
-                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640))
-                    {
-                        tracing::warn!(
-                            target: "control_token",
-                            event = "control_token.chmod_failed",
-                            path = %path.display(),
-                            error = %e,
-                            "chgrp'd control.token to permitlayer-clients but chmod 0640 \
-                             failed; file stays at the prior mode — operator-CLI may not \
-                             be able to read it"
-                        );
-                    } else {
-                        tracing::info!(
-                            target: "control_token",
-                            event = "control_token.chgrp_complete",
-                            path = %path.display(),
-                            "control.token chgrp'd to permitlayer-clients mode 0640 for \
-                             cross-user CLI access"
-                        );
-                    }
-                }
-                Ok(None) => {
-                    tracing::warn!(
-                        target: "control_token",
-                        event = "control_token.permitlayer_clients_group_missing",
-                        path = %path.display(),
-                        "permitlayer-clients group not found — control.token stays 0600 \
-                         root-only. Operator-CLI cross-user auth will fail with \
-                         `forbidden_missing_control_token`. Run `sudo agentsso service \
-                         install` to create the group and grant operator access."
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        target: "control_token",
-                        event = "control_token.permitlayer_clients_lookup_failed",
-                        path = %path.display(),
-                        error = %e,
-                        "nss lookup for permitlayer-clients group failed — control.token \
-                         stays 0600 root-only; operator-CLI cross-user auth may not work"
-                    );
-                }
-            }
-        }
+        reconcile_macos_cross_user_perms(path);
 
         Ok(Self { encoded: Zeroizing::new(encoded) })
     }
@@ -388,6 +298,164 @@ fn decode_token(s: &str) -> Option<[u8; TOKEN_RAW_BYTES]> {
     let body = s.strip_prefix(TOKEN_PREFIX)?;
     let bytes = permitlayer_core::agent::base64_url_no_pad_decode(body)?;
     bytes.try_into().ok()
+}
+
+/// Whether an on-disk control-token mode is safe on macOS.
+///
+/// Owner-only `0o600` is always safe. The Story-7.27 cross-user
+/// end-state `0o640` is safe ONLY when the file's group is exactly
+/// `permitlayer-clients` (passed as `group_gid`). If the group is
+/// missing / unresolvable (`group_gid == None`), a `0o640` file is
+/// rejected — it is group-readable by some arbitrary gid and is not
+/// the curated cross-user state. Pure (no I/O) so it is unit-testable
+/// without root.
+#[cfg(target_os = "macos")]
+fn macos_mode_is_safe(mode: u32, file_gid: u32, group_gid: Option<u32>) -> bool {
+    mode == 0o600 || (mode == 0o640 && Some(file_gid) == group_gid)
+}
+
+/// Reconcile the control token to the macOS cross-user end-state.
+///
+/// Story 7.27 cross-user CLI fix: on macOS the daemon runs as root via
+/// LaunchDaemon, but the operator-CLI (`agentsso agent register` etc.)
+/// runs as the unprivileged operator. The CLI reads this token to send
+/// as `X-Agentsso-Control`; it can't read a root-owned 0600 file.
+/// Re-chmod to 0640 + chgrp `permitlayer-clients` so operators in that
+/// group (added by `service install`) can read the secret without
+/// gaining write/delete access.
+///
+/// Called from BOTH `mint_and_write` (first mint) and `read_existing`
+/// (every subsequent daemon start). Idempotent and a no-op when not
+/// running as root, so it is safe to call unconditionally on both paths.
+///
+/// # Threat model
+///
+/// **Why is group-readable safe?** The bearer-token check is a
+/// SUPPLEMENTARY signal; the kernel-attested peer UID from
+/// `LOCAL_PEERCRED` on the UDS connection is the PRIMARY identity gate.
+/// Even if a malicious `permitlayer-clients` member reads
+/// `control.token` from disk, they cannot impersonate the operator over
+/// UDS because:
+///
+///   1. UDS peer-cred capture (`record_peer_credentials_layer` in
+///      `server/control_listener.rs`) records the kernel-attested peer
+///      UID/GID at accept time. The attacker connects as themselves;
+///      the daemon sees THEIR UID, not the operator's.
+///   2. AC #11 `control.identity_mismatch` detection at
+///      `server/control.rs::require_control_token` fires a WARN audit
+///      event when the peer UID ≠ `PERMITLAYER_OPERATOR_UID` (the
+///      operator's UID captured at `service install` time and persisted
+///      in the LaunchDaemon plist `EnvironmentVariables`). Audit-log
+///      readers can trace the impersonation attempt.
+///   3. UDS connect itself is gated on `permitlayer-clients` group
+///      membership at the kernel layer (socket mode 0660
+///      root:permitlayer-clients per AC #5). A non-member cannot even
+///      open the connection.
+///
+/// So the operator-CLI cross-user-auth model assumes a trusted
+/// `permitlayer-clients` membership (curated via `dseditgroup`), where
+/// every member is permitted to operate as themselves — never as
+/// anyone else.
+///
+/// # Fallback behavior
+///
+/// If `permitlayer-clients` is absent (operator never ran `service
+/// install`), `Group::from_name` returns `Ok(None)`. Pre-Round-2, this
+/// branch silently no-op'd, leaving the file 0600 root-only —
+/// operator-CLI then fails with `forbidden_missing_control_token` and
+/// no log indicating WHY. Round-2 fix: emit `tracing::warn!` on every
+/// fallback branch so operators can grep
+/// `control_token.permitlayer_clients_group_missing` and follow the
+/// remediation. Also capture chown/chmod errors instead of `let _ =`
+/// so partial-success doesn't masquerade as full success.
+///
+/// The fallback branches (group missing / lookup failed / chgrp
+/// failed) never widen permissions — chgrp-failure actively re-narrows
+/// to 0o600 — so calling this on every restart cannot loosen a file
+/// that should legitimately stay 0o600.
+#[cfg(target_os = "macos")]
+fn reconcile_macos_cross_user_perms(path: &Path) {
+    if nix::unistd::getuid().is_root() {
+        use std::os::unix::fs::PermissionsExt;
+        match nix::unistd::Group::from_name("permitlayer-clients") {
+            Ok(Some(group)) => {
+                let chown_result = nix::unistd::chown(
+                    path,
+                    Some(nix::unistd::Uid::from_raw(0)),
+                    Some(nix::unistd::Gid::from_raw(group.gid.as_raw())),
+                );
+                if let Err(e) = chown_result {
+                    // Round-3 review fix (R3-C5-P6): force 0o600 on
+                    // chgrp failure. The Round-2 warn said "file stays
+                    // at the prior owner" — but if a previous boot
+                    // already chgrp'd to `permitlayer-clients`, the
+                    // file remains `0640 :permitlayer-clients`
+                    // group-readable while this code path believes
+                    // "stays at prior owner". Re-narrowing to 0o600
+                    // closes the read surface defensively; operators
+                    // see the warn and know cross-user CLI access is
+                    // broken until they fix the group membership.
+                    let mode_after = std::fs::metadata(path).ok().map(|m| {
+                        std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o777
+                    });
+                    let _ =
+                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                    tracing::warn!(
+                        target: "control_token",
+                        event = "control_token.chgrp_failed",
+                        path = %path.display(),
+                        error = %e,
+                        prior_mode = ?mode_after.map(|m| format!("0o{m:o}")),
+                        "failed to chgrp control.token to permitlayer-clients; \
+                         re-narrowed to 0o600 to close the read surface (operator-CLI \
+                         cross-user auth will not work until the group membership is \
+                         fixed)"
+                    );
+                } else if let Err(e) =
+                    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o640))
+                {
+                    tracing::warn!(
+                        target: "control_token",
+                        event = "control_token.chmod_failed",
+                        path = %path.display(),
+                        error = %e,
+                        "chgrp'd control.token to permitlayer-clients but chmod 0640 \
+                         failed; file stays at the prior mode — operator-CLI may not \
+                         be able to read it"
+                    );
+                } else {
+                    tracing::info!(
+                        target: "control_token",
+                        event = "control_token.chgrp_complete",
+                        path = %path.display(),
+                        "control.token chgrp'd to permitlayer-clients mode 0640 for \
+                         cross-user CLI access"
+                    );
+                }
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    target: "control_token",
+                    event = "control_token.permitlayer_clients_group_missing",
+                    path = %path.display(),
+                    "permitlayer-clients group not found — control.token stays 0600 \
+                     root-only. Operator-CLI cross-user auth will fail with \
+                     `forbidden_missing_control_token`. Run `sudo agentsso service \
+                     install` to create the group and grant operator access."
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    target: "control_token",
+                    event = "control_token.permitlayer_clients_lookup_failed",
+                    path = %path.display(),
+                    error = %e,
+                    "nss lookup for permitlayer-clients group failed — control.token \
+                     stays 0600 root-only; operator-CLI cross-user auth may not work"
+                );
+            }
+        }
+    }
 }
 
 // Test-only constructors. Cfg-gated so they don't ship in release
@@ -545,5 +613,48 @@ mod tests {
         if let Err(panic) = result {
             std::panic::resume_unwind(panic);
         }
+    }
+
+    /// The security-critical accept/reject decision for `read_existing`
+    /// on macOS, tested as a pure function (no root, no real chgrp).
+    /// Story 7.27 regression guard: a restarted daemon must accept the
+    /// cross-user end-state `0o640 root:permitlayer-clients` while still
+    /// rejecting genuinely-unsafe modes.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_mode_is_safe_truth_table() {
+        let g = 501; // arbitrary "permitlayer-clients" gid
+        // Owner-only is always safe, regardless of group resolution.
+        assert!(macos_mode_is_safe(0o600, g, Some(g)));
+        assert!(macos_mode_is_safe(0o600, 0, None));
+        // Cross-user end-state: 0o640 safe ONLY with matching group.
+        assert!(macos_mode_is_safe(0o640, g, Some(g)));
+        assert!(!macos_mode_is_safe(0o640, g, Some(999)));
+        assert!(!macos_mode_is_safe(0o640, g, None));
+        // Genuinely-unsafe modes are always rejected.
+        assert!(!macos_mode_is_safe(0o644, g, Some(g)));
+        assert!(!macos_mode_is_safe(0o604, g, Some(g)));
+        assert!(!macos_mode_is_safe(0o660, g, Some(g)));
+        assert!(!macos_mode_is_safe(0o666, g, Some(g)));
+        assert!(!macos_mode_is_safe(0o640, 999, Some(g)));
+    }
+
+    /// Reconciliation is a no-op when not running as root (the test
+    /// process is unprivileged in CI). Pins both the idempotency and
+    /// the no-widen-when-not-root property: a 0o600 file stays 0o600.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn reconcile_is_noop_when_not_root() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("control.token");
+        std::fs::write(&path, "agt_ctl_x").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        reconcile_macos_cross_user_perms(&path);
+
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "reconcile must not widen perms when not root");
     }
 }

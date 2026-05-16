@@ -221,6 +221,19 @@ fn control_command_works_cross_home_via_env_var() {
 /// cron jobs and other automation. This test pins the persistence
 /// invariant: shut down the daemon, restart, the token file content
 /// is byte-identical.
+///
+/// Story 7.27 regression guard (Bug 1): the second boot exercises the
+/// `read_existing` path, which now also runs
+/// `reconcile_macos_cross_user_perms`. We assert the restarted token
+/// is still readable by the test process. NOTE: the *true* regression
+/// (root daemon + `permitlayer-clients` group → 0o640 cross-user
+/// reconcile) is not CI-reproducible (requires running the daemon as
+/// root with that group present). This test runs unprivileged, so
+/// `reconcile_*` is a no-op (the `is_root()` guard) and the token
+/// stays 0o600 — owner-readable. The portable guards for the
+/// security-critical accept/reject logic are the pure
+/// `macos_mode_is_safe` truth-table unit test and the retained
+/// 0o644-rejection unit test in `lifecycle/control_token.rs`.
 #[test]
 fn control_token_persists_across_daemon_restart() {
     let home = tempfile::tempdir().unwrap();
@@ -244,6 +257,10 @@ fn control_token_persists_across_daemon_restart() {
         ..Default::default()
     });
     assert!(wait_for_health(daemon2.port), "second daemon should boot");
+    // `read_test_control_token` panics if the file is unreadable, so
+    // this call is itself the post-restart-readability assertion: the
+    // second boot went through `read_existing` (+ reconcile) and the
+    // token is still readable.
     let token_second = read_test_control_token(home.path());
     drop(daemon2);
 
