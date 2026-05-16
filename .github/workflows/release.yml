@@ -1450,17 +1450,89 @@ jobs:
             --policy gmail-read-only \
             --token-out "$RUNNER_TEMP/release-inspector.token"
           TOKEN="$(cat "$RUNNER_TEMP/release-inspector.token")"
+          export TOKEN
+          export PROXY_TARGET="http://127.0.0.1:3820/mcp/gmail"
+
+          # Inspector 0.16.0 CLI does not expose an HTTP-header flag.
+          # Run a loopback-only shim that forwards Inspector traffic to
+          # agentsso with the release-smoke bearer token and scope.
+          cat > "$RUNNER_TEMP/inspector_header_proxy.py" <<'PY'
+          from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+          import os
+          import urllib.error
+          import urllib.parse
+          import urllib.request
+
+          TARGET = os.environ["PROXY_TARGET"]
+          TOKEN = os.environ["TOKEN"]
+
+          class Handler(BaseHTTPRequestHandler):
+              protocol_version = "HTTP/1.1"
+
+              def log_message(self, fmt, *args):
+                  return
+
+              def do_GET(self):
+                  self.forward()
+
+              def do_POST(self):
+                  self.forward()
+
+              def do_DELETE(self):
+                  self.forward()
+
+              def forward(self):
+                  length = int(self.headers.get("Content-Length", "0") or "0")
+                  body = self.rfile.read(length) if length else None
+                  query = urllib.parse.urlsplit(self.path).query
+                  url = TARGET + (("?" + query) if query else "")
+                  headers = {
+                      k: v
+                      for k, v in self.headers.items()
+                      if k.lower() not in {"host", "content-length", "connection", "authorization"}
+                  }
+                  headers["Authorization"] = f"Bearer {TOKEN}"
+                  headers["x-agentsso-scope"] = "gmail.readonly"
+                  req = urllib.request.Request(url, data=body, headers=headers, method=self.command)
+                  try:
+                      with urllib.request.urlopen(req, timeout=30) as resp:
+                          self.respond(resp.status, resp.headers.items(), resp.read())
+                  except urllib.error.HTTPError as err:
+                      self.respond(err.code, err.headers.items(), err.read())
+
+              def respond(self, status, headers, body):
+                  self.send_response(status)
+                  for key, value in headers:
+                      if key.lower() not in {"connection", "content-length", "transfer-encoding"}:
+                          self.send_header(key, value)
+                  self.send_header("Content-Length", str(len(body)))
+                  self.end_headers()
+                  self.wfile.write(body)
+
+          ThreadingHTTPServer(("127.0.0.1", 3821), Handler).serve_forever()
+          PY
+          python3 "$RUNNER_TEMP/inspector_header_proxy.py" &
+          PROXY_PID=$!
+          trap 'kill -TERM "$PROXY_PID" 2>/dev/null || true; wait "$PROXY_PID" 2>/dev/null || true; if [ -n "$DAEMON_PID" ]; then kill -TERM "$DAEMON_PID" 2>/dev/null || true; wait "$DAEMON_PID" 2>/dev/null || true; fi' EXIT
+          for i in $(seq 1 20); do
+            if nc -z 127.0.0.1 3821; then
+              echo "header proxy bound 127.0.0.1:3821 after $i × 0.25s"
+              break
+            fi
+            sleep 0.25
+          done
+          if ! nc -z 127.0.0.1 3821; then
+            echo "::error::header proxy did not bind 127.0.0.1:3821 within 5s"
+            exit 1
+          fi
 
           # Use Inspector's non-interactive CLI mode. The old
           # `mcp-inspector test --conformance` form starts a long-running
           # session with current Inspector builds instead of exiting.
           timeout 120s mcp-inspector \
-            --cli \
+            --cli http://127.0.0.1:3821/mcp \
             --transport http \
-            --method tools/list \
-            --header "Authorization: Bearer $TOKEN" \
-            --header "x-agentsso-scope: gmail.readonly" \
-            http://127.0.0.1:3820/mcp/gmail
+            --method tools/list
       - name: Partial-failure issue on error
         if: failure()
         run: |
