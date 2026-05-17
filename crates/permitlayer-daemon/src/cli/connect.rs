@@ -1132,9 +1132,18 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
                     // Story 7.35: the client JSON is now sealed in the
                     // vault; the daemon no longer reads the original
                     // file at refresh time.
+                    //
+                    // Bind ONLY the non-sensitive source path to a
+                    // local string before the sink. We deliberately do
+                    // NOT pass `oauth_config` (which also holds the
+                    // client_secret) into any println!/tracing — this
+                    // also resolves a CodeQL `rust/cleartext-logging`
+                    // taint false-positive that flagged the whole
+                    // `oauth_config` reaching this output even though
+                    // only `.source_path()` is read.
+                    let client_json_path = oauth_config.source_path().display().to_string();
                     println!(
-                        "  {check} client credentials sealed \u{2014} the original {} is no longer",
-                        oauth_config.source_path().display()
+                        "  {check} client credentials sealed \u{2014} the original {client_json_path} is no longer"
                     );
                     println!("    needed by the daemon (you may keep or delete it)");
                 } else {
