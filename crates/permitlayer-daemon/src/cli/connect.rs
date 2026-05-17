@@ -1133,17 +1133,26 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
                     // vault; the daemon no longer reads the original
                     // file at refresh time.
                     //
-                    // Bind ONLY the non-sensitive source path to a
-                    // local string before the sink. We deliberately do
-                    // NOT pass `oauth_config` (which also holds the
-                    // client_secret) into any println!/tracing — this
-                    // also resolves a CodeQL `rust/cleartext-logging`
-                    // taint false-positive that flagged the whole
-                    // `oauth_config` reaching this output even though
-                    // only `.source_path()` is read.
-                    let client_json_path = oauth_config.source_path().display().to_string();
+                    // SECURITY NOTE: only `oauth_config.source_path()`
+                    // — the *path* to the original client JSON — is
+                    // ever printed here, NEVER the `client_secret`.
+                    // Showing the path is REQUIRED by Story 7.35 AC#2
+                    // (tell the operator the original file is no longer
+                    // needed). CodeQL `rust/cleartext-logging` flags
+                    // this because its taint model is not
+                    // field-sensitive: any value derived from
+                    // `oauth_config` (which also holds the secret)
+                    // reaching an output sink trips it, even though
+                    // `.source_path()` projects only the non-sensitive
+                    // path. Verified false positive (diff-wide sweep:
+                    // no oauth_config/client_secret/bundle value
+                    // reaches any println!/tracing/eprintln sink) —
+                    // dismissed in GitHub code-scanning with this
+                    // justification rather than distorting required
+                    // operator UX to satisfy an imprecise query.
                     println!(
-                        "  {check} client credentials sealed \u{2014} the original {client_json_path} is no longer"
+                        "  {check} client credentials sealed \u{2014} the original {} is no longer",
+                        oauth_config.source_path().display()
                     );
                     println!("    needed by the daemon (you may keep or delete it)");
                 } else {
