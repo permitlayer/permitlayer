@@ -244,6 +244,32 @@ async fn register_agent(args: RegisterArgs) -> Result<()> {
             std::process::exit(3);
         }
     };
+    // Bug 2: nested control-plane auth errors
+    // (`{"status":"error","error":{"code":"forbidden_*",...}}`) carry a
+    // top-level `status:"error"` and would otherwise be consumed by the
+    // flat-error branch below as a useless `agent.unknown_error`. Detect
+    // and surface them first. `--json` callers get the auth error
+    // flattened into the standard `RegisterErrorJson` stdout shape so
+    // `jq -r .code` pipelines fail loudly with the real cause.
+    if let Some((code, message)) = crate::cli::kill::nested_control_plane_auth_error(&parsed) {
+        if args.json {
+            let payload = RegisterErrorJson { status: "error", code: code.clone(), message };
+            match serde_json::to_string(&payload) {
+                Ok(s) => println!("{s}"),
+                Err(e) => {
+                    tracing::error!(error = %e, "register --json auth-error serialization failed");
+                    eprint!("{}", error_block_protocol_error());
+                    std::process::exit(3);
+                }
+            }
+        } else {
+            eprint!(
+                "{}",
+                error_block(&code, &message, crate::cli::kill::CONTROL_AUTH_REMEDIATION, None)
+            );
+        }
+        std::process::exit(3);
+    }
     // Story 7.11 review-round-1 D3: explicit `Some("ok")` positive
     // check. Pre-7.11 the register/list/remove handlers fell through
     // to success on missing/unknown status; D3 lifts the rebind-path
@@ -493,6 +519,19 @@ async fn list_agents() -> Result<()> {
             std::process::exit(3);
         }
     };
+    // Bug 2: surface nested control-plane auth errors first. The
+    // pre-fix "Plan B" block lived AFTER the flat-error branch and was
+    // dead code — the nested body carries top-level `status:"error"`,
+    // so the flat branch consumed it and exited with a misleading
+    // `agent.unknown_error` (or, for list, a phantom "no agents
+    // registered" empty state) before Plan B was ever reached.
+    if let Some((code, message)) = crate::cli::kill::nested_control_plane_auth_error(&parsed) {
+        eprint!(
+            "{}",
+            error_block(&code, &message, crate::cli::kill::CONTROL_AUTH_REMEDIATION, None)
+        );
+        std::process::exit(3);
+    }
     // Distinguish structured error bodies from the success shape BEFORE
     // reading `agents`. The daemon returns 503 `agent.store_unavailable`
     // (with `status: "error"`) when the backing store is degraded —
@@ -500,10 +539,6 @@ async fn list_agents() -> Result<()> {
     // and chase a red herring.
     //
     // Story 7.11 review-round-1 D3: explicit Some("ok") discipline.
-    // NB: list responses can ALSO take the Plan B
-    // `{"error":{"code":"forbidden_*"}}` shape (auth errors), handled
-    // immediately below — so the unknown-status branch only fires
-    // when neither shape matches.
     let status = parsed["status"].as_str();
     if status == Some("error") {
         let code = parsed["code"].as_str().unwrap_or("agent.unknown_error").to_owned();
@@ -518,25 +553,6 @@ async fn list_agents() -> Result<()> {
         eprint!("{}", error_block(&code, &message, &suggested, None));
         // Story 7.11 review-round-2 Q2: shared exit-code helper.
         std::process::exit(agent_control_exit_code(&code));
-    }
-    // Plan B: control-plane auth errors come back with a different
-    // top-level shape: `{"error":{"code":"forbidden_*", "message":...}}`.
-    // Surface them so the operator sees the actual cause instead of a
-    // misleading "no agents registered" empty state.
-    if let Some(err) = parsed.get("error") {
-        let code = err["code"].as_str().unwrap_or("control.unknown_error").to_owned();
-        let message = err["message"].as_str().unwrap_or("(no message)").to_owned();
-        let suggested = match code.as_str() {
-            "forbidden_missing_control_token" | "forbidden_invalid_control_token" => {
-                "set AGENTSSO_CONTROL_TOKEN or run as the daemon-owner user. \
-                 If you cannot read the daemon's <home>/control.token, ask the operator \
-                 to share it explicitly (e.g. via `sudo cat`)."
-                    .to_owned()
-            }
-            _ => "see message above".to_owned(),
-        };
-        eprint!("{}", error_block(&code, &message, &suggested, None));
-        std::process::exit(3);
     }
 
     // Story 7.11 review-round-1 D3: now that BOTH error shapes are
@@ -636,6 +652,15 @@ async fn remove_agent(args: RemoveArgs) -> Result<()> {
         }
     };
 
+    // Bug 2: surface nested control-plane auth errors before the flat
+    // branch (which would otherwise report `agent.unknown_error`).
+    if let Some((code, message)) = crate::cli::kill::nested_control_plane_auth_error(&parsed) {
+        eprint!(
+            "{}",
+            error_block(&code, &message, crate::cli::kill::CONTROL_AUTH_REMEDIATION, None)
+        );
+        std::process::exit(3);
+    }
     // Story 7.11 review-round-1 D3: explicit Some("ok") discipline.
     let status = parsed["status"].as_str();
     if status == Some("error") {
@@ -704,6 +729,15 @@ async fn rebind_agent(args: RebindArgs) -> Result<()> {
         }
     };
 
+    // Bug 2: surface nested control-plane auth errors before the flat
+    // branch (which would otherwise report `agent.unknown_error`).
+    if let Some((code, message)) = crate::cli::kill::nested_control_plane_auth_error(&parsed) {
+        eprint!(
+            "{}",
+            error_block(&code, &message, crate::cli::kill::CONTROL_AUTH_REMEDIATION, None)
+        );
+        std::process::exit(3);
+    }
     // Story 7.11 review-round-1 P4: explicit positive `status == "ok"`
     // check. Pre-existing register/remove handlers fall through to
     // success on missing/unknown status — the rebind path tightens
@@ -816,6 +850,15 @@ async fn rotate_agent(args: RotateArgs) -> Result<()> {
         }
     };
 
+    // Bug 2: surface nested control-plane auth errors before the flat
+    // branch (which would otherwise report `agent.unknown_error`).
+    if let Some((code, message)) = crate::cli::kill::nested_control_plane_auth_error(&parsed) {
+        eprint!(
+            "{}",
+            error_block(&code, &message, crate::cli::kill::CONTROL_AUTH_REMEDIATION, None)
+        );
+        std::process::exit(3);
+    }
     let status = parsed["status"].as_str();
     if status == Some("error") {
         let code = parsed["code"].as_str().unwrap_or("agent.unknown_error").to_owned();

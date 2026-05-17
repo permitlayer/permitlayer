@@ -291,9 +291,67 @@ pub(crate) fn read_control_token(home: &std::path::Path) -> Option<String> {
         }
     }
     let path = home.join("control.token");
-    let content = std::fs::read_to_string(&path).ok()?;
+    // Bug 2c: don't silently swallow the read failure. An unreadable
+    // token (e.g. macOS `0o600 root:permitlayer-clients` before the
+    // cross-user reconcile, or the group-missing fallback) otherwise
+    // sends the request unauthenticated with no breadcrumb explaining
+    // WHY the operator gets `forbidden_missing_control_token`. `debug`
+    // (not `warn`) because the same path is normal on Linux where the
+    // env var is the intended channel and the file legitimately lives
+    // in a per-user home.
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::debug!(
+                error = %e,
+                path = %path.display(),
+                "could not read control.token; sending request unauthenticated \
+                 (daemon will reject with forbidden_missing_control_token)"
+            );
+            return None;
+        }
+    };
     let trimmed = content.trim();
     if validate_control_token(trimmed) { Some(trimmed.to_owned()) } else { None }
+}
+
+/// Operator-facing remediation for a control-plane auth failure
+/// (`forbidden_*`). Shared by every `/v1/control/*` CLI consumer so
+/// the message is identical across `agent`, `connectors list`, and
+/// `policy list`.
+pub(crate) const CONTROL_AUTH_REMEDIATION: &str = "set AGENTSSO_CONTROL_TOKEN or run as the daemon-owner user. \
+     If you cannot read the daemon's <home>/control.token, ask the operator \
+     to share it explicitly (e.g. via `sudo cat`).";
+
+/// Detect the *nested* control-plane auth error shape and return its
+/// `(code, message)`.
+///
+/// The daemon serializes `/v1/control/*` auth rejections via
+/// `ControlErrorBody` as
+/// `{"status":"error","error":{"code":"forbidden_*","message":...}}`
+/// — note it ALSO carries a top-level `"status":"error"`, so a caller
+/// that checks the flat shape first (`parsed["status"] == "error"` then
+/// `parsed["code"]`) consumes this body, finds no top-level `code`, and
+/// reports a useless `*.unknown_error`. Callers must run THIS detector
+/// *before* the flat-shape branch and surface the real cause.
+///
+/// Returns `None` (caller falls through to flat/protocol handling) for:
+/// flat agent/connector/policy errors (no nested `error` object), the
+/// flat `ConnectorsPayloadTooLargeBody` shape, success bodies, and any
+/// nested `error.code` that is not a `forbidden_*` auth code. Only the
+/// three `forbidden_*` codes (`forbidden_not_loopback`,
+/// `forbidden_missing_control_token`, `forbidden_invalid_control_token`)
+/// match — all warrant `CONTROL_AUTH_REMEDIATION`.
+pub(crate) fn nested_control_plane_auth_error(
+    parsed: &serde_json::Value,
+) -> Option<(String, String)> {
+    let err = parsed.get("error")?;
+    let code = err.get("code")?.as_str()?;
+    if !code.starts_with("forbidden_") {
+        return None;
+    }
+    let message = err.get("message").and_then(|m| m.as_str()).unwrap_or("(no message)").to_owned();
+    Some((code.to_owned(), message))
 }
 
 /// Round-1 review P37: validate a control-token string is safe to
@@ -1025,5 +1083,66 @@ mod tests {
         assert_eq!(parsed.activation.tokens_invalidated, 3);
         assert_eq!(parsed.activation.activated_at, "2026-04-10T12:34:56.789Z");
         assert!(!parsed.activation.was_already_active);
+    }
+
+    // --- nested_control_plane_auth_error (Bug 2) -------------------
+
+    #[test]
+    fn nested_auth_error_detects_missing_token() {
+        // Exact `ControlErrorBody` shape from server/control.rs.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"status":"error","error":{"code":"forbidden_missing_control_token","message":"X-Agentsso-Control header is required on /v1/control/* endpoints"}}"#,
+        )
+        .unwrap();
+        let (code, message) = nested_control_plane_auth_error(&v).unwrap();
+        assert_eq!(code, "forbidden_missing_control_token");
+        assert!(message.contains("X-Agentsso-Control"), "message: {message}");
+    }
+
+    #[test]
+    fn nested_auth_error_detects_invalid_token() {
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"status":"error","error":{"code":"forbidden_invalid_control_token","message":"X-Agentsso-Control token did not match"}}"#,
+        )
+        .unwrap();
+        let (code, _) = nested_control_plane_auth_error(&v).unwrap();
+        assert_eq!(code, "forbidden_invalid_control_token");
+    }
+
+    #[test]
+    fn nested_auth_error_ignores_flat_agent_error() {
+        // Flat shape: no nested `error` object → fall through to flat handling.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"status":"error","code":"agent.duplicate_name","message":"already registered","request_id":"r1"}"#,
+        )
+        .unwrap();
+        assert!(nested_control_plane_auth_error(&v).is_none());
+    }
+
+    #[test]
+    fn nested_auth_error_ignores_flat_payload_too_large() {
+        // `ConnectorsPayloadTooLargeBody` is FLAT (no nested `error`).
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"status":"error","code":"connectors.payload_too_large","message":"too big","size_bytes":2000000,"limit_bytes":1048576}"#,
+        )
+        .unwrap();
+        assert!(nested_control_plane_auth_error(&v).is_none());
+    }
+
+    #[test]
+    fn nested_auth_error_ignores_success() {
+        let v: serde_json::Value =
+            serde_json::from_str(r#"{"status":"ok","name":"angie"}"#).unwrap();
+        assert!(nested_control_plane_auth_error(&v).is_none());
+    }
+
+    #[test]
+    fn nested_auth_error_ignores_non_forbidden_nested() {
+        // A nested `error` whose code is not `forbidden_*` falls through.
+        let v: serde_json::Value = serde_json::from_str(
+            r#"{"status":"error","error":{"code":"some.other_error","message":"x"}}"#,
+        )
+        .unwrap();
+        assert!(nested_control_plane_auth_error(&v).is_none());
     }
 }
