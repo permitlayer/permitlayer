@@ -251,9 +251,7 @@ async fn register_agent(args: RegisterArgs) -> Result<()> {
     // and surface them first. `--json` callers get the auth error
     // flattened into the standard `RegisterErrorJson` stdout shape so
     // `jq -r .code` pipelines fail loudly with the real cause.
-    if let Some((code, message)) =
-        crate::cli::kill::nested_control_plane_auth_error(&parsed)
-    {
+    if let Some((code, message)) = crate::cli::kill::nested_control_plane_auth_error(&parsed) {
         if args.json {
             let payload = RegisterErrorJson { status: "error", code: code.clone(), message };
             match serde_json::to_string(&payload) {
@@ -527,9 +525,7 @@ async fn list_agents() -> Result<()> {
     // so the flat branch consumed it and exited with a misleading
     // `agent.unknown_error` (or, for list, a phantom "no agents
     // registered" empty state) before Plan B was ever reached.
-    if let Some((code, message)) =
-        crate::cli::kill::nested_control_plane_auth_error(&parsed)
-    {
+    if let Some((code, message)) = crate::cli::kill::nested_control_plane_auth_error(&parsed) {
         eprint!(
             "{}",
             error_block(&code, &message, crate::cli::kill::CONTROL_AUTH_REMEDIATION, None)
@@ -658,9 +654,7 @@ async fn remove_agent(args: RemoveArgs) -> Result<()> {
 
     // Bug 2: surface nested control-plane auth errors before the flat
     // branch (which would otherwise report `agent.unknown_error`).
-    if let Some((code, message)) =
-        crate::cli::kill::nested_control_plane_auth_error(&parsed)
-    {
+    if let Some((code, message)) = crate::cli::kill::nested_control_plane_auth_error(&parsed) {
         eprint!(
             "{}",
             error_block(&code, &message, crate::cli::kill::CONTROL_AUTH_REMEDIATION, None)
@@ -737,9 +731,7 @@ async fn rebind_agent(args: RebindArgs) -> Result<()> {
 
     // Bug 2: surface nested control-plane auth errors before the flat
     // branch (which would otherwise report `agent.unknown_error`).
-    if let Some((code, message)) =
-        crate::cli::kill::nested_control_plane_auth_error(&parsed)
-    {
+    if let Some((code, message)) = crate::cli::kill::nested_control_plane_auth_error(&parsed) {
         eprint!(
             "{}",
             error_block(&code, &message, crate::cli::kill::CONTROL_AUTH_REMEDIATION, None)
@@ -860,9 +852,7 @@ async fn rotate_agent(args: RotateArgs) -> Result<()> {
 
     // Bug 2: surface nested control-plane auth errors before the flat
     // branch (which would otherwise report `agent.unknown_error`).
-    if let Some((code, message)) =
-        crate::cli::kill::nested_control_plane_auth_error(&parsed)
-    {
+    if let Some((code, message)) = crate::cli::kill::nested_control_plane_auth_error(&parsed) {
         eprint!(
             "{}",
             error_block(&code, &message, crate::cli::kill::CONTROL_AUTH_REMEDIATION, None)

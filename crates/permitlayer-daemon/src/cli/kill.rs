@@ -319,8 +319,7 @@ pub(crate) fn read_control_token(home: &std::path::Path) -> Option<String> {
 /// (`forbidden_*`). Shared by every `/v1/control/*` CLI consumer so
 /// the message is identical across `agent`, `connectors list`, and
 /// `policy list`.
-pub(crate) const CONTROL_AUTH_REMEDIATION: &str =
-    "set AGENTSSO_CONTROL_TOKEN or run as the daemon-owner user. \
+pub(crate) const CONTROL_AUTH_REMEDIATION: &str = "set AGENTSSO_CONTROL_TOKEN or run as the daemon-owner user. \
      If you cannot read the daemon's <home>/control.token, ask the operator \
      to share it explicitly (e.g. via `sudo cat`).";
 
@@ -351,8 +350,7 @@ pub(crate) fn nested_control_plane_auth_error(
     if !code.starts_with("forbidden_") {
         return None;
     }
-    let message =
-        err.get("message").and_then(|m| m.as_str()).unwrap_or("(no message)").to_owned();
+    let message = err.get("message").and_then(|m| m.as_str()).unwrap_or("(no message)").to_owned();
     Some((code.to_owned(), message))
 }
 

@@ -252,9 +252,7 @@ async fn list_policies() -> Result<()> {
     // correctable input) for what is actually an auth failure. Surface
     // them first with the correct exit 3, matching every other
     // `/v1/control/*` consumer. Genuine `policy.*` errors keep exit 2.
-    if let Some((code, message)) =
-        crate::cli::kill::nested_control_plane_auth_error(&parsed)
-    {
+    if let Some((code, message)) = crate::cli::kill::nested_control_plane_auth_error(&parsed) {
         eprint!(
             "{}",
             error_block(&code, &message, crate::cli::kill::CONTROL_AUTH_REMEDIATION, None)

@@ -84,9 +84,7 @@ pub async fn list_connectors(args: ListArgs) -> Result<()> {
     // flat branch below as a useless `connectors.unknown_error`. (The
     // `--json` path above already dumps the raw body so `jq` sees
     // `.error.code` — only the human path needs this.)
-    if let Some((code, message)) =
-        crate::cli::kill::nested_control_plane_auth_error(&parsed)
-    {
+    if let Some((code, message)) = crate::cli::kill::nested_control_plane_auth_error(&parsed) {
         eprint!(
             "{}",
             error_block(&code, &message, crate::cli::kill::CONTROL_AUTH_REMEDIATION, None)

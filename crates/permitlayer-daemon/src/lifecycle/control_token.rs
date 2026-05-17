@@ -395,11 +395,10 @@ fn reconcile_macos_cross_user_perms(path: &Path) {
                     // closes the read surface defensively; operators
                     // see the warn and know cross-user CLI access is
                     // broken until they fix the group membership.
-                    let mode_after = std::fs::metadata(path).ok().map(|m| {
-                        std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o777
-                    });
-                    let _ =
-                        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+                    let mode_after = std::fs::metadata(path)
+                        .ok()
+                        .map(|m| std::os::unix::fs::PermissionsExt::mode(&m.permissions()) & 0o777);
+                    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
                     tracing::warn!(
                         target: "control_token",
                         event = "control_token.chgrp_failed",
