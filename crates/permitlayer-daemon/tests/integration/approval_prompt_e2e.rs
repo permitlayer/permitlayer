@@ -333,6 +333,16 @@ fn register_agent(port: u16, home: &std::path::Path, name: &str, policy: &str) -
 
 fn seal_gmail_credential(port: u16, home: &std::path::Path, agent: &str) {
     let ctl = crate::common::read_test_control_token(home);
+    // Story 7.35: the seal request carries the parsed BYO client
+    // bundle as canonical SealedClientBundle JSON (sealed under
+    // `{service}-client`), not a `client_source` path.
+    let client_bundle_json = serde_json::json!({
+        "client_id": "123.apps.googleusercontent.com",
+        "client_secret": "GOCSPX-test-client-secret",
+        "project_id": "test-project",
+        "v": 1,
+    })
+    .to_string();
     let body = serde_json::json!({
         "service": "gmail",
         "agent": agent,
@@ -340,7 +350,7 @@ fn seal_gmail_credential(port: u16, home: &std::path::Path, agent: &str) {
         "refresh_token": "1//test-refresh-token",
         "granted_scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
         "client_type": "byo",
-        "client_source": "/tmp/test-oauth-client.json",
+        "client_bundle_json": client_bundle_json,
         "expires_in_secs": 3600,
         "if_exists": "replace"
     })
