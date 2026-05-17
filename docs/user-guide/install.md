@@ -8,6 +8,15 @@ This guide is the canonical install reference. The
 [README](../../README.md) quickstart points here for the full
 lifecycle.
 
+Two companion runbooks cover scenarios this guide does not:
+
+- [Cross-user / multi-machine setup runbook](multi-user-setup.md) —
+  provisioning across more than one OS user (the most common
+  "it doesn't work" trap).
+- [launchd troubleshooting reference](troubleshooting-launchd.md) —
+  diagnosing `Bootstrap failed: 5: Input/output error` for the
+  daemon or a per-user agent.
+
 ## Prerequisites
 
 - macOS 13 (Ventura) or later. Apple Silicon and Intel both supported.
@@ -230,7 +239,11 @@ sudo launchctl print system/dev.permitlayer.daemon | less
 ```
 
 The `state =` line near the top tells you whether launchd thinks the
-daemon should be running and why it isn't. Common failures:
+daemon should be running and why it isn't. If you see
+`Bootstrap failed: 5: Input/output error` (for the daemon or a
+per-user agent like the OpenClaw gateway), use the
+[launchd troubleshooting reference](troubleshooting-launchd.md).
+Other common failures:
 
 - **Background item disabled**: System Settings → General → Login
   Items shows permitlayer toggled off. Toggle on, then
@@ -266,6 +279,12 @@ contain spaces — e.g. `first.last@corp` or federated identities —
 don't word-split through to `dseditgroup`'s arg parser.)
 
 Log out and back in so the new group membership takes effect.
+
+If you are provisioning across more than one OS user, or the error
+persists after re-login, work through the
+[cross-user setup runbook](multi-user-setup.md#two-false-alarms-that-look-identical):
+the same error has two distinct root causes (stale session vs.
+`service install` run as the wrong user) that need different fixes.
 
 ### `agentsso connect` says `connect.daemon_must_run`
 

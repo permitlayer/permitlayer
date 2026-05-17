@@ -256,6 +256,11 @@ where
         // Clone everything the async block needs up front — `self`
         // and `req` both cross the await boundary.
         let agent_store = self.agent_store.clone();
+        // Story 7.37: the data path must also advance the IN-MEMORY
+        // registry's last_seen (what `agentsso agent list` reads), not
+        // just the fs store — otherwise an actively-authenticating
+        // agent shows `LAST SEEN = never` until the next reload.
+        let agent_registry = Arc::clone(&self.registry);
         let audit_dispatcher = Arc::clone(&self.audit_dispatcher);
         let inner_clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, inner_clone);
@@ -310,7 +315,8 @@ where
             if !verified {
                 warn!(
                     agent_name = %agent.name(),
-                    "HMAC lookup hit but Argon2id verification failed — possible map corruption or hash drift"
+                    "{}",
+                    hmac_hit_argon2id_miss_message()
                 );
                 let prefix = audit_token_prefix(&token_str);
                 write_auth_denied_event(
@@ -337,9 +343,18 @@ where
             // updates it so tail-debugging logs show the real name).
             tracing::Span::current().record("agent_id", agent_name.as_str());
 
+            // Story 7.37: stamp ONE timestamp and apply it to BOTH the
+            // in-memory registry (what `agentsso agent list` /
+            // GET /v1/control/agent/list reads) and the fs store (the
+            // durable record). Pre-7.37 only the fs store was touched,
+            // so an actively-authenticating agent showed
+            // `LAST SEEN = never` until the next registry reload.
+            let now = chrono::Utc::now();
+            // Cheap lock-free ArcSwap RMW — safe to do inline (no spawn).
+            agent_registry.touch_last_seen(&agent_name, now);
             if let Some(store) = agent_store {
                 let mut updated = agent;
-                updated.last_seen_at = Some(chrono::Utc::now());
+                updated.last_seen_at = Some(now);
                 let agent_name_for_log = agent_name.clone();
                 tokio::spawn(async move {
                     if let Err(e) = store.touch_last_seen(updated).await {
@@ -453,6 +468,52 @@ fn audit_token_prefix(token: &str) -> Option<String> {
         count += 1;
     }
     if count < TOKEN_PREFIX_AUDIT_LEN { None } else { Some(prefix) }
+}
+
+/// Log-message text for the "HMAC index hit but Argon2id verify
+/// failed" auth path (Story 7.36).
+///
+/// # Why this is NOT (primarily) corruption
+///
+/// The HMAC lookup key is `HMAC-SHA-256(daemon_subkey, agent_name)` —
+/// it is **stable** across a token rotate / `agentsso connect` rewrite
+/// / agent re-register, because the agent *name* doesn't change. The
+/// Argon2id `token_hash`, by contrast, is replaced whenever a new
+/// bearer token is minted (`agent register`, `agentsso agent rotate`,
+/// or a connect-driven re-register). So the signature "HMAC index hit
+/// (name found) + Argon2id verify miss (hash no longer matches)" is
+/// the **expected** fingerprint of a client still presenting an OLD
+/// bearer token after the agent's token was rotated/re-issued — i.e.
+/// routine, operator-correctable token drift, NOT in-memory map
+/// corruption.
+///
+/// The previous wording ("possible map corruption or hash drift") led
+/// with the catastrophic-but-near-impossible cause and buried the
+/// routine one, sending operators on long misdirected
+/// data-corruption hunts for what is almost always a stale snippet.
+/// This wording leads with the likely cause + the concrete fix
+/// (re-fetch the MCP snippet) and keeps genuine corruption as the
+/// explicitly-secondary alternative.
+///
+/// The security behaviour at the call site is unchanged: the request
+/// is still denied, still audited as `invalid_token`, still answered
+/// with `AuthInvalidToken`. Only this operator-facing text changed.
+///
+/// Returns `&'static str` (no `agent_name` interpolation) so it is a
+/// pure, allocation-free, directly-unit-testable function; the call
+/// site keeps `agent_name` as a structured `tracing` field, which is
+/// the grep-correlatable form anyway.
+#[must_use]
+fn hmac_hit_argon2id_miss_message() -> &'static str {
+    "bearer token rejected: agent name resolved via the HMAC index but \
+     the presented token failed Argon2id verification. Most likely the \
+     client is presenting a STALE or ROTATED bearer token — the agent \
+     was re-registered / rotated / reconnected and its token changed, \
+     but this client still holds the old one. Fix: re-fetch the MCP \
+     client snippet (re-run `agentsso connect` / `agentsso agent \
+     register` and redeploy the new bearer). Far less likely: genuine \
+     in-memory agent-map corruption (would require process \
+     compromise). The agent_name is in the structured fields below."
 }
 
 #[cfg(test)]
@@ -882,6 +943,46 @@ mod tests {
         let prefix = audit_token_prefix(token);
         assert!(prefix.is_some());
         assert_eq!(prefix.unwrap().chars().count(), TOKEN_PREFIX_AUDIT_LEN);
+    }
+
+    // ── Story 7.36 — HMAC-hit / Argon2id-miss message variant ─────
+
+    #[test]
+    fn hmac_hit_argon2id_miss_message_is_stale_token_guidance_not_corruption() {
+        let msg = hmac_hit_argon2id_miss_message();
+        let lower = msg.to_lowercase();
+
+        // AC #3: the chosen variant must be the stale/rotated-token
+        // guidance — it must name the routine cause and the concrete
+        // operator action (re-fetch the snippet / re-run connect).
+        assert!(
+            lower.contains("stale") || lower.contains("rotated"),
+            "message must lead with the stale/rotated-token cause: {msg:?}"
+        );
+        assert!(
+            lower.contains("re-fetch") && lower.contains("agentsso connect"),
+            "message must give the actionable fix (re-fetch the snippet via agentsso connect): {msg:?}"
+        );
+
+        // It must NOT *lead* with corruption. Corruption may still be
+        // mentioned as the explicitly-secondary alternative, but the
+        // first sentence must not be the corruption diagnosis (that
+        // was the misdiagnosis Story 7.36 removes).
+        let first_sentence = msg.split('.').next().unwrap_or(msg).to_lowercase();
+        assert!(
+            !first_sentence.contains("corrupt"),
+            "message must NOT lead with corruption (misdiagnosis): {msg:?}"
+        );
+        // If corruption is mentioned at all, it must be flagged as the
+        // less-likely branch, not the headline.
+        if lower.contains("corrupt") {
+            assert!(
+                lower.contains("less likely")
+                    || lower.contains("far less likely")
+                    || lower.contains("unlikely"),
+                "corruption must be framed as the less-likely alternative: {msg:?}"
+            );
+        }
     }
 
     // ── touch_last_seen integration ───────────────────────────────

@@ -397,7 +397,14 @@ pub(crate) struct CredentialsSealRequest<'a> {
     pub refresh_token: Option<&'a str>,
     pub granted_scopes: &'a [String],
     pub client_type: &'a str,
-    pub client_source: &'a str,
+    /// Story 7.35: the parsed BYO OAuth client bundle as canonical JSON
+    /// (`SealedClientBundle`), NOT a filesystem path. The CLI already
+    /// parsed the client JSON; it sends the parsed bundle over this UDS
+    /// (which already carries plaintext access/refresh tokens) and the
+    /// daemon seals it into the vault under `{service}-client`. Replaces
+    /// the pre-7.35 `client_source` path that the proxy re-read in
+    /// plaintext on every refresh.
+    pub client_bundle_json: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub expires_in_secs: Option<u64>,
     pub if_exists: &'a str,

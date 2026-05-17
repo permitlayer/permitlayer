@@ -37,6 +37,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, Ordering};
 
 use arc_swap::ArcSwap;
 use argon2::password_hash::rand_core::OsRng;
@@ -595,6 +596,13 @@ impl RegistrySnapshot {
         v.sort_by(|a, b| a.name().cmp(b.name()));
         v
     }
+
+    /// Names of all agents in this snapshot (used by
+    /// [`AgentRegistry`] to keep the `last_seen` side-table in sync on
+    /// `replace_with`).
+    fn agent_names(&self) -> impl Iterator<Item = &str> {
+        self.by_name.keys().map(String::as_str)
+    }
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -630,7 +638,37 @@ pub struct AgentRegistry {
     /// against the recomputed HMAC. Wrapped in `Zeroizing` so the
     /// backing allocation is scrubbed at registry drop.
     daemon_subkey: Option<Zeroizing<[u8; LOOKUP_KEY_BYTES]>>,
+    /// Story 7.37 (bmad-code-review F5 redesign) — per-agent live
+    /// `last_seen` clock, name → epoch-millis `AtomicI64`
+    /// ([`LAST_SEEN_NEVER`] sentinel = never authenticated this
+    /// process-lifetime).
+    ///
+    /// **Why a side-table of atomics instead of patching the
+    /// snapshot:** the data path (`AuthLayer` on `/mcp/*`) must record
+    /// `last_seen` on every authenticated request, inline (not
+    /// spawned). The original Story 7.37 implementation cloned the
+    /// snapshot's two `HashMap`s and `ArcSwap::rcu`-swapped per
+    /// request — an unbounded per-request cost on the auth hot path
+    /// that worsened super-linearly under concurrent multi-agent load.
+    /// A `fetch_max` on a per-agent `AtomicI64` is O(1), lock-free,
+    /// allocation-free, monotonic by construction (no rewind guard
+    /// needed — `fetch_max` is the guard), and has no throttle tunable.
+    ///
+    /// The map itself is `ArcSwap`-wrapped and rebuilt ONLY on the cold
+    /// `replace_with` path (boot / reload / register / remove /
+    /// rotate), carrying forward each surviving agent's existing
+    /// `Arc<AtomicI64>` BY NAME so a registry reload never resets a
+    /// live agent's `last_seen`. New agents get a fresh `NEVER` atomic;
+    /// removed agents' atomics are simply dropped.
+    last_seen: ArcSwap<HashMap<String, Arc<AtomicI64>>>,
 }
+
+/// `last_seen` epoch-millis sentinel meaning "never authenticated on
+/// the data path during this daemon process lifetime". Distinct from a
+/// real timestamp and from the persisted `AgentIdentity.last_seen_at`
+/// (which survives restarts via the fs store). `i64::MIN` so any real
+/// `Utc::now()` millis value wins the `fetch_max`.
+const LAST_SEEN_NEVER: i64 = i64::MIN;
 
 impl AgentRegistry {
     /// Construct a registry without a `daemon_subkey` — the legacy
@@ -640,10 +678,32 @@ impl AgentRegistry {
     /// this constructor is retained for tests and pre-bootstrap code.
     #[must_use]
     pub fn new(agents: Vec<AgentIdentity>) -> Self {
+        let snapshot = RegistrySnapshot::from_agents(agents);
+        let last_seen = Self::build_last_seen_map(snapshot.agent_names(), None);
         Self {
-            snapshot: ArcSwap::from_pointee(RegistrySnapshot::from_agents(agents)),
+            snapshot: ArcSwap::from_pointee(snapshot),
             daemon_subkey: None,
+            last_seen: ArcSwap::from_pointee(last_seen),
         }
+    }
+
+    /// Build the `name → Arc<AtomicI64>` last-seen side-table for a set
+    /// of agent names. When `carry_forward` is `Some`, each name that
+    /// already has an atomic reuses that SAME `Arc` (so its live
+    /// `last_seen` value survives a `replace_with`); names not present
+    /// in `carry_forward` get a fresh [`LAST_SEEN_NEVER`] atomic.
+    fn build_last_seen_map<'a>(
+        names: impl Iterator<Item = &'a str>,
+        carry_forward: Option<&HashMap<String, Arc<AtomicI64>>>,
+    ) -> HashMap<String, Arc<AtomicI64>> {
+        names
+            .map(|name| {
+                let atomic = carry_forward
+                    .and_then(|prev| prev.get(name).cloned())
+                    .unwrap_or_else(|| Arc::new(AtomicI64::new(LAST_SEEN_NEVER)));
+                (name.to_owned(), atomic)
+            })
+            .collect()
     }
 
     /// Construct a registry with a `daemon_subkey` — every snapshot
@@ -653,9 +713,12 @@ impl AgentRegistry {
     #[must_use]
     pub fn with_subkey(agents: Vec<AgentIdentity>, daemon_subkey: [u8; LOOKUP_KEY_BYTES]) -> Self {
         let subkey = Zeroizing::new(daemon_subkey);
+        let snapshot = RegistrySnapshot::from_agents_checked(agents, &subkey);
+        let last_seen = Self::build_last_seen_map(snapshot.agent_names(), None);
         Self {
-            snapshot: ArcSwap::from_pointee(RegistrySnapshot::from_agents_checked(agents, &subkey)),
+            snapshot: ArcSwap::from_pointee(snapshot),
             daemon_subkey: Some(subkey),
+            last_seen: ArcSwap::from_pointee(last_seen),
         }
     }
 
@@ -670,7 +733,17 @@ impl AgentRegistry {
             None => RegistrySnapshot::from_agents(agents),
         };
         let count = snapshot.len();
+        // Rebuild the last-seen side-table, carrying forward each
+        // surviving agent's existing `Arc<AtomicI64>` BY NAME so a
+        // reload/register/remove never resets a live agent's
+        // `last_seen` (Story 7.37 F5). New agents get a fresh NEVER
+        // atomic; dropped agents' atomics fall away with the old map.
+        // `replace_with` is the cold path — the per-rebuild clone here
+        // is acceptable; the hot path (`touch_last_seen`) never clones.
+        let prev = self.last_seen.load();
+        let next = Self::build_last_seen_map(snapshot.agent_names(), Some(&prev));
         self.snapshot.store(Arc::new(snapshot));
+        self.last_seen.store(Arc::new(next));
         count
     }
 
@@ -680,6 +753,89 @@ impl AgentRegistry {
     #[must_use]
     pub fn snapshot(&self) -> arc_swap::Guard<Arc<RegistrySnapshot>> {
         self.snapshot.load()
+    }
+
+    /// Story 7.37 — advance `name`'s live `last_seen` to `ts`,
+    /// lock-free and allocation-free.
+    ///
+    /// Returns `true` if `name` exists in the registry and `ts` moved
+    /// its `last_seen` strictly forward (a genuinely newer
+    /// authentication); `false` if the agent is unknown or `ts` did
+    /// not advance the clock.
+    ///
+    /// # Why the data path must call this
+    ///
+    /// `agentsso agent list` → `GET /v1/control/agent/list` reads
+    /// `last_seen` via [`Self::agents_sorted_with_last_seen`], which
+    /// overlays this side-table onto each `AgentIdentity`. `AuthLayer`'s
+    /// data-path success only writes the durable fs store
+    /// (`store.touch_last_seen`, spawned), so without this an agent
+    /// actively issuing scoped tokens on `/mcp/*` would show
+    /// `LAST SEEN = never` until the next full `replace_with` — a
+    /// working agent looks broken. AC #1.
+    ///
+    /// # Cost and concurrency (bmad-code-review F5 redesign)
+    ///
+    /// O(1): one `ArcSwap` load (lock-free, no clone) + one
+    /// `AtomicI64::fetch_max` on the agent's per-name atomic. No
+    /// snapshot clone, no `rcu`, no retry, no allocation — safe to call
+    /// INLINE on every authenticated request. `fetch_max` IS the
+    /// monotonic guard: a stale `ts` (clock skew, reordered concurrent
+    /// touches) cannot rewind the value, with no explicit compare.
+    /// Concurrent `replace_with` carries the SAME `Arc<AtomicI64>`
+    /// forward by name, so a touch racing a reload still lands on the
+    /// surviving agent's live clock (worst case: it updates an atomic
+    /// the map swap is about to carry forward anyway — no lost update,
+    /// no clobber of register/remove/reload).
+    pub fn touch_last_seen(&self, name: &str, ts: chrono::DateTime<chrono::Utc>) -> bool {
+        let ts_millis = ts.timestamp_millis();
+        let map = self.last_seen.load();
+        let Some(atomic) = map.get(name) else {
+            return false;
+        };
+        // `fetch_max` returns the PREVIOUS value; the touch advanced the
+        // clock iff the new ts is strictly greater than what was there.
+        let prev = atomic.fetch_max(ts_millis, Ordering::Relaxed);
+        ts_millis > prev
+    }
+
+    /// All agents, sorted by name, with each agent's `last_seen_at`
+    /// overlaid from the live [`touch_last_seen`](Self::touch_last_seen)
+    /// side-table when the in-process clock is newer than the persisted
+    /// value.
+    ///
+    /// This is the read path for `agentsso agent list` /
+    /// `GET /v1/control/agent/list`. The persisted
+    /// `AgentIdentity.last_seen_at` (from the fs store, survives
+    /// restarts) is the floor; the live atomic reflects data-path auth
+    /// since the last `replace_with`. We surface whichever is newer so
+    /// the operator never sees a stale `never`/old timestamp for an
+    /// agent that is actively authenticating this process lifetime.
+    #[must_use]
+    pub fn agents_sorted_with_last_seen(&self) -> Vec<AgentIdentity> {
+        let snapshot = self.snapshot.load();
+        let live = self.last_seen.load();
+        let mut v: Vec<AgentIdentity> = snapshot
+            .agents_sorted()
+            .into_iter()
+            .map(|mut agent| {
+                if let Some(atomic) = live.get(agent.name()) {
+                    let millis = atomic.load(Ordering::Relaxed);
+                    if millis != LAST_SEEN_NEVER
+                        && let Some(live_ts) = chrono::DateTime::from_timestamp_millis(millis)
+                    {
+                        // Overlay only when the live clock is newer than
+                        // the persisted floor (or there is no floor).
+                        if agent.last_seen_at.is_none_or(|persisted| live_ts > persisted) {
+                            agent.last_seen_at = Some(live_ts);
+                        }
+                    }
+                }
+                agent
+            })
+            .collect();
+        v.sort_by(|a, b| a.name().cmp(b.name()));
+        v
     }
 
     /// Number of agents in the current snapshot.
@@ -699,7 +855,7 @@ impl AgentRegistry {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use chrono::{TimeZone, Utc};
 
     fn fake_agent(name: &str, lookup_key: [u8; LOOKUP_KEY_BYTES]) -> AgentIdentity {
         AgentIdentity::new(
@@ -1063,6 +1219,165 @@ mod tests {
         reg.replace_with(vec![fake_agent("new", [0x02u8; LOOKUP_KEY_BYTES])]);
         assert!(reg.snapshot().get_by_name("old").is_none());
         assert!(reg.snapshot().get_by_name("new").is_some());
+    }
+
+    // ── Story 7.37: data-path last_seen reflected in the registry ──
+
+    #[test]
+    fn touch_last_seen_updates_in_memory_snapshot_for_agent_list() {
+        // AC #1 + AC #3: simulate the data-path auth flow. An agent is
+        // registered (last_seen_at = None, the "never" the CLI prints)
+        // and then the daemon authenticates a `/mcp/*` request for it.
+        // After `touch_last_seen`, the SAME read path that
+        // `GET /v1/control/agent/list` uses
+        // (`agents_sorted_with_last_seen` → AgentSummary.last_seen_at)
+        // MUST reflect the authentication instead of `None`.
+        let key = [0x44u8; LOOKUP_KEY_BYTES];
+        let reg = AgentRegistry::new(vec![fake_agent("angie", key)]);
+
+        // Pre-condition: this is exactly what the CLI renders as
+        // `LAST SEEN = never` — both the persisted snapshot field and
+        // the live-overlaid list accessor.
+        assert!(reg.snapshot().get_by_name("angie").unwrap().last_seen_at.is_none());
+        assert!(reg.agents_sorted_with_last_seen()[0].last_seen_at.is_none());
+
+        let auth_ts = Utc::now();
+        let updated = reg.touch_last_seen("angie", auth_ts);
+        assert!(updated, "touch must report it advanced an existing agent");
+
+        // Post-condition: the exact accessor the control-plane list
+        // handler maps into the wire response now reflects the auth.
+        // (ms-resolution: the side-table stores epoch-millis, so
+        // compare at that precision rather than the full DateTime.)
+        let listed = reg.agents_sorted_with_last_seen();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].last_seen_at.map(|t| t.timestamp_millis()),
+            Some(auth_ts.timestamp_millis())
+        );
+    }
+
+    #[test]
+    fn touch_last_seen_is_noop_for_unknown_agent() {
+        let reg = AgentRegistry::new(vec![fake_agent("known", [0x01u8; LOOKUP_KEY_BYTES])]);
+        assert!(!reg.touch_last_seen("ghost", Utc::now()));
+        // The known agent is untouched and no phantom entry appears.
+        assert_eq!(reg.len(), 1);
+        assert!(reg.snapshot().get_by_name("ghost").is_none());
+        assert!(reg.agents_sorted_with_last_seen()[0].last_seen_at.is_none());
+    }
+
+    #[test]
+    fn touch_last_seen_is_monotonic_and_ignores_stale_timestamps() {
+        // Two near-simultaneous authenticated requests can land here in
+        // reverse order (clock skew / concurrent touches). `fetch_max`
+        // IS the monotonic guard: a stale (older) timestamp MUST NOT
+        // rewind a fresher one, or `agent list` would flicker backwards.
+        let reg = AgentRegistry::new(vec![fake_agent("angie", [0x07u8; LOOKUP_KEY_BYTES])]);
+        let t_old = Utc.with_ymd_and_hms(2026, 5, 16, 10, 0, 0).unwrap();
+        let t_new = Utc.with_ymd_and_hms(2026, 5, 16, 10, 5, 0).unwrap();
+
+        assert!(reg.touch_last_seen("angie", t_new));
+        let seen = |r: &AgentRegistry| {
+            r.agents_sorted_with_last_seen()[0].last_seen_at.map(|t| t.timestamp_millis())
+        };
+        assert_eq!(seen(&reg), Some(t_new.timestamp_millis()));
+
+        // Out-of-order older touch: must be rejected, value stays at t_new.
+        assert!(!reg.touch_last_seen("angie", t_old));
+        assert_eq!(seen(&reg), Some(t_new.timestamp_millis()));
+
+        // A strictly newer touch still advances.
+        let t_newer = t_new + chrono::Duration::seconds(1);
+        assert!(reg.touch_last_seen("angie", t_newer));
+        assert_eq!(seen(&reg), Some(t_newer.timestamp_millis()));
+    }
+
+    #[test]
+    fn touch_last_seen_survives_replace_with_for_surviving_agents() {
+        // F5: a registry reload/register/remove (`replace_with`) must
+        // carry forward a surviving agent's live `last_seen` by name —
+        // a reload must NOT reset an actively-authenticating agent's
+        // clock back to `never`. A replaced-away agent's touch is a
+        // no-op (the atomic is gone with the old map).
+        let reg = AgentRegistry::new(vec![
+            fake_agent("survivor", [0x01u8; LOOKUP_KEY_BYTES]),
+            fake_agent("doomed", [0x02u8; LOOKUP_KEY_BYTES]),
+        ]);
+        let auth_ts = Utc::now();
+        assert!(reg.touch_last_seen("survivor", auth_ts));
+        assert!(reg.touch_last_seen("doomed", auth_ts));
+
+        // Reload: "doomed" gone, "survivor" stays, "newcomer" added.
+        reg.replace_with(vec![
+            fake_agent("survivor", [0x01u8; LOOKUP_KEY_BYTES]),
+            fake_agent("newcomer", [0x03u8; LOOKUP_KEY_BYTES]),
+        ]);
+
+        let listed = reg.agents_sorted_with_last_seen();
+        let by = |n: &str| {
+            listed
+                .iter()
+                .find(|a| a.name() == n)
+                .unwrap()
+                .last_seen_at
+                .map(|t| t.timestamp_millis())
+        };
+        // Survivor's live last_seen carried across the reload.
+        assert_eq!(by("survivor"), Some(auth_ts.timestamp_millis()));
+        // Newcomer starts at never.
+        assert_eq!(by("newcomer"), None);
+        // Doomed is gone; a late touch finds no atomic → no-op, no
+        // resurrection.
+        assert!(!reg.touch_last_seen("doomed", Utc::now()));
+        assert!(reg.snapshot().get_by_name("doomed").is_none());
+        assert_eq!(reg.len(), 2);
+    }
+
+    #[test]
+    fn touch_last_seen_concurrent_fetch_max_is_monotonic_and_lossless() {
+        // F6 (replaces the old sequential-but-named-"concurrent"
+        // test): genuinely race many threads doing `touch_last_seen`
+        // with ascending timestamps against one agent. `fetch_max`
+        // guarantees the final value is the maximum submitted, with no
+        // lost update and no rewind, regardless of interleave.
+        use std::sync::Barrier;
+        use std::thread;
+
+        let reg = Arc::new(AgentRegistry::new(vec![fake_agent("hot", [0x09u8; LOOKUP_KEY_BYTES])]));
+        let base = Utc.with_ymd_and_hms(2026, 5, 16, 12, 0, 0).unwrap();
+        const THREADS: usize = 8;
+        const PER_THREAD: i64 = 200;
+        let barrier = Arc::new(Barrier::new(THREADS));
+        let max_offset = (THREADS as i64) * PER_THREAD; // exclusive upper bound
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let reg = Arc::clone(&reg);
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    // Interleave timestamp ranges across threads so the
+                    // global max is contended, not produced by one
+                    // thread monotonically.
+                    for i in 0..PER_THREAD {
+                        let offset = (i * THREADS as i64) + t as i64;
+                        let ts = base + chrono::Duration::milliseconds(offset);
+                        reg.touch_last_seen("hot", ts);
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        // The final value must be exactly the maximum timestamp any
+        // thread submitted — no lost update, no rewind.
+        let expected_max = base + chrono::Duration::milliseconds(max_offset - 1);
+        let final_seen =
+            reg.agents_sorted_with_last_seen()[0].last_seen_at.map(|t| t.timestamp_millis());
+        assert_eq!(final_seen, Some(expected_max.timestamp_millis()));
     }
 
     // ── Concurrency: AC #13 ────────────────────────────────────────

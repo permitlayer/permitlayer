@@ -210,6 +210,15 @@ pub enum OAuthError {
         reason: String,
     },
 
+    /// The vault-sealed BYO OAuth client bundle could not be
+    /// (de)serialized (Story 7.35). `reason` carries only the serde
+    /// error position/kind — never the bundle contents.
+    #[error("sealed OAuth client bundle is malformed: {reason}")]
+    SealedClientBundleInvalid {
+        /// Serde (de)serialization failure detail (no secret material).
+        reason: String,
+    },
+
     /// Post-consent verification query failed.
     #[error("verification failed for service '{service}': {reason}")]
     VerificationFailed {
@@ -383,6 +392,9 @@ impl OAuthError {
             Self::ClientJsonInvalid { .. } => {
                 "The file must be a Google Cloud Console OAuth client JSON (installed or web type)."
             }
+            Self::SealedClientBundleInvalid { .. } => {
+                "The sealed OAuth client bundle is unreadable. Re-run `agentsso connect <service> --agent <agent> --oauth-client <path>` to re-seal it."
+            }
             Self::VerificationFailed { .. } => VERIFY_FAILED_GENERIC_REMEDIATION,
             Self::PastedUrlMalformed => {
                 "Copy the entire URL from your browser's address bar (starting with http://127.0.0.1:) and paste it again."
@@ -432,6 +444,7 @@ impl OAuthError {
             Self::VaultError { .. } => "vault_error",
             Self::ClientJsonReadFailed { .. } => "client_json_read_failed",
             Self::ClientJsonInvalid { .. } => "client_json_invalid",
+            Self::SealedClientBundleInvalid { .. } => "sealed_client_bundle_invalid",
             Self::VerificationFailed { .. } => "verification_failed",
             Self::PastedUrlMalformed => "pasted_url_malformed",
             Self::PastedUrlMismatch { .. } => "pasted_url_mismatch",
