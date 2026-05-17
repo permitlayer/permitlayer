@@ -242,6 +242,51 @@ pub(crate) fn sanitize_for_terminal(s: &str) -> String {
         .collect()
 }
 
+/// Story 7.38: the verify probe confirms ONLY that the sealed Google
+/// credential can mint an upstream token — it does NOT exercise the
+/// agent→daemon→Google bearer chain. The old wording (`gmail verified`)
+/// read as end-to-end success and repeatedly misdirected diagnosis when
+/// the bearer token in the MCP client was stale/wrong. Scope the claim
+/// to exactly what was checked.
+///
+/// The interactive call site styles the service token separately
+/// (color), so the wording is split: the caller prints
+/// `<styled service> <VERIFY_SUFFIX>`. This fixed suffix is the only
+/// load-bearing string — the snapshot test pins it directly so a
+/// deliberate change to operator-facing semantics is a deliberate edit
+/// here. (Mirrors the 7.36 `hmac_hit_argon2id_miss_message` pattern of
+/// a pure, testable wording unit.)
+const VERIFY_SUFFIX: &str = "Google credential verified (upstream token mint OK)";
+
+/// Story 7.38: the post-connect next-steps block must make explicit
+/// that verify success does NOT mean the chain works — the bearer token
+/// still has to be valid in whatever runs the MCP client. Without this,
+/// `gmail verified` + a broken bearer = an operator who believes the
+/// connection is healthy and looks everywhere except the token.
+pub(crate) fn next_steps_bearer_note() -> &'static str {
+    "the bearer token in the snippet must be valid in the MCP client \
+     for the agent\u{2192}daemon\u{2192}Google chain to work \u{2014} \
+     \"verified\" above only confirms the sealed Google credential"
+}
+
+/// Story 7.36 (AC #1): connect's policy rebind preserves the agent's
+/// bearer token (Story 7.11 invariant — pinned E2E in
+/// `agent_rebind_e2e.rs`). The Angie-2 footgun was an operator who'd
+/// re-run connect and then assumed a token problem meant connect had
+/// re-issued/orphaned the bearer, chasing the alarming daemon-side
+/// "Argon2id verification failed — possible map corruption" log
+/// (rewritten in 7.36 AC #2). Surface the invariant at the rebind site
+/// so the operator knows connect did NOT touch their deployed bearer
+/// and the existing snippet is still valid.
+///
+/// Pure for string-testing — same extraction pattern as the 7.36
+/// `hmac_hit_argon2id_miss_message` daemon-side helper.
+pub(crate) fn rebind_bearer_preserved_note() -> &'static str {
+    "existing bearer token preserved \u{2014} connect only changed the \
+     policy binding; do NOT re-deploy the snippet unless you rotated \
+     the agent (\u{0060}agentsso agent rotate\u{0060})"
+}
+
 pub(crate) fn silent_err_for_code(code: &str, internal_msg: &'static str) -> anyhow::Error {
     let marker_attached = match connect_exit_code(code) {
         2 => anyhow::Error::new(ConnectExitCode2),
@@ -1042,7 +1087,28 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
                 )),
                 None => None,
             };
-        let client_source_str = oauth_config.source_path().display().to_string();
+        // Story 7.35: serialize the parsed BYO client bundle and send it
+        // to the daemon to be SEALED — instead of sending a filesystem
+        // path the proxy would re-read in plaintext on every refresh.
+        // Kept in `Zeroizing` (mirrors the access-token handling above)
+        // so the transient client_secret-bearing JSON is scrubbed.
+        let client_bundle_bytes = oauth_config
+            .to_sealed_bundle_bytes()
+            .map_err(|e| anyhow::anyhow!("failed to serialize OAuth client bundle: {e}"))?;
+        // `.to_vec()` copies out of the `Zeroizing<Vec<u8>>`; the copy
+        // is scrubbed on the success path by the `Zeroizing<String>`
+        // wrapper below. L1: also scrub it on the
+        // `FromUtf8Error`-owns-the-bytes path (effectively unreachable
+        // — `serde_json::to_vec` always emits UTF-8 — but the
+        // surrounding code is meticulous about plaintext windows).
+        let client_bundle_str: zeroize::Zeroizing<String> = zeroize::Zeroizing::new(
+            String::from_utf8(client_bundle_bytes.to_vec()).map_err(|e| {
+                use zeroize::Zeroize;
+                let mut leaked = e.into_bytes();
+                leaked.zeroize();
+                anyhow::anyhow!("OAuth client bundle is not valid UTF-8")
+            })?,
+        );
         let seal_req = super::connect_uds::CredentialsSealRequest {
             service: &service,
             agent: &args.agent,
@@ -1050,7 +1116,7 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
             refresh_token: refresh_token_str.as_ref().map(|z| z.as_str()),
             granted_scopes: &granted_scopes_for_seal,
             client_type: "byo",
-            client_source: &client_source_str,
+            client_bundle_json: client_bundle_str.as_str(),
             expires_in_secs: result.expires_in.map(|d| d.as_secs()),
             if_exists: "replace",
         };
@@ -1063,11 +1129,19 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
                     } else {
                         println!("  {check} tokens sealed");
                     }
+                    // Story 7.35: the client JSON is now sealed in the
+                    // vault; the daemon no longer reads the original
+                    // file at refresh time.
+                    println!(
+                        "  {check} client credentials sealed \u{2014} the original {} is no longer",
+                        oauth_config.source_path().display()
+                    );
+                    println!("    needed by the daemon (you may keep or delete it)");
                 } else {
                     tracing::info!(
                         service = %service,
                         replaced_previous = resp.replaced_previous,
-                        "access token sealed via daemon"
+                        "access token + client bundle sealed via daemon"
                     );
                 }
             }
@@ -1129,9 +1203,17 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
     if interactive {
         let check = styled("\u{2713}", theme.tokens().accent, color_support);
         let styled_service = styled(&service, theme.tokens().accent, color_support);
-        println!("  {check} {styled_service} verified");
+        // Story 7.38: scope the claim — verify only proves the sealed
+        // Google credential mints an upstream token, not the full
+        // agent→daemon→Google bearer chain. Service token is styled
+        // separately; suffix is shared with `verify_success_line` (and
+        // its snapshot test) via `VERIFY_SUFFIX`.
+        println!("  {check} {styled_service} {VERIFY_SUFFIX}");
     } else {
-        tracing::info!(service = %service, "connection verified");
+        tracing::info!(
+            service = %service,
+            "google credential verified (upstream token mint ok; bearer chain not exercised)"
+        );
     }
 
     // ── Step 4 — policy edit ───────────────────────────────────────
@@ -1322,8 +1404,17 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
                     "  {check} agent '{}' \u{00b7} bound to policy '{}'",
                     args.agent, agent_policy_name
                 );
+                // Story 7.36 AC #1: tell the operator the bearer was
+                // NOT touched, so a later token problem isn't misread
+                // as connect having orphaned it.
+                println!("    {}", rebind_bearer_preserved_note());
             } else {
-                tracing::info!(agent = %args.agent, policy = %agent_policy_name, "rebind ok");
+                tracing::info!(
+                    agent = %args.agent,
+                    policy = %agent_policy_name,
+                    bearer_preserved = true,
+                    "rebind ok; bearer token preserved (policy-only change)"
+                );
             }
         }
         Err(e) => {
@@ -1382,6 +1473,9 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
         }
         println!();
         println!("  next: hand the snippet above to whoever runs OpenClaw on this machine.");
+        // Story 7.38: be explicit that verify success ≠ chain works —
+        // the bearer token still has to be valid in the MCP client.
+        println!("  note: {}", next_steps_bearer_note());
         println!();
     } else {
         tracing::info!(
@@ -2223,5 +2317,63 @@ mod tests {
 
         assert_eq!(default_scope_for_snippet(&empty_resp, &["gmail.readonly"]), None);
         assert_eq!(default_scope_for_snippet(&empty_resp, &[]), None);
+    }
+
+    // ── Story 7.38: verify-success wording is scoped, not absolute ──
+
+    #[test]
+    fn verify_suffix_scopes_the_claim() {
+        // The operator sees `<service> {VERIFY_SUFFIX}` (service is
+        // styled separately at the call site).
+        let line = format!("gmail {VERIFY_SUFFIX}");
+        // AC #1: must NOT be an unqualified "<svc> verified" — that
+        // read as end-to-end success and misdirected diagnosis.
+        assert_ne!(line, "gmail verified");
+        assert!(!line.ends_with(" verified"));
+        // It must name *what* was verified (the Google credential),
+        // not imply the bearer/chain.
+        assert!(line.contains("gmail"));
+        assert!(VERIFY_SUFFIX.contains("Google credential verified"));
+        assert!(VERIFY_SUFFIX.to_lowercase().contains("token mint"));
+        assert!(!VERIFY_SUFFIX.to_lowercase().contains("bearer"));
+    }
+
+    #[test]
+    fn verify_suffix_pins_exact_wording() {
+        // Snapshot pin (AC #3): `VERIFY_SUFFIX` is the exact string the
+        // interactive connect path prints after the styled service
+        // token — a deliberate change here is a deliberate change to
+        // operator-facing semantics.
+        assert_eq!(VERIFY_SUFFIX, "Google credential verified (upstream token mint OK)");
+    }
+
+    // ── Story 7.36 AC #1: connect surfaces bearer preservation ─────
+
+    #[test]
+    fn rebind_bearer_preserved_note_states_bearer_untouched() {
+        // AC #1: the operator must be told connect preserved the
+        // bearer (so a later token problem isn't misread as connect
+        // having orphaned it — the Angie-2 footgun).
+        let note = rebind_bearer_preserved_note();
+        assert!(note.contains("bearer token preserved"));
+        assert!(note.contains("policy"));
+        // Must point at the ONE op that does invalidate it, so the
+        // operator knows when re-deploying the snippet IS required.
+        assert!(note.contains("agentsso agent rotate"));
+        // Must NOT imply connect rotated/re-issued anything.
+        assert!(!note.to_lowercase().contains("new bearer"));
+        assert!(!note.to_lowercase().contains("re-issued"));
+    }
+
+    #[test]
+    fn next_steps_bearer_note_makes_chain_dependency_explicit() {
+        // AC #2: the next-steps block must say the bearer token has to
+        // be valid in the MCP client for the chain to work, and that
+        // "verified" only covered the sealed Google credential.
+        let note = next_steps_bearer_note();
+        assert!(note.contains("bearer token"));
+        assert!(note.contains("MCP client"));
+        assert!(note.contains("chain"));
+        assert!(note.contains("sealed Google credential"));
     }
 }

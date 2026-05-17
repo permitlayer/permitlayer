@@ -640,8 +640,12 @@ async fn refresh_credentials(args: RefreshArgs) -> anyhow::Result<()> {
     // `&OAuthClientResolver<'_>` = `&dyn Fn + Send + Sync`, and
     // Rust auto-coerces `&impl Fn` into that.
     let vault_dir_for_resolver = vault_dir.clone();
+    // Story 7.35: the resolver now unseals the `{service}-client` bundle
+    // via the vault instead of re-reading a plaintext client JSON path,
+    // so it needs the vault.
+    let vault_for_resolver = Arc::clone(&vault);
     let resolver = move |svc: &str| {
-        build_oauth_client_for_cli(&vault_dir_for_resolver, svc)
+        build_oauth_client_for_cli(&vault_for_resolver, &vault_dir_for_resolver, svc)
             .map_err(|detail| RefreshFlowError::MetaInvalid { service: svc.to_owned(), detail })
     };
 
@@ -809,6 +813,7 @@ async fn refresh_credentials(args: RefreshArgs) -> anyhow::Result<()> {
 /// yet). Returns `Err(String)` with a human-readable detail so the
 /// caller can wrap it in `RefreshFlowError::MetaInvalid`.
 fn build_oauth_client_for_cli(
+    vault: &permitlayer_vault::Vault,
     vault_dir: &std::path::Path,
     service: &str,
 ) -> Result<Arc<permitlayer_oauth::OAuthClient>, String> {
@@ -829,11 +834,33 @@ fn build_oauth_client_for_cli(
             ));
         }
         "byo" => {
-            let source = meta.client_source.as_ref().ok_or_else(|| {
-                format!("metadata for service '{service}' is marked 'byo' but has no client_source")
+            // Story 7.35: parity with `ProxyService::build_oauth_client_for_service`.
+            // Sealed bundle only; legacy path-based records are rejected
+            // with an actionable re-connect message (no plaintext re-read).
+            if !meta.client_sealed {
+                return Err(format!(
+                    "OAuth client for service '{service}' is not sealed (legacy/path-based record). \
+                     Re-run: agentsso connect {service} --agent <agent> --oauth-client <path/to/client_secret.json>"
+                ));
+            }
+            let client_service = format!("{service}-client");
+            let sealed_path = vault_dir.join(format!("{client_service}.sealed"));
+            let bytes = std::fs::read(&sealed_path).map_err(|e| {
+                format!(
+                    "could not read sealed OAuth client bundle for service '{service}' at {}: {e}",
+                    sealed_path.display()
+                )
             })?;
-            GoogleOAuthConfig::from_client_json(std::path::Path::new(source))
-                .map_err(|e| format!("could not re-read BYO OAuth client JSON at {source}: {e}"))?
+            let sealed = permitlayer_core::store::fs::credential_fs::decode_envelope(&bytes)
+                .map_err(|e| {
+                    format!("corrupt sealed OAuth client bundle for service '{service}': {e}")
+                })?;
+            let token = vault.unseal(&client_service, &sealed).map_err(|e| {
+                format!("could not unseal OAuth client bundle for service '{service}': {e}")
+            })?;
+            GoogleOAuthConfig::from_sealed_bundle_bytes(token.reveal()).map_err(|e| {
+                format!("malformed sealed OAuth client bundle for service '{service}': {e}")
+            })?
         }
         other => {
             return Err(format!(
@@ -1033,6 +1060,7 @@ mod tests {
         CredentialMeta {
             client_type: "shared-casa".to_owned(),
             client_source: None,
+            client_sealed: false,
             connected_at: connected_at.to_owned(),
             last_refreshed_at: last_refreshed_at.map(str::to_owned),
             scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".to_owned()],
@@ -1164,5 +1192,129 @@ mod tests {
         let (validity, remaining) = compute_token_validity(&meta);
         assert_eq!(validity, "unknown");
         assert!(remaining.is_empty());
+    }
+
+    // ── bmad-code-review F10 + F11: Story 7.35 sealed-client coverage
+    //    for the CLI refresh path (parity with the proxy) and the
+    //    vault namespace-isolation invariant ─────────────────────────
+
+    use permitlayer_vault::Vault;
+
+    const CR_TEST_MASTER_KEY: [u8; 32] = [0x42; 32];
+
+    fn cr_test_vault() -> Vault {
+        Vault::new(zeroize::Zeroizing::new(CR_TEST_MASTER_KEY), 0)
+    }
+
+    /// Seal a BYO client bundle into `{service}-client.sealed` exactly
+    /// as the daemon's seal handler does, then write a matching
+    /// `{service}-meta.json`. `client_sealed` controls the meta flag.
+    fn cr_seal_byo(vault_dir: &std::path::Path, service: &str, client_sealed: bool) {
+        let bundle = serde_json::json!({
+            "client_id": "123.apps.googleusercontent.com",
+            "client_secret": "GOCSPX-cli-parity-secret",
+            "project_id": "cli-parity-proj",
+            "v": 1,
+        })
+        .to_string();
+        let token = permitlayer_credential::OAuthToken::from_trusted_bytes(bundle.into_bytes());
+        let sealed = cr_test_vault().seal(&format!("{service}-client"), &token).unwrap();
+        let bytes = permitlayer_core::store::fs::credential_fs::encode_envelope(&sealed);
+        std::fs::write(vault_dir.join(format!("{service}-client.sealed")), bytes).unwrap();
+
+        let meta = CredentialMeta {
+            client_type: "byo".to_owned(),
+            client_source: if client_sealed {
+                None
+            } else {
+                Some("/Users/op/Downloads/client_secret.json".to_owned())
+            },
+            client_sealed,
+            connected_at: "2026-05-16T00:00:00Z".to_owned(),
+            last_refreshed_at: None,
+            scopes: vec!["https://mail.google.com/".to_owned()],
+            expires_in_secs: Some(3599),
+        };
+        std::fs::write(
+            vault_dir.join(format!("{service}-meta.json")),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cli_build_oauth_client_reconstructs_from_sealed_bundle_not_a_file() {
+        // F11 CLI-parity: the CLI refresh path
+        // (`build_oauth_client_for_cli`) must unseal `{svc}-client`
+        // with NO filesystem read of any client JSON — same contract
+        // the proxy's `byo_client_is_reconstructed_from_sealed_bundle_
+        // not_a_file` pins for `ProxyService`.
+        let dir = tempfile::tempdir().unwrap();
+        cr_seal_byo(dir.path(), "gmail", /* client_sealed */ true);
+        // No client_secret.json on disk: a path fallback would error.
+        let client = build_oauth_client_for_cli(&cr_test_vault(), dir.path(), "gmail")
+            .expect("CLI must reconstruct the sealed byo client with no file read");
+        // Constructed successfully ⇒ the bundle was unsealed.
+        let _ = client; // OAuthClient has no public accessors; success is the assertion.
+    }
+
+    #[test]
+    fn cli_build_oauth_client_rejects_legacy_non_sealed_no_path_fallback() {
+        // F11 CLI-parity: a legacy `client_sealed:false` byo record
+        // must be hard-rejected with the actionable re-connect message,
+        // never silently re-reading a client JSON — even one sitting
+        // right next to the meta.
+        let dir = tempfile::tempdir().unwrap();
+        cr_seal_byo(dir.path(), "gmail", /* client_sealed */ false);
+        std::fs::write(
+            dir.path().join("legacy_client_secret.json"),
+            r#"{"installed":{"client_id":"x","client_secret":"y"}}"#,
+        )
+        .unwrap();
+
+        // `OAuthClient` isn't `Debug`, so `expect_err` won't compile.
+        let err = match build_oauth_client_for_cli(&cr_test_vault(), dir.path(), "gmail") {
+            Ok(_) => panic!("legacy non-sealed record must be rejected, not path-read"),
+            Err(e) => e,
+        };
+        assert!(
+            err.contains("not sealed") && err.contains("legacy/path-based"),
+            "must explain the record is legacy/non-sealed; got: {err}"
+        );
+        assert!(
+            err.contains("agentsso connect") && err.contains("--oauth-client"),
+            "must name the actionable fix (re-run connect); got: {err}"
+        );
+    }
+
+    #[test]
+    fn vault_namespace_isolation_client_bundle_not_cross_unsealable() {
+        // F10 (the spec-enumerated AC#7 negative test): the
+        // `{service}-client` HKDF subkey MUST be cryptographically
+        // distinct from `{service}` and `{service}-refresh`. A bundle
+        // sealed under `gmail-client` must NOT unseal under `gmail` or
+        // `gmail-refresh` — this is the assertion that proves the
+        // per-namespace isolation the whole 7.35 seal design relies on.
+        let dir = tempfile::tempdir().unwrap();
+        let vault = cr_test_vault();
+        let bundle = br#"{"client_id":"x.apps.googleusercontent.com","v":1}"#.to_vec();
+        let token = permitlayer_credential::OAuthToken::from_trusted_bytes(bundle);
+        let sealed = vault.seal("gmail-client", &token).unwrap();
+
+        // Same vault, wrong namespace → AEAD/AAD mismatch → error.
+        assert!(
+            vault.unseal("gmail", &sealed).is_err(),
+            "a gmail-client envelope must NOT unseal under the `gmail` namespace"
+        );
+        assert!(
+            vault.unseal("gmail-refresh", &sealed).is_err(),
+            "a gmail-client envelope must NOT unseal under the `gmail-refresh` namespace"
+        );
+        // Sanity: it DOES unseal under its own namespace.
+        assert!(
+            vault.unseal("gmail-client", &sealed).is_ok(),
+            "the envelope must unseal under its own `gmail-client` namespace"
+        );
+        let _ = dir;
     }
 }

@@ -2099,9 +2099,12 @@ pub(crate) async fn list_agents_handler(
         );
     }
 
-    let snapshot = state.agent_registry.snapshot();
-    let agents: Vec<AgentSummary> = snapshot
-        .agents_sorted()
+    // Story 7.37 (F5 redesign): use the live-overlaid accessor so an
+    // agent actively authenticating on the data path this process
+    // lifetime shows a fresh LAST SEEN, not a stale persisted value.
+    let agents: Vec<AgentSummary> = state
+        .agent_registry
+        .agents_sorted_with_last_seen()
         .into_iter()
         .map(|a| AgentSummary {
             name: a.name().to_owned(),
@@ -2352,7 +2355,11 @@ pub(crate) struct CredentialsSealRequest {
     pub refresh_token: Option<zeroize::Zeroizing<String>>,
     pub granted_scopes: Vec<String>,
     pub client_type: String,
-    pub client_source: String,
+    /// Story 7.35: the parsed BYO OAuth client bundle as canonical JSON
+    /// (`SealedClientBundle`), to be sealed into the vault under
+    /// `{service}-client`. Replaces the pre-7.35 `client_source` path.
+    /// `Zeroizing` because it transiently carries the client_secret.
+    pub client_bundle_json: zeroize::Zeroizing<String>,
     #[serde(default)]
     pub expires_in_secs: Option<u64>,
     #[serde(default)]
@@ -2659,39 +2666,66 @@ pub(crate) async fn credentials_seal_handler(
             // through to the fresh-seal path in that case so the
             // operator's `--no-force` re-run rebuilds the credential
             // instead of silently asserting it's fine.
+            // Story 7.35: a usable BYO credential now requires BOTH the
+            // access envelope AND the `{service}-client.sealed` bundle.
+            // If a partial cleanup removed either, fall through to a
+            // fresh seal rather than lying with `sealed: true`.
             let envelope_path = state.vault_dir.join(format!("{}.sealed", payload.service));
+            let client_envelope_path =
+                state.vault_dir.join(format!("{}-client.sealed", payload.service));
             let envelope_path_for_exists = envelope_path.clone();
-            let envelope_exists = match tokio::task::spawn_blocking(move || {
-                envelope_path_for_exists.exists()
-            })
-            .await
-            {
-                Ok(exists) => exists,
-                Err(e) => {
-                    emit_seal_denied_audit(
-                        &state,
-                        &request_id,
-                        Some(&payload.service),
-                        Some(&payload.agent),
-                        "credentials.meta_io_failed",
-                        peer_creds_for_audit,
-                    )
-                    .await;
-                    return agent_error_response(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "credentials.meta_io_failed",
-                        format!("blocking task join failed during envelope existence check: {e}"),
-                        Some(request_id),
-                    );
-                }
-            };
+            // bmad-code-review F8: check the two envelopes separately so
+            // the fall-through warn can name whichever one is actually
+            // missing (a partial cleanup may remove only the client
+            // bundle, leaving `{service}.sealed` present — the prior
+            // warn always blamed `{service}.sealed`, misdirecting the
+            // operator during partial-state recovery).
+            let (access_envelope_exists, client_envelope_exists) =
+                match tokio::task::spawn_blocking(move || {
+                    (envelope_path_for_exists.exists(), client_envelope_path.exists())
+                })
+                .await
+                {
+                    Ok(pair) => pair,
+                    Err(e) => {
+                        emit_seal_denied_audit(
+                            &state,
+                            &request_id,
+                            Some(&payload.service),
+                            Some(&payload.agent),
+                            "credentials.meta_io_failed",
+                            peer_creds_for_audit,
+                        )
+                        .await;
+                        return agent_error_response(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "credentials.meta_io_failed",
+                            format!(
+                                "blocking task join failed during envelope existence check: {e}"
+                            ),
+                            Some(request_id),
+                        );
+                    }
+                };
+            let envelope_exists = access_envelope_exists && client_envelope_exists;
             if !envelope_exists {
+                // Name the envelope(s) actually missing (F8) so a
+                // partial-cleanup recovery looks at the right file.
+                let missing = match (access_envelope_exists, client_envelope_exists) {
+                    (false, false) => {
+                        format!("`{0}.sealed` and `{0}-client.sealed`", payload.service)
+                    }
+                    (false, true) => format!("`{}.sealed`", payload.service),
+                    (true, false) => format!("`{}-client.sealed`", payload.service),
+                    (true, true) => unreachable!("envelope_exists would be true"),
+                };
                 tracing::warn!(
                     target: "control",
                     request_id = %request_id,
                     service = %payload.service,
-                    "Skip: meta present but `{service}.sealed` envelope missing — falling through to fresh seal",
-                    service = payload.service,
+                    access_envelope_exists,
+                    client_envelope_exists,
+                    "Skip: meta present but {missing} envelope missing — falling through to fresh seal",
                 );
                 // Don't return — fall out of the match and proceed to
                 // the Replace-equivalent seal path. `replaced_previous`
@@ -2894,6 +2928,38 @@ pub(crate) async fn credentials_seal_handler(
         None => None,
     };
 
+    // Story 7.35: seal the BYO OAuth client bundle under
+    // `{service}-client` (own HKDF subkey, mirrors `{service}-refresh`).
+    // The bundle JSON arrives over the same UDS that already carried
+    // the plaintext access/refresh tokens; sealing it here means the
+    // proxy/CLI never re-read a plaintext `client_secret.json` path.
+    let client_service = format!("{}-client", payload.service);
+    let sealed_client = {
+        let client_token = permitlayer_credential::OAuthToken::from_trusted_bytes(
+            payload.client_bundle_json.as_bytes().to_vec(),
+        );
+        match state.vault.seal(&client_service, &client_token) {
+            Ok(s) => s,
+            Err(e) => {
+                emit_seal_denied_audit(
+                    &state,
+                    &request_id,
+                    Some(&payload.service),
+                    Some(&payload.agent),
+                    "credentials.seal_failed",
+                    peer_creds_for_audit,
+                )
+                .await;
+                return agent_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "credentials.seal_failed",
+                    format!("vault seal failed for OAuth client bundle: {e}"),
+                    Some(request_id),
+                );
+            }
+        }
+    };
+
     let had_refresh_token = sealed_refresh.is_some();
 
     let store = match permitlayer_core::store::fs::CredentialFsStore::new(home.clone()) {
@@ -2963,9 +3029,35 @@ pub(crate) async fn credentials_seal_handler(
         written_services.push(refresh_service);
     }
 
+    // Story 7.35: persist the sealed client bundle. Same rollback
+    // discipline as access/refresh — on failure, unwind every envelope
+    // written so far (incl. `{service}-client`).
+    if let Err(e) = store.put(&client_service, sealed_client).await {
+        rollback_sealed_envelopes(&state.vault_dir, &written_services).await;
+        emit_seal_denied_audit(
+            &state,
+            &request_id,
+            Some(&payload.service),
+            Some(&payload.agent),
+            "credentials.store_io_failed",
+            peer_creds_for_audit,
+        )
+        .await;
+        return agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "credentials.store_io_failed",
+            format!("credential store write failed for sealed OAuth client bundle: {e}"),
+            Some(request_id),
+        );
+    }
+    written_services.push(client_service.clone());
+
     let meta = permitlayer_oauth::metadata::CredentialMeta {
         client_type: payload.client_type.clone(),
-        client_source: Some(payload.client_source.clone()),
+        // Story 7.35: the client bundle is sealed in the vault, not
+        // referenced by a plaintext path.
+        client_source: None,
+        client_sealed: true,
         // Round-1 review P4: use canonical `format_audit_timestamp`
         // so meta.connected_at matches the audit-log `Z` format
         // instead of rfc3339's `+00:00` suffix.
@@ -3041,7 +3133,9 @@ pub(crate) async fn credentials_seal_handler(
             "agent": payload.agent,
             "scopes": payload.granted_scopes,
             "client_type": payload.client_type,
-            "client_source": payload.client_source,
+            // Story 7.35: client bundle is sealed in the vault; the
+            // plaintext path is no longer recorded (or stored).
+            "client_sealed": true,
             "replaced_previous": replaced_previous,
             "had_refresh_token": had_refresh_token,
         });
@@ -7267,13 +7361,23 @@ mod tests {
         if_exists: &str,
         with_refresh: bool,
     ) -> serde_json::Value {
+        // Story 7.35: the seal request now carries the parsed BYO client
+        // bundle as canonical `SealedClientBundle` JSON (sealed under
+        // `{service}-client`), not a `client_source` path.
+        let client_bundle_json = serde_json::json!({
+            "client_id": "123.apps.googleusercontent.com",
+            "client_secret": "GOCSPX-test-client-secret",
+            "project_id": "test-project",
+            "v": 1,
+        })
+        .to_string();
         let mut body = serde_json::json!({
             "service": service,
             "agent": agent,
             "access_token": "ya29.test-access-token-bytes",
             "granted_scopes": ["https://mail.google.com/"],
             "client_type": "byo",
-            "client_source": "/abs/cs.json",
+            "client_bundle_json": client_bundle_json,
             "expires_in_secs": 3599,
             "if_exists": if_exists,
         });
@@ -7492,7 +7596,15 @@ mod tests {
         assert_eq!(first.extra["service"], "gmail");
         assert_eq!(first.extra["agent"], "test-agent");
         assert_eq!(first.extra["client_type"], "byo");
-        assert_eq!(first.extra["client_source"], "/abs/cs.json");
+        // Story 7.35: the client bundle is sealed in the vault; the
+        // audit records `client_sealed: true` and no longer emits the
+        // plaintext `client_source` path (it isn't stored at all).
+        assert_eq!(first.extra["client_sealed"], true);
+        assert!(
+            first.extra.get("client_source").is_none(),
+            "client_source must not appear in the seal audit extra post-7.35; got: {:?}",
+            first.extra.get("client_source")
+        );
         assert_eq!(first.extra["replaced_previous"], false);
         assert_eq!(first.extra["had_refresh_token"], true);
         assert_eq!(first.extra["scopes"][0], "https://mail.google.com/");

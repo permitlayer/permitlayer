@@ -447,6 +447,7 @@ async fn make_test_service_full(
     let meta = CredentialMeta {
         client_type: "shared-casa".to_owned(),
         client_source: None,
+        client_sealed: false,
         connected_at: "2026-04-09T12:00:00Z".to_owned(),
         last_refreshed_at: None,
         scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".to_owned()],

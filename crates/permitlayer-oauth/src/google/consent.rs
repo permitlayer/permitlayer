@@ -63,11 +63,19 @@ fn validate_gcp_project_id(raw: &str) -> Option<String> {
 /// Persisted credential metadata from earlier versions may still carry
 /// `client_type = "shared-casa"`; those records are treated as
 /// re-setup-required rather than re-constructible.
-#[derive(Debug, Clone)]
+/// `Debug` is hand-written (NOT derived) so `client_secret` can never
+/// leak via a `{:?}` anywhere — Story 7.35 hardening (review M3). The
+/// derived impl would have printed the secret; this redacts it while
+/// keeping the field's presence/absence visible for diagnostics.
+#[derive(Clone)]
 pub struct GoogleOAuthConfig {
     /// The client ID from the JSON file.
     client_id: String,
     /// The client secret (optional — PKCE-capable clients may omit it).
+    /// Held as a plaintext `String` for the life of the config (same
+    /// in-RAM window as the legacy `from_client_json` path); the
+    /// redacting `Debug` impl below prevents accidental log/format
+    /// disclosure.
     client_secret: Option<String>,
     /// The Google Cloud project ID from the JSON file. Optional because
     /// older or hand-edited client JSON may omit it; Google Cloud Console
@@ -75,8 +83,74 @@ pub struct GoogleOAuthConfig {
     /// Surfaced to the verify path so 403 actionable-remediation URLs
     /// (Story 7.12) can pre-fill `?project=<id>`.
     project_id: Option<String>,
-    /// Path to the original JSON file (for provenance display).
+    /// Path to the original JSON file (for provenance display). For a
+    /// config reconstructed from a sealed bundle (Story 7.35) this is
+    /// the sentinel `<sealed>` and is NEVER opened as a file.
     source_path: PathBuf,
+}
+
+impl std::fmt::Debug for GoogleOAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GoogleOAuthConfig")
+            .field("client_id", &self.client_id)
+            // NEVER print the secret — only whether one is present.
+            .field("client_secret", &self.client_secret.as_ref().map(|_| "<redacted>"))
+            .field("project_id", &self.project_id)
+            .field("source_path", &self.source_path)
+            .finish()
+    }
+}
+
+/// Sentinel `source_path` for a [`GoogleOAuthConfig`] reconstructed from
+/// a sealed vault bundle rather than an on-disk JSON file (Story 7.35).
+/// Code that would open `source_path` must treat this value as "no file"
+/// — the credential lives in the vault, not on the filesystem.
+pub const SEALED_SOURCE_SENTINEL: &str = "<sealed>";
+
+/// Canonical, vault-sealed representation of a BYO OAuth client
+/// (Story 7.35). Serialized to JSON and sealed via `Vault::seal` under
+/// the `{service}-client` namespace so the `client_secret` is encrypted
+/// at rest instead of re-read from a plaintext path on every refresh.
+///
+/// This type is NOT a `permitlayer-credential` newtype; keeping it out
+/// of the policed set avoids expanding `xtask validate-credentials`.
+/// Exposure scope, stated precisely:
+/// - The serialized *bundle bytes* in transit (CLI→UDS→daemon seal,
+///   and unseal→`from_sealed_bundle_bytes`) ARE wrapped in
+///   `Zeroizing`/`ZeroizeOnDrop` (the `OAuthToken` seal path).
+/// - `SealedClientBundle` itself and the `GoogleOAuthConfig` produced
+///   by `from_sealed_bundle_bytes` hold plain `String` fields that are
+///   NOT zeroized — `client_secret` lives in process heap for the
+///   reconstructed config's lifetime. This in-RAM window is identical
+///   to the legacy `from_client_json` path (7.35 does not regress it;
+///   it removes the at-rest plaintext-on-disk exposure). The
+///   `GoogleOAuthConfig` `Debug` impl is hand-written to redact the
+///   secret so this window can't leak via formatting/logs.
+#[derive(serde::Serialize, serde::Deserialize)]
+pub struct SealedClientBundle {
+    pub client_id: String,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub client_secret: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub project_id: Option<String>,
+    /// Bundle format version. v1 = this shape. The reconstruction gate
+    /// is intentionally strict-equality (`v != CURRENT` → hard
+    /// `SealedClientBundleInvalid`, NOT an in-place migration): the
+    /// single-machine scope of Story 7.35 is reset-and-reconnect, so a
+    /// version bump is a deliberate breaking change that forces a
+    /// re-`connect` rather than a silent misparse of an
+    /// incompatible-shape bundle. (bmad-code-review F4: the prior
+    /// "detect and migrate older sealed bundles" wording was
+    /// contradicted by the strict-equality gate — there is no migration
+    /// path by design.) `#[serde(default)]` only covers a v1 bundle
+    /// written before this field existed; it does not imply
+    /// cross-version tolerance.
+    #[serde(default = "default_bundle_version")]
+    pub v: u8,
+}
+
+fn default_bundle_version() -> u8 {
+    1
 }
 
 impl GoogleOAuthConfig {
@@ -191,6 +265,70 @@ impl GoogleOAuthConfig {
             client_obj.get("project_id").and_then(|v| v.as_str()).and_then(validate_gcp_project_id);
 
         Ok(Self { client_id, client_secret, project_id, source_path: path.to_owned() })
+    }
+
+    /// Serialize this config into the canonical [`SealedClientBundle`]
+    /// JSON bytes for vault sealing (Story 7.35). The returned buffer is
+    /// `Zeroizing` so the plaintext `client_secret` is scrubbed when the
+    /// caller drops it (it is moved into an `OAuthToken` immediately).
+    pub fn to_sealed_bundle_bytes(&self) -> Result<zeroize::Zeroizing<Vec<u8>>, OAuthError> {
+        let bundle = SealedClientBundle {
+            client_id: self.client_id.clone(),
+            client_secret: self.client_secret.clone(),
+            project_id: self.project_id.clone(),
+            v: default_bundle_version(),
+        };
+        let bytes = serde_json::to_vec(&bundle).map_err(|e| {
+            OAuthError::SealedClientBundleInvalid { reason: format!("serialize: {e}") }
+        })?;
+        Ok(zeroize::Zeroizing::new(bytes))
+    }
+
+    /// Reconstruct a config from the canonical [`SealedClientBundle`]
+    /// JSON bytes produced by [`Self::to_sealed_bundle_bytes`] and
+    /// recovered via `Vault::unseal` (Story 7.35). `source_path` is set
+    /// to the [`SEALED_SOURCE_SENTINEL`] — this config must NEVER be
+    /// used to open a file.
+    pub fn from_sealed_bundle_bytes(bytes: &[u8]) -> Result<Self, OAuthError> {
+        let bundle: SealedClientBundle = serde_json::from_slice(bytes).map_err(|e| {
+            OAuthError::SealedClientBundleInvalid { reason: format!("deserialize: {e}") }
+        })?;
+        if bundle.v != default_bundle_version() {
+            return Err(OAuthError::SealedClientBundleInvalid {
+                reason: format!("unsupported bundle version {}", bundle.v),
+            });
+        }
+
+        // bmad-code-review F2: the sealed-bundle reconstruction MUST
+        // enforce the same field validation as `from_client_json` — the
+        // two paths are documented as behaviorally identical, and a
+        // decryptable-but-corrupt bundle (operator-crafted, or a future
+        // bundle-version producer that relaxes validation) otherwise
+        // bypasses the Story 7.12 guard. Without this:
+        //  - empty `client_id` → opaque upstream-refresh failure instead
+        //    of an actionable SealedClientBundleInvalid;
+        //  - `client_secret == Some("")` → empty secret sent to Google's
+        //    token endpoint instead of PKCE-omitted (wire divergence);
+        //  - unvalidated `project_id` → re-opens the URL/`gcloud`
+        //    injection vector Story 7.12 review P3 closed (the value
+        //    flows raw into the 403 remediation URL + `--project`).
+        if bundle.client_id.is_empty() {
+            return Err(OAuthError::SealedClientBundleInvalid {
+                reason: "missing or empty 'client_id' field".to_owned(),
+            });
+        }
+        // Match `from_client_json`: empty secret ≡ absent (PKCE client).
+        let client_secret = bundle.client_secret.filter(|s| !s.is_empty());
+        // Match `from_client_json`: any project_id failing the GCP
+        // grammar is treated identically to absent (renderer omits it).
+        let project_id = bundle.project_id.as_deref().and_then(validate_gcp_project_id);
+
+        Ok(Self {
+            client_id: bundle.client_id,
+            client_secret,
+            project_id,
+            source_path: PathBuf::from(SEALED_SOURCE_SENTINEL),
+        })
     }
 }
 
@@ -505,5 +643,120 @@ mod tests {
             format!("{err}").contains("expected 'installed' or 'web'"),
             "error should mention expected keys: {err}"
         );
+    }
+
+    // --- Story 7.35: sealed client bundle round-trip ---
+
+    fn cfg(client_id: &str, secret: Option<&str>, project: Option<&str>) -> GoogleOAuthConfig {
+        GoogleOAuthConfig {
+            client_id: client_id.to_owned(),
+            client_secret: secret.map(str::to_owned),
+            project_id: project.map(str::to_owned),
+            source_path: std::path::PathBuf::from("/tmp/orig-client.json"),
+        }
+    }
+
+    #[test]
+    fn sealed_bundle_round_trip_full() {
+        let c = cfg("123.apps.googleusercontent.com", Some("GOCSPX-secret"), Some("my-project"));
+        let bytes = c.to_sealed_bundle_bytes().unwrap();
+        let back = GoogleOAuthConfig::from_sealed_bundle_bytes(&bytes).unwrap();
+        assert_eq!(back.client_id(), "123.apps.googleusercontent.com");
+        assert_eq!(back.client_secret(), Some("GOCSPX-secret"));
+        assert_eq!(back.project_id(), Some("my-project"));
+        // Reconstructed config must carry the sealed sentinel, never a
+        // real path (it must never be opened as a file).
+        assert_eq!(back.source_path().to_string_lossy(), SEALED_SOURCE_SENTINEL);
+    }
+
+    #[test]
+    fn sealed_bundle_round_trip_pkce_no_secret() {
+        // project_id must satisfy the GCP grammar (6-30 chars) — the
+        // F2 hardening makes from_sealed_bundle_bytes validate it just
+        // like from_client_json, so the round-trip property only holds
+        // for a value a real (validated) config could actually carry.
+        let c = cfg("pkce.apps.googleusercontent.com", None, Some("pkce-proj"));
+        let bytes = c.to_sealed_bundle_bytes().unwrap();
+        let back = GoogleOAuthConfig::from_sealed_bundle_bytes(&bytes).unwrap();
+        assert_eq!(back.client_id(), "pkce.apps.googleusercontent.com");
+        assert_eq!(back.client_secret(), None);
+        assert_eq!(back.project_id(), Some("pkce-proj"));
+    }
+
+    #[test]
+    fn sealed_bundle_round_trip_no_project() {
+        let c = cfg("noproj.apps.googleusercontent.com", Some("s"), None);
+        let bytes = c.to_sealed_bundle_bytes().unwrap();
+        let back = GoogleOAuthConfig::from_sealed_bundle_bytes(&bytes).unwrap();
+        assert_eq!(back.client_secret(), Some("s"));
+        assert_eq!(back.project_id(), None);
+    }
+
+    #[test]
+    fn sealed_bundle_rejects_unknown_version() {
+        let json = br#"{"client_id":"x","v":99}"#;
+        let err = GoogleOAuthConfig::from_sealed_bundle_bytes(json).unwrap_err();
+        assert!(
+            matches!(err, OAuthError::SealedClientBundleInvalid { .. }),
+            "unsupported version must be SealedClientBundleInvalid, got: {err}"
+        );
+    }
+
+    #[test]
+    fn sealed_bundle_rejects_garbage() {
+        let err = GoogleOAuthConfig::from_sealed_bundle_bytes(b"not json").unwrap_err();
+        assert!(matches!(err, OAuthError::SealedClientBundleInvalid { .. }), "got: {err}");
+    }
+
+    // ── bmad-code-review F2: from_sealed_bundle_bytes must enforce the
+    //    same field validation as from_client_json (parity) ──────────
+
+    #[test]
+    fn sealed_bundle_rejects_empty_client_id() {
+        // A decryptable-but-corrupt bundle with an empty client_id must
+        // fail with an actionable error, not produce a config that
+        // refreshes opaquely against Google with no client_id.
+        let json = br#"{"client_id":"","client_secret":"s","v":1}"#;
+        let err = GoogleOAuthConfig::from_sealed_bundle_bytes(json).unwrap_err();
+        assert!(
+            matches!(err, OAuthError::SealedClientBundleInvalid { .. }),
+            "empty client_id must be SealedClientBundleInvalid, got: {err}"
+        );
+    }
+
+    #[test]
+    fn sealed_bundle_empty_client_secret_normalizes_to_none() {
+        // Parity with from_client_json: "" ≡ absent (PKCE client). A
+        // bundle carrying "client_secret":"" must NOT send an empty
+        // secret to Google's token endpoint.
+        let json = br#"{"client_id":"pkce.apps.googleusercontent.com","client_secret":"","v":1}"#;
+        let back = GoogleOAuthConfig::from_sealed_bundle_bytes(json).unwrap();
+        assert_eq!(back.client_secret(), None);
+    }
+
+    #[test]
+    fn sealed_bundle_invalid_project_id_treated_as_absent() {
+        // Story 7.12 review P3: project_id flows raw into the 403
+        // remediation URL + `gcloud --project`. A bundle with an
+        // injection-y project_id must be dropped (treated as absent),
+        // identically to from_client_json — NOT carried through.
+        let json =
+            br#"{"client_id":"x.apps.googleusercontent.com","project_id":"p?inject=1","v":1}"#;
+        let back = GoogleOAuthConfig::from_sealed_bundle_bytes(json).unwrap();
+        assert_eq!(
+            back.project_id(),
+            None,
+            "an invalid/injection project_id must be dropped, not carried into URL/CLI rendering"
+        );
+    }
+
+    #[test]
+    fn sealed_bundle_valid_project_id_survives() {
+        // Sanity: a grammar-valid project_id is preserved (the F2
+        // hardening must not reject legitimate values).
+        let json =
+            br#"{"client_id":"x.apps.googleusercontent.com","project_id":"my-proj-123","v":1}"#;
+        let back = GoogleOAuthConfig::from_sealed_bundle_bytes(json).unwrap();
+        assert_eq!(back.project_id(), Some("my-proj-123"));
     }
 }

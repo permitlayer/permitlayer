@@ -26,10 +26,20 @@ pub struct CredentialMeta {
     /// credential metadata written by pre-0.1 daemons; records with that
     /// value require re-running `agentsso setup` to migrate.
     pub client_type: String,
-    /// For BYO clients, the source file path. Absent on historical
-    /// shared-casa records (which require re-setup to use).
+    /// Pre-Story-7.35: for BYO clients, the source file path the proxy
+    /// re-read in plaintext on every refresh. Story 7.35 seals the
+    /// client bundle into the vault instead; fresh records write `None`
+    /// here and set `client_sealed = true`. Still deserialized so a
+    /// legacy path-based record is detectable (and rejected with an
+    /// actionable "re-run connect" error rather than silently re-read).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_source: Option<String>,
+    /// Story 7.35: `true` when the BYO OAuth client credentials are
+    /// sealed in the vault under `{service}-client` (the secure path).
+    /// `#[serde(default)]` so legacy meta files (no such field)
+    /// deserialize as `false` and are treated as non-sealed/legacy.
+    #[serde(default)]
+    pub client_sealed: bool,
     /// ISO 8601 timestamp of when the connection was established.
     pub connected_at: String,
     /// ISO 8601 timestamp of the last successful token refresh. `None`
@@ -160,6 +170,7 @@ mod tests {
         let meta = CredentialMeta {
             client_type: "shared-casa".to_owned(),
             client_source: None,
+            client_sealed: false,
             connected_at: "2026-04-06T12:00:00Z".to_owned(),
             last_refreshed_at: None,
             scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".to_owned()],
@@ -176,6 +187,7 @@ mod tests {
         let meta = CredentialMeta {
             client_type: "byo".to_owned(),
             client_source: Some("./my-client.json".to_owned()),
+            client_sealed: false,
             connected_at: "2026-04-06T12:00:00Z".to_owned(),
             last_refreshed_at: None,
             scopes: vec![
@@ -195,6 +207,7 @@ mod tests {
         let meta = CredentialMeta {
             client_type: "shared-casa".to_owned(),
             client_source: None,
+            client_sealed: false,
             connected_at: "2026-04-06T12:00:00Z".to_owned(),
             last_refreshed_at: None,
             scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".to_owned()],
@@ -216,6 +229,7 @@ mod tests {
         let meta = CredentialMeta {
             client_type: "shared-casa".to_owned(),
             client_source: None,
+            client_sealed: false,
             connected_at: "2026-04-06T12:00:00Z".to_owned(),
             last_refreshed_at: None,
             scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".to_owned()],
@@ -234,6 +248,7 @@ mod tests {
         let meta = CredentialMeta {
             client_type: "shared-casa".to_owned(),
             client_source: None,
+            client_sealed: false,
             connected_at: "2026-04-06T12:00:00Z".to_owned(),
             last_refreshed_at: Some("2026-04-09T12:34:56Z".to_owned()),
             scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".to_owned()],
@@ -255,6 +270,7 @@ mod tests {
         let meta = CredentialMeta {
             client_type: "shared-casa".to_owned(),
             client_source: None,
+            client_sealed: false,
             connected_at: "2026-04-10T12:00:00Z".to_owned(),
             last_refreshed_at: Some("2026-04-10T13:00:00Z".to_owned()),
             scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".to_owned()],
@@ -289,6 +305,7 @@ mod tests {
         let mut meta = CredentialMeta {
             client_type: "shared-casa".to_owned(),
             client_source: None,
+            client_sealed: false,
             connected_at: "2026-04-10T12:00:00Z".to_owned(),
             last_refreshed_at: None,
             scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".to_owned()],
@@ -327,5 +344,45 @@ mod tests {
         // Sanity: other fields still parse.
         assert_eq!(deserialized.client_type, "shared-casa");
         assert_eq!(deserialized.expires_in_secs, Some(3600));
+    }
+
+    // --- Story 7.35: client_sealed serde back-compat ---
+
+    #[test]
+    fn client_sealed_absent_in_legacy_json_deserializes_to_false() {
+        // A pre-7.35 meta file has no `client_sealed` field. The
+        // `#[serde(default)]` must make it `false` so the refresh path
+        // treats it as a legacy/path-based record (and rejects it with
+        // an actionable re-connect error rather than silently re-reading
+        // a plaintext path).
+        let legacy_json = r#"{
+            "client_type": "byo",
+            "client_source": "/Users/op/Downloads/client_secret.json",
+            "connected_at": "2026-04-06T12:00:00Z",
+            "scopes": ["https://www.googleapis.com/auth/gmail.readonly"]
+        }"#;
+        let meta: CredentialMeta = serde_json::from_str(legacy_json).unwrap();
+        assert!(!meta.client_sealed, "legacy meta must deserialize as non-sealed");
+        assert_eq!(meta.client_source.as_deref(), Some("/Users/op/Downloads/client_secret.json"));
+    }
+
+    #[test]
+    fn client_sealed_true_round_trips_without_client_source() {
+        // A fresh Story-7.35 record: sealed in the vault, no path.
+        let meta = CredentialMeta {
+            client_type: "byo".to_owned(),
+            client_source: None,
+            client_sealed: true,
+            connected_at: "2026-05-17T12:00:00Z".to_owned(),
+            last_refreshed_at: None,
+            scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".to_owned()],
+            expires_in_secs: Some(3600),
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains("\"client_sealed\":true"), "got: {json}");
+        assert!(!json.contains("client_source"), "sealed record must not carry a path: {json}");
+        let back: CredentialMeta = serde_json::from_str(&json).unwrap();
+        assert!(back.client_sealed);
+        assert!(back.client_source.is_none());
     }
 }

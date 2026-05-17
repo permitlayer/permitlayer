@@ -298,18 +298,20 @@ impl ProxyService {
                 });
             }
             "byo" => {
-                let source = meta.client_source.as_ref().ok_or_else(|| ProxyError::Internal {
-                    message: format!(
-                        "metadata for service '{service}' is marked 'byo' but has no client_source"
-                    ),
-                })?;
-                GoogleOAuthConfig::from_client_json(std::path::Path::new(source)).map_err(|e| {
-                    ProxyError::Internal {
+                // Story 7.35: the BYO client credentials are sealed in
+                // the vault under `{service}-client`. A legacy
+                // path-based record (`client_sealed == false`) is NOT
+                // silently re-read from a plaintext path anymore —
+                // single-machine scope means reset-and-reconnect.
+                if !meta.client_sealed {
+                    return Err(ProxyError::Internal {
                         message: format!(
-                            "could not re-read BYO OAuth client JSON for service '{service}' at {source}: {e}"
+                            "OAuth client for service '{service}' is not sealed (legacy/path-based record). \
+                             Re-run: agentsso connect {service} --agent <agent> --oauth-client <path/to/client_secret.json>"
                         ),
-                    }
-                })?
+                    });
+                }
+                self.unseal_byo_client_config(service)?
             }
             other => {
                 return Err(ProxyError::Internal {
@@ -325,6 +327,43 @@ impl ProxyService {
             .map_err(|e| ProxyError::Internal {
                 message: format!("could not construct OAuth client for service '{service}': {e}"),
             })
+    }
+
+    /// Story 7.35: recover the BYO OAuth client config by unsealing the
+    /// `{service}-client` vault envelope — never reading a plaintext
+    /// path. Mirrors this fn's existing sync `std::fs` discipline (the
+    /// `{service}-client.sealed` file is decoded with the same public
+    /// `decode_envelope` the credential store uses, then `vault.unseal`).
+    fn unseal_byo_client_config(&self, service: &str) -> Result<GoogleOAuthConfig, ProxyError> {
+        let client_service = format!("{service}-client");
+        let sealed_path = self.vault_dir.join(format!("{client_service}.sealed"));
+        let bytes = std::fs::read(&sealed_path).map_err(|e| ProxyError::Internal {
+            message: format!(
+                "could not read sealed OAuth client bundle for service '{service}' at {}: {e}",
+                sealed_path.display()
+            ),
+        })?;
+        let sealed =
+            permitlayer_core::store::fs::credential_fs::decode_envelope(&bytes).map_err(|e| {
+                ProxyError::Internal {
+                    message: format!(
+                        "corrupt sealed OAuth client bundle for service '{service}': {e}"
+                    ),
+                }
+            })?;
+        let token =
+            self.vault.unseal(&client_service, &sealed).map_err(|e| ProxyError::Internal {
+                message: format!(
+                    "could not unseal OAuth client bundle for service '{service}': {e}"
+                ),
+            })?;
+        GoogleOAuthConfig::from_sealed_bundle_bytes(token.reveal()).map_err(|e| {
+            ProxyError::Internal {
+                message: format!(
+                    "malformed sealed OAuth client bundle for service '{service}': {e}"
+                ),
+            }
+        })
     }
 
     /// Attempt a single transparent OAuth token refresh on behalf of an
@@ -1249,6 +1288,129 @@ mod tests {
 
         assert!(matches!(err, ProxyError::Internal { .. }));
         assert!(err.to_string().contains("no credentials"));
+    }
+
+    // ── Story 7.35: BYO client bundle is unsealed from the vault,
+    //    never re-read from a plaintext path (review M1) ─────────────
+
+    /// Build a minimal `ProxyService` whose `vault_dir` is `dir`, using
+    /// `TEST_MASTER_KEY` (so `test_vault()` can unseal what we seal
+    /// here). No upstream/credential wiring — these tests only drive
+    /// `build_oauth_client_for_service`.
+    fn service_with_vault_dir(dir: &std::path::Path) -> ProxyService {
+        ProxyService::new(
+            Arc::new(MockCredentialStore::new(TEST_MASTER_KEY)) as Arc<dyn CredentialStore>,
+            Arc::new(test_vault()),
+            Arc::new(test_token_issuer()),
+            Arc::new(UpstreamClient::new().unwrap()),
+            Arc::new(MockAuditStore::new()) as Arc<dyn AuditStore>,
+            test_scrub_engine(),
+            dir.to_path_buf(),
+        )
+    }
+
+    /// Write `{service}-meta.json` into `vault_dir` with the given
+    /// `client_sealed` flag (byo client_type).
+    fn write_byo_meta(vault_dir: &std::path::Path, service: &str, client_sealed: bool) {
+        let meta = CredentialMeta {
+            client_type: "byo".to_owned(),
+            client_source: if client_sealed {
+                None
+            } else {
+                Some("/Users/op/Downloads/client_secret.json".to_owned())
+            },
+            client_sealed,
+            connected_at: "2026-05-16T00:00:00Z".to_owned(),
+            last_refreshed_at: None,
+            scopes: vec!["https://mail.google.com/".to_owned()],
+            expires_in_secs: Some(3599),
+        };
+        std::fs::write(
+            vault_dir.join(format!("{service}-meta.json")),
+            serde_json::to_string(&meta).unwrap(),
+        )
+        .unwrap();
+    }
+
+    /// Seal a BYO client bundle into `{service}-client.sealed` exactly
+    /// as the daemon's seal handler does: `OAuthToken::from_trusted_bytes`
+    /// over the canonical bundle JSON → `vault.seal("{service}-client")`
+    /// → `encode_envelope` to disk.
+    fn seal_client_bundle(
+        vault_dir: &std::path::Path,
+        service: &str,
+        client_id: &str,
+        client_secret: &str,
+    ) {
+        let bundle = serde_json::json!({
+            "client_id": client_id,
+            "client_secret": client_secret,
+            "project_id": "p",
+            "v": 1,
+        })
+        .to_string();
+        let token = permitlayer_credential::OAuthToken::from_trusted_bytes(bundle.into_bytes());
+        let sealed = test_vault().seal(&format!("{service}-client"), &token).unwrap();
+        let bytes = permitlayer_core::store::fs::credential_fs::encode_envelope(&sealed);
+        std::fs::write(vault_dir.join(format!("{service}-client.sealed")), bytes).unwrap();
+    }
+
+    #[tokio::test]
+    async fn byo_client_is_reconstructed_from_sealed_bundle_not_a_file() {
+        let dir = TempDir::new().unwrap();
+        write_byo_meta(dir.path(), "gmail", /* client_sealed */ true);
+        seal_client_bundle(
+            dir.path(),
+            "gmail",
+            "123.apps.googleusercontent.com",
+            "GOCSPX-sealed-secret",
+        );
+        // Deliberately DO NOT create any client_secret.json — if the
+        // code falls back to a path read this must fail, not succeed.
+
+        let service = service_with_vault_dir(dir.path());
+        // Success here proves the BYO client was reconstructed by
+        // unsealing `gmail-client.sealed` — there is no client JSON on
+        // disk, so any plaintext-path fallback would error instead.
+        let _client = service
+            .build_oauth_client_for_service("gmail")
+            .expect("sealed byo client must reconstruct from the vault with no file read");
+
+        // And the underlying unseal yields exactly the sealed bundle.
+        let cfg = service.unseal_byo_client_config("gmail").unwrap();
+        assert_eq!(cfg.client_id(), "123.apps.googleusercontent.com");
+        assert_eq!(cfg.client_secret(), Some("GOCSPX-sealed-secret"));
+    }
+
+    #[tokio::test]
+    async fn legacy_non_sealed_byo_record_fails_with_actionable_error_no_path_fallback() {
+        let dir = TempDir::new().unwrap();
+        write_byo_meta(dir.path(), "gmail", /* client_sealed */ false);
+        // A real client_secret.json sitting right there must NOT be
+        // silently re-read — the legacy record is hard-rejected.
+        std::fs::write(
+            dir.path().join("legacy_client_secret.json"),
+            r#"{"installed":{"client_id":"x","client_secret":"y"}}"#,
+        )
+        .unwrap();
+
+        let service = service_with_vault_dir(dir.path());
+        // `OAuthClient` isn't `Debug`, so `expect_err` won't compile —
+        // match the error out explicitly.
+        let err = match service.build_oauth_client_for_service("gmail") {
+            Ok(_) => panic!("legacy non-sealed byo record must be rejected, not path-read"),
+            Err(e) => e,
+        };
+
+        let msg = err.to_string();
+        assert!(
+            msg.contains("not sealed") && msg.contains("legacy/path-based"),
+            "error must explain the record is legacy/non-sealed; got: {msg}"
+        );
+        assert!(
+            msg.contains("agentsso connect") && msg.contains("--oauth-client"),
+            "error must name the actionable fix (re-run connect); got: {msg}"
+        );
     }
 
     #[tokio::test]
