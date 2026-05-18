@@ -207,3 +207,50 @@ scopes = ["gmail.readonly", "gmail.metadata"]
 resources = ["*"]
 approval-mode = "auto"
 auto-approve-reads = true
+
+# =================================================================
+# Operator-specific: unattended autonomous-write tiers for the
+# `angie` bot.
+#
+# DELIBERATE SECURITY POSTURE (operator decision, eyes open): the
+# daemon runs headless as root with no controlling TTY, and Angie is
+# an LLM agent that cannot and must not be asked to approve its own
+# writes. prompt-on-write would HTTP-503 every write here, so these
+# tiers set approval-mode = "auto" — writes are auto-approved with NO
+# human circuit-breaker. An autonomous agent on these policies can
+# send mail, permanently delete/modify calendar events, and
+# create/delete Drive files without per-action review. The only
+# remaining controls are the scope ceiling below and the audit log.
+# This is the single-operator trust model taken to its logical end;
+# see docs/user-guide/policy-tiers-threat-model.md.
+# =================================================================
+
+# -----------------------------------------------------------------
+# Policy: angie-gmail-rw  (autonomous, no prompt)
+# -----------------------------------------------------------------
+[[policies]]
+name = "angie-gmail-rw"
+scopes = ["gmail.readonly", "gmail.metadata", "gmail.send", "gmail.compose", "gmail.modify"]
+resources = ["*"]
+approval-mode = "auto"
+auto-approve-reads = true
+
+# -----------------------------------------------------------------
+# Policy: angie-calendar-rw  (autonomous, no prompt)
+# -----------------------------------------------------------------
+[[policies]]
+name = "angie-calendar-rw"
+scopes = ["calendar.readonly", "calendar.events"]
+resources = ["*"]
+approval-mode = "auto"
+auto-approve-reads = true
+
+# -----------------------------------------------------------------
+# Policy: angie-drive-rw  (autonomous, no prompt)
+# -----------------------------------------------------------------
+[[policies]]
+name = "angie-drive-rw"
+scopes = ["drive.readonly", "drive.file"]
+resources = ["*"]
+approval-mode = "auto"
+auto-approve-reads = true

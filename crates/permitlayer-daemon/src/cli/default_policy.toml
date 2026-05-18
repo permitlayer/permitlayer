@@ -302,3 +302,64 @@ scopes = ["gmail.readonly", "gmail.metadata"]
 resources = ["*"]
 approval-mode = "auto"
 auto-approve-reads = true
+
+# =================================================================
+# Operator-specific: unattended autonomous-write tiers (`angie` bot).
+#
+# ⚠️ DELIBERATE SECURITY POSTURE — operator decision, made eyes open:
+#
+# This daemon runs headless as root with no controlling TTY, and the
+# `angie` agent is an LLM that cannot (and must not) be prompted to
+# approve its own actions. The stock `*-read-write` tiers use
+# approval-mode = "prompt", which on a TTY-less daemon returns HTTP
+# 503 policy.approval_unavailable for EVERY write — i.e. prompt-on-
+# write is unusable here. These three policies instead set
+# approval-mode = "auto": writes are auto-approved with NO human
+# circuit-breaker.
+#
+# Consequence: an agent bound to one of these can send email as you,
+# permanently delete or modify calendar events, and create/update/
+# delete Drive files AUTONOMOUSLY, with no per-action review. The
+# only remaining controls are (a) the scope allowlist in each policy
+# (the capability ceiling) and (b) the append-only audit log (after
+# the fact). The prompt-on-write circuit-breaker that the Epic 9
+# threat-model relies on for prompt-injection / model-error /
+# agent-compromise scenarios is intentionally absent here. This is
+# the single-operator trust model taken to its end; the residual
+# risk is accepted. See
+# docs/user-guide/policy-tiers-threat-model.md.
+#
+# These [[policies]] blocks are byte-identical with
+# test-fixtures/policies/default.toml (the drift test enforces it).
+# =================================================================
+
+# -----------------------------------------------------------------
+# Policy: angie-gmail-rw  (autonomous, NO prompt — see warning above)
+# -----------------------------------------------------------------
+[[policies]]
+name = "angie-gmail-rw"
+scopes = ["gmail.readonly", "gmail.metadata", "gmail.send", "gmail.compose", "gmail.modify"]
+resources = ["*"]
+approval-mode = "auto"
+auto-approve-reads = true
+
+# -----------------------------------------------------------------
+# Policy: angie-calendar-rw  (autonomous, NO prompt)
+# -----------------------------------------------------------------
+[[policies]]
+name = "angie-calendar-rw"
+scopes = ["calendar.readonly", "calendar.events"]
+resources = ["*"]
+approval-mode = "auto"
+auto-approve-reads = true
+
+# -----------------------------------------------------------------
+# Policy: angie-drive-rw  (autonomous, NO prompt — files.delete is
+# PERMANENT)
+# -----------------------------------------------------------------
+[[policies]]
+name = "angie-drive-rw"
+scopes = ["drive.readonly", "drive.file"]
+resources = ["*"]
+approval-mode = "auto"
+auto-approve-reads = true
