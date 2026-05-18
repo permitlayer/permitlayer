@@ -45,10 +45,9 @@ fn load_default_policy_set() -> PolicySet {
 fn default_fixture_compiles() {
     let set = load_default_policy_set();
     // Epic 9 added six per-service tier policies on top of the
-    // original three (RETAINED unchanged — existing agents and
-    // policy/edit.rs tests bind to them by name), plus three
-    // operator-specific `angie-*-rw` autonomous-write tiers = 12.
-    assert_eq!(set.len(), 12);
+    // original three (which are RETAINED unchanged — existing agents
+    // and policy/edit.rs tests bind to them by name).
+    assert_eq!(set.len(), 9);
     // Original three (pre-Epic-9).
     assert!(set.get("gmail-read-only").is_some());
     assert!(set.get("calendar-prompt-on-write").is_some());
@@ -63,10 +62,6 @@ fn default_fixture_compiles() {
         "gmail-read-only-tier",
     ] {
         assert!(set.get(name).is_some(), "Epic 9 tier policy {name} must be present");
-    }
-    // Operator-specific unattended autonomous-write tiers.
-    for name in ["angie-gmail-rw", "angie-calendar-rw", "angie-drive-rw"] {
-        assert!(set.get(name).is_some(), "operator tier {name} must be present");
     }
 }
 

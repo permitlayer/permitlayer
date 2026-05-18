@@ -2121,9 +2121,8 @@ mod tests {
     const BUNDLED_DEFAULT_TOML: &str =
         include_str!("../../../permitlayer-daemon/src/cli/default_policy.toml");
 
-    /// AC #5/#6: the expanded fixture compiles and contains the
-    /// 3 original + 6 Epic-9 tier policies + 3 operator-specific
-    /// `angie-*-rw` autonomous-write tiers = 12.
+    /// AC #5/#6: the shipped fixture compiles and contains exactly the
+    /// 3 original + 6 Epic-9 per-service tier policies = 9.
     #[test]
     fn epic9_default_toml_compiles_with_all_policies() {
         let set = PolicySet::compile_from_str(FIXTURE_DEFAULT_TOML, &p("default.toml"))
@@ -2138,13 +2137,10 @@ mod tests {
             "drive-read-only",
             "drive-read-write",
             "gmail-read-only-tier",
-            "angie-gmail-rw",
-            "angie-calendar-rw",
-            "angie-drive-rw",
         ] {
             assert!(set.get(name).is_some(), "policy {name} must be present");
         }
-        assert_eq!(set.len(), 12, "expected exactly 12 policies in the shipped default.toml");
+        assert_eq!(set.len(), 9, "expected exactly 9 policies in the shipped default.toml");
     }
 
     /// AC #2: every `{svc}-read-only` tier denies its service's write
@@ -2240,9 +2236,6 @@ mod tests {
             "drive-read-only",
             "drive-read-write",
             "gmail-read-only-tier",
-            "angie-gmail-rw",
-            "angie-calendar-rw",
-            "angie-drive-rw",
         ];
         for name in names {
             let f = fixture
