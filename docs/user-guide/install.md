@@ -137,6 +137,11 @@ keychain. The `--agent <name>` flag is required; `connect` composes
 credential sealing, policy update, and agent rebind in one
 idempotent command.
 
+How much each agent can do with a connected service depends on the
+policy it is bound to. See [Connector access
+tiers](connector-tiers.md) for the read-only vs read/write tier model,
+the per-service tool matrix, and the security posture.
+
 ### Connecting over SSH
 
 If the operator account has no local browser (SSH session, `su`

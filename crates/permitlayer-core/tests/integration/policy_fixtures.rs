@@ -44,10 +44,25 @@ fn load_default_policy_set() -> PolicySet {
 #[test]
 fn default_fixture_compiles() {
     let set = load_default_policy_set();
-    assert_eq!(set.len(), 3);
+    // Epic 9 added six per-service tier policies on top of the
+    // original three (which are RETAINED unchanged — existing agents
+    // and policy/edit.rs tests bind to them by name).
+    assert_eq!(set.len(), 9);
+    // Original three (pre-Epic-9).
     assert!(set.get("gmail-read-only").is_some());
     assert!(set.get("calendar-prompt-on-write").is_some());
     assert!(set.get("drive-research-scope-restricted").is_some());
+    // Epic 9 per-service read-only / read-write tiers.
+    for name in [
+        "gmail-read-write",
+        "calendar-read-only",
+        "calendar-read-write",
+        "drive-read-only",
+        "drive-read-write",
+        "gmail-read-only-tier",
+    ] {
+        assert!(set.get(name).is_some(), "Epic 9 tier policy {name} must be present");
+    }
 }
 
 #[test]

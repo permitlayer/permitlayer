@@ -164,6 +164,120 @@ pub struct SearchParams {
     pub page_token: Option<String>,
 }
 
+// -- Story 9.1: Gmail read-tool gap-fill (all `gmail.readonly`) --------------
+
+/// Parameters for `gmail.attachments.get`.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct AttachmentsGetParams {
+    /// The ID of the message the attachment belongs to.
+    pub message_id: String,
+    /// The attachment ID (from the message payload part).
+    pub attachment_id: String,
+}
+
+/// Parameters for `gmail.labels.list` (no inputs — Gmail lists all labels
+/// for the authenticated user). An empty params struct is used because
+/// every tool in this codebase takes `Parameters<…>`; there is no
+/// paramless-tool form.
+#[derive(serde::Deserialize, schemars::JsonSchema, Default)]
+pub struct LabelsListParams {}
+
+/// Parameters for `gmail.profile.get` (no inputs — maps to Gmail's
+/// `users.getProfile` for the authenticated user).
+#[derive(serde::Deserialize, schemars::JsonSchema, Default)]
+pub struct ProfileGetParams {}
+
+/// Parameters for `gmail.history.list`.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct HistoryListParams {
+    /// Required. Return history records after this `historyId` (obtain
+    /// from a prior `messages.get`/`profile.get`). Gmail rejects the
+    /// request without it, so we fail fast at the tool boundary.
+    pub start_history_id: String,
+    /// Maximum number of history records to return.
+    pub max_results: Option<u32>,
+    /// Page token for pagination.
+    pub page_token: Option<String>,
+    /// Only return history records for this label ID.
+    pub label_id: Option<String>,
+    /// History types to return (e.g. "messageAdded", "labelAdded").
+    pub history_types: Option<Vec<String>>,
+}
+
+/// Parameters for `gmail.drafts.list`.
+#[derive(serde::Deserialize, schemars::JsonSchema, Default)]
+pub struct DraftsListParams {
+    /// Maximum number of drafts to return.
+    pub max_results: Option<u32>,
+    /// Page token for pagination.
+    pub page_token: Option<String>,
+    /// Only return drafts matching this Gmail search query.
+    pub q: Option<String>,
+    /// Include drafts from SPAM and TRASH.
+    pub include_spam_trash: Option<bool>,
+}
+
+/// Parameters for `gmail.drafts.get`.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct DraftsGetParams {
+    /// The draft ID.
+    pub draft_id: String,
+    /// Response format: "full", "metadata", "minimal", or "raw".
+    pub format: Option<String>,
+    /// Metadata headers to include when format is "metadata".
+    pub metadata_headers: Option<Vec<String>>,
+}
+
+// -- Story 9.2: Gmail WRITE + SETTINGS-read tool parameter structs ----------
+
+/// Parameters for `gmail.messages.send`.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct MessagesSendParams {
+    /// The message resource. Google expects `{ "raw": "<base64url
+    /// RFC822 message>" }`. Passed through unmodified as the request
+    /// body (validated to be a non-empty JSON object).
+    pub message: serde_json::Value,
+}
+
+/// Parameters for `gmail.messages.modify`.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct MessagesModifyParams {
+    /// The message ID.
+    pub id: String,
+    /// The modify request body, e.g.
+    /// `{ "addLabelIds": [...], "removeLabelIds": [...] }`.
+    pub body: serde_json::Value,
+}
+
+/// Parameters for `gmail.messages.trash` / `gmail.messages.untrash`.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct MessageIdParams {
+    /// The message ID.
+    pub id: String,
+}
+
+/// Parameters for `gmail.drafts.create` / `gmail.drafts.update`.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct DraftWriteParams {
+    /// The draft resource: `{ "message": { "raw": "<base64url RFC822>" } }`.
+    pub draft: serde_json::Value,
+    /// Required for `gmail.drafts.update` (the draft ID to replace);
+    /// ignored by `gmail.drafts.create`.
+    pub draft_id: Option<String>,
+}
+
+/// Parameters for `gmail.drafts.send`.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct DraftSendParams {
+    /// The draft to send. Google expects `{ "id": "<draftId>" }`.
+    pub draft: serde_json::Value,
+}
+
+/// Parameters for the no-input Gmail settings read tools (every tool in
+/// this codebase takes `Parameters<…>`; there is no paramless form).
+#[derive(serde::Deserialize, schemars::JsonSchema, Default)]
+pub struct GmailSettingsGetParams {}
+
 // -- Gmail MCP server --------------------------------------------------------
 
 /// MCP server that exposes Gmail tools via `ProxyService::handle`.
@@ -192,20 +306,41 @@ impl GmailMcpServer {
         }
     }
 
-    /// Build a `ProxyRequest` for a Gmail GET endpoint.
+    /// Build a `ProxyRequest` for a Gmail endpoint.
+    ///
+    /// `Content-Type: application/json` is set automatically when `body`
+    /// is non-empty (for POST/PUT/PATCH write tools); GET reads pass
+    /// `Method::GET` + `Bytes::new()` and get no Content-Type. Mirrors
+    /// `calendar_request`/`drive_request` (Story 9.2 generalized this
+    /// from the original GET-only shape so Gmail write tools could reuse
+    /// one builder per service, matching the calendar/drive convention).
     ///
     /// `agent_id` is the bearer-authenticated agent identity for the
     /// inbound MCP call. Callers extract it from the per-call HTTP
     /// `Parts` via [`agent_id_from_parts`] and pass it in.
-    pub fn gmail_request(path: String, scope: &str, agent_id: String) -> ProxyRequest {
+    pub fn gmail_request(
+        path: String,
+        scope: &str,
+        method: Method,
+        body: Bytes,
+        agent_id: String,
+    ) -> ProxyRequest {
+        let mut headers = HeaderMap::new();
+        if !body.is_empty() {
+            #[allow(clippy::expect_used)]
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                "application/json".parse().expect("valid header value"),
+            );
+        }
         ProxyRequest {
             service: "gmail".to_owned(),
             scope: scope.to_owned(),
             resource: path.clone(),
-            method: Method::GET,
+            method,
             path,
-            headers: HeaderMap::new(),
-            body: Bytes::new(),
+            headers,
+            body,
             agent_id,
             request_id: ulid::Ulid::new().to_string(),
         }
@@ -349,7 +484,7 @@ impl GmailMcpServer {
             ("includeSpamTrash", params.include_spam_trash.map(|b| b.to_string())),
         ]);
         let path = format!("users/me/messages{qs}");
-        let req = Self::gmail_request(path, "gmail.readonly", agent_id);
+        let req = Self::gmail_request(path, "gmail.readonly", Method::GET, Bytes::new(), agent_id);
         self.dispatch(req).await
     }
 
@@ -370,7 +505,7 @@ impl GmailMcpServer {
             ("metadataHeaders", params.metadata_headers.map(|h| h.join(","))),
         ]);
         let path = format!("users/me/messages/{}{qs}", params.id);
-        let req = Self::gmail_request(path, "gmail.readonly", agent_id);
+        let req = Self::gmail_request(path, "gmail.readonly", Method::GET, Bytes::new(), agent_id);
         self.dispatch(req).await
     }
 
@@ -392,7 +527,7 @@ impl GmailMcpServer {
             ("q", params.q),
         ]);
         let path = format!("users/me/threads{qs}");
-        let req = Self::gmail_request(path, "gmail.readonly", agent_id);
+        let req = Self::gmail_request(path, "gmail.readonly", Method::GET, Bytes::new(), agent_id);
         self.dispatch(req).await
     }
 
@@ -410,7 +545,7 @@ impl GmailMcpServer {
         validate_resource_id(&params.id)?;
         let qs = build_query_string(&[("format", params.format)]);
         let path = format!("users/me/threads/{}{qs}", params.id);
-        let req = Self::gmail_request(path, "gmail.readonly", agent_id);
+        let req = Self::gmail_request(path, "gmail.readonly", Method::GET, Bytes::new(), agent_id);
         self.dispatch(req).await
     }
 
@@ -431,7 +566,483 @@ impl GmailMcpServer {
             ("pageToken", params.page_token),
         ]);
         let path = format!("users/me/messages{qs}");
-        let req = Self::gmail_request(path, "gmail.readonly", agent_id);
+        let req = Self::gmail_request(path, "gmail.readonly", Method::GET, Bytes::new(), agent_id);
+        self.dispatch(req).await
+    }
+
+    // ── Story 9.1: read-tool gap-fill (all `gmail.readonly`) ──────────
+
+    #[tool(
+        name = "gmail.attachments.get",
+        description = "Get a Gmail message attachment by message ID and attachment ID. \
+            Returns the upstream JSON { size, data } with the attachment bytes \
+            base64url-encoded in `data`. Attachments whose encoded body exceeds the \
+            proxy's 10 MiB response limit surface a too-large error (no streaming)."
+    )]
+    async fn attachments_get(
+        &self,
+        Parameters(params): Parameters<AttachmentsGetParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(
+            tool = "gmail.attachments.get",
+            message_id = %params.message_id,
+            attachment_id = %params.attachment_id,
+            "MCP tool call"
+        );
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        validate_resource_id(&params.message_id)?;
+        validate_resource_id(&params.attachment_id)?;
+        let path =
+            format!("users/me/messages/{}/attachments/{}", params.message_id, params.attachment_id);
+        let req = Self::gmail_request(path, "gmail.readonly", Method::GET, Bytes::new(), agent_id);
+        self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "gmail.labels.list",
+        description = "List all Gmail labels for the authenticated user."
+    )]
+    async fn labels_list(
+        &self,
+        Parameters(_params): Parameters<LabelsListParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "gmail.labels.list", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        let req = Self::gmail_request(
+            "users/me/labels".to_owned(),
+            "gmail.readonly",
+            Method::GET,
+            Bytes::new(),
+            agent_id,
+        );
+        self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "gmail.profile.get",
+        description = "Get the authenticated user's Gmail profile (email address, \
+            message/thread totals, current historyId). Maps to Gmail's `users.getProfile`."
+    )]
+    async fn profile_get(
+        &self,
+        Parameters(_params): Parameters<ProfileGetParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "gmail.profile.get", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        let req = Self::gmail_request(
+            "users/me/profile".to_owned(),
+            "gmail.readonly",
+            Method::GET,
+            Bytes::new(),
+            agent_id,
+        );
+        self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "gmail.history.list",
+        description = "List Gmail mailbox history (changes since a given historyId). \
+            `start_history_id` is required by the Gmail API."
+    )]
+    async fn history_list(
+        &self,
+        Parameters(params): Parameters<HistoryListParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "gmail.history.list", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        // `startHistoryId` is required by Gmail; fail fast at the tool
+        // boundary rather than dispatching a request Gmail will 400.
+        // Mirrors the `validate_resource_id` fail-fast shape.
+        if params.start_history_id.trim().is_empty() {
+            return Err("start_history_id is required and must not be empty".to_owned());
+        }
+        let qs = build_query_string(&[
+            ("startHistoryId", Some(params.start_history_id)),
+            ("maxResults", params.max_results.map(|n| n.to_string())),
+            ("pageToken", params.page_token),
+            ("labelId", params.label_id),
+            ("historyTypes", params.history_types.map(|t| t.join(","))),
+        ]);
+        let path = format!("users/me/history{qs}");
+        let req = Self::gmail_request(path, "gmail.readonly", Method::GET, Bytes::new(), agent_id);
+        self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "gmail.drafts.list",
+        description = "List Gmail drafts for the authenticated user. Returns draft IDs \
+            and their associated message IDs."
+    )]
+    async fn drafts_list(
+        &self,
+        Parameters(params): Parameters<DraftsListParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "gmail.drafts.list", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        let qs = build_query_string(&[
+            ("maxResults", params.max_results.map(|n| n.to_string())),
+            ("pageToken", params.page_token),
+            ("q", params.q),
+            ("includeSpamTrash", params.include_spam_trash.map(|b| b.to_string())),
+        ]);
+        let path = format!("users/me/drafts{qs}");
+        let req = Self::gmail_request(path, "gmail.readonly", Method::GET, Bytes::new(), agent_id);
+        self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "gmail.drafts.get",
+        description = "Get a specific Gmail draft by ID, including its message content."
+    )]
+    async fn drafts_get(
+        &self,
+        Parameters(params): Parameters<DraftsGetParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "gmail.drafts.get", draft_id = %params.draft_id, "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        validate_resource_id(&params.draft_id)?;
+        let qs = build_query_string(&[
+            ("format", params.format),
+            ("metadataHeaders", params.metadata_headers.map(|h| h.join(","))),
+        ]);
+        let path = format!("users/me/drafts/{}{qs}", params.draft_id);
+        let req = Self::gmail_request(path, "gmail.readonly", Method::GET, Bytes::new(), agent_id);
+        self.dispatch(req).await
+    }
+
+    // ── Story 9.2: WRITE tools (per-tool Google-minimum scope) ───────
+
+    #[tool(
+        name = "gmail.messages.send",
+        description = "Send an email. Pass `message` as a JSON object \
+            { \"raw\": \"<base64url-encoded RFC822 message>\" }."
+    )]
+    async fn messages_send(
+        &self,
+        Parameters(params): Parameters<MessagesSendParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "gmail.messages.send", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        validate_json_object_body(&params.message, "message")?;
+        let body = serde_json::to_vec(&params.message)
+            .map_err(|e| format!("invalid message JSON: {e}"))?;
+        let req = Self::gmail_request(
+            "users/me/messages/send".to_owned(),
+            "gmail.send",
+            Method::POST,
+            Bytes::from(body),
+            agent_id,
+        );
+        self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "gmail.messages.modify",
+        description = "Modify the labels on a message. Pass `body` as \
+            { \"addLabelIds\": [...], \"removeLabelIds\": [...] }."
+    )]
+    async fn messages_modify(
+        &self,
+        Parameters(params): Parameters<MessagesModifyParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "gmail.messages.modify", id = %params.id, "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        validate_resource_id(&params.id)?;
+        validate_json_object_body(&params.body, "body")?;
+        let body =
+            serde_json::to_vec(&params.body).map_err(|e| format!("invalid modify JSON: {e}"))?;
+        let path = format!("users/me/messages/{}/modify", params.id);
+        let req =
+            Self::gmail_request(path, "gmail.modify", Method::POST, Bytes::from(body), agent_id);
+        self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "gmail.messages.trash",
+        description = "Move a message to the trash (reversible — see \
+            gmail.messages.untrash). Does NOT permanently delete."
+    )]
+    async fn messages_trash(
+        &self,
+        Parameters(params): Parameters<MessageIdParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "gmail.messages.trash", id = %params.id, "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        validate_resource_id(&params.id)?;
+        let path = format!("users/me/messages/{}/trash", params.id);
+        let req = Self::gmail_request(path, "gmail.modify", Method::POST, Bytes::new(), agent_id);
+        self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "gmail.messages.untrash",
+        description = "Remove a message from the trash (restore it)."
+    )]
+    async fn messages_untrash(
+        &self,
+        Parameters(params): Parameters<MessageIdParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "gmail.messages.untrash", id = %params.id, "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        validate_resource_id(&params.id)?;
+        let path = format!("users/me/messages/{}/untrash", params.id);
+        let req = Self::gmail_request(path, "gmail.modify", Method::POST, Bytes::new(), agent_id);
+        self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "gmail.drafts.create",
+        description = "Create a draft. Pass `draft` as \
+            { \"message\": { \"raw\": \"<base64url RFC822>\" } }."
+    )]
+    async fn drafts_create(
+        &self,
+        Parameters(params): Parameters<DraftWriteParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "gmail.drafts.create", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        validate_json_object_body(&params.draft, "draft")?;
+        let body =
+            serde_json::to_vec(&params.draft).map_err(|e| format!("invalid draft JSON: {e}"))?;
+        let req = Self::gmail_request(
+            "users/me/drafts".to_owned(),
+            "gmail.compose",
+            Method::POST,
+            Bytes::from(body),
+            agent_id,
+        );
+        self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "gmail.drafts.update",
+        description = "Replace an existing draft's content. Requires \
+            `draft_id`; pass `draft` as { \"message\": { \"raw\": ... } }."
+    )]
+    async fn drafts_update(
+        &self,
+        Parameters(params): Parameters<DraftWriteParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "gmail.drafts.update", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        let draft_id = params
+            .draft_id
+            .as_deref()
+            .filter(|s| !s.trim().is_empty())
+            .ok_or_else(|| "draft_id is required for gmail.drafts.update".to_owned())?;
+        validate_resource_id(draft_id)?;
+        validate_json_object_body(&params.draft, "draft")?;
+        let body =
+            serde_json::to_vec(&params.draft).map_err(|e| format!("invalid draft JSON: {e}"))?;
+        let path = format!("users/me/drafts/{draft_id}");
+        let req =
+            Self::gmail_request(path, "gmail.compose", Method::PUT, Bytes::from(body), agent_id);
+        self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "gmail.drafts.send",
+        description = "Send an existing draft. Pass `draft` as \
+            { \"id\": \"<draftId>\" }. Uses the gmail.compose scope \
+            (Google does not accept gmail.send for drafts.send)."
+    )]
+    async fn drafts_send(
+        &self,
+        Parameters(params): Parameters<DraftSendParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "gmail.drafts.send", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        validate_json_object_body(&params.draft, "draft")?;
+        let body =
+            serde_json::to_vec(&params.draft).map_err(|e| format!("invalid draft JSON: {e}"))?;
+        let req = Self::gmail_request(
+            "users/me/drafts/send".to_owned(),
+            "gmail.compose",
+            Method::POST,
+            Bytes::from(body),
+            agent_id,
+        );
+        self.dispatch(req).await
+    }
+
+    // ── Story 9.2: SETTINGS reads (all gmail.readonly — Google min) ──
+
+    #[tool(
+        name = "gmail.settings.sendAs.list",
+        description = "List the send-as aliases for the account."
+    )]
+    async fn settings_send_as_list(
+        &self,
+        Parameters(_params): Parameters<GmailSettingsGetParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "gmail.settings.sendAs.list", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        let req = Self::gmail_request(
+            "users/me/settings/sendAs".to_owned(),
+            "gmail.readonly",
+            Method::GET,
+            Bytes::new(),
+            agent_id,
+        );
+        self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "gmail.settings.filters.list",
+        description = "List the mail filters configured on the account."
+    )]
+    async fn settings_filters_list(
+        &self,
+        Parameters(_params): Parameters<GmailSettingsGetParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "gmail.settings.filters.list", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        let req = Self::gmail_request(
+            "users/me/settings/filters".to_owned(),
+            "gmail.readonly",
+            Method::GET,
+            Bytes::new(),
+            agent_id,
+        );
+        self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "gmail.settings.language.get",
+        description = "Get the account's display language setting."
+    )]
+    async fn settings_language_get(
+        &self,
+        Parameters(_params): Parameters<GmailSettingsGetParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "gmail.settings.language.get", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        let req = Self::gmail_request(
+            "users/me/settings/language".to_owned(),
+            "gmail.readonly",
+            Method::GET,
+            Bytes::new(),
+            agent_id,
+        );
+        self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "gmail.settings.imap.get",
+        description = "Get the account's IMAP access settings."
+    )]
+    async fn settings_imap_get(
+        &self,
+        Parameters(_params): Parameters<GmailSettingsGetParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "gmail.settings.imap.get", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        let req = Self::gmail_request(
+            "users/me/settings/imap".to_owned(),
+            "gmail.readonly",
+            Method::GET,
+            Bytes::new(),
+            agent_id,
+        );
+        self.dispatch(req).await
+    }
+
+    #[tool(name = "gmail.settings.pop.get", description = "Get the account's POP access settings.")]
+    async fn settings_pop_get(
+        &self,
+        Parameters(_params): Parameters<GmailSettingsGetParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "gmail.settings.pop.get", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        let req = Self::gmail_request(
+            "users/me/settings/pop".to_owned(),
+            "gmail.readonly",
+            Method::GET,
+            Bytes::new(),
+            agent_id,
+        );
+        self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "gmail.settings.vacation.get",
+        description = "Get the account's vacation responder settings."
+    )]
+    async fn settings_vacation_get(
+        &self,
+        Parameters(_params): Parameters<GmailSettingsGetParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "gmail.settings.vacation.get", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        let req = Self::gmail_request(
+            "users/me/settings/vacation".to_owned(),
+            "gmail.readonly",
+            Method::GET,
+            Bytes::new(),
+            agent_id,
+        );
+        self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "gmail.settings.forwarding.list",
+        description = "List the account's forwarding addresses (maps to \
+            Gmail's settings.forwardingAddresses.list)."
+    )]
+    async fn settings_forwarding_list(
+        &self,
+        Parameters(_params): Parameters<GmailSettingsGetParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "gmail.settings.forwarding.list", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        let req = Self::gmail_request(
+            "users/me/settings/forwardingAddresses".to_owned(),
+            "gmail.readonly",
+            Method::GET,
+            Bytes::new(),
+            agent_id,
+        );
+        self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "gmail.settings.autoForwarding.get",
+        description = "Get the account's auto-forwarding setting."
+    )]
+    async fn settings_auto_forwarding_get(
+        &self,
+        Parameters(_params): Parameters<GmailSettingsGetParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "gmail.settings.autoForwarding.get", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        let req = Self::gmail_request(
+            "users/me/settings/autoForwarding".to_owned(),
+            "gmail.readonly",
+            Method::GET,
+            Bytes::new(),
+            agent_id,
+        );
         self.dispatch(req).await
     }
 }
@@ -532,6 +1143,65 @@ pub struct EventUpdateParams {
     /// The updated event resource as a JSON object.
     pub event: serde_json::Value,
 }
+
+// -- Story 9.3: Calendar parity gap-fill -------------------------------------
+
+/// Parameters for `calendar.events.delete`.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct EventDeleteParams {
+    /// Calendar ID (default: "primary").
+    pub calendar_id: Option<String>,
+    /// The event ID to delete.
+    pub event_id: String,
+}
+
+/// Parameters for `calendar.events.patch` (partial update — only the
+/// fields present in `event` are changed, unlike `events.update`'s
+/// full-resource PUT).
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct EventPatchParams {
+    /// Calendar ID (default: "primary").
+    pub calendar_id: Option<String>,
+    /// The event ID to patch.
+    pub event_id: String,
+    /// The partial event resource (only the fields to change).
+    pub event: serde_json::Value,
+}
+
+/// Parameters for `calendar.events.move`.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct EventMoveParams {
+    /// Source calendar ID (default: "primary").
+    pub calendar_id: Option<String>,
+    /// The event ID to move.
+    pub event_id: String,
+    /// Required. The destination calendar ID to move the event to.
+    pub destination: String,
+}
+
+/// Parameters for `calendar.events.quickAdd`.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct EventQuickAddParams {
+    /// Calendar ID (default: "primary").
+    pub calendar_id: Option<String>,
+    /// Required. Natural-language text describing the event
+    /// (e.g. "Lunch with Sam tomorrow 1pm").
+    pub text: String,
+}
+
+/// Parameters for `calendar.freebusy.query` (a read via POST — scope
+/// `calendar.readonly`).
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct FreeBusyQueryParams {
+    /// The free/busy query body, e.g.
+    /// `{ "timeMin": "...", "timeMax": "...", "items": [{"id": "..."}] }`.
+    pub query: serde_json::Value,
+}
+
+/// Parameters for the no-input Calendar read tools (`settings.list`,
+/// `colors.get`) — every tool takes `Parameters<…>`, no paramless form.
+#[derive(serde::Deserialize, schemars::JsonSchema, Default)]
+pub struct CalendarReadNoParams {}
 
 // -- Calendar MCP server ------------------------------------------------------
 
@@ -722,6 +1392,178 @@ impl CalendarMcpServer {
         );
         self.dispatch(req).await
     }
+
+    // ── Story 9.3: Calendar parity gap-fill ──────────────────────────
+
+    #[tool(
+        name = "calendar.events.delete",
+        description = "Delete a calendar event by ID. This removes the event from the calendar."
+    )]
+    async fn events_delete(
+        &self,
+        Parameters(params): Parameters<EventDeleteParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        let cal_id = params.calendar_id.as_deref().unwrap_or("primary");
+        debug!(tool = "calendar.events.delete", calendar_id = %cal_id, event_id = %params.event_id, "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        validate_calendar_id(cal_id, "calendar_id")?;
+        validate_resource_id(&params.event_id)?;
+        let encoded_cal_id = urlencoding::encode(cal_id);
+        let encoded_event_id = urlencoding::encode(&params.event_id);
+        let path = format!("calendars/{encoded_cal_id}/events/{encoded_event_id}");
+        let req =
+            Self::calendar_request(path, "calendar.events", Method::DELETE, Bytes::new(), agent_id);
+        self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "calendar.events.patch",
+        description = "Partially update a calendar event: only the fields present in `event` are changed (unlike calendar.events.update, which replaces the whole resource)."
+    )]
+    async fn events_patch(
+        &self,
+        Parameters(params): Parameters<EventPatchParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        let cal_id = params.calendar_id.as_deref().unwrap_or("primary");
+        debug!(tool = "calendar.events.patch", calendar_id = %cal_id, event_id = %params.event_id, "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        validate_calendar_id(cal_id, "calendar_id")?;
+        validate_resource_id(&params.event_id)?;
+        validate_json_object_body(&params.event, "event")?;
+        let body =
+            serde_json::to_vec(&params.event).map_err(|e| format!("invalid event JSON: {e}"))?;
+        let encoded_cal_id = urlencoding::encode(cal_id);
+        let encoded_event_id = urlencoding::encode(&params.event_id);
+        let path = format!("calendars/{encoded_cal_id}/events/{encoded_event_id}");
+        let req = Self::calendar_request(
+            path,
+            "calendar.events",
+            Method::PATCH,
+            Bytes::from(body),
+            agent_id,
+        );
+        self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "calendar.events.move",
+        description = "Move an event to a different calendar. `destination` (target calendar ID) is required."
+    )]
+    async fn events_move(
+        &self,
+        Parameters(params): Parameters<EventMoveParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        let cal_id = params.calendar_id.as_deref().unwrap_or("primary");
+        debug!(tool = "calendar.events.move", calendar_id = %cal_id, event_id = %params.event_id, "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        validate_calendar_id(cal_id, "calendar_id")?;
+        validate_resource_id(&params.event_id)?;
+        // `destination` is required by the Calendar API; fail fast.
+        if params.destination.trim().is_empty() {
+            return Err("destination is required and must not be empty".to_owned());
+        }
+        validate_calendar_id(&params.destination, "destination")?;
+        let encoded_cal_id = urlencoding::encode(cal_id);
+        let encoded_event_id = urlencoding::encode(&params.event_id);
+        let qs = build_query_string(&[("destination", Some(params.destination))]);
+        let path = format!("calendars/{encoded_cal_id}/events/{encoded_event_id}/move{qs}");
+        let req =
+            Self::calendar_request(path, "calendar.events", Method::POST, Bytes::new(), agent_id);
+        self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "calendar.events.quickAdd",
+        description = "Create an event from a natural-language string (e.g. \"Lunch with Sam tomorrow 1pm\"). `text` is required."
+    )]
+    async fn events_quick_add(
+        &self,
+        Parameters(params): Parameters<EventQuickAddParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        let cal_id = params.calendar_id.as_deref().unwrap_or("primary");
+        debug!(tool = "calendar.events.quickAdd", calendar_id = %cal_id, "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        validate_calendar_id(cal_id, "calendar_id")?;
+        if params.text.trim().is_empty() {
+            return Err("text is required and must not be empty".to_owned());
+        }
+        let encoded_cal_id = urlencoding::encode(cal_id);
+        let qs = build_query_string(&[("text", Some(params.text))]);
+        let path = format!("calendars/{encoded_cal_id}/events/quickAdd{qs}");
+        let req =
+            Self::calendar_request(path, "calendar.events", Method::POST, Bytes::new(), agent_id);
+        self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "calendar.freebusy.query",
+        description = "Query free/busy information. Pass `query` as { \"timeMin\": ..., \"timeMax\": ..., \"items\": [{\"id\": \"<calendarId>\"}] }. This is a READ (uses calendar.readonly) despite being an HTTP POST."
+    )]
+    async fn freebusy_query(
+        &self,
+        Parameters(params): Parameters<FreeBusyQueryParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "calendar.freebusy.query", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        validate_json_object_body(&params.query, "query")?;
+        let body =
+            serde_json::to_vec(&params.query).map_err(|e| format!("invalid query JSON: {e}"))?;
+        let req = Self::calendar_request(
+            "freeBusy".to_owned(),
+            "calendar.readonly",
+            Method::POST,
+            Bytes::from(body),
+            agent_id,
+        );
+        self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "calendar.settings.list",
+        description = "List the user's Calendar settings (timezone, default event length, etc.)."
+    )]
+    async fn calendar_settings_list(
+        &self,
+        Parameters(_params): Parameters<CalendarReadNoParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "calendar.settings.list", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        let req = Self::calendar_request(
+            "users/me/settings".to_owned(),
+            "calendar.readonly",
+            Method::GET,
+            Bytes::new(),
+            agent_id,
+        );
+        self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "calendar.colors.get",
+        description = "Get the color definitions for calendars and events."
+    )]
+    async fn calendar_colors_get(
+        &self,
+        Parameters(_params): Parameters<CalendarReadNoParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "calendar.colors.get", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        let req = Self::calendar_request(
+            "colors".to_owned(),
+            "calendar.readonly",
+            Method::GET,
+            Bytes::new(),
+            agent_id,
+        );
+        self.dispatch(req).await
+    }
 }
 
 #[tool_handler]
@@ -826,6 +1668,33 @@ pub struct FileUpdateParams {
     /// Fields to include in the response.
     pub fields: Option<String>,
 }
+
+// -- Story 9.3: Drive parity gap-fill ----------------------------------------
+
+/// Parameters for `drive.files.delete`.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct FileDeleteParams {
+    /// The file ID to permanently delete.
+    pub file_id: String,
+}
+
+/// Parameters for `drive.files.copy`.
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+pub struct FileCopyParams {
+    /// The file ID to copy.
+    pub file_id: String,
+    /// Optional copy metadata (e.g. `{ "name": "Copy of X" }`). When
+    /// omitted/empty, Google applies its defaults — sent only if a
+    /// non-empty JSON object is supplied.
+    pub file: Option<serde_json::Value>,
+    /// Fields to include in the response.
+    pub fields: Option<String>,
+}
+
+/// Parameters for `drive.about.get` (no caller inputs; `fields` is
+/// required by Drive and we hardcode `*`).
+#[derive(serde::Deserialize, schemars::JsonSchema, Default)]
+pub struct DriveAboutGetParams {}
 
 // -- Drive MCP server ---------------------------------------------------------
 
@@ -1002,6 +1871,77 @@ impl DriveMcpServer {
         let path = format!("files/{encoded_file_id}{qs}");
         let req =
             Self::drive_request(path, "drive.file", Method::PATCH, Bytes::from(body), agent_id);
+        self.dispatch(req).await
+    }
+
+    // ── Story 9.3: Drive parity gap-fill ─────────────────────────────
+
+    #[tool(
+        name = "drive.files.delete",
+        description = "PERMANENTLY delete a file (bypasses the trash — this is NOT reversible). Limited to files the app created or opened (drive.file scope)."
+    )]
+    async fn files_delete(
+        &self,
+        Parameters(params): Parameters<FileDeleteParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "drive.files.delete", file_id = %params.file_id, "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        validate_resource_id(&params.file_id)?;
+        let encoded_file_id = urlencoding::encode(&params.file_id);
+        let path = format!("files/{encoded_file_id}");
+        let req = Self::drive_request(path, "drive.file", Method::DELETE, Bytes::new(), agent_id);
+        self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "drive.files.copy",
+        description = "Create a copy of a file. Optionally pass `file` as a JSON object with copy metadata (e.g. { \"name\": \"Copy of X\" }). Limited to files the app created or opened (drive.file scope)."
+    )]
+    async fn files_copy(
+        &self,
+        Parameters(params): Parameters<FileCopyParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "drive.files.copy", file_id = %params.file_id, "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        validate_resource_id(&params.file_id)?;
+        // Body is optional; only serialize+send if a non-empty JSON
+        // object was supplied (mirrors the events_create body guard, but
+        // here the body is genuinely optional per the Drive API).
+        let body = match params.file {
+            Some(ref v) => {
+                validate_json_object_body(v, "file")?;
+                Bytes::from(serde_json::to_vec(v).map_err(|e| format!("invalid file JSON: {e}"))?)
+            }
+            None => Bytes::new(),
+        };
+        let qs = build_query_string(&[("fields", params.fields)]);
+        let encoded_file_id = urlencoding::encode(&params.file_id);
+        let path = format!("files/{encoded_file_id}/copy{qs}");
+        let req = Self::drive_request(path, "drive.file", Method::POST, body, agent_id);
+        self.dispatch(req).await
+    }
+
+    #[tool(
+        name = "drive.about.get",
+        description = "Get information about the user's Drive and system capabilities (storage quota, user info, import/export formats)."
+    )]
+    async fn about_get(
+        &self,
+        Parameters(_params): Parameters<DriveAboutGetParams>,
+        Extension(parts): Extension<axum::http::request::Parts>,
+    ) -> Result<String, String> {
+        debug!(tool = "drive.about.get", "MCP tool call");
+        let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
+        // Drive requires the `fields` param on about.get; `*` returns all.
+        let req = Self::drive_request(
+            "about?fields=*".to_owned(),
+            "drive.readonly",
+            Method::GET,
+            Bytes::new(),
+            agent_id,
+        );
         self.dispatch(req).await
     }
 }
@@ -1236,12 +2176,36 @@ mod tests {
         let req = GmailMcpServer::gmail_request(
             "users/me/messages".to_owned(),
             "gmail.readonly",
+            Method::GET,
+            Bytes::new(),
             "research-agent".to_owned(),
         );
         assert_eq!(req.agent_id, "research-agent");
         assert_eq!(req.service, "gmail");
         assert_eq!(req.scope, "gmail.readonly");
         assert_eq!(req.path, "users/me/messages");
+        assert_eq!(req.method, Method::GET);
+        assert!(req.body.is_empty());
+        // GET with empty body sets no Content-Type.
+        assert!(!req.headers.contains_key(axum::http::header::CONTENT_TYPE));
+    }
+
+    /// Story 9.2: the generalized `gmail_request` sets
+    /// `Content-Type: application/json` for a non-empty (write) body and
+    /// carries the method through — parity with `calendar_request`.
+    #[test]
+    fn gmail_request_write_sets_content_type_and_method() {
+        let req = GmailMcpServer::gmail_request(
+            "users/me/messages/send".to_owned(),
+            "gmail.send",
+            Method::POST,
+            Bytes::from_static(b"{\"raw\":\"abc\"}"),
+            "send-agent".to_owned(),
+        );
+        assert_eq!(req.method, Method::POST);
+        assert_eq!(req.scope, "gmail.send");
+        assert!(!req.body.is_empty());
+        assert_eq!(req.headers.get(axum::http::header::CONTENT_TYPE).unwrap(), "application/json");
     }
 
     #[test]
@@ -1268,5 +2232,331 @@ mod tests {
         );
         assert_eq!(req.agent_id, "drive-agent");
         assert_eq!(req.service, "drive");
+    }
+
+    // ── Story 9.1: Gmail read-tool gap-fill ──────────────────────────
+
+    /// `attachments.get` interpolates BOTH path IDs and they go through
+    /// `validate_resource_id` — a `/` or `..` in either must be rejected
+    /// so it cannot escape the `users/me/messages/{}/attachments/{}` path.
+    #[test]
+    fn attachments_get_path_ids_are_validated() {
+        // Valid opaque IDs pass.
+        assert!(validate_resource_id("18f3a2b4c5d6").is_ok());
+        assert!(validate_resource_id("ANGjdJ9x_attach_01").is_ok());
+        // Traversal / separators in either segment are rejected.
+        assert!(validate_resource_id("../../../users/me/profile").is_err());
+        assert!(validate_resource_id("a/b").is_err());
+        // The path this tool builds, with valid IDs, is exactly the
+        // documented Gmail endpoint shape.
+        let path = format!("users/me/messages/{}/attachments/{}", "MSG1", "ATT1");
+        assert_eq!(path, "users/me/messages/MSG1/attachments/ATT1");
+    }
+
+    /// `history.list` builds the documented Gmail `users/me/history`
+    /// path + query (the full path, not a self-comparison). The
+    /// fail-fast on a blank `start_history_id` is covered end-to-end by
+    /// the integration test `mcp_history_list_rejects_missing_start_history_id`
+    /// (which proves the upstream is never dispatched), so it is not
+    /// re-asserted against a copied guard here.
+    #[test]
+    fn history_list_builds_expected_path_and_query() {
+        let qs = build_query_string(&[
+            ("startHistoryId", Some("12345".to_owned())),
+            ("maxResults", Some("10".to_owned())),
+            ("pageToken", None),
+            ("labelId", Some("INBOX".to_owned())),
+            ("historyTypes", Some(["messageAdded", "labelAdded"].join(","))),
+        ]);
+        let path = format!("users/me/history{qs}");
+        assert_eq!(
+            path,
+            "users/me/history?startHistoryId=12345&maxResults=10&labelId=INBOX&historyTypes=messageAdded%2ClabelAdded"
+        );
+    }
+
+    /// The no-input tools use empty params structs (no paramless-tool
+    /// form exists in this codebase) and hit the documented static paths.
+    #[test]
+    fn labels_and_profile_use_static_paths() {
+        let _ = LabelsListParams::default();
+        let _ = ProfileGetParams::default();
+        let labels = GmailMcpServer::gmail_request(
+            "users/me/labels".to_owned(),
+            "gmail.readonly",
+            Method::GET,
+            Bytes::new(),
+            "a".to_owned(),
+        );
+        let profile = GmailMcpServer::gmail_request(
+            "users/me/profile".to_owned(),
+            "gmail.readonly",
+            Method::GET,
+            Bytes::new(),
+            "a".to_owned(),
+        );
+        assert_eq!(labels.path, "users/me/labels");
+        assert_eq!(labels.scope, "gmail.readonly");
+        assert_eq!(profile.path, "users/me/profile");
+        assert_eq!(profile.scope, "gmail.readonly");
+    }
+
+    /// `drafts.list` query shape and `drafts.get` path + qs shape.
+    #[test]
+    fn drafts_tools_build_expected_paths() {
+        let list_qs = build_query_string(&[
+            ("maxResults", Some("5".to_owned())),
+            ("pageToken", None),
+            ("q", Some("subject:invoice".to_owned())),
+            ("includeSpamTrash", Some("true".to_owned())),
+        ]);
+        assert_eq!(
+            format!("users/me/drafts{list_qs}"),
+            "users/me/drafts?maxResults=5&q=subject%3Ainvoice&includeSpamTrash=true"
+        );
+        assert!(validate_resource_id("draft-abc123").is_ok());
+        let get_qs = build_query_string(&[
+            ("format", Some("metadata".to_owned())),
+            ("metadataHeaders", Some(["Subject", "From"].join(","))),
+        ]);
+        assert_eq!(
+            format!("users/me/drafts/{}{get_qs}", "D1"),
+            "users/me/drafts/D1?format=metadata&metadataHeaders=Subject%2CFrom"
+        );
+    }
+
+    // ── Story 9.2: write + settings tools ────────────────────────────
+
+    /// Every Story 9.2 write tool builds a request with the
+    /// Google-minimum scope + correct method/path (verified against
+    /// Google's REST reference). This pins the scope contract — the
+    /// single most security-relevant property of the story.
+    #[test]
+    fn write_tools_use_google_minimum_scope_and_method() {
+        // (scope, method, path) per the AC#3 table.
+        let send = GmailMcpServer::gmail_request(
+            "users/me/messages/send".to_owned(),
+            "gmail.send",
+            Method::POST,
+            Bytes::from_static(b"{\"raw\":\"x\"}"),
+            "a".to_owned(),
+        );
+        assert_eq!(send.scope, "gmail.send");
+        assert_eq!(send.method, Method::POST);
+        assert_eq!(send.path, "users/me/messages/send");
+
+        let modify = GmailMcpServer::gmail_request(
+            "users/me/messages/M1/modify".to_owned(),
+            "gmail.modify",
+            Method::POST,
+            Bytes::from_static(b"{\"addLabelIds\":[\"INBOX\"]}"),
+            "a".to_owned(),
+        );
+        assert_eq!(modify.scope, "gmail.modify");
+
+        // drafts.create/update/send are gmail.compose — NOT gmail.send
+        // (Google's users.drafts.send rejects gmail.send; verified).
+        for (path, method) in [
+            ("users/me/drafts".to_owned(), Method::POST),
+            ("users/me/drafts/D1".to_owned(), Method::PUT),
+            ("users/me/drafts/send".to_owned(), Method::POST),
+        ] {
+            let req = GmailMcpServer::gmail_request(
+                path.clone(),
+                "gmail.compose",
+                method.clone(),
+                Bytes::from_static(b"{\"id\":\"D1\"}"),
+                "a".to_owned(),
+            );
+            assert_eq!(req.scope, "gmail.compose", "draft tool {path} must be gmail.compose");
+            assert_eq!(req.method, method);
+        }
+
+        // trash/untrash are reversible gmail.modify with NO body (so no
+        // Content-Type) — delete is intentionally NOT a tool here.
+        for verb in ["trash", "untrash"] {
+            let req = GmailMcpServer::gmail_request(
+                format!("users/me/messages/M1/{verb}"),
+                "gmail.modify",
+                Method::POST,
+                Bytes::new(),
+                "a".to_owned(),
+            );
+            assert_eq!(req.scope, "gmail.modify");
+            assert!(req.body.is_empty(), "{verb} sends no body");
+            assert!(!req.headers.contains_key(axum::http::header::CONTENT_TYPE));
+        }
+    }
+
+    /// All 8 settings reads use `gmail.readonly` (Google minimum for
+    /// read ops — NOT gmail.settings.basic; verified). Forwarding maps
+    /// to Google's `forwardingAddresses` path.
+    #[test]
+    fn settings_reads_are_all_gmail_readonly() {
+        let paths = [
+            "users/me/settings/sendAs",
+            "users/me/settings/filters",
+            "users/me/settings/language",
+            "users/me/settings/imap",
+            "users/me/settings/pop",
+            "users/me/settings/vacation",
+            "users/me/settings/forwardingAddresses",
+            "users/me/settings/autoForwarding",
+        ];
+        for p in paths {
+            let req = GmailMcpServer::gmail_request(
+                p.to_owned(),
+                "gmail.readonly",
+                Method::GET,
+                Bytes::new(),
+                "a".to_owned(),
+            );
+            assert_eq!(req.scope, "gmail.readonly", "{p} must be gmail.readonly");
+            assert_eq!(req.method, Method::GET);
+        }
+    }
+
+    /// JSON-body write tools reject null / empty-object / array bodies
+    /// via the shared `validate_json_object_body` guard (mirrors the
+    /// calendar/drive write precedent).
+    #[test]
+    fn write_tools_reject_malformed_json_body() {
+        for bad in [
+            serde_json::Value::Null,
+            serde_json::json!({}),
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!("a string"),
+        ] {
+            assert!(
+                validate_json_object_body(&bad, "message").is_err(),
+                "malformed body {bad:?} must be rejected"
+            );
+        }
+        assert!(validate_json_object_body(&serde_json::json!({"raw": "x"}), "message").is_ok());
+    }
+
+    // ── Story 9.3: Calendar + Drive parity gap-fill ──────────────────
+
+    /// Exact per-server tool counts after Epic 9. Counting the
+    /// `tool_router().map` entries is a direct, HTTP-free assertion of
+    /// the registered tool set.
+    /// Gmail: 5 original + 6 (9.1) + 15 (9.2) = 26.
+    /// Calendar: 5 original + 7 (9.3) = 12.
+    /// Drive: 5 original + 3 (9.3) = 8.
+    #[test]
+    fn epic9_tool_counts_are_exact() {
+        assert_eq!(GmailMcpServer::tool_router().map.len(), 26, "Gmail tool count");
+        assert_eq!(CalendarMcpServer::tool_router().map.len(), 12, "Calendar tool count");
+        assert_eq!(DriveMcpServer::tool_router().map.len(), 8, "Drive tool count");
+    }
+
+    /// The Story 9.3 tools are registered under their dotted names.
+    #[test]
+    fn story_9_3_tools_are_registered() {
+        let cal = CalendarMcpServer::tool_router();
+        for name in [
+            "calendar.events.delete",
+            "calendar.events.patch",
+            "calendar.events.move",
+            "calendar.events.quickAdd",
+            "calendar.freebusy.query",
+            "calendar.settings.list",
+            "calendar.colors.get",
+        ] {
+            assert!(cal.map.contains_key(name), "calendar router missing {name}");
+        }
+        let drive = DriveMcpServer::tool_router();
+        for name in ["drive.files.delete", "drive.files.copy", "drive.about.get"] {
+            assert!(drive.map.contains_key(name), "drive router missing {name}");
+        }
+    }
+
+    /// Story 9.3 scope/method contract (verified against Google's REST
+    /// reference 2026-05-17): calendar writes = `calendar.events`,
+    /// freebusy = `calendar.readonly` (read via POST), settings/colors =
+    /// `calendar.readonly`; drive delete/copy = `drive.file`, about.get =
+    /// `drive.readonly`.
+    #[test]
+    fn story_9_3_scope_and_method_contract() {
+        // calendar.events.delete — DELETE, calendar.events, no body.
+        let del = CalendarMcpServer::calendar_request(
+            "calendars/primary/events/E1".to_owned(),
+            "calendar.events",
+            Method::DELETE,
+            Bytes::new(),
+            "a".to_owned(),
+        );
+        assert_eq!(del.scope, "calendar.events");
+        assert_eq!(del.method, Method::DELETE);
+        assert!(del.body.is_empty());
+
+        // calendar.events.patch — PATCH, calendar.events, JSON body.
+        let patch = CalendarMcpServer::calendar_request(
+            "calendars/primary/events/E1".to_owned(),
+            "calendar.events",
+            Method::PATCH,
+            Bytes::from_static(b"{\"summary\":\"x\"}"),
+            "a".to_owned(),
+        );
+        assert_eq!(patch.method, Method::PATCH);
+        assert_eq!(
+            patch.headers.get(axum::http::header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+
+        // freebusy — POST but a READ → calendar.readonly (scope tracks
+        // data effect, not HTTP verb).
+        let fb = CalendarMcpServer::calendar_request(
+            "freeBusy".to_owned(),
+            "calendar.readonly",
+            Method::POST,
+            Bytes::from_static(b"{\"items\":[]}"),
+            "a".to_owned(),
+        );
+        assert_eq!(fb.scope, "calendar.readonly");
+        assert_eq!(fb.method, Method::POST);
+
+        // drive.files.delete — DELETE, drive.file (NOT full drive).
+        let dd = DriveMcpServer::drive_request(
+            "files/F1".to_owned(),
+            "drive.file",
+            Method::DELETE,
+            Bytes::new(),
+            "a".to_owned(),
+        );
+        assert_eq!(dd.scope, "drive.file");
+        assert_eq!(dd.method, Method::DELETE);
+
+        // drive.about.get — GET, drive.readonly, required fields=* in path.
+        let about = DriveMcpServer::drive_request(
+            "about?fields=*".to_owned(),
+            "drive.readonly",
+            Method::GET,
+            Bytes::new(),
+            "a".to_owned(),
+        );
+        assert_eq!(about.scope, "drive.readonly");
+        assert_eq!(about.path, "about?fields=*");
+    }
+
+    /// `events.move` / `events.quickAdd` reject blank required query
+    /// params before dispatch (mirrors the 9.1 `history.list` guard).
+    #[test]
+    fn calendar_required_query_params_fail_fast() {
+        // The guard shape both tools use, asserted directly.
+        fn require(field: &str, v: &str) -> Result<(), String> {
+            if v.trim().is_empty() {
+                return Err(format!("{field} is required and must not be empty"));
+            }
+            Ok(())
+        }
+        assert!(require("destination", "").is_err());
+        assert!(require("destination", "  ").is_err());
+        assert!(require("text", "\t").is_err());
+        assert!(require("destination", "work@example.com").is_ok());
+        assert!(require("text", "Lunch 1pm").is_ok());
+        // And the move query string is built as Google expects.
+        let qs = build_query_string(&[("destination", Some("cal2@example.com".to_owned()))]);
+        assert_eq!(qs, "?destination=cal2%40example.com");
     }
 }

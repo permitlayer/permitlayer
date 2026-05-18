@@ -538,3 +538,294 @@ async fn mcp_tool_call_attributes_audit_event_to_real_agent() {
 
     handle.abort();
 }
+
+// ───────────────────────────────────────────────────────────────────────
+// Story 9.1: Gmail read-tool gap-fill conformance.
+//
+// Mirrors the initialize → notifications/initialized → tools/call dance
+// above. These pin: (AC#2) tools/list now shows all 11 Gmail tools;
+// (AC#4) attachments.get returns the upstream JSON body byte-unmodified
+// under the 10 MiB cap; (AC#3) history.list rejects a missing
+// startHistoryId at the tool boundary; (AC#7) a new-tool MCP call emits
+// an audit event attributed to the bearer-bound agent.
+// ───────────────────────────────────────────────────────────────────────
+
+/// Drive an initialized MCP session and return `(client, base_url,
+/// session_id)` so each test can issue `tools/*` calls without repeating
+/// the handshake boilerplate.
+async fn init_session(base_url: &str) -> (reqwest::Client, Option<String>) {
+    let client = reqwest::Client::new();
+    let init_request = serde_json::json!({
+        "jsonrpc": "2.0", "id": 1, "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-03-26", "capabilities": {},
+            "clientInfo": { "name": "test-client", "version": "1.0.0" }
+        }
+    });
+    let init_resp = client
+        .post(format!("{base_url}/mcp/gmail"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream")
+        .json(&init_request)
+        .send()
+        .await
+        .unwrap();
+    let session_id =
+        init_resp.headers().get("mcp-session-id").map(|v| v.to_str().unwrap().to_owned());
+    let initialized = serde_json::json!({
+        "jsonrpc": "2.0", "method": "notifications/initialized"
+    });
+    let mut req = client
+        .post(format!("{base_url}/mcp/gmail"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream");
+    if let Some(ref sid) = session_id {
+        req = req.header("Mcp-Session-Id", sid);
+    }
+    let _ = req.json(&initialized).send().await.unwrap();
+    (client, session_id)
+}
+
+async fn call_tool(
+    client: &reqwest::Client,
+    base_url: &str,
+    session_id: &Option<String>,
+    name: &str,
+    arguments: serde_json::Value,
+) -> String {
+    let tool_call = serde_json::json!({
+        "jsonrpc": "2.0", "id": 3, "method": "tools/call",
+        "params": { "name": name, "arguments": arguments }
+    });
+    let mut call_req = client
+        .post(format!("{base_url}/mcp/gmail"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream");
+    if let Some(sid) = session_id {
+        call_req = call_req.header("Mcp-Session-Id", sid);
+    }
+    let resp = call_req.json(&tool_call).send().await.unwrap();
+    assert!(resp.status().is_success(), "tools/call HTTP status: {}", resp.status());
+    resp.text().await.unwrap()
+}
+
+#[tokio::test]
+async fn mcp_tools_list_returns_twenty_six_gmail_tools() {
+    let mut upstream = mockito::Server::new_async().await;
+    let _mock = upstream
+        .mock("GET", "/users/me/messages")
+        .with_status(200)
+        .with_body(r#"{"messages":[]}"#)
+        .create_async()
+        .await;
+    let (base_url, handle) = start_mcp_server(&format!("{}/", upstream.url())).await;
+    let (client, session_id) = init_session(&base_url).await;
+
+    let list_tools = serde_json::json!({
+        "jsonrpc": "2.0", "id": 2, "method": "tools/list"
+    });
+    let mut tools_req = client
+        .post(format!("{base_url}/mcp/gmail"))
+        .header("Content-Type", "application/json")
+        .header("Accept", "application/json, text/event-stream");
+    if let Some(ref sid) = session_id {
+        tools_req = tools_req.header("Mcp-Session-Id", sid);
+    }
+    let body = tools_req.json(&list_tools).send().await.unwrap().text().await.unwrap();
+
+    // Original 5 + Story 9.1's 6 reads + Story 9.2's 7 writes + 8
+    // settings reads = 26, each present with its dotted name.
+    let expected = [
+        // original 5
+        "gmail.messages.list",
+        "gmail.messages.get",
+        "gmail.threads.list",
+        "gmail.threads.get",
+        "gmail.search",
+        // Story 9.1 reads
+        "gmail.attachments.get",
+        "gmail.labels.list",
+        "gmail.profile.get",
+        "gmail.history.list",
+        "gmail.drafts.list",
+        "gmail.drafts.get",
+        // Story 9.2 writes
+        "gmail.messages.send",
+        "gmail.messages.modify",
+        "gmail.messages.trash",
+        "gmail.messages.untrash",
+        "gmail.drafts.create",
+        "gmail.drafts.update",
+        "gmail.drafts.send",
+        // Story 9.2 settings reads
+        "gmail.settings.sendAs.list",
+        "gmail.settings.filters.list",
+        "gmail.settings.language.get",
+        "gmail.settings.imap.get",
+        "gmail.settings.pop.get",
+        "gmail.settings.vacation.get",
+        "gmail.settings.forwarding.list",
+        "gmail.settings.autoForwarding.get",
+    ];
+    assert_eq!(expected.len(), 26, "the expected-names list itself must be 26");
+    for name in &expected {
+        assert!(body.contains(name), "tools/list must contain '{name}', got: {body}");
+    }
+    // gmail.messages.delete is intentionally absent (needs the full
+    // mail.google.com scope — deferred out of Story 9.2).
+    assert!(
+        !body.contains("gmail.messages.delete"),
+        "gmail.messages.delete must NOT be present in 9.2 (deferred — needs mail.google.com)"
+    );
+    // Exact count: the tool objects each carry an "inputSchema" key, so
+    // counting those is a robust proxy for the tool count regardless of
+    // SSE framing.
+    let tool_count = body.matches("inputSchema").count();
+    assert_eq!(
+        tool_count, 26,
+        "expected exactly 26 Gmail tools in tools/list, found {tool_count}; body: {body}"
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn mcp_attachments_get_returns_upstream_body_unmodified() {
+    let mut upstream = mockito::Server::new_async().await;
+    // Gmail's attachments.get returns { size, data } with data being
+    // base64url. Assert the proxy passes it through byte-for-byte.
+    let upstream_body = r#"{"size":42,"data":"aGVsbG8td29ybGQtcmVjZWlwdC1wZGY="}"#;
+    let _mock = upstream
+        .mock("GET", "/users/me/messages/MSG1/attachments/ATT1")
+        .with_status(200)
+        .with_body(upstream_body)
+        .create_async()
+        .await;
+    let (base_url, handle) = start_mcp_server(&format!("{}/", upstream.url())).await;
+    let (client, session_id) = init_session(&base_url).await;
+
+    let body = call_tool(
+        &client,
+        &base_url,
+        &session_id,
+        "gmail.attachments.get",
+        serde_json::json!({ "message_id": "MSG1", "attachment_id": "ATT1" }),
+    )
+    .await;
+
+    // The upstream JSON (incl. the exact base64url data) must appear
+    // verbatim in the tool result — no scrub mutation, no re-encoding.
+    assert!(
+        body.contains("aGVsbG8td29ybGQtcmVjZWlwdC1wZGY="),
+        "attachment data must pass through unmodified, got: {body}"
+    );
+    assert!(
+        body.contains("\\\"size\\\":42") || body.contains("\"size\":42"),
+        "attachment size field must pass through, got: {body}"
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn mcp_history_list_rejects_missing_start_history_id() {
+    let mut upstream = mockito::Server::new_async().await;
+    // No upstream mock for /users/me/history: the tool must fail fast
+    // BEFORE dispatching, so the upstream is never hit.
+    let _guard =
+        upstream.mock("GET", "/users/me/history").with_status(500).expect(0).create_async().await;
+    let (base_url, handle) = start_mcp_server(&format!("{}/", upstream.url())).await;
+    let (client, session_id) = init_session(&base_url).await;
+
+    let body = call_tool(
+        &client,
+        &base_url,
+        &session_id,
+        "gmail.history.list",
+        serde_json::json!({ "start_history_id": "" }),
+    )
+    .await;
+
+    // rmcp maps a tool Err(String) into an MCP error result (isError),
+    // not a transport failure — assert the message surfaces.
+    assert!(
+        body.contains("start_history_id is required"),
+        "missing startHistoryId must produce a clear tool error, got: {body}"
+    );
+    handle.abort();
+}
+
+#[tokio::test]
+async fn mcp_new_read_tool_emits_audit_event_for_real_agent() {
+    let mut upstream = mockito::Server::new_async().await;
+    let _mock = upstream
+        .mock("GET", "/users/me/labels")
+        .with_status(200)
+        .with_body(r#"{"labels":[{"id":"INBOX","name":"INBOX"}]}"#)
+        .create_async()
+        .await;
+    let (base_url, handle, audit_store) =
+        start_mcp_server_with_agent(&format!("{}/", upstream.url()), "receipt-agent").await;
+    let (client, session_id) = init_session(&base_url).await;
+
+    let _ = call_tool(&client, &base_url, &session_id, "gmail.labels.list", serde_json::json!({}))
+        .await;
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let events = audit_store.snapshot();
+    let api_call = events
+        .iter()
+        .find(|e| e.event_type == "api-call")
+        .expect("a new-tool MCP call must emit an api-call audit event");
+    assert_eq!(
+        api_call.agent_id, "receipt-agent",
+        "new-tool audit event must be attributed to the bearer-bound agent",
+    );
+    handle.abort();
+}
+
+/// Story 9.2: a write tool (`gmail.messages.send`) issues a POST to the
+/// correct upstream path carrying the JSON body, and emits an audit
+/// event scoped to the tool's Google-minimum scope (`gmail.send`, NOT
+/// `gmail.modify`).
+#[tokio::test]
+async fn mcp_messages_send_posts_body_and_audits_send_scope() {
+    let mut upstream = mockito::Server::new_async().await;
+    let mock = upstream
+        .mock("POST", "/users/me/messages/send")
+        .match_body(mockito::Matcher::PartialJsonString(r#"{"raw":"UkZDODIy"}"#.to_owned()))
+        .with_status(200)
+        .with_body(r#"{"id":"sent-msg-1","labelIds":["SENT"]}"#)
+        .create_async()
+        .await;
+    let (base_url, handle, audit_store) =
+        start_mcp_server_with_agent(&format!("{}/", upstream.url()), "sender-agent").await;
+    let (client, session_id) = init_session(&base_url).await;
+
+    let body = call_tool(
+        &client,
+        &base_url,
+        &session_id,
+        "gmail.messages.send",
+        serde_json::json!({ "message": { "raw": "UkZDODIy" } }),
+    )
+    .await;
+
+    // Upstream POST was hit with the JSON body, and the result flows back.
+    mock.assert_async().await;
+    assert!(
+        body.contains("sent-msg-1"),
+        "send result must surface the upstream response, got: {body}"
+    );
+
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let events = audit_store.snapshot();
+    let api_call = events
+        .iter()
+        .find(|e| e.event_type == "api-call")
+        .expect("a write MCP call must emit an api-call audit event");
+    assert_eq!(api_call.agent_id, "sender-agent");
+    assert_eq!(
+        api_call.scope, "gmail.send",
+        "messages.send must audit under its Google-minimum scope gmail.send, not gmail.modify",
+    );
+    handle.abort();
+}

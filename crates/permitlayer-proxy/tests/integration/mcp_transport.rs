@@ -281,6 +281,8 @@ async fn mcp_messages_list_returns_upstream_json() {
     let req = GmailMcpServer::gmail_request(
         "users/me/messages".to_owned(),
         "gmail.readonly",
+        Method::GET,
+        Bytes::new(),
         "test-agent".to_owned(),
     );
     let result = mcp_server.dispatch(req).await;
@@ -307,6 +309,8 @@ async fn mcp_messages_get_constructs_correct_path() {
     let req = GmailMcpServer::gmail_request(
         "users/me/messages/abc123".to_owned(),
         "gmail.readonly",
+        Method::GET,
+        Bytes::new(),
         "test-agent".to_owned(),
     );
     let result = mcp_server.dispatch(req).await;
@@ -333,6 +337,8 @@ async fn mcp_search_constructs_correct_query_string() {
     let req = GmailMcpServer::gmail_request(
         "users/me/messages?q=from:me".to_owned(),
         "gmail.readonly",
+        Method::GET,
+        Bytes::new(),
         "test-agent".to_owned(),
     );
     let result = mcp_server.dispatch(req).await;
@@ -370,6 +376,8 @@ async fn mcp_tool_error_returns_error_string_not_transport_error() {
     let req = GmailMcpServer::gmail_request(
         "users/me/messages".to_owned(),
         "gmail.readonly",
+        Method::GET,
+        Bytes::new(),
         "test-agent".to_owned(),
     );
 
@@ -401,6 +409,8 @@ async fn mcp_originated_call_writes_audit_event() {
     let req = GmailMcpServer::gmail_request(
         "users/me/messages".to_owned(),
         "gmail.readonly",
+        Method::GET,
+        Bytes::new(),
         "test-agent".to_owned(),
     );
     let result = mcp_server.dispatch(req).await;
@@ -437,6 +447,8 @@ async fn rest_and_mcp_return_equivalent_response_data() {
     let mcp_req = GmailMcpServer::gmail_request(
         "users/me/messages".to_owned(),
         "gmail.readonly",
+        Method::GET,
+        Bytes::new(),
         "test-agent".to_owned(),
     );
     let mcp_result = mcp_server.dispatch(mcp_req).await.unwrap();
