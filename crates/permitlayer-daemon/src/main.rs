@@ -71,10 +71,17 @@ enum Commands {
     Agent(cli::agent::AgentArgs),
     /// List plugin connectors loaded by the daemon (built-in + user-installed) — FR40
     Connectors(cli::connectors::ConnectorsArgs),
-    /// Manage the daemon as a macOS system service (Story 7.27 +
-    /// rc.22). Replaces `agentsso autostart`. Three subcommands:
-    /// `install` (root-required one-time setup), `uninstall`
-    /// (root-required teardown), `status` (no-root state report).
+    /// Install / upgrade / repair the privileged macOS daemon — the
+    /// single idempotent root command (UX-overhaul Story 2). Stages
+    /// a versioned binary, atomically re-points the stable symlink,
+    /// bootstraps, and self-verifies the running daemon's version
+    /// over the control plane (rolls back on failure). Replaces
+    /// `agentsso service install`.
+    Setup(cli::setup::SetupArgs),
+    /// Manage the daemon as a macOS system service. `install` is now
+    /// `agentsso setup` (this verb redirects). `uninstall`
+    /// (root-required teardown) + `status` (no-root state report)
+    /// remain.
     Service(cli::service::ServiceArgs),
     /// Uninstall permitlayer cleanly: stop daemon, remove keychain
     /// entry, autostart, data dir, and binary (FR8). Destructive —
@@ -169,26 +176,38 @@ async fn main() -> ExitCode {
     let first_subcommand_arg: Option<String> =
         std::env::args().skip(1).find(|a| !a.starts_with('-'));
 
-    // Story 7.13 AC #7 — legacy `agentsso setup` interceptor.
+    // UX-overhaul Story 2 — `agentsso service install` → `setup`
+    // redirect interceptor.
     //
-    // The `setup` subcommand was removed in favor of the
-    // orchestration-aware `agentsso connect <service>` verb. Operators
-    // (or scripts) still typing `agentsso setup` get a structured
-    // remediation block instead of clap's terse "unrecognized
-    // subcommand" error. Runs BEFORE clap parsing so it short-circuits
-    // even when later args would themselves fail clap.
-    if first_subcommand_arg.as_deref() == Some("setup") {
-        eprint!(
-            "{}",
-            crate::design::render::error_block(
-                "setup.removed",
-                "`agentsso setup` was removed; use `agentsso connect <service> --agent <name>`",
-                "agentsso connect <service> --agent <name> --oauth-client <path>\n\n  \
-                 supported services: gmail, calendar, drive",
-                None,
-            )
-        );
-        return ExitCode::from(2);
+    // `setup` is RECLAIMED as a real subcommand in this story (it is
+    // the single idempotent privileged install/upgrade/repair verb;
+    // see `cli::setup`). The Story-7.13 `setup`→"removed"→`connect`
+    // interceptor is therefore DELETED — `setup` now falls through to
+    // clap's dispatch. `service install` is demoted: operators (or
+    // scripts) typing it get a loud structured redirect to `setup`
+    // (the established "burn the boats" interceptor style, mirroring
+    // the `autostart`→removed block below). Runs BEFORE clap parsing.
+    //
+    // `service install` is TWO tokens; `first_subcommand_arg` is the
+    // first non-flag token (`service`). Match the second non-flag
+    // token too so `service uninstall` / `service status` are
+    // untouched — only `service install` is redirected.
+    if first_subcommand_arg.as_deref() == Some("service") {
+        let second = std::env::args().skip(1).filter(|a| !a.starts_with('-')).nth(1);
+        if second.as_deref() == Some("install") {
+            eprint!(
+                "{}",
+                crate::design::render::error_block(
+                    "service.install.redirected",
+                    "`agentsso service install` is now `sudo agentsso setup` — the single \
+                     idempotent install / upgrade / repair command (versioned-symlink, \
+                     self-verifying)",
+                    "sudo agentsso setup",
+                    None,
+                )
+            );
+            return ExitCode::from(2);
+        }
     }
 
     // Story 7.27 — legacy `agentsso autostart` interceptor.
@@ -267,6 +286,7 @@ async fn main() -> ExitCode {
         Some(Commands::Resume(args)) => anyhow_to_exit_code(cli::resume::run(args).await),
         Some(Commands::Agent(args)) => anyhow_to_exit_code(cli::agent::run(args).await),
         Some(Commands::Connectors(args)) => anyhow_to_exit_code(cli::connectors::run(args).await),
+        Some(Commands::Setup(args)) => anyhow_to_exit_code(cli::setup::run(args).await),
         Some(Commands::Service(args)) => anyhow_to_exit_code(cli::service::run(args).await),
         Some(Commands::Uninstall(args)) => uninstall_to_exit_code(cli::uninstall::run(args).await),
         Some(Commands::Update(args)) => update_to_exit_code(cli::update::run(args).await),

@@ -431,6 +431,19 @@ fn build_prompt_manifest(
     };
     out.push_str(&autostart_line);
 
+    // Scope clarification: this unprivileged `agentsso uninstall`
+    // only removes the brew/CLI binary + this user's data dir. The
+    // privileged macOS system service — the
+    // /Library/PrivilegedHelperTools/agentsso symlink + versioned
+    // binaries, the LaunchDaemon, and managed policies — is removed
+    // by `sudo agentsso service uninstall`, NOT by this command.
+    #[cfg(target_os = "macos")]
+    out.push_str(
+        "  • (note) the privileged daemon (LaunchDaemon, \
+         /Library/PrivilegedHelperTools binaries, managed policies)\n    \
+         is NOT removed here — run `sudo agentsso service uninstall` for that.\n",
+    );
+
     out
 }
 
@@ -1169,6 +1182,15 @@ fn print_closing_line(g: &StepGlyphs, outcomes: &[StepOutcome]) -> Result<()> {
             g.arrow, g.check
         );
     }
+    // Scope reminder: the privileged macOS system service (the
+    // /Library/PrivilegedHelperTools/agentsso symlink + versioned
+    // binaries, the LaunchDaemon, and managed policies) is removed
+    // by `sudo agentsso service uninstall`, NOT by this command.
+    #[cfg(target_os = "macos")]
+    println!(
+        "{} note: the privileged daemon is removed separately — run `sudo agentsso service uninstall`",
+        g.arrow
+    );
     Ok(())
 }
 

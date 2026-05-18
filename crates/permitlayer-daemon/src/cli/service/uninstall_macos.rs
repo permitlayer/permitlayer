@@ -122,13 +122,52 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
     // restructure the if/else-if/else so the success-path "removed"
     // line actually prints (the prior chain landed the success case
     // in the "already gone" branch).
+    //
+    // Symlink model: `PRIVILEGED_HELPER_PATH` is now a symlink to a
+    // versioned `agentsso-<semver>` sibling. Tear down the symlink
+    // itself, then every `agentsso-<semver>` versioned binary plus
+    // any `agentsso.tmp` / `agentsso-*.tmp.*` staging crumbs left by
+    // an interrupted atomic stage. A legacy pre-symlink install has
+    // a regular file at the path — handle that case as before.
     let helper = Path::new(PRIVILEGED_HELPER_PATH);
-    if helper.exists() {
-        match std::fs::remove_file(helper) {
-            Ok(()) => println!("  ✓ removed privileged helper binary"),
-            Err(e) => {
-                tracing::warn!(error = %e, path = PRIVILEGED_HELPER_PATH, "failed to remove helper binary");
+    match std::fs::symlink_metadata(helper) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            match std::fs::remove_file(helper) {
+                Ok(()) => println!("  ✓ removed privileged helper symlink"),
+                Err(e) => {
+                    tracing::warn!(error = %e, path = PRIVILEGED_HELPER_PATH, "failed to remove helper symlink");
+                }
             }
+            if let Some(helper_dir) = helper.parent()
+                && let Ok(entries) = std::fs::read_dir(helper_dir)
+            {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    if is_versioned_helper_binary(&name) || is_helper_staging_crumb(&name) {
+                        let path = entry.path();
+                        match std::fs::remove_file(&path) {
+                            Ok(()) => println!("  ✓ removed {}", path.display()),
+                            Err(e) => {
+                                tracing::warn!(error = %e, path = %path.display(), "failed to remove helper binary/crumb");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(_) => {
+            // Legacy pre-symlink install: a regular file at the path.
+            match std::fs::remove_file(helper) {
+                Ok(()) => println!("  ✓ removed privileged helper binary"),
+                Err(e) => {
+                    tracing::warn!(error = %e, path = PRIVILEGED_HELPER_PATH, "failed to remove helper binary");
+                }
+            }
+        }
+        Err(_) => {
+            // Not present — idempotent no-op (uninstall after a
+            // partially-installed state always succeeds).
         }
     }
 
@@ -149,6 +188,14 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
     println!("  ✓ master-key entry removed from System.keychain (if present)");
 
     // (4) Remove state, log, runtime dirs.
+    //
+    // NOTE: Story 1's managed-policy dir is
+    // `daemon_state_dir().join("policies-managed")` — a child of the
+    // daemon state dir removed here. The `remove_dir_all` below
+    // therefore transitively wipes `policies-managed/` already; no
+    // separate removal step is needed (and adding one would be a
+    // redundant double-remove). Do NOT "fix" this by adding an
+    // explicit policies-managed removal.
     for dir in [
         permitlayer_core::paths::daemon_state_dir(None),
         permitlayer_core::paths::daemon_log_dir(None),
@@ -216,6 +263,39 @@ pub async fn run(args: UninstallArgs) -> Result<()> {
     println!("    — remove manually with `rm -rf ~/.agentsso/` for a clean slate");
     println!("──────────────────────────────────────────────────────────────");
     Ok(())
+}
+
+/// True for `agentsso-<semver-ish>` versioned helper binaries (the
+/// symlink targets installed under
+/// `/Library/PrivilegedHelperTools/`). "Semver-ish" is intentionally
+/// loose — accept the `agentsso-` prefix followed by a non-empty
+/// version-like tail whose chars are `[0-9A-Za-z._+-]` (covers
+/// `0.3.0`, `0.3.0-rc.36`, build metadata). Deliberately excludes
+/// the bare `agentsso` symlink name (no `-` suffix) and staging
+/// crumbs (handled separately by `is_helper_staging_crumb`).
+fn is_versioned_helper_binary(name: &str) -> bool {
+    let Some(tail) = name.strip_prefix("agentsso-") else {
+        return false;
+    };
+    if tail.is_empty() {
+        return false;
+    }
+    // A `.tmp.` infix means it's a staging crumb, not a finished
+    // versioned binary — let `is_helper_staging_crumb` own it.
+    if tail.contains(".tmp.") {
+        return false;
+    }
+    tail.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
+}
+
+/// True for atomic-stage staging crumbs left by an interrupted
+/// install: `agentsso.tmp` (legacy single-name stage) or
+/// `agentsso-*.tmp.*` (the `<dest>.tmp.<pid>` pattern that
+/// `stage_file_atomic` writes before the rename).
+fn is_helper_staging_crumb(name: &str) -> bool {
+    name == "agentsso.tmp"
+        || name.starts_with("agentsso.tmp.")
+        || (name.starts_with("agentsso-") && name.contains(".tmp."))
 }
 
 fn remove_per_user_bearer_tokens() -> u32 {

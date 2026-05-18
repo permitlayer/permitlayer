@@ -6,7 +6,12 @@
 //!
 //! - **AC #5** (unknown agent → exit 2, no daemon contact, no vault touch).
 //! - **AC #6** (daemon-running gate when credential needs sealing).
-//! - **AC #7** (legacy `agentsso setup` → `setup.removed` block + exit 2).
+//! - **AC #7** — SUPERSEDED by UX-overhaul Story 2: `setup` is no
+//!   longer a removed verb that redirects to `connect`; it is
+//!   RECLAIMED as the real privileged install/upgrade/repair command.
+//!   The two tests below now assert the Story-2 contract instead of
+//!   the old `setup.removed` block (the old service-name positional
+//!   is rejected by clap; bare `setup` gates on root).
 //! - **AC #8** (snippet emission to stdout + `--mcp-config-out`).
 //!
 //! The full happy path (Step 2 OAuth + seal + Steps 3-6) is covered
@@ -35,35 +40,89 @@ fn run_cli(home: &std::path::Path, args: &[&str]) -> (Option<i32>, String, Strin
 }
 
 // --------------------------------------------------------------------------
-// AC #7 — legacy `agentsso setup` interceptor.
+// AC #7 (SUPERSEDED by UX-overhaul Story 2) — `setup` is now the real
+// privileged install/upgrade/repair command, NOT a removed verb that
+// redirects to `connect`. The old `agentsso setup <service>` shape
+// (a leftover from when `setup` was the OAuth wizard) is no longer
+// valid: `setup` takes no service positional, so clap rejects it with
+// exit 2; bare `agentsso setup` runs the real command and fails the
+// root gate (exit 1) when not run as root. These tests pin that new
+// contract so a future regression that re-adds a `setup`→`connect`
+// redirect (or accepts a stray positional) is caught.
 // --------------------------------------------------------------------------
 
 #[test]
-fn connect_setup_legacy_verb_emits_remediation() {
+fn setup_with_service_positional_is_rejected_by_clap() {
     let home = tempfile::TempDir::new().unwrap();
     let (status, _stdout, stderr) = run_cli(home.path(), &["setup", "gmail"]);
-    assert_eq!(status, Some(2), "legacy `agentsso setup` should exit 2; stderr={stderr}");
-    assert!(
-        stderr.contains("setup.removed"),
-        "stderr should contain `setup.removed` code: {stderr}"
+    assert_eq!(
+        status,
+        Some(2),
+        "`agentsso setup gmail` — `setup` takes no service positional, clap should \
+         reject with exit 2; stderr={stderr}"
     );
     assert!(
-        stderr.contains("agentsso connect"),
-        "stderr should suggest `agentsso connect`: {stderr}"
+        stderr.contains("unexpected argument 'gmail'"),
+        "stderr should be clap's unexpected-argument error, NOT the old \
+         `setup.removed` redirect: {stderr}"
+    );
+    assert!(
+        !stderr.contains("setup.removed"),
+        "the legacy `setup.removed`→connect redirect must be gone (Story 2 \
+         reclaimed `setup`): {stderr}"
     );
 }
 
 #[test]
-fn connect_setup_legacy_verb_with_extra_args_still_intercepts() {
+fn setup_with_service_positional_and_extra_flags_still_rejected() {
     let home = tempfile::TempDir::new().unwrap();
     let (status, _stdout, stderr) =
         run_cli(home.path(), &["setup", "calendar", "--non-interactive", "--force"]);
     assert_eq!(
         status,
         Some(2),
-        "interceptor should fire regardless of extra args; stderr={stderr}"
+        "stray positional must be rejected regardless of extra flags; stderr={stderr}"
     );
-    assert!(stderr.contains("setup.removed"), "{stderr}");
+    assert!(
+        stderr.contains("unexpected argument 'calendar'"),
+        "clap rejects the stray service positional, not `setup.removed`: {stderr}"
+    );
+}
+
+#[test]
+fn bare_setup_runs_real_command_not_legacy_redirect() {
+    // No service positional → clap accepts → the real Story-2 `setup`
+    // command runs. It exits 1 on every platform (silent_cli_error →
+    // ExitCode::FAILURE), but the structured block differs by OS:
+    // macOS hits the root gate (`setup.requires_root`); Linux/Windows
+    // hit `setup.macos_only` (the privileged-install model is
+    // macOS-only). Both prove `setup` is a LIVE command, not the old
+    // `setup.removed`→`connect` redirect. Assert the platform-
+    // invariant facts plus the OS-appropriate block.
+    let home = tempfile::TempDir::new().unwrap();
+    let (status, _stdout, stderr) = run_cli(home.path(), &["setup"]);
+    assert_eq!(
+        status,
+        Some(1),
+        "bare `agentsso setup` should run the real command and exit 1 (not \
+         clap-error 2, not a redirect); stderr={stderr}"
+    );
+    assert!(
+        !stderr.contains("setup.removed"),
+        "the legacy `setup.removed`→connect redirect must be gone (Story 2 \
+         reclaimed `setup`): {stderr}"
+    );
+    #[cfg(target_os = "macos")]
+    assert!(
+        stderr.contains("setup.requires_root"),
+        "macOS: bare non-root `setup` should hit the Story-2 root gate: {stderr}"
+    );
+    #[cfg(not(target_os = "macos"))]
+    assert!(
+        stderr.contains("setup.macos_only"),
+        "non-macOS: `setup` should report the macOS-only privileged-install \
+         model: {stderr}"
+    );
 }
 
 // --------------------------------------------------------------------------

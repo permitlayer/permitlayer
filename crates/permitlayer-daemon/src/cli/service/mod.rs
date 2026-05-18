@@ -83,8 +83,13 @@ pub struct UninstallArgs {
     pub force: bool,
 }
 
+// `pub(crate)` (was private to `service`): UX-overhaul Story 2's
+// `cli::setup` reuses the install helpers (bootout, staging, plist,
+// operator resolution, …) and `cli::start`'s brew-path guard reads
+// `PRIVILEGED_HELPER_PATH` from here. macOS-only, so every reachable
+// item is itself macOS-gated.
 #[cfg(target_os = "macos")]
-mod install_macos;
+pub(crate) mod install_macos;
 #[cfg(target_os = "macos")]
 mod status_macos;
 #[cfg(target_os = "macos")]
