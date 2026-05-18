@@ -2121,10 +2121,11 @@ mod tests {
     const BUNDLED_DEFAULT_TOML: &str =
         include_str!("../../../permitlayer-daemon/src/cli/default_policy.toml");
 
-    /// AC #5/#6: the expanded fixture compiles and contains exactly the
-    /// 3 original + 6 Epic-9 tier policies = 9.
+    /// AC #5/#6: the expanded fixture compiles and contains the
+    /// 3 original + 6 Epic-9 tier policies + 3 operator-specific
+    /// `angie-*-rw` autonomous-write tiers = 12.
     #[test]
-    fn epic9_default_toml_compiles_with_nine_policies() {
+    fn epic9_default_toml_compiles_with_all_policies() {
         let set = PolicySet::compile_from_str(FIXTURE_DEFAULT_TOML, &p("default.toml"))
             .expect("expanded default.toml must compile");
         for name in [
@@ -2137,9 +2138,13 @@ mod tests {
             "drive-read-only",
             "drive-read-write",
             "gmail-read-only-tier",
+            "angie-gmail-rw",
+            "angie-calendar-rw",
+            "angie-drive-rw",
         ] {
             assert!(set.get(name).is_some(), "policy {name} must be present");
         }
+        assert_eq!(set.len(), 12, "expected exactly 12 policies in the shipped default.toml");
     }
 
     /// AC #2: every `{svc}-read-only` tier denies its service's write
@@ -2235,6 +2240,9 @@ mod tests {
             "drive-read-only",
             "drive-read-write",
             "gmail-read-only-tier",
+            "angie-gmail-rw",
+            "angie-calendar-rw",
+            "angie-drive-rw",
         ];
         for name in names {
             let f = fixture
@@ -2261,10 +2269,28 @@ mod tests {
             }
         }
         // And neither file silently grew/shrank relative to the other.
+        // Count actual `[[policies]]` TOML table headers (a trimmed
+        // line equal to the header), NOT raw substring occurrences —
+        // the latter also matches the literal "[[policies]]" inside
+        // explanatory comments, which is not a policy and differs
+        // between the two files by design (the bundled file has more
+        // prose). This is the real invariant: equal table-header count.
+        let header_count = |s: &str| {
+            s.lines().filter(|l| l.trim() == "[[policies]]").count()
+        };
+        let fixture_n = header_count(FIXTURE_DEFAULT_TOML);
         assert_eq!(
-            FIXTURE_DEFAULT_TOML.matches("[[policies]]").count(),
-            BUNDLED_DEFAULT_TOML.matches("[[policies]]").count(),
+            fixture_n,
+            header_count(BUNDLED_DEFAULT_TOML),
             "the two default-policy files have a different number of [[policies]] blocks"
+        );
+        // Cross-check: the header count must match the compiled
+        // policy-set size we just walked, so a stray header (or a
+        // commented-out block) can't pass silently.
+        assert_eq!(
+            fixture_n, names.len(),
+            "[[policies]] header count must equal the {} policies the test enumerates",
+            names.len()
         );
     }
 }
