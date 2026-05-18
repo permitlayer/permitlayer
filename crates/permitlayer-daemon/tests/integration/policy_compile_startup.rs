@@ -1,13 +1,17 @@
 //! Integration test: `agentsso start` compiles policy files at boot
 //! and fails fast on schema errors.
 //!
-//! Covers Story 4.1 AC #2 and AC #8 end-to-end:
+//! Covers Story 4.1 AC #2 / AC #8 + UX-overhaul Story 1 (two-layer
+//! policy model) end-to-end:
 //!
-//! - Happy path: a valid `policies/default.toml` (the seeded default)
-//!   compiles cleanly, the daemon boots, and `/health` returns 200.
-//! - Failure path: a malformed policy file causes the daemon to exit
-//!   non-zero within a short deadline, and stderr carries the
-//!   offending filename plus a diagnostic banner.
+//! - Happy path: the daemon writes the product bundle to the
+//!   **managed** layer (`policies-managed/default.toml`) every boot,
+//!   creates the **operator** layer (`policies/`) EMPTY (never
+//!   seeded), compiles both via `compile_from_layers`, boots, and
+//!   `/health` returns 200.
+//! - Failure path: a malformed file in the **operator** layer causes
+//!   the daemon to exit non-zero within a short deadline, and stderr
+//!   carries the offending filename plus a diagnostic banner.
 //!
 //! Follows the subprocess pattern established by `daemon_lifecycle.rs`
 //! and `kill_switch_e2e.rs`. Requires `--test-threads=4` or lower for
@@ -17,7 +21,7 @@ use crate::common::{DaemonTestConfig, free_port, start_daemon, wait_for_health};
 use std::time::{Duration, Instant};
 
 #[test]
-fn happy_path_seeds_default_toml_and_boots() {
+fn happy_path_writes_managed_layer_empty_operator_and_boots() {
     let home = tempfile::tempdir().unwrap();
     // Config dir required by figment's Toml::file loader.
     std::fs::create_dir_all(home.path().join("config")).unwrap();
@@ -40,12 +44,31 @@ fn happy_path_seeds_default_toml_and_boots() {
     let output = daemon.wait_with_output().unwrap();
     let stdout_buf = String::from_utf8_lossy(&output.stdout).to_string();
 
-    // First-run seeded the default policy file.
-    let seeded = home.path().join("policies").join("default.toml");
-    assert!(seeded.exists(), "daemon should have seeded the default policies file on first boot");
-    let contents = std::fs::read_to_string(&seeded).unwrap();
+    // UX-overhaul Story 1: the product bundle is written to the
+    // MANAGED layer (`policies-managed/default.toml`) every boot...
+    let managed = home.path().join("policies-managed").join("default.toml");
+    assert!(
+        managed.exists(),
+        "daemon must write the product bundle to policies-managed/default.toml on boot"
+    );
+    let contents = std::fs::read_to_string(&managed).unwrap();
     assert!(contents.contains("gmail-read-only"));
     assert!(contents.contains("approval-mode"));
+    // ...and the OPERATOR layer is created EMPTY and NEVER seeded
+    // (this is the frozen-policy / operator-leak fix).
+    let operator_dir = home.path().join("policies");
+    assert!(operator_dir.is_dir(), "operator policies/ dir must be created");
+    assert!(
+        !operator_dir.join("default.toml").exists(),
+        "operator policies/ must NOT be seeded — product content lives in the managed layer"
+    );
+    let operator_entries: Vec<_> =
+        std::fs::read_dir(&operator_dir).unwrap().filter_map(Result::ok).collect();
+    assert!(
+        operator_entries.is_empty(),
+        "operator policies/ must be empty on first boot, found: {:?}",
+        operator_entries.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+    );
 
     // Regression-test AC #2 + AC #9: the daemon must actually have
     // compiled the seeded policies into its `PolicySet`, not just
@@ -59,19 +82,24 @@ fn happy_path_seeds_default_toml_and_boots() {
     // asserting.
     let plain = strip_ansi(&stdout_buf);
     assert!(
-        plain.contains("policies compiled"),
-        "daemon stdout should contain 'policies compiled' tracing log line. Got: {plain}"
+        plain.contains("policies compiled (two-layer: managed + operator)"),
+        "daemon stdout should contain the two-layer 'policies compiled' log line. Got: {plain}"
     );
-    // The seeded default.toml ships 9 policies: the original 3
+    // The managed bundle ships 9 policies: the original 3
     // (gmail-read-only, calendar-prompt-on-write,
     // drive-research-scope-restricted) plus the 6 Epic 9 per-service
     // tier templates (gmail/calendar/drive read-only + read-write,
-    // incl. the gmail-read-only-tier alias). The compiled count must
-    // be exactly 9 — this asserts the daemon actually compiled the
-    // seeded file rather than just writing it.
+    // incl. the gmail-read-only-tier alias). With an EMPTY operator
+    // layer the merged count must be exactly 9 — asserting the daemon
+    // actually compiled the managed bundle, not just wrote it.
     assert!(
         plain.contains("policies_loaded=9"),
-        "daemon should have compiled exactly 9 policies from seeded default.toml. Got: {plain}"
+        "daemon should have compiled exactly 9 policies from the managed bundle. Got: {plain}"
+    );
+    // No operator overrides on a clean first boot (empty operator).
+    assert!(
+        plain.contains("operator_overrides=0"),
+        "clean first boot must report zero operator overrides. Got: {plain}"
     );
 }
 
@@ -112,9 +140,12 @@ fn failure_path_malformed_policy_exits_nonzero_with_diagnostic() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("config")).unwrap();
 
-    // Pre-create a broken policy file BEFORE the daemon boots. Because the
-    // policies directory exists, the first-run seed is skipped and our
-    // broken file is the only thing the compiler sees.
+    // Pre-create a broken policy file in the OPERATOR layer BEFORE
+    // the daemon boots. UX-overhaul Story 1: the daemon still writes
+    // the (valid) managed bundle on boot and compiles it, then
+    // compiles the operator layer — where this broken file lives.
+    // `compile_from_layers` fails fast on the operator-layer parse
+    // error and names the offending file, exactly as before.
     let policies_dir = home.path().join("policies");
     std::fs::create_dir_all(&policies_dir).unwrap();
     // Fixture: empty scopes array. `EmptyScopesAllowlist` is one of the

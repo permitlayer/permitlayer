@@ -2811,19 +2811,65 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     // 7. Build shared middleware state.
     let kill_switch = Arc::new(KillSwitch::new());
 
-    // 7a. Compile policies from the daemon policy directory (seeding
-    // default.toml on first run). Fail-fast per FR15: any compile error
-    // exits non-zero with a multi-line diagnostic naming the offending
-    // file and line.
+    // 7a. UX-overhaul Story 1: two-layer policy compile.
+    //
+    //  - Managed (product) layer: `policies-managed/`, rewritten
+    //    UNCONDITIONALLY from the embedded bundle every boot
+    //    (`sync_managed_policies`). Kills frozen-policy-on-upgrade.
+    //  - Operator layer: `policies/`, created EMPTY, never seeded.
+    //    An operator file may intentionally override a managed
+    //    policy only with an explicit `override = "<name>"` marker;
+    //    an unmarked same-name collision is fatal (fail-closed).
+    //
+    // Fail-fast per FR15: any compile / layering-rule violation
+    // exits non-zero with a multi-line diagnostic naming the file.
     let policies_dir = permitlayer_core::paths::policies_dir(Some(&config.paths.home));
-    ensure_policies_dir(&policies_dir)
+    let managed_policies_dir =
+        permitlayer_core::paths::managed_policies_dir(Some(&config.paths.home));
+    sync_managed_policies(&managed_policies_dir)
+        .map_err(|source| StartError::PoliciesDir { path: managed_policies_dir.clone(), source })?;
+    ensure_operator_policies_dir(&policies_dir)
         .map_err(|source| StartError::PoliciesDir { path: policies_dir.clone(), source })?;
-    let compiled_policies = permitlayer_core::policy::PolicySet::compile_from_dir(&policies_dir)
-        .map_err(|e| StartError::PolicyCompile { rendered: render_policy_error(&e) })?;
+    let compiled_policies = permitlayer_core::policy::PolicySet::compile_from_layers(
+        Some(&managed_policies_dir),
+        &policies_dir,
+    )
+    .map_err(|e| StartError::PolicyCompile { rendered: render_policy_error(&e) })?;
+
+    // Fail-closed, made explicit (Story 1): a daemon that compiled
+    // ZERO policies would serve an all-deny gate (every request hits
+    // `default-deny-unmatched-policy`). That is almost certainly a
+    // broken managed-sync or a wiped bundle, not an intended posture
+    // — refuse to boot rather than masquerade as a working gate.
+    if compiled_policies.is_empty() {
+        return Err(StartError::PolicyCompile {
+            rendered: format!(
+                "error: zero policies compiled\n  \
+                 managed layer: {}\n  operator layer: {}\n  \
+                 reason: the managed (product) bundle must always yield at least one\n\
+                 \x20         policy; an empty compiled set means the embedded bundle or\n\
+                 \x20         the managed directory is broken\n  \
+                 fix: reinstall/upgrade agentsso (the bundle ships embedded in the\n\
+                 \x20      binary); if this persists it is a build/release bug\n",
+                managed_policies_dir.display(),
+                policies_dir.display(),
+            ),
+        });
+    }
+
+    // Captured for the post-audit-store emission below (the audit
+    // store isn't constructed until `build_shared_services`, a few
+    // steps down). Each accepted operator override of a managed
+    // policy gets a structured `policy.operator_override` event.
+    let accepted_policy_overrides: Vec<permitlayer_core::policy::OverrideRecord> =
+        compiled_policies.accepted_overrides().to_vec();
+
     tracing::info!(
         policies_loaded = compiled_policies.len(),
-        dir = %policies_dir.display(),
-        "policies compiled"
+        operator_overrides = accepted_policy_overrides.len(),
+        managed_dir = %managed_policies_dir.display(),
+        operator_dir = %policies_dir.display(),
+        "policies compiled (two-layer: managed + operator)"
     );
     let policy_set = Arc::new(ArcSwap::from_pointee(compiled_policies));
 
@@ -2952,6 +2998,36 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
             "service_id": service_id,
         });
         audit_dispatcher.dispatch(event).await;
+    }
+
+    // UX-overhaul Story 1: emit a structured `policy.operator_override`
+    // audit event for every accepted operator override of a managed
+    // (product) policy. Each is an operator deliberately + auditably
+    // shadowing a shipped policy via an explicit `override = "<name>"`
+    // marker (an UNMARKED collision is fatal and never reaches here).
+    // `doctor` (Story 4) surfaces these; the tamper-evident audit log
+    // is the compliance record that a product policy was replaced.
+    for ov in &accepted_policy_overrides {
+        let mut event = permitlayer_core::audit::event::AuditEvent::new(
+            "daemon".to_owned(),
+            "policy".to_owned(),
+            "n/a".to_owned(),
+            ov.name.clone(),
+            "ok".to_owned(),
+            "policy.operator_override".to_owned(),
+        );
+        event.extra = serde_json::json!({
+            "policy": ov.name,
+            "managed_path": ov.managed_path.display().to_string(),
+            "operator_path": ov.operator_path.display().to_string(),
+        });
+        audit_dispatcher.dispatch(event).await;
+        tracing::warn!(
+            policy = %ov.name,
+            managed_path = %ov.managed_path.display(),
+            operator_path = %ov.operator_path.display(),
+            "operator policy overrides a shipped (managed) policy"
+        );
     }
 
     // Story 7.6a AC #12: walk the vault and compute the active
@@ -3741,13 +3817,22 @@ pub(crate) fn clamp_approval_timeout_seconds(raw: u64) -> u64 {
     raw.clamp(1, 300)
 }
 
-fn ensure_policies_dir(dir: &std::path::Path) -> std::io::Result<()> {
+/// UX-overhaul Story 1: ensure the **operator** policy directory
+/// exists, created empty at mode 0700.
+///
+/// **It is NEVER seeded.** The first-run-only `default.toml` seed
+/// here was the frozen-policy-on-upgrade bug AND the operator-config-
+/// leak path (an operator edit to a "product" file that then looked
+/// like product). Product policies now live in the managed layer
+/// (see [`sync_managed_policies`]) and are rewritten every boot;
+/// this directory holds operator-authored files only and starts
+/// empty.
+fn ensure_operator_policies_dir(dir: &std::path::Path) -> std::io::Result<()> {
     if dir.exists() {
         return Ok(());
     }
-    // Create the directory atomically at the intended mode to avoid a
-    // TOCTOU window where the dir briefly exists at the process umask
-    // (typically 0755) before being chmoded to 0700.
+    // Atomic create-at-mode to avoid the TOCTOU window where the dir
+    // briefly exists at the process umask before a chmod.
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -3759,32 +3844,96 @@ fn ensure_policies_dir(dir: &std::path::Path) -> std::io::Result<()> {
     {
         std::fs::create_dir_all(dir)?;
     }
+    tracing::info!(path = %dir.display(), "created empty operator policy directory");
+    Ok(())
+}
 
-    let default_path = dir.join("default.toml");
-    // Write the seed file with mode 0600 on Unix. Use `OpenOptions`
-    // so the permissions are set at creation time, not chmoded after
-    // a write under the process umask.
+/// UX-overhaul Story 1: synchronize the **managed** (product) policy
+/// layer.
+///
+/// Every daemon `start` UNCONDITIONALLY rewrites
+/// `policies-managed/default.toml` from the `include_str!`-embedded
+/// bundle ([`DEFAULT_POLICY_TOML`]). No first-run-only seed ⇒ no
+/// frozen policies on upgrade: the shipped bundle is whatever the
+/// running binary embeds, refreshed on every boot.
+///
+/// Hardening (mirrors `service::install_macos`'s proven pattern):
+/// the directory is created/asserted at mode 0700, owned 0:0 on
+/// Unix (TOCTOU-safe: chmod+chown immediately after create); the
+/// write is atomic (same-dir temp → fsync → `rename` → parent
+/// fsync). The managed *file* is mode 0644 — it is output-only
+/// product content (not a secret), and a non-root `doctor` must be
+/// able to hash it for the Story-4 staleness check.
+fn sync_managed_policies(dir: &std::path::Path) -> std::io::Result<()> {
+    // Create-or-assert the directory at 0700, owned root:wheel on
+    // Unix. `create_dir_all` uses the process umask; immediately
+    // re-assert mode + ownership idempotently (safe to re-run every
+    // boot) so a pre-existing dir at the wrong mode is corrected.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        if !dir.exists() {
+            let mut builder = std::fs::DirBuilder::new();
+            builder.recursive(true).mode(0o700);
+            builder.create(dir)?;
+        }
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+        // Best-effort chown to 0:0 — only meaningful when running as
+        // root (the privileged LaunchDaemon). A non-root dev run
+        // can't chown and that's fine: the EPERM is ignored, the
+        // dir stays owned by the dev user, mode 0700 still applies.
+        let _ = nix::unistd::chown(
+            dir,
+            Some(nix::unistd::Uid::from_raw(0)),
+            Some(nix::unistd::Gid::from_raw(0)),
+        );
+    }
+    #[cfg(not(unix))]
+    {
+        if !dir.exists() {
+            std::fs::create_dir_all(dir)?;
+        }
+    }
+
+    let target = dir.join("default.toml");
+    // Atomic same-dir temp → rename. The temp name carries the pid
+    // so two daemons (shouldn't happen — PidFile guards that, but
+    // defense-in-depth) don't collide on the temp path.
+    let tmp = dir.join(format!(".default.toml.tmp.{}", std::process::id()));
     #[cfg(unix)]
     {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let mut file = std::fs::OpenOptions::new()
             .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&default_path)?;
+            .create(true)
+            .truncate(true)
+            .mode(0o644)
+            .open(&tmp)?;
         file.write_all(DEFAULT_POLICY_TOML.as_bytes())?;
         file.sync_all()?;
     }
     #[cfg(not(unix))]
     {
-        std::fs::write(&default_path, DEFAULT_POLICY_TOML)?;
+        std::fs::write(&tmp, DEFAULT_POLICY_TOML)?;
     }
-
-    tracing::info!(
-        path = %default_path.display(),
-        "seeded default policy file"
-    );
+    // Rename is atomic on the same filesystem (same dir). On any
+    // error, best-effort remove the temp so we don't orphan it.
+    if let Err(e) = std::fs::rename(&tmp, &target) {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(e);
+    }
+    // fsync the directory so the rename is durable across a crash
+    // (POSIX: a rename is not durable until the containing dir is
+    // fsync'd). Best-effort on platforms/filesystems that reject it.
+    #[cfg(unix)]
+    {
+        if let Ok(dir_file) = std::fs::File::open(dir) {
+            let _ = dir_file.sync_all();
+        }
+    }
+    tracing::info!(path = %target.display(), "synchronized managed policy bundle");
     Ok(())
 }
 
@@ -3934,6 +4083,43 @@ fn render_policy_error(err: &PolicyCompileError) -> String {
             ));
             out.push_str(
                 "  fix: either use resources = [\"*\"] for any resource, or list only explicit entries\n",
+            );
+        }
+        PolicyCompileError::UnmarkedCrossLayerOverride { name, operator_path, managed_path } => {
+            out.push_str(&format!("  operator file: {}\n", operator_path.display()));
+            out.push_str(&format!("  managed file:  {}\n", managed_path.display()));
+            out.push_str(&format!("  policy: {name:?}\n"));
+            out.push_str(
+                "  reason: an operator policy shadows a shipped (managed) policy of the\n\
+                 \x20         same name without an explicit override marker\n",
+            );
+            out.push_str(&format!(
+                "  fix: if you intend to override the shipped policy, add\n\
+                 \x20      `override = {name:?}` to the operator policy; otherwise rename it\n"
+            ));
+        }
+        PolicyCompileError::DanglingOverrideMarker { name, target, operator_path } => {
+            out.push_str(&format!("  file: {}\n", operator_path.display()));
+            out.push_str(&format!("  policy: {name:?}\n"));
+            out.push_str(&format!(
+                "  reason: `override = {target:?}` does not name a shipped (managed) policy,\n\
+                 \x20         and the marker must equal the policy's own name\n"
+            ));
+            out.push_str(&format!(
+                "  fix: set `override = {name:?}` (must equal this policy's name) and ensure a\n\
+                 \x20      managed policy of that name exists, or remove the marker\n"
+            ));
+        }
+        PolicyCompileError::OverrideMarkerInManagedLayer { name, managed_path } => {
+            out.push_str(&format!("  managed file: {}\n", managed_path.display()));
+            out.push_str(&format!("  policy: {name:?}\n"));
+            out.push_str(
+                "  reason: a shipped (managed/product) policy carries an `override` marker;\n\
+                 \x20         the product bundle must never override anything\n",
+            );
+            out.push_str(
+                "  fix: this is a build-time bug — remove the `override` field from the\n\
+                 \x20      bundled policy (cli/default_policy.toml) and re-ship\n",
             );
         }
         // `PolicyCompileError` is `#[non_exhaustive]` across the

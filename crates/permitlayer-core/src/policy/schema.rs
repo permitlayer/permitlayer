@@ -92,6 +92,25 @@ pub struct TomlPolicy {
     /// erased to default.
     #[serde(rename = "auto-approve-reads", default)]
     pub auto_approve_reads: bool,
+
+    /// UX-overhaul Story 1: explicit cross-layer override marker.
+    ///
+    /// Only meaningful in an **operator-layer** file. When set, it
+    /// must equal this policy's own `name` and that name must also
+    /// exist in the managed (product) layer — this is the operator
+    /// explicitly, auditably shadowing a shipped policy. An operator
+    /// policy whose `name` collides with a managed policy *without*
+    /// this marker is **fatal** (`UnmarkedCrossLayerOverride`) —
+    /// fail-closed; an accidental name clash must never silently
+    /// replace product policy. A managed-layer file carrying this
+    /// field is itself fatal (`OverrideMarkerInManagedLayer`): the
+    /// product bundle never overrides anything.
+    ///
+    /// `skip_serializing_if`: absent by default and omitted on
+    /// round-trip so existing non-override files are byte-stable
+    /// (the leak-defense fixture-equivalence test depends on this).
+    #[serde(rename = "override", default, skip_serializing_if = "Option::is_none")]
+    pub r#override: Option<String>,
 }
 
 /// Approval dispositions available at the policy and rule level.

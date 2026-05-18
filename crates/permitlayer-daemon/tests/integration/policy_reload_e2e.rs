@@ -2,13 +2,34 @@
 //!
 //! Covers Story 4.2 ACs #1-#6 end-to-end:
 //!
-//! - Start daemon with one policy, assert reload returns `unchanged=1`.
-//! - Add a second policy, reload, assert `added=1`.
-//! - Replace the first policy with an invalid file, reload, assert the
-//!   daemon returns an error and the old set is preserved.
-//! - Assert `policy-reloaded` audit event was written on the success reload.
+//! - Start daemon with one operator policy, assert reload reports it
+//!   `unchanged`.
+//! - Add a second operator policy, reload, assert `added=1`.
+//! - Replace with an invalid file, reload, assert error + old set
+//!   preserved.
+//! - Assert `policy-reloaded` audit event written on the success
+//!   reload.
+//!
+//! UX-overhaul Story 1: the daemon now ALWAYS compiles the managed
+//! (product) bundle alongside the operator layer. The managed bundle
+//! ships [`MANAGED_COUNT`] policies and is NOT rewritten on reload
+//! (only at `start`), so it is stable across every reload here:
+//! `policies_loaded` == `MANAGED_COUNT` + (operator policies), and
+//! `added`/`modified`/`unchanged` track the OPERATOR-layer deltas
+//! plus the unchanged managed baseline. Assertions are written
+//! relative to `MANAGED_COUNT` so they pin the reload-diff mechanics
+//! without hard-coding the product bundle size at every call site.
 
 use crate::common::{DaemonTestConfig, start_daemon, wait_for_health};
+
+/// Number of policies the shipped/managed product bundle
+/// (`cli/default_policy.toml`, mirrored to `policies-managed/` every
+/// boot) compiles to. Pinned by the core
+/// `epic9_bundled_and_fixture_policy_sets_are_identical` /
+/// `bundled_seed_has_no_auto_approve_with_write_scope` invariants;
+/// if the product bundle's policy count ever changes, that core test
+/// fails first and this constant is updated in lockstep.
+const MANAGED_COUNT: i64 = 9;
 
 const POLICY_A: &str = r#"
 [[policies]]
@@ -58,8 +79,9 @@ fn reload_lifecycle_add_and_error_and_audit() {
     assert_eq!(status, 200, "reload should succeed, body: {body}");
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["status"], "ok");
-    assert_eq!(json["policies_loaded"], 1);
-    assert_eq!(json["unchanged"], 1);
+    // operator policy-a + the unchanged managed baseline.
+    assert_eq!(json["policies_loaded"], MANAGED_COUNT + 1);
+    assert_eq!(json["unchanged"], MANAGED_COUNT + 1);
     assert_eq!(json["added"], 0);
     assert_eq!(json["modified"], 0);
 
@@ -77,9 +99,10 @@ fn reload_lifecycle_add_and_error_and_audit() {
     assert_eq!(status, 200, "reload should succeed, body: {body}");
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(json["status"], "ok");
-    assert_eq!(json["policies_loaded"], 2);
-    assert_eq!(json["added"], 1);
-    assert_eq!(json["unchanged"], 1);
+    // policy-a + policy-b + the unchanged managed baseline.
+    assert_eq!(json["policies_loaded"], MANAGED_COUNT + 2);
+    assert_eq!(json["added"], 1); // policy-b is the only NEW policy
+    assert_eq!(json["unchanged"], MANAGED_COUNT + 1); // policy-a + managed
 
     // --- Reload 3: introduce an invalid file, should fail and keep old set ---
     std::fs::write(
@@ -120,7 +143,11 @@ approval-mode = "auto"
     );
     assert_eq!(status, 200, "reload after removing bad file should succeed, body: {body}");
     let json: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert_eq!(json["policies_loaded"], 2, "old set was preserved through failed reload");
+    assert_eq!(
+        json["policies_loaded"],
+        MANAGED_COUNT + 2,
+        "old set (managed + policy-a + policy-b) was preserved through the failed reload"
+    );
 
     // DaemonHandle::Drop SIGKILLs the subprocess when `_daemon` goes
     // out of scope (at end of this function), so no explicit kill

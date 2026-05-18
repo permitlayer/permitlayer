@@ -285,10 +285,21 @@ fn seed_prompt_policy(home: &std::path::Path) {
     std::fs::write(policies_dir.join("prompt.toml"), POLICY_PROMPT_TOML).unwrap();
 }
 
-fn seed_gmail_readonly_policy(home: &std::path::Path) {
-    let policies_dir = home.join("policies");
-    std::fs::create_dir_all(&policies_dir).unwrap();
-    std::fs::write(policies_dir.join("gmail.toml"), POLICY_GMAIL_READONLY_TOML).unwrap();
+/// UX-overhaul Story 1: `gmail-read-only` is now a **managed**
+/// (product) policy shipped in the bundle the daemon writes to
+/// `policies-managed/` on every boot. Re-seeding an identically-named
+/// policy into the OPERATOR layer is now an unmarked cross-layer
+/// collision → the daemon fail-closes and refuses to boot (by
+/// design). So this no longer writes a file: agents binding to
+/// `gmail-read-only` resolve it from the managed layer. Kept as a
+/// named no-op so the call sites still read intentionally ("this
+/// test exercises an agent on the gmail-read-only policy") and
+/// `POLICY_GMAIL_READONLY_TOML` documents what the managed bundle
+/// provides.
+fn seed_gmail_readonly_policy(_home: &std::path::Path) {
+    // Intentionally empty — the managed layer provides
+    // `gmail-read-only`. See doc comment above.
+    let _ = POLICY_GMAIL_READONLY_TOML;
 }
 
 fn seed_prompt_with_reads_policy(home: &std::path::Path) {
