@@ -33,6 +33,8 @@ pub const ALLOWED_SCOPES: &[&str] = &[
     "gmail.search",
     "gmail.modify",
     "gmail.send",
+    // Story 9.2: drafts create/update/send minimum scope.
+    "gmail.compose",
     // Google Calendar (Epic 2: built-in Calendar connector)
     "calendar.readonly",
     "calendar.events",

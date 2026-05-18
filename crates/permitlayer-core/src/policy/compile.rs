@@ -2111,4 +2111,160 @@ mod tests {
         assert_eq!(toml.rules[1].resources, None);
         assert_eq!(toml.rules[1].action, super::super::schema::TomlRuleAction::Deny);
     }
+
+    // ── Story 9.4: per-service tier templates ────────────────────────
+
+    /// The shipped test fixture (`test-fixtures/policies/default.toml`)
+    /// and the bundled seed (`default_policy.toml`) after Epic 9.
+    const FIXTURE_DEFAULT_TOML: &str =
+        include_str!("../../../../test-fixtures/policies/default.toml");
+    const BUNDLED_DEFAULT_TOML: &str =
+        include_str!("../../../permitlayer-daemon/src/cli/default_policy.toml");
+
+    /// AC #5/#6: the expanded fixture compiles and contains exactly the
+    /// 3 original + 6 Epic-9 tier policies = 9.
+    #[test]
+    fn epic9_default_toml_compiles_with_nine_policies() {
+        let set = PolicySet::compile_from_str(FIXTURE_DEFAULT_TOML, &p("default.toml"))
+            .expect("expanded default.toml must compile");
+        for name in [
+            "gmail-read-only",
+            "calendar-prompt-on-write",
+            "drive-research-scope-restricted",
+            "gmail-read-write",
+            "calendar-read-only",
+            "calendar-read-write",
+            "drive-read-only",
+            "drive-read-write",
+            "gmail-read-only-tier",
+        ] {
+            assert!(set.get(name).is_some(), "policy {name} must be present");
+        }
+    }
+
+    /// AC #2: every `{svc}-read-only` tier denies its service's write
+    /// scope via the compile-time allowlist (default-deny).
+    #[test]
+    fn epic9_read_only_tiers_deny_writes() {
+        let set = PolicySet::compile_from_str(FIXTURE_DEFAULT_TOML, &p("default.toml")).unwrap();
+        for (policy, write_scope) in [
+            ("calendar-read-only", "calendar.events"),
+            ("drive-read-only", "drive.file"),
+            ("gmail-read-only-tier", "gmail.modify"),
+        ] {
+            let req = EvalRequest {
+                policy_name: policy.to_owned(),
+                scope: write_scope.to_owned(),
+                resource: Some("anything".to_owned()),
+            };
+            match set.evaluate(&req) {
+                Decision::Deny { rule_id, .. } => {
+                    assert_eq!(
+                        rule_id, DEFAULT_DENY_SCOPE,
+                        "{policy} must default-deny {write_scope}"
+                    );
+                }
+                other => panic!("{policy}+{write_scope}: expected Deny, got {other:?}"),
+            }
+        }
+    }
+
+    /// AC #3: every `{svc}-read-write` tier ALLOWS a representative read
+    /// scope and PROMPTS a representative write scope (prompt-on-write
+    /// default posture — the charter's hard requirement).
+    #[test]
+    fn epic9_read_write_tiers_allow_reads_prompt_writes() {
+        let set = PolicySet::compile_from_str(FIXTURE_DEFAULT_TOML, &p("default.toml")).unwrap();
+        // (policy, read_scope, write_scope, expected prompt rule id)
+        let cases = [
+            ("gmail-read-write", "gmail.readonly", "gmail.send", "prompt-gmail-writes"),
+            ("gmail-read-write", "gmail.metadata", "gmail.modify", "prompt-gmail-writes"),
+            (
+                "calendar-read-write",
+                "calendar.readonly",
+                "calendar.events",
+                "prompt-calendar-writes",
+            ),
+            ("drive-read-write", "drive.readonly", "drive.file", "prompt-drive-writes"),
+        ];
+        for (policy, read_scope, write_scope, prompt_rule) in cases {
+            let read_req = EvalRequest {
+                policy_name: policy.to_owned(),
+                scope: read_scope.to_owned(),
+                resource: Some("anything".to_owned()),
+            };
+            assert!(
+                matches!(set.evaluate(&read_req), Decision::Allow),
+                "{policy}: read scope {read_scope} must be allowed (auto-approved)"
+            );
+            let write_req = EvalRequest {
+                policy_name: policy.to_owned(),
+                scope: write_scope.to_owned(),
+                resource: Some("anything".to_owned()),
+            };
+            match set.evaluate(&write_req) {
+                Decision::Prompt { rule_id, policy_name } => {
+                    assert_eq!(rule_id, prompt_rule, "{policy} write must hit {prompt_rule}");
+                    assert_eq!(policy_name, policy);
+                }
+                other => {
+                    panic!("{policy}+{write_scope}: expected Prompt, got {other:?}")
+                }
+            }
+        }
+    }
+
+    /// AC #6: the bundled seed and the test fixture have IDENTICAL
+    /// policy definitions (comments may differ). This closes the
+    /// silent-drift risk — a different security posture shipping in the
+    /// binary than the tests verify. Compares the compiled
+    /// `to_toml_policy()` of every policy in both files.
+    #[test]
+    fn epic9_bundled_and_fixture_policy_sets_are_identical() {
+        let fixture =
+            PolicySet::compile_from_str(FIXTURE_DEFAULT_TOML, &p("fixture.toml")).unwrap();
+        let bundled =
+            PolicySet::compile_from_str(BUNDLED_DEFAULT_TOML, &p("bundled.toml")).unwrap();
+        let names = [
+            "gmail-read-only",
+            "calendar-prompt-on-write",
+            "drive-research-scope-restricted",
+            "gmail-read-write",
+            "calendar-read-only",
+            "calendar-read-write",
+            "drive-read-only",
+            "drive-read-write",
+            "gmail-read-only-tier",
+        ];
+        for name in names {
+            let f = fixture
+                .get(name)
+                .unwrap_or_else(|| panic!("fixture missing {name}"))
+                .to_toml_policy();
+            let b = bundled
+                .get(name)
+                .unwrap_or_else(|| panic!("bundled missing {name}"))
+                .to_toml_policy();
+            assert_eq!(f.name, b.name, "{name}: name");
+            assert_eq!(f.scopes, b.scopes, "{name}: scopes drifted between the two files");
+            assert_eq!(f.resources, b.resources, "{name}: resources drifted");
+            assert_eq!(f.approval_mode, b.approval_mode, "{name}: approval-mode drifted");
+            assert_eq!(
+                f.auto_approve_reads, b.auto_approve_reads,
+                "{name}: auto-approve-reads drifted"
+            );
+            assert_eq!(f.rules.len(), b.rules.len(), "{name}: rule count drifted");
+            for (fr, br) in f.rules.iter().zip(b.rules.iter()) {
+                assert_eq!(fr.id, br.id, "{name}: rule id drifted");
+                assert_eq!(fr.scopes, br.scopes, "{name}: rule {} scopes drifted", fr.id);
+                assert_eq!(fr.action, br.action, "{name}: rule {} action drifted", fr.id);
+            }
+        }
+        // And neither file silently grew/shrank relative to the other.
+        assert_eq!(
+            FIXTURE_DEFAULT_TOML.matches("[[policies]]").count(),
+            BUNDLED_DEFAULT_TOML.matches("[[policies]]").count(),
+            "the two default-policy files have a different number of [[policies]] blocks"
+        );
+    }
 }

@@ -3,8 +3,30 @@
 
 // Gmail scopes
 pub const GMAIL_READONLY: &str = "https://www.googleapis.com/auth/gmail.readonly";
+/// Metadata-only Gmail scope (headers + labels, NO message body).
+///
+/// Narrower than [`GMAIL_READONLY`]. Reconciled in Story 9.1: this scope
+/// has shipped in the `gmail-read-only` policy fixture and the plugin
+/// `scope_allowlist` ("reviewed scopes") since the initial public release
+/// (`23774ed`), but `scopes.rs` never carried a constant/`scope_info`
+/// row for it — so the fixture loaded structurally yet mapped to no
+/// metadata. This adds the missing constant + `scope_info` entry to make
+/// `scopes.rs` coherent with the long-standing fixture + allowlist. It is
+/// deliberately NOT added to `default_scopes_for_service` (no
+/// metadata-only default-grant tier was ever wired, and Story 9.1
+/// exposes no metadata-only tool — see story Dev Notes / Task 7).
+pub const GMAIL_METADATA: &str = "https://www.googleapis.com/auth/gmail.metadata";
 pub const GMAIL_MODIFY: &str = "https://www.googleapis.com/auth/gmail.modify";
 pub const GMAIL_SEND: &str = "https://www.googleapis.com/auth/gmail.send";
+/// Draft compose/manage scope (Story 9.2). Google's `users.drafts.*`
+/// (create/update/send) accept `gmail.compose` as their minimum — NOT
+/// `gmail.send` (verified against Google's REST reference 2026-05-17:
+/// `users.drafts.send` accepts mail.google.com / gmail.modify /
+/// gmail.compose only). Like the other write scopes it is deliberately
+/// NOT in `default_scopes_for_service` — the write tier is a Story 9.4
+/// policy choice, not a default OAuth grant (same rule as 9.1's
+/// `GMAIL_METADATA`).
+pub const GMAIL_COMPOSE: &str = "https://www.googleapis.com/auth/gmail.compose";
 
 // Calendar scopes
 pub const CALENDAR_READONLY: &str = "https://www.googleapis.com/auth/calendar.readonly";
@@ -37,6 +59,11 @@ pub fn scope_info(scope_uri: &str) -> Option<ScopeInfo> {
             short_name: "gmail.readonly",
             description: "Read your email messages and settings",
         }),
+        GMAIL_METADATA => Some(ScopeInfo {
+            uri: GMAIL_METADATA,
+            short_name: "gmail.metadata",
+            description: "Read email metadata (headers and labels) but not message bodies",
+        }),
         GMAIL_MODIFY => Some(ScopeInfo {
             uri: GMAIL_MODIFY,
             short_name: "gmail.modify",
@@ -46,6 +73,11 @@ pub fn scope_info(scope_uri: &str) -> Option<ScopeInfo> {
             uri: GMAIL_SEND,
             short_name: "gmail.send",
             description: "Send email on your behalf",
+        }),
+        GMAIL_COMPOSE => Some(ScopeInfo {
+            uri: GMAIL_COMPOSE,
+            short_name: "gmail.compose",
+            description: "Create, update, and send drafts on your behalf",
         }),
         CALENDAR_READONLY => Some(ScopeInfo {
             uri: CALENDAR_READONLY,
@@ -150,8 +182,10 @@ mod tests {
     fn each_known_scope_has_info() {
         let all_scopes = [
             GMAIL_READONLY,
+            GMAIL_METADATA,
             GMAIL_MODIFY,
             GMAIL_SEND,
+            GMAIL_COMPOSE,
             CALENDAR_READONLY,
             CALENDAR_EVENTS,
             DRIVE_READONLY,
@@ -170,6 +204,52 @@ mod tests {
     #[test]
     fn unknown_scope_returns_none() {
         assert!(scope_info("https://example.com/unknown.scope").is_none());
+    }
+
+    /// Story 9.1 Task 7 reconciliation: `gmail.metadata` shipped in the
+    /// `gmail-read-only` fixture + plugin scope_allowlist since the initial
+    /// public release but had no `scope_info` row. It now resolves...
+    #[test]
+    fn gmail_metadata_scope_is_reconciled() {
+        let info = scope_info(GMAIL_METADATA);
+        assert!(info.is_some(), "gmail.metadata must resolve after Story 9.1 reconciliation");
+        let info = info.unwrap();
+        assert_eq!(info.uri, "https://www.googleapis.com/auth/gmail.metadata");
+        assert_eq!(info.short_name, "gmail.metadata");
+        assert!(!info.description.is_empty());
+        assert_eq!(uri_to_short_name(GMAIL_METADATA), Some("gmail.metadata"));
+    }
+
+    /// ...but it is deliberately NOT in the gmail default grant (no
+    /// metadata-only default tier was ever wired — Story 9.1 Dev Notes).
+    #[test]
+    fn gmail_metadata_not_in_default_grant() {
+        let scopes = default_scopes_for_service("gmail");
+        assert_eq!(scopes, vec![GMAIL_READONLY]);
+        assert!(!scopes.contains(&GMAIL_METADATA));
+    }
+
+    /// Story 9.2: `gmail.compose` resolves (drafts create/update/send
+    /// minimum scope — verified against Google's REST reference; NOT
+    /// `gmail.send`).
+    #[test]
+    fn gmail_compose_reconciled() {
+        let info = scope_info(GMAIL_COMPOSE);
+        assert!(info.is_some(), "gmail.compose must resolve (Story 9.2)");
+        let info = info.unwrap();
+        assert_eq!(info.uri, "https://www.googleapis.com/auth/gmail.compose");
+        assert_eq!(info.short_name, "gmail.compose");
+        assert!(!info.description.is_empty());
+        assert_eq!(uri_to_short_name(GMAIL_COMPOSE), Some("gmail.compose"));
+    }
+
+    /// ...and like every write scope it is NOT in the gmail default
+    /// grant (write tier is a Story 9.4 policy choice, not a default).
+    #[test]
+    fn gmail_compose_not_in_default_grant() {
+        let scopes = default_scopes_for_service("gmail");
+        assert_eq!(scopes, vec![GMAIL_READONLY]);
+        assert!(!scopes.contains(&GMAIL_COMPOSE));
     }
 
     #[test]

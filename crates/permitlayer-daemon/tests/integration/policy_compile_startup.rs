@@ -62,12 +62,16 @@ fn happy_path_seeds_default_toml_and_boots() {
         plain.contains("policies compiled"),
         "daemon stdout should contain 'policies compiled' tracing log line. Got: {plain}"
     );
-    // The seeded default.toml ships 3 policies (gmail-read-only,
-    // calendar-prompt-on-write, drive-research-scope-restricted),
-    // so the compiled count must be exactly 3.
+    // The seeded default.toml ships 9 policies: the original 3
+    // (gmail-read-only, calendar-prompt-on-write,
+    // drive-research-scope-restricted) plus the 6 Epic 9 per-service
+    // tier templates (gmail/calendar/drive read-only + read-write,
+    // incl. the gmail-read-only-tier alias). The compiled count must
+    // be exactly 9 — this asserts the daemon actually compiled the
+    // seeded file rather than just writing it.
     assert!(
-        plain.contains("policies_loaded=3"),
-        "daemon should have compiled exactly 3 policies from seeded default.toml. Got: {plain}"
+        plain.contains("policies_loaded=9"),
+        "daemon should have compiled exactly 9 policies from seeded default.toml. Got: {plain}"
     );
 }
 
