@@ -25,6 +25,7 @@ pub mod root_guard;
 pub mod rotate_key;
 pub mod scrub;
 pub mod service;
+pub mod setup;
 pub mod start;
 pub mod status;
 pub mod stop;

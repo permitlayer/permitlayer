@@ -73,6 +73,85 @@ fn foreground_start_collision(
     !allow_foreground && effective_root && plist_exists && !launched_by_launchd
 }
 
+/// UX-overhaul Story 2: refuse `agentsso start` when this binary is
+/// the brew/CLI copy and a privileged versioned-symlink install
+/// exists. Operators upgrading via `brew upgrade agentsso` then
+/// (muscle-memory) `agentsso start` would otherwise spawn a SECOND,
+/// unmanaged daemon from the brew path that double-binds the control
+/// plane and drifts from the launchd-supervised privileged install.
+/// The supported path is `sudo agentsso setup` (re-stage) /
+/// `sudo launchctl kickstart -k system/dev.permitlayer.daemon`
+/// (restart). Distinct from [`foreground_start_collision`], which
+/// only fires for root; this is the common NON-root footgun.
+fn start_from_brew_path_managed(allow_foreground: bool) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // launchd-spawned daemon execs the symlink → current_exe IS
+        // the privileged target; never refuse there. Also honor the
+        // explicit foreground escape hatch.
+        if allow_foreground || std::env::var("LAUNCHD_SOCKET").is_ok() {
+            return false;
+        }
+        // Non-default home ⇒ no system collision is possible, so
+        // there is nothing for this guard to prevent. The footgun
+        // this guard exists for is a SECOND daemon that double-binds
+        // the *system* daemon's control plane. When
+        // `AGENTSSO_PATHS__HOME` is set to a valid non-default path
+        // the control UDS, pid file and vault all live under that
+        // home (see `permitlayer_core::paths` — `home_override` is
+        // the centralized resolver every consumer, this module
+        // included, shares), so the started daemon is topologically
+        // isolated from the privileged install and cannot collide
+        // with it. This is the precise expression of the guard's own
+        // rationale — not a test special-case — and it is also what
+        // makes the guard safe under the integration harness, which
+        // always points `AGENTSSO_PATHS__HOME` at a unique temp dir
+        // (every spawn site, regardless of master-key mode). Without
+        // it the guard would abort the daemon before bind on any
+        // developer/CI host that has run `sudo agentsso setup` (the
+        // dogfooding workflow this epic ships), breaking every
+        // daemon-spawning e2e test. The real footgun (default home,
+        // brew copy vs privileged symlink) is still refused and is
+        // covered by the pure `brew_path_collision` unit tests.
+        if permitlayer_core::paths::home_override().is_some() {
+            return false;
+        }
+        let helper =
+            std::path::Path::new(crate::cli::service::install_macos::PRIVILEGED_HELPER_PATH);
+        // No privileged install present → nothing to collide with;
+        // a bare `agentsso start` is legitimate (dev / first run).
+        if !helper.exists() {
+            return false;
+        }
+        let this = std::env::current_exe().ok().and_then(|p| p.canonicalize().ok());
+        // The symlink's realpath = the active `agentsso-<V>`.
+        let privileged = std::fs::canonicalize(helper).ok();
+        brew_path_collision(this, privileged)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = allow_foreground;
+        false
+    }
+}
+
+/// Pure decision for [`start_from_brew_path_managed`]: refuse iff we
+/// can resolve BOTH paths and they differ (this binary is not the
+/// privileged install's active target). If either path is
+/// unresolvable we do NOT refuse — fail open here so a transient
+/// stat error never bricks `start` (the daemon's own PID/port
+/// guards still prevent a true double-bind).
+#[cfg(any(test, target_os = "macos"))]
+fn brew_path_collision(
+    this_exe: Option<std::path::PathBuf>,
+    privileged_realpath: Option<std::path::PathBuf>,
+) -> bool {
+    match (this_exe, privileged_realpath) {
+        (Some(a), Some(b)) => a != b,
+        _ => false,
+    }
+}
+
 // -- App state shared with handlers --
 
 #[derive(Clone)]
@@ -1595,6 +1674,19 @@ pub(crate) enum StartError {
     #[error("daemon is managed by launchd")]
     LaunchdManagedForegroundStart,
 
+    /// UX-overhaul Story 2: `agentsso start` was invoked from a
+    /// brew/CLI binary path that is NOT the privileged install's
+    /// active versioned-symlink target, while a privileged install
+    /// exists. Starting here would spawn a second, unmanaged daemon
+    /// that double-binds the control plane and drifts from the
+    /// launchd-supervised install. The supported paths are
+    /// `sudo agentsso setup` (re-stage/upgrade) or
+    /// `sudo launchctl kickstart -k system/dev.permitlayer.daemon`
+    /// (restart). Exit 3 (resource-conflict family — same as
+    /// [`Self::LaunchdManagedForegroundStart`]).
+    #[error("daemon is the privileged install; this binary is a brew/CLI copy")]
+    BrewPathManagedStart,
+
     /// PID file could not be acquired for reasons other than "already
     /// running" (filesystem permissions, IO error).
     #[error("failed to acquire PID file: {0}")]
@@ -1782,6 +1874,7 @@ impl StartError {
             // Exit 3 — another process holds a coordination resource.
             Self::DaemonAlreadyRunning { .. }
             | Self::LaunchdManagedForegroundStart
+            | Self::BrewPathManagedStart
             | Self::PidFileAcquire(_)
             | Self::ControlTokenBootstrap { .. }
             | Self::DaemonStartVaultBusy { .. } => 3,
@@ -1916,6 +2009,20 @@ impl StartError {
             }
             Self::LaunchdManagedForegroundStart => {
                 "daemon is managed by launchd; use 'sudo launchctl kickstart -k system/dev.permitlayer.daemon' instead\n"
+                    .to_owned()
+            }
+            Self::BrewPathManagedStart => {
+                "error: this is the brew/CLI `agentsso` binary, but the daemon is the \
+                 privileged install (a versioned binary under \
+                 /Library/PrivilegedHelperTools, supervised by launchd).\n\
+                 \n\
+                 Starting here would spawn a SECOND, unmanaged daemon that conflicts \
+                 with the privileged install.\n\
+                 \n\
+                 remediation:\n\
+                 - to upgrade/repair the privileged install: `sudo agentsso setup`\n\
+                 - to just restart it: `sudo launchctl kickstart -k system/dev.permitlayer.daemon`\n\
+                 - to run a throwaway foreground daemon anyway (dev): re-run with `--allow-foreground`\n"
                     .to_owned()
             }
             Self::PidFileAcquire(msg) => format!("error: failed to acquire PID file: {msg}\n"),
@@ -2427,6 +2534,13 @@ fn build_shared_services(
 }
 
 pub async fn run(args: StartArgs) -> Result<(), StartError> {
+    // UX-overhaul Story 2: the brew-path guard runs FIRST — it is
+    // the common NON-root footgun (`brew upgrade` then `agentsso
+    // start`) and its banner is the more specific/actionable one.
+    // The launchd-managed guard below only fires for root.
+    if start_from_brew_path_managed(args.allow_foreground) {
+        return Err(StartError::BrewPathManagedStart);
+    }
     if foreground_start_managed_by_launchd(args.allow_foreground) {
         return Err(StartError::LaunchdManagedForegroundStart);
     }
@@ -4177,6 +4291,41 @@ mod tests {
             "daemon is managed by launchd; use 'sudo launchctl kickstart -k system/dev.permitlayer.daemon' instead\n"
         );
         assert_ne!(StartError::LaunchdManagedForegroundStart.exit_code(), 0);
+    }
+
+    #[test]
+    fn brew_path_collision_refuses_only_when_paths_differ_and_both_resolve() {
+        use std::path::PathBuf;
+        let priv_path = PathBuf::from("/Library/PrivilegedHelperTools/agentsso-0.3.0");
+        // brew copy ≠ privileged active target → refuse.
+        assert!(brew_path_collision(
+            Some(PathBuf::from("/opt/homebrew/bin/agentsso")),
+            Some(priv_path.clone())
+        ));
+        // This binary IS the privileged target (launchd-spawned) →
+        // allow.
+        assert!(!brew_path_collision(Some(priv_path.clone()), Some(priv_path.clone())));
+        // current_exe unresolvable → fail OPEN (don't brick start).
+        assert!(!brew_path_collision(None, Some(priv_path.clone())));
+        // privileged realpath unresolvable (no install) → allow.
+        assert!(!brew_path_collision(Some(PathBuf::from("/opt/homebrew/bin/agentsso")), None));
+        // Neither resolves → allow.
+        assert!(!brew_path_collision(None, None));
+    }
+
+    #[test]
+    fn brew_path_managed_banner_matches_remediation() {
+        let banner = StartError::BrewPathManagedStart.render_banner();
+        assert!(
+            banner.contains("brew/CLI") && banner.contains("sudo agentsso setup"),
+            "banner must name the cause + the supported remediation; got: {banner}"
+        );
+        assert!(
+            banner.contains("--allow-foreground"),
+            "banner must mention the dev escape hatch; got: {banner}"
+        );
+        // Resource-conflict family, same as LaunchdManaged.
+        assert_eq!(StartError::BrewPathManagedStart.exit_code(), 3);
     }
 
     #[tokio::test]

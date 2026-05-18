@@ -37,10 +37,15 @@ include = ["LICENSE", "README.md", "install/install.sh", "install/install.ps1"]
 # omits both) and pushes to the tap repo using HOMEBREW_TAP_TOKEN.
 tap = "permitlayer/homebrew-tap"
 formula = "agentsso"
-# Pre-release tags (e.g. v0.2.0-rc.1) do NOT auto-update the tap by default.
-# Override via the HOMEBREW_PUBLISH_PRERELEASES repo variable in the
-# release.yml job guard when exercising the pipeline end-to-end.
-publish-prereleases = false
+# UX-overhaul Story 2: every shipped tag is a semver prerelease
+# (vX.Y.Z-rc.N) — this project has no stable-release cadence. The tap
+# MUST track every release; prerelease tap publication is PERMANENT.
+# (The load-bearing gate lives in release.yml's homebrew-publish job;
+# this dist setting governs dist's own generated publish path and is
+# set true for consistency so a future dist-driven path can't
+# reintroduce the silent-stale-tap skip. The undocumented
+# HOMEBREW_PUBLISH_PRERELEASES repo-var gate is removed.)
+publish-prereleases = true
 # Allow our custom release.yml to differ from dist's generated version
 # (we add minisign signing steps + a homebrew-publish job that dist doesn't
 # know about).

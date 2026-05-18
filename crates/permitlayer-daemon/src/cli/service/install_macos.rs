@@ -20,7 +20,7 @@ use crate::design::render::error_block;
 const PLIST_PATH: &str = LAUNCHD_PLIST_PATH;
 
 /// Privileged-helper binary install location.
-const PRIVILEGED_HELPER_PATH: &str = "/Library/PrivilegedHelperTools/agentsso";
+pub(crate) const PRIVILEGED_HELPER_PATH: &str = "/Library/PrivilegedHelperTools/agentsso";
 
 /// macOS group restricting access to the control socket. Created by
 /// `service install` via `dscl`; daemon's UDS at
@@ -167,18 +167,7 @@ pub async fn run(args: InstallArgs) -> Result<()> {
     // `service install`. The trade-off: on those Macs the operator
     // may need to re-prompt for System.keychain unlock after sleep/
     // wake; we surface this in the post-install caveats.
-    let out = Command::new("/usr/bin/security")
-        .args(["set-keychain-settings", "-u", "/Library/Keychains/System.keychain"])
-        .output()
-        .context("failed to invoke /usr/bin/security set-keychain-settings")?;
-    let keychain_settings_warning = if out.status.success() {
-        println!("  ✓ System.keychain lock-on-sleep disabled");
-        None
-    } else {
-        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
-        println!("  ⚠ System.keychain `set-keychain-settings -u` returned non-zero — continuing");
-        Some(stderr)
-    };
+    let keychain_settings_warning = disable_keychain_lock_on_sleep();
 
     // (6) Copy binary to privileged-helper path.
     let source = resolve_binary_source(&args)?;
@@ -186,8 +175,12 @@ pub async fn run(args: InstallArgs) -> Result<()> {
     println!("  ✓ daemon binary installed at {PRIVILEGED_HELPER_PATH}");
 
     // (7) Write LaunchDaemon plist.
-    write_launchdaemon_plist(operator_uid, &operator_username)?;
-    println!("  ✓ LaunchDaemon plist written at {PLIST_PATH}");
+    let wrote = write_launchdaemon_plist(operator_uid, &operator_username)?;
+    if wrote {
+        println!("  ✓ LaunchDaemon plist written at {PLIST_PATH}");
+    } else {
+        println!("  ✓ LaunchDaemon plist unchanged at {PLIST_PATH}");
+    }
 
     // (8) launchctl bootstrap.
     bootstrap_daemon()?;
@@ -242,7 +235,7 @@ pub async fn run(args: InstallArgs) -> Result<()> {
 /// Resolve `(SUDO_UID, username)` — refuses missing or root SUDO_UID
 /// so direct-as-root invocations (someone `su -`d to root) are
 /// caught.
-fn resolve_operator() -> Result<(u32, String)> {
+pub(crate) fn resolve_operator() -> Result<(u32, String)> {
     // Story 7.27 review fix: trim before parse — `SUDO_UID="0\n"` and
     // other whitespace-padded values otherwise produce a confusing
     // `parse::<u32>` failure instead of the structured error block.
@@ -323,6 +316,43 @@ fn resolve_operator() -> Result<(u32, String)> {
         return Err(silent_cli_error("operator username failed safe-charset check"));
     }
     Ok((uid, user.name))
+}
+
+/// Disable lock-on-sleep on `System.keychain` via
+/// `/usr/bin/security set-keychain-settings -u`. Returns `None` on
+/// success, `Some(stderr)` on failure (warn-and-continue — this is a
+/// usability optimization, not a security gate; see the caller's
+/// step-(5) comment block for the MDM/FileVault/SIP rationale).
+/// Extracted from `run()` so a future `cli/setup` module can reuse it.
+pub(crate) fn disable_keychain_lock_on_sleep() -> Option<String> {
+    // Behavior-preserving extraction. The original site used
+    // `.output().context(...)?` so an *invocation* failure aborted
+    // the install. `/usr/bin/security` is a guaranteed-present system
+    // binary in this macOS-only module, so that Err branch is
+    // unreachable in practice; mapping it to `Some(stderr)` keeps the
+    // mandated `Option<String>` signature and is consistent with the
+    // documented warn-and-continue posture for this step.
+    let out = match Command::new("/usr/bin/security")
+        .args(["set-keychain-settings", "-u", "/Library/Keychains/System.keychain"])
+        .output()
+    {
+        Ok(o) => o,
+        Err(e) => {
+            let msg = format!("failed to invoke /usr/bin/security set-keychain-settings: {e}");
+            println!(
+                "  ⚠ System.keychain `set-keychain-settings -u` returned non-zero — continuing"
+            );
+            return Some(msg);
+        }
+    };
+    if out.status.success() {
+        println!("  ✓ System.keychain lock-on-sleep disabled");
+        None
+    } else {
+        let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+        println!("  ⚠ System.keychain `set-keychain-settings -u` returned non-zero — continuing");
+        Some(stderr)
+    }
 }
 
 /// Walk `/Users/*/Library/LaunchAgents/` looking for rc.21
@@ -535,7 +565,7 @@ fn operator_sudo_uid() -> Option<u32> {
 /// guaranteed to exist by this point (`create_state_dirs()` ran),
 /// so writer init does not need the parent-dir self-heal that
 /// `emit_rc21_cleanup_audit` does.
-fn emit_install_complete_audit(
+pub(crate) fn emit_install_complete_audit(
     operator_uid: u32,
     operator_username: &str,
     daemon_pid: u32,
@@ -594,7 +624,7 @@ fn emit_install_complete_audit(
 /// `create_new` succeed — install-lock guarantee broken. `flock(2)`
 /// removes the race entirely; the lockfile inode persists across
 /// processes and the kernel arbitrates which holder is live.
-pub(super) struct InstallLock {
+pub(crate) struct InstallLock {
     // Kept alive for the lifetime of the lock; dropping releases.
     // `None` for the `--force` uninstall path (R3-C4-P9), which
     // explicitly opts out of mutual exclusion to allow recovery
@@ -605,7 +635,7 @@ pub(super) struct InstallLock {
 /// Story 7.27 Round-2 review fix (P2): exposed via
 /// [`acquire_install_lock_pub`] so the uninstall flow can acquire
 /// the same lock and prevent concurrent install+uninstall races.
-pub(super) fn acquire_install_lock_pub() -> Result<InstallLock> {
+pub(crate) fn acquire_install_lock_pub() -> Result<InstallLock> {
     acquire_install_lock_inner(false)
 }
 
@@ -623,6 +653,20 @@ pub(super) fn acquire_install_lock_pub_force() -> InstallLock {
 /// Story 7.27 Round-2 review fix (P2): exposed for uninstall so it
 /// can clean up rc.21 LaunchAgents symmetrically with install.
 pub(super) async fn cleanup_rc21_launchagents_for_uninstall() -> Vec<(PathBuf, u32)> {
+    cleanup_rc21_launchagents().await
+}
+
+/// Thin `pub(crate)` wrapper over [`cleanup_rc21_launchagents`] so a
+/// future `cli/setup` module can reuse the rc.21 cleanup discipline.
+/// Behavior identical to the internal entrypoint.
+///
+/// `#[allow(dead_code)]`: the only consumer (`cli/setup`) is being
+/// written in parallel by another engineer and does not exist in the
+/// tree yet. Every other `pub(crate)` helper widened in this refactor
+/// already has an in-crate caller; this thin wrapper is the lone
+/// exception until `cli/setup` lands.
+#[allow(dead_code)]
+pub(crate) async fn cleanup_rc21_launchagents_pub() -> Vec<(std::path::PathBuf, u32)> {
     cleanup_rc21_launchagents().await
 }
 
@@ -711,7 +755,7 @@ fn acquire_install_lock_inner(_force: bool) -> Result<InstallLock> {
 /// are structurally impossible. If you add a new caller, validate
 /// input or extend this helper to numeric-escape (`&#xN;`) the
 /// control range.
-fn xml_escape(s: &str) -> String {
+pub(crate) fn xml_escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for ch in s.chars() {
         match ch {
@@ -742,7 +786,7 @@ mod xml_escape_tests {
 
 /// Create the `permitlayer-clients` macOS group via `dscl` and add
 /// the operator user. Idempotent — reuses an existing group.
-async fn ensure_permitlayer_clients_group(operator_username: &str) -> Result<()> {
+pub(crate) async fn ensure_permitlayer_clients_group(operator_username: &str) -> Result<()> {
     // (a) Check if group already exists.
     let out = Command::new("/usr/bin/dscl")
         .args([".", "-read", &format!("/Groups/{CLIENTS_GROUP}"), "PrimaryGroupID"])
@@ -931,7 +975,7 @@ fn resolve_clients_group_gid_with_retry() -> Result<u32> {
     )
 }
 
-fn create_state_dirs() -> Result<()> {
+pub(crate) fn create_state_dirs() -> Result<()> {
     let state = permitlayer_core::paths::daemon_state_dir(None);
     let log = permitlayer_core::paths::daemon_log_dir(None);
     let runtime = permitlayer_core::paths::daemon_runtime_dir(None);
@@ -1004,7 +1048,15 @@ fn create_state_dirs() -> Result<()> {
 /// `cargo build --release` testing where the binary lives under
 /// `target/release/`).
 fn resolve_binary_source(args: &InstallArgs) -> Result<PathBuf> {
-    let candidate = match args.from.as_ref() {
+    resolve_binary_source_path(args.from.as_deref())
+}
+
+/// Resolve the source binary path from an optional `--from` override.
+/// Body extracted verbatim from `resolve_binary_source` (reads `from`
+/// instead of `args.from`) so a future `cli/setup` module can reuse
+/// the symlink/hardlink/exec-bit hardening.
+pub(crate) fn resolve_binary_source_path(from: Option<&std::path::Path>) -> Result<PathBuf> {
+    let candidate = match from {
         Some(p) => {
             // Story 7.27 Round-2 review fix (P2): validate operator-
             // supplied `--from <path>` against symlink swap +
@@ -1064,7 +1116,7 @@ fn resolve_binary_source(args: &InstallArgs) -> Result<PathBuf> {
                     meta.permissions().mode() & 0o777
                 );
             }
-            p.clone()
+            p.to_path_buf()
         }
         None => std::env::current_exe()
             .context("std::env::current_exe() failed")?
@@ -1080,10 +1132,20 @@ fn resolve_binary_source(args: &InstallArgs) -> Result<PathBuf> {
 /// otherwise leave a partially-written or zero-byte binary at the
 /// helper path.
 fn copy_binary_to_helper_tools(from: &Path) -> Result<()> {
-    let helper_dir = Path::new(PRIVILEGED_HELPER_PATH).parent().unwrap_or(Path::new("/"));
+    stage_file_atomic(from, Path::new(PRIVILEGED_HELPER_PATH))
+}
+
+/// Atomically stage `from` at `dest`: mkdir `dest.parent()`, copy to
+/// `<dest>.tmp.<pid>`, chown root:wheel, chmod 0755, fsync the tmp
+/// file, rename tmp→dest, fsync the parent dir. Body extracted
+/// verbatim from `copy_binary_to_helper_tools`, parameterized on
+/// `dest`, so a future `cli/setup` module can reuse the atomic-stage
+/// discipline.
+pub(crate) fn stage_file_atomic(from: &Path, dest: &Path) -> Result<()> {
+    let helper_dir = dest.parent().unwrap_or(Path::new("/"));
     std::fs::create_dir_all(helper_dir)
         .with_context(|| format!("mkdir -p {}", helper_dir.display()))?;
-    let tmp_path = PathBuf::from(format!("{PRIVILEGED_HELPER_PATH}.tmp.{}", std::process::id()));
+    let tmp_path = PathBuf::from(format!("{}.tmp.{}", dest.display(), std::process::id()));
     std::fs::copy(from, &tmp_path)
         .with_context(|| format!("copy {} → {}", from.display(), tmp_path.display()))?;
     chown(&tmp_path, Some(Uid::from_raw(0)), Some(Gid::from_raw(0)))
@@ -1094,7 +1156,7 @@ fn copy_binary_to_helper_tools(from: &Path) -> Result<()> {
     // before the rename. Atomic-via-rename is only atomic w.r.t.
     // crash if the tmp file's data is fsync'd first; otherwise a
     // power loss between `rename` and writeback yields a zero-byte
-    // helper at `PRIVILEGED_HELPER_PATH` with a valid dirent —
+    // helper at `dest` with a valid dirent —
     // exactly the failure mode the rename pattern claims to prevent.
     let tmp_file = std::fs::OpenOptions::new()
         .write(true)
@@ -1102,8 +1164,8 @@ fn copy_binary_to_helper_tools(from: &Path) -> Result<()> {
         .with_context(|| format!("open {} for fsync", tmp_path.display()))?;
     tmp_file.sync_all().with_context(|| format!("fsync {}", tmp_path.display()))?;
     drop(tmp_file);
-    std::fs::rename(&tmp_path, PRIVILEGED_HELPER_PATH)
-        .with_context(|| format!("rename {} → {}", tmp_path.display(), PRIVILEGED_HELPER_PATH))?;
+    std::fs::rename(&tmp_path, dest)
+        .with_context(|| format!("rename {} → {}", tmp_path.display(), dest.display()))?;
     // fsync the parent dir so the rename is durable.
     if let Ok(dir) = std::fs::File::open(helper_dir) {
         let _ = dir.sync_all();
@@ -1113,7 +1175,13 @@ fn copy_binary_to_helper_tools(from: &Path) -> Result<()> {
 
 /// Build the LaunchDaemon plist XML and write it to `PLIST_PATH`,
 /// chown root:wheel, chmod 0644. Per Story 7.27 AC #10.
-fn write_launchdaemon_plist(operator_uid: u32, operator_username: &str) -> Result<()> {
+///
+/// Returns `Ok(true)` if it wrote the plist, `Ok(false)` if the
+/// on-disk plist already had byte-identical contents (idempotent
+/// no-op — avoids spurious launchd churn when `service install` is
+/// re-run unchanged). This compare-then-write behavior is benign +
+/// strictly-better and is required by the Story 7.27 follow-up plan.
+pub(crate) fn write_launchdaemon_plist(operator_uid: u32, operator_username: &str) -> Result<bool> {
     // Hand-built XML keeps the deps minimal (no `plist` crate
     // workspace addition needed). The plist is small + deterministic;
     // a unit test below could `plutil -lint` the output to catch
@@ -1150,6 +1218,16 @@ fn write_launchdaemon_plist(operator_uid: u32, operator_username: &str) -> Resul
 </plist>
 "#
     );
+    // Compare-then-write: if the on-disk plist already matches `body`
+    // byte-for-byte, skip the tmp+chown+chmod+rename entirely. A
+    // re-run of `service install` with identical operator identity
+    // otherwise rewrites the plist (new inode via rename) for no
+    // reason; idempotent skip avoids spurious launchd churn.
+    if let Ok(existing) = std::fs::read_to_string(PLIST_PATH)
+        && existing == body
+    {
+        return Ok(false);
+    }
     // Atomic write: tmp file + rename. Mode 0644, owner root:wheel.
     let tmp_path = format!("{PLIST_PATH}.tmp.{}", std::process::id());
     std::fs::write(&tmp_path, body.as_bytes()).with_context(|| format!("write {tmp_path}"))?;
@@ -1159,12 +1237,23 @@ fn write_launchdaemon_plist(operator_uid: u32, operator_username: &str) -> Resul
         .with_context(|| format!("chmod 0644 {tmp_path}"))?;
     std::fs::rename(&tmp_path, PLIST_PATH)
         .with_context(|| format!("rename {tmp_path} → {PLIST_PATH}"))?;
-    Ok(())
+    Ok(true)
 }
 
 /// `launchctl bootstrap system /Library/LaunchDaemons/...`. Idempotent:
 /// if the daemon is already bootstrapped, bootout it first.
 fn bootstrap_daemon() -> Result<()> {
+    bootout_daemon()?;
+    launchctl_bootstrap_system()
+}
+
+/// Best-effort `launchctl bootout system/<label>` (covers the
+/// re-install case). Returns `Ok(())` on success OR when the service
+/// was not loaded; returns the `silent_cli_error` (after the
+/// structured error block) when bootout fails with the service still
+/// in use. Body extracted verbatim from `bootstrap_daemon`'s bootout
+/// block so a future `cli/setup` module can reuse it.
+pub(crate) fn bootout_daemon() -> Result<()> {
     // Best-effort bootout (covers re-install case). Story 7.27 review
     // fix: inspect bootout exit code. launchctl bootout exit codes
     // include 0 (success), 36 / `Could not find specified service`
@@ -1206,6 +1295,14 @@ fn bootstrap_daemon() -> Result<()> {
             return Err(silent_cli_error("launchctl bootout failed (service in use)"));
         }
     }
+    Ok(())
+}
+
+/// `launchctl bootstrap system /Library/LaunchDaemons/...`. Body
+/// extracted verbatim from `bootstrap_daemon`'s bootstrap block
+/// (including the plutil diagnostic) so a future `cli/setup` module
+/// can reuse it.
+pub(crate) fn launchctl_bootstrap_system() -> Result<()> {
     let out = Command::new("/bin/launchctl")
         .args(["bootstrap", "system", PLIST_PATH])
         .output()
@@ -1235,6 +1332,21 @@ fn bootstrap_daemon() -> Result<()> {
     Ok(())
 }
 
+/// Pure parser for `launchctl print system/<label>` stdout. Returns
+/// `Some(pid)` iff a `state = running` line AND a `pid = N` line with
+/// `N != 0` are both present, else `None`. Extracted verbatim from
+/// `verify_daemon_running`'s poll loop so a future `cli/setup` module
+/// can reuse the parse (and so it is unit-testable in isolation).
+pub(crate) fn parse_launchctl_running(stdout: &str) -> Option<u32> {
+    let running = stdout.lines().any(|l| l.trim_start().starts_with("state = running"));
+    let pid: Option<u32> = stdout.lines().find_map(|l| {
+        let trimmed = l.trim_start();
+        let rest = trimmed.strip_prefix("pid = ")?;
+        rest.trim().parse::<u32>().ok().filter(|&p| p != 0)
+    });
+    if running { pid } else { None }
+}
+
 /// Poll `launchctl print system/<label>` until `state = running`
 /// appears or `timeout` elapses. Returns the parsed PID on success.
 /// Story 7.27 review fix: parse defensively — `launchctl print`
@@ -1262,12 +1374,6 @@ fn verify_daemon_running(timeout: Duration) -> Result<u32> {
             // Combined buffer kept only for the failure-diagnostic
             // `last_output` dump.
             last_output = format!("--- stdout ---\n{stdout}\n--- stderr ---\n{stderr}");
-            let running = stdout.lines().any(|l| l.trim_start().starts_with("state = running"));
-            let pid: Option<u32> = stdout.lines().find_map(|l| {
-                let trimmed = l.trim_start();
-                let rest = trimmed.strip_prefix("pid = ")?;
-                rest.trim().parse::<u32>().ok().filter(|&p| p != 0)
-            });
             // Story 7.27 Round-2 review fix (P1): require `state =
             // running` strictly. Pre-fix, `running || pid.is_some()`
             // returned Ok for `state = exited` / `state = waiting`
@@ -1286,8 +1392,8 @@ fn verify_daemon_running(timeout: Duration) -> Result<u32> {
             // install-complete audit would record the kernel
             // scheduler's PID, not the daemon's. Continue polling
             // until both fields are present.
-            if running && pid.is_some() {
-                return Ok(pid.unwrap_or(0));
+            if let Some(pid) = parse_launchctl_running(&stdout) {
+                return Ok(pid);
             }
         }
         std::thread::sleep(interval);

@@ -68,6 +68,7 @@ mod policy_validate_e2e;
 mod rotate_key_crash_resume_e2e;
 mod rotate_key_e2e;
 mod scrub_explain_warnings;
+mod setup_e2e;
 mod status_connections_e2e;
 mod uninstall_e2e;
 mod update_e2e;

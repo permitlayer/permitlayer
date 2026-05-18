@@ -710,9 +710,12 @@ jobs:
   # the tap. The tap repo itself remains the source-of-truth for
   # brew users.
   #
-  # Pre-release gate: tags with a hyphen in the version part (v0.2.0-rc.1)
-  # skip the tap push unless the HOMEBREW_PUBLISH_PRERELEASES repo
-  # variable is set to "1" (see Story 7.1 Task 5.1 for rationale).
+  # UX-overhaul Story 2: prerelease tap publication is PERMANENT.
+  # Every shipped tag is a `-rc.N` prerelease; the tap tracks all of
+  # them. Only `+build-metadata` tags skip (unverified dist path).
+  # The old `HOMEBREW_PUBLISH_PRERELEASES` repo-var gate was an
+  # undocumented load-bearing footgun (silent stale CLI when unset)
+  # and is removed.
   homebrew-publish:
     needs:
       - plan
@@ -730,31 +733,33 @@ jobs:
       GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
       TAG: ${{ needs.plan.outputs.tag }}
-      PUBLISH_PRERELEASES: ${{ vars.HOMEBREW_PUBLISH_PRERELEASES }}
     steps:
       - name: Checkout main repo
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
 
-      - name: Decide whether this tag is a pre-release
+      - name: Decide whether to publish to the tap
         id: gate
         shell: bash
         run: |
-          # Semver pre-release tags contain a hyphen in the version
-          # part (e.g. v0.2.0-rc.1). Build-metadata tags use `+`
-          # (e.g. v0.2.0+gpu); we treat those as untrusted too — dist
-          # behaviour with `+meta` is unverified, so route them through
-          # the same gate as pre-releases until someone exercises that
-          # path explicitly.
-          if [[ "$TAG" == *-* || "$TAG" == *+* ]]; then
-            IS_PRERELEASE=1
-          else
-            IS_PRERELEASE=0
-          fi
-          if [ "$IS_PRERELEASE" = "1" ] && [ "${PUBLISH_PRERELEASES:-}" != "1" ]; then
+          # UX-overhaul Story 2: prerelease tap publication is now
+          # PERMANENT, not gated on the undocumented load-bearing
+          # `HOMEBREW_PUBLISH_PRERELEASES` repo variable. Every shipped
+          # tag is a semver prerelease (`vX.Y.Z-rc.N`) — this project
+          # has no stable-release cadence — so gating prereleases meant
+          # the tap silently went stale whenever the repo var was unset
+          # and the release STILL went green (the "silent stale CLI
+          # after brew upgrade" incident class, #58-adjacent). The tap
+          # MUST track every release.
+          #
+          # The ONLY remaining skip is build-metadata tags (`vX.Y.Z+meta`):
+          # dist behaviour with `+meta` is unverified, so route those
+          # through a skip until someone exercises that path. Normal
+          # `-rc.N` prereleases ALWAYS publish.
+          if [[ "$TAG" == *+* ]]; then
             echo "skip=1" >> "$GITHUB_OUTPUT"
-            echo "::notice::Tag $TAG is a pre-release and HOMEBREW_PUBLISH_PRERELEASES != 1; skipping tap push"
+            echo "::notice::Tag $TAG carries +build-metadata (unverified dist path); skipping tap push"
           else
             echo "skip=0" >> "$GITHUB_OUTPUT"
           fi
@@ -909,6 +914,39 @@ jobs:
           done
           echo "::error::Tap remote HEAD did not converge to $PUSHED_SHA after 10 attempts"
           exit 1
+
+      - name: Assert tap formula references the just-tagged version
+        if: ${{ steps.gate.outputs.skip == '0' }}
+        run: |
+          # UX-overhaul Story 2: assert the TAP CONTENT (not just that
+          # a push command ran). The patch step can legitimately say
+          # "nothing to push, formula unchanged" — if that ever
+          # happens while the formula is actually stale, the release
+          # would still go green and `brew upgrade` would silently
+          # deliver an old CLI. Clone the tap at the converged HEAD and
+          # assert Formula/agentsso.rb's url/version references the
+          # tagged version. This fails the release LOUDLY on a stale
+          # tap, independently of the brew-install smoke (which a
+          # cached bottle could otherwise mask).
+          EXPECTED_VERSION="${TAG#v}"
+          TMP_TAP="$(mktemp -d)"
+          git clone --depth 1 https://github.com/permitlayer/homebrew-tap.git "$TMP_TAP"
+          FORMULA="$TMP_TAP/Formula/agentsso.rb"
+          if [ ! -f "$FORMULA" ]; then
+            echo "::error::tap has no Formula/agentsso.rb after push"
+            exit 1
+          fi
+          # The dist-generated formula pins the release tarball by URL
+          # (…/download/v<version>/…) and/or a `version "<version>"`
+          # stanza. Require the exact tagged version to appear in the
+          # download URL path — the load-bearing reference brew uses.
+          if ! grep -Eq "releases/download/v${EXPECTED_VERSION}/" "$FORMULA"; then
+            echo "::error::tap Formula/agentsso.rb does not reference v${EXPECTED_VERSION} in its download URL — the tap is STALE for tag ${TAG}"
+            echo "--- Formula/agentsso.rb (url/version lines) ---"
+            grep -nE 'url |version ' "$FORMULA" || true
+            exit 1
+          fi
+          echo "Tap formula correctly references v${EXPECTED_VERSION}"
 
       - name: Smoke test — brew tap && brew install && agentsso --version
         if: ${{ steps.gate.outputs.skip == '0' }}
