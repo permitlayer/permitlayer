@@ -149,6 +149,24 @@ pub(crate) fn plist_path(home: &Path) -> PathBuf {
 /// `/usr/local/bin/` or `~/.cargo/bin/` won't hit this in practice,
 /// but the helper escapes anyway so a path like
 /// `~/dev/foo & bar/agentsso` doesn't produce malformed XML.
+// ── macOS enable-cluster: architecturally orphaned on macOS ─────────
+//
+// Everything from here through `already_loaded` is the macOS
+// user-LaunchAgent `enable` path + its brew-services-migration
+// decision tree. Its ONLY caller was `update --apply`'s autostart-
+// path-drift rewrite, deleted in the UX-overhaul epic (Story 3).
+// macOS now installs via the privileged root LaunchDaemon
+// (`cli/service/install_macos.rs`, Story 2 `setup`), so this
+// user-LaunchAgent path is unreachable on macOS *by architecture*
+// while the equivalent Linux/Windows backends stay live. `disable`
+// + `status` (the macOS surface uninstall still uses) are separate
+// and remain live. Story 4 (`doctor`) owns deciding what of this
+// macOS autostart surface, if any, `doctor`'s stale-registration /
+// symlink-integrity checks reuse. Each item carries
+// `#[allow(dead_code)]` (it is exercised by this module's tests, so
+// it is verified, not untested dead weight — removing it wholesale
+// is Story 4's call, not Story 3's scope).
+#[allow(dead_code)]
 pub(crate) fn render_plist(daemon_path: &Path, log_path: &Path, working_dir: &Path) -> String {
     let daemon = xml_escape(&daemon_path.to_string_lossy());
     let log = xml_escape(&log_path.to_string_lossy());
@@ -195,6 +213,7 @@ pub(crate) fn render_plist(daemon_path: &Path, log_path: &Path, working_dir: &Pa
     )
 }
 
+#[allow(dead_code)] // macOS enable-cluster (see render_plist note)
 fn xml_escape(s: &str) -> String {
     let mut buf = String::with_capacity(s.len());
     for c in s.chars() {
@@ -211,6 +230,7 @@ fn xml_escape(s: &str) -> String {
 }
 
 /// macOS [`super::enable`] implementation.
+#[allow(dead_code)] // macOS enable-cluster (see render_plist note)
 pub(crate) fn enable(exec: &impl Engine, home: &Path) -> Result<EnableOutcome, AutostartError> {
     // Story 7.16 Task 2: brew-services migration. Replaces the previous
     // refuse-on-conflict path with a migrate-or-refuse-with-validation
@@ -572,6 +592,7 @@ pub(crate) fn parse_brew_services_active(stdout: &[u8]) -> bool {
 
 /// Result of inspecting the brew-managed plist on disk.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // macOS enable-cluster (see render_plist note)
 pub(crate) struct BrewPlistInspection {
     /// Absolute path to the plist file.
     pub file_path: PathBuf,
@@ -588,6 +609,7 @@ pub(crate) struct BrewPlistInspection {
 /// actionable error (the plist on disk doesn't match what we expect, so
 /// auto-removing it would be an operator footgun).
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)] // macOS enable-cluster (see render_plist note)
 pub(crate) enum BrewMigrationDecision {
     /// No brew-services state detected; proceed straight to user-domain bootstrap.
     Skip,
@@ -602,6 +624,7 @@ pub(crate) enum BrewMigrationDecision {
 /// Which signal(s) triggered a migration. Informational; included in the
 /// stderr log line so an operator can correlate with their box's prior state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)] // macOS enable-cluster (see render_plist note)
 pub(crate) enum BrewMigrationReason {
     /// `brew services list --json` reported agentsso as `started`/`scheduled`,
     /// but no plist on disk (pathological — brew claims active without an artifact).
@@ -625,6 +648,7 @@ pub(crate) enum BrewMigrationReason {
 /// — the file is malformed enough that we can't make a confident decision,
 /// and the safest action is to skip migration (operator's hand-rolled
 /// config stays untouched).
+#[allow(dead_code)] // macOS enable-cluster (see render_plist note)
 pub(crate) fn inspect_brew_plist_path(home: &Path) -> std::io::Result<Option<BrewPlistInspection>> {
     // Per-user `brew services` writes to `~/Library/LaunchAgents/`.
     // System-wide `sudo brew services` writes to `/Library/LaunchAgents/`
@@ -669,6 +693,7 @@ pub(crate) fn inspect_brew_plist_path(home: &Path) -> std::io::Result<Option<Bre
 /// rejects the match. Without this guard the function would skip past
 /// non-string values to find a later `<string>` belonging to a
 /// different key (review finding 2026-05-07).
+#[allow(dead_code)] // macOS enable-cluster (see render_plist note)
 fn extract_plist_string_after_key(xml: &str, key: &str) -> Option<String> {
     let key_marker = format!("<key>{key}</key>");
     let key_idx = xml.find(&key_marker)?;
@@ -691,6 +716,7 @@ fn extract_plist_string_after_key(xml: &str, key: &str) -> Option<String> {
 /// and return FIRST as a `PathBuf`. Returns `None` on parse failure.
 /// Mirrors [`parse_program_path`] (line 415) but operates on the
 /// brew-managed plist (which may have a different overall shape).
+#[allow(dead_code)] // macOS enable-cluster (see render_plist note)
 fn extract_plist_program_args_first(xml: &str) -> Option<PathBuf> {
     let key_idx = xml.find("<key>ProgramArguments</key>")?;
     let array_start = xml[key_idx..].find("<array>")? + key_idx;
@@ -716,6 +742,7 @@ fn extract_plist_program_args_first(xml: &str) -> Option<PathBuf> {
 /// upgrade. We try `canonicalize` on both sides; if either fails to
 /// resolve (e.g., binary already removed mid-upgrade), fall back to
 /// byte-exact equality so a real path drift still triggers `Refuse`.
+#[allow(dead_code)] // macOS enable-cluster (see render_plist note)
 fn same_binary(a: &Path, b: &Path) -> bool {
     if a == b {
         return true;
@@ -744,6 +771,7 @@ fn same_binary(a: &Path, b: &Path) -> bool {
 /// "Matches binary" means `<Label> == "homebrew.mxcl.agentsso"` AND
 /// `<ProgramArguments>[0]` is the same path as `expected_binary`. Both
 /// must validate; either failing → `Refuse`.
+#[allow(dead_code)] // macOS enable-cluster (see render_plist note)
 pub(crate) fn decide_brew_migration(
     brew_active: bool,
     plist_inspection: Option<&BrewPlistInspection>,
@@ -808,6 +836,7 @@ pub(crate) fn decide_brew_migration(
 /// on the second run — backup paths use nanosecond-precision RFC3339
 /// stamps via `chrono::SecondsFormat::AutoSi`, so collisions are not
 /// realistic.)
+#[allow(dead_code)] // macOS enable-cluster (see render_plist note)
 pub(crate) fn execute_brew_migration(
     exec: &impl Engine,
     plist_inspection: Option<&BrewPlistInspection>,
@@ -879,6 +908,7 @@ pub(crate) fn execute_brew_migration(
 /// colons (`2026-05-07T20:15:30Z`) — these are valid filename
 /// characters on macOS and Linux but NOT on Windows; this code path
 /// is `#[cfg(target_os = "macos")]` only so that's not a concern.
+#[allow(dead_code)] // macOS enable-cluster (see render_plist note)
 fn backup_path_for(original: &Path) -> PathBuf {
     let ts = chrono::Utc::now().to_rfc3339();
     let mut backup = original.to_path_buf();
@@ -931,6 +961,7 @@ fn parse_program_path(xml: &str) -> Option<PathBuf> {
 /// login, so we silently violated AC #1. The bootstrap path now
 /// detects 119 separately and runs `launchctl enable` to clear the
 /// flag before reporting success.
+#[allow(dead_code)] // macOS enable-cluster (see render_plist note)
 fn already_loaded(out: &Output) -> bool {
     matches!(out.status.code(), Some(17))
 }

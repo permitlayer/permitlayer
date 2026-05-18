@@ -1,9 +1,22 @@
 //! GitHub Releases API client for `agentsso update`.
 //!
-//! Hits `https://api.github.com/repos/botsdown/permitlayer/releases/latest`
+//! Hits `https://api.github.com/repos/permitlayer/permitlayer/releases?per_page=100`
 //! (matching the same `REPO_OWNER`/`REPO_NAME` constants the curl|sh
-//! installer hardcodes at `install/install.sh:17-18`) to discover
-//! the latest non-draft, non-prerelease release.
+//! installer hardcodes at `install/install.sh:17-18`, which is also
+//! the minisign-trusted release source) and selects the highest
+//! semver release among the non-draft entries.
+//!
+//! # Why `/releases` and not `/releases/latest` (UX-overhaul Story 3)
+//!
+//! `/releases/latest` excludes *every* prerelease. All `permitlayer`
+//! releases to date are prereleases (`v0.3.0-rc.NN`), so
+//! `/releases/latest` returns 404 and the self-updater never finds
+//! anything — issue #58. We now list all releases, drop `draft`
+//! entries (and tags that don't parse as semver — so the lexical
+//! fallback can't mis-rank `rc.9` above `rc.10`), and pick the
+//! maximum by [`semver::Version`]. `prerelease` is no longer a
+//! rejection criterion: shipping only prereleases is this project's
+//! actual release posture.
 //!
 //! # Test seam
 //!
@@ -22,8 +35,16 @@ use serde::Deserialize;
 /// Production API base URL.
 pub(crate) const PRODUCTION_API_BASE_URL: &str = "https://api.github.com";
 
-/// Repo path (relative to the API base). Matches `install/install.sh:17-18`.
-pub(crate) const REPO_PATH: &str = "/repos/botsdown/permitlayer";
+/// Repo path (relative to the API base).
+///
+/// **UX-overhaul Story 3 supply-chain fix:** this was
+/// `/repos/botsdown/permitlayer` — a stale org that did not match
+/// `install/install.sh:17-18` (`permitlayer/permitlayer`, the
+/// minisign-trusted release source). A drift detector that points
+/// at a different repo than the install/upgrade path is a
+/// supply-chain correctness bug, not a cosmetic mismatch:
+/// `repo_path_matches_install_sh` pins them together.
+pub(crate) const REPO_PATH: &str = "/repos/permitlayer/permitlayer";
 
 /// Resolve the API base URL.
 ///
@@ -62,49 +83,34 @@ pub(crate) fn api_base_url_with(override_url: Option<&str>) -> String {
     }
 }
 
-/// Subset of the GitHub Releases response we care about.
+/// Subset of the GitHub Releases response the drift report consumes.
 ///
-/// Field-by-field justification — each field has a single consumer:
-/// - `tag_name` → version-comparison + canonical "what version" label.
-/// - `name` → human-readable release title (printed in the check-only
-///   summary).
-/// - `body` → release notes (printed truncated in the check-only
-///   summary).
-/// - `published_at` → relative-time line in the check-only summary.
-/// - `draft` + `prerelease` → skip non-stable releases. We use the
-///   `/releases/latest` endpoint which already filters these, but
-///   keep the fields so the deserializer warns if GitHub ever drops
-///   them.
-/// - `assets[]` → which platform-target artifact + minisig to fetch.
+/// Field-by-field justification — each field has a real consumer in
+/// the drift report (no deserialize-but-never-read fields):
+/// - `tag_name` → version comparison + the canonical version label.
+/// - `name` → human-readable release title, shown in the report.
+/// - `published_at` → "published:" line in the report.
+/// - `draft` → excluded during selection (unpublished).
+/// - `prerelease` → report label (`(prerelease)`); NOT a rejection
+///   criterion (this project ships only prereleases — issue #58).
 ///
-/// We deserialize through `serde_json::Value` rather than this struct
-/// directly so that a future GitHub schema change adding a required
-/// field doesn't break the update flow on every running binary.
+/// `body`/`assets` are intentionally NOT modeled: the drift report
+/// shows neither release notes nor asset URLs (the apply/download
+/// flow that needed them was deleted). serde ignores unknown JSON
+/// fields by default, so dropping them keeps deserialization
+/// forward-compatible without carrying unread fields.
 #[derive(Debug, Deserialize, Clone)]
 pub(crate) struct ReleaseInfo {
     pub(crate) tag_name: String,
     pub(crate) name: Option<String>,
-    pub(crate) body: Option<String>,
     pub(crate) published_at: Option<String>,
     #[serde(default)]
     pub(crate) draft: bool,
-    /// `prerelease` is read by GitHub's `/releases/latest` endpoint
-    /// (which already filters prereleases out), but we keep the
-    /// field so the deserializer doesn't reject a future GitHub
-    /// schema change that adds it back. Reading it is intentional
-    /// belt-and-braces.
+    /// Surfaced in the drift-report label (e.g. `0.3.0-rc.36
+    /// (prerelease)`) so the operator knows the channel. NOT a
+    /// rejection criterion — see the module docs.
     #[serde(default)]
-    #[allow(dead_code)]
     pub(crate) prerelease: bool,
-    #[serde(default)]
-    pub(crate) assets: Vec<ReleaseAsset>,
-}
-
-#[derive(Debug, Deserialize, Clone)]
-pub(crate) struct ReleaseAsset {
-    pub(crate) name: String,
-    pub(crate) browser_download_url: String,
-    pub(crate) size: u64,
 }
 
 impl ReleaseInfo {
@@ -115,28 +121,15 @@ impl ReleaseInfo {
         self.tag_name.strip_prefix('v').unwrap_or(&self.tag_name)
     }
 
-    /// Find the asset matching this binary's target triple.
+    /// Parse [`Self::version`] as a [`semver::Version`].
     ///
-    /// Returns `None` if no matching asset exists (release not yet
-    /// published for this target — surface as a clean error in the
-    /// orchestrator).
-    ///
-    /// **Review patch P12 (F14 — Edge):** exact prefix-match
-    /// `agentsso-<target>.tar.gz` (or `.zip`) instead of the
-    /// previous `name.contains(target)` substring scan, which
-    /// would have collided with hypothetical future variant
-    /// suffixes like `agentsso-x86_64-pc-windows-msvc-static.tar.gz`.
-    pub(crate) fn asset_for_target(&self, target: &str) -> Option<&ReleaseAsset> {
-        let expected_targz = format!("agentsso-{target}.tar.gz");
-        let expected_zip = format!("agentsso-{target}.zip");
-        self.assets.iter().find(|a| a.name == expected_targz || a.name == expected_zip)
-    }
-
-    /// Find the matching minisig sidecar for a given primary asset.
-    /// Convention: `<asset>.minisig`.
-    pub(crate) fn minisig_for(&self, primary: &ReleaseAsset) -> Option<&ReleaseAsset> {
-        let expected_name = format!("{}.minisig", primary.name);
-        self.assets.iter().find(|a| a.name == expected_name)
+    /// Selection (UX-overhaul Story 3) drops releases whose tag does
+    /// not parse — otherwise the lexical fallback in
+    /// [`compare_versions`] mis-ranks (`rc.9` sorts after `rc.10`
+    /// lexically). A release we cannot semver-order is a release we
+    /// must not silently pick as "latest".
+    pub(crate) fn semver_version(&self) -> Option<semver::Version> {
+        semver::Version::parse(self.version()).ok()
     }
 }
 
@@ -190,8 +183,8 @@ fn default_headers(current_version: &str) -> Result<HeaderMap> {
     Ok(headers)
 }
 
-/// Fetch the latest release. 30s total timeout; see story file Task
-/// 2 for the rationale.
+/// Fetch + select the highest-semver published release. 30s total
+/// timeout.
 pub(crate) async fn fetch_latest_release(current_version: &str) -> Result<ReleaseInfo> {
     fetch_latest_release_with(current_version, &api_base_url()).await
 }
@@ -201,16 +194,18 @@ pub(crate) async fn fetch_latest_release_with(
     current_version: &str,
     base: &str,
 ) -> Result<ReleaseInfo> {
-    let url = format!("{base}{REPO_PATH}/releases/latest");
-    // **Review patch P14 (F16 — Blind + Edge):** limit redirect
-    // policy to a single hop. `api.github.com` does not redirect
-    // for `/releases/latest`; allowing arbitrary follow chains
-    // would let a compromised intermediary (or the env-var test
-    // seam in debug builds) chain through attacker-controlled
-    // hosts that serve forged release JSON. Signature verification
-    // is on the binary download (separate path), but the JSON
-    // metadata gets emitted into the audit log + check-summary
-    // verbatim — keeping it un-redirectable closes that hole.
+    // `per_page=100` is GitHub's max page size. The project has far
+    // fewer than 100 releases; if that ever changes, selection would
+    // miss older pages — but "the newest release is on page 1" holds
+    // for any project that releases monotonically, and we sort by
+    // semver within the page rather than trusting list order.
+    let url = format!("{base}{REPO_PATH}/releases?per_page=100");
+    // Single-hop redirect policy (was: review patch P14). The JSON
+    // metadata is emitted into operator-visible output verbatim, so
+    // keep it un-redirectable; an attacker who can MITM cannot chain
+    // through hosts serving forged release JSON. The integrity-
+    // critical path (Story 2's binary staging) is minisign-verified
+    // separately.
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(30))
         .redirect(reqwest::redirect::Policy::limited(1))
@@ -225,45 +220,43 @@ pub(crate) async fn fetch_latest_release_with(
         return Err(anyhow!("GitHub Releases API returned {status} for {url}"));
     }
 
-    // **Review patch P10 (F11 — Edge):** bound the JSON read.
-    // `response.json()` allocates the full body before parsing; a
-    // malicious or misbehaving server returning a 200 with a 2GB
-    // body would OOM the runner. GitHub's real `/releases/latest`
-    // response is tens of KB; 1MB is a 50× headroom that catches
-    // accidents but allows for unusually-verbose release notes.
-    const MAX_RELEASE_JSON_BYTES: usize = 1024 * 1024;
+    // Bound the JSON read (was: review patch P10). A full release
+    // list is larger than a single `/latest` object; 4MB is ~100
+    // releases of generously-sized notes and still rejects a
+    // multi-GB OOM attempt.
+    const MAX_RELEASE_JSON_BYTES: usize = 4 * 1024 * 1024;
     let body_bytes =
         response.bytes().await.with_context(|| format!("read body from {url} failed"))?;
     if body_bytes.len() > MAX_RELEASE_JSON_BYTES {
         return Err(anyhow!(
-            "GitHub /releases/latest body for {url} is {} bytes — exceeds {MAX_RELEASE_JSON_BYTES} byte cap",
+            "GitHub releases body for {url} is {} bytes — exceeds {MAX_RELEASE_JSON_BYTES} byte cap",
             body_bytes.len()
         ));
     }
-    let release: ReleaseInfo = serde_json::from_slice(&body_bytes)
-        .with_context(|| format!("could not deserialize GitHub Releases response from {url}"))?;
+    let releases: Vec<ReleaseInfo> = serde_json::from_slice(&body_bytes)
+        .with_context(|| format!("could not deserialize GitHub Releases list from {url}"))?;
 
-    if release.draft {
-        return Err(anyhow!(
-            "GitHub /releases/latest returned a draft release ({}) — refusing to consider",
-            release.tag_name
-        ));
-    }
-    // **Review patch P9 (F10 — Edge + Auditor):** explicitly
-    // refuse prereleases. The `/releases/latest` endpoint already
-    // filters them server-side, but if a future GitHub change OR
-    // a misconfigured asset stream surfaces one, the orchestrator
-    // would silently apply a pre-1.0 release as a stable upgrade.
-    // Operators opt into prereleases via the GitHub UI manually;
-    // `agentsso update` is for stable releases only.
-    if release.prerelease {
-        return Err(anyhow!(
-            "GitHub /releases/latest returned a prerelease ({}) — refusing to consider; \
-             stable releases only",
-            release.tag_name
-        ));
-    }
-    Ok(release)
+    select_latest(releases)
+        .ok_or_else(|| anyhow!("GitHub returned no usable (non-draft, semver-tagged) release"))
+}
+
+/// Pick the highest-[`semver::Version`] release among the non-draft
+/// entries whose tag parses as semver.
+///
+/// - `draft` releases are excluded (unpublished — not deliverable).
+/// - `prerelease` releases are KEPT (issue #58: this project ships
+///   only prereleases; excluding them was the bug).
+/// - Tags that fail `semver::Version::parse` are DROPPED before the
+///   max, not lexically ranked — `compare_versions`'s lexical
+///   fallback mis-orders (`rc.9 > rc.10` as strings); an
+///   unparseable tag must never win selection.
+pub(crate) fn select_latest(releases: Vec<ReleaseInfo>) -> Option<ReleaseInfo> {
+    releases
+        .into_iter()
+        .filter(|r| !r.draft)
+        .filter_map(|r| r.semver_version().map(|v| (v, r)))
+        .max_by(|(a, _), (b, _)| a.cmp(b))
+        .map(|(_, r)| r)
 }
 
 #[cfg(test)]
@@ -271,29 +264,70 @@ pub(crate) async fn fetch_latest_release_with(
 mod tests {
     use super::*;
 
+    /// Construct a `ReleaseInfo` with just the fields selection
+    /// cares about.
+    fn mk(tag: &str, draft: bool, prerelease: bool) -> ReleaseInfo {
+        ReleaseInfo { tag_name: tag.into(), name: None, published_at: None, draft, prerelease }
+    }
+
     #[test]
     fn version_strips_v_prefix() {
-        let release = ReleaseInfo {
-            tag_name: "v0.4.0".into(),
-            name: None,
-            body: None,
-            published_at: None,
-            draft: false,
-            prerelease: false,
-            assets: vec![],
-        };
-        assert_eq!(release.version(), "0.4.0");
+        assert_eq!(mk("v0.4.0", false, false).version(), "0.4.0");
+        assert_eq!(mk("0.4.0", false, false).version(), "0.4.0");
+    }
 
-        let no_prefix = ReleaseInfo {
-            tag_name: "0.4.0".into(),
-            name: None,
-            body: None,
-            published_at: None,
-            draft: false,
-            prerelease: false,
-            assets: vec![],
-        };
-        assert_eq!(no_prefix.version(), "0.4.0");
+    #[test]
+    fn select_latest_picks_highest_among_all_prereleases() {
+        // Issue #58: every permitlayer release is a prerelease.
+        // `/releases/latest` would 404; selection must still work
+        // and must pick rc.36 over rc.35/rc.34 (and NOT lexically
+        // rank rc.9 above rc.10).
+        let releases = vec![
+            mk("v0.3.0-rc.34", false, true),
+            mk("v0.3.0-rc.9", false, true),
+            mk("v0.3.0-rc.36", false, true),
+            mk("v0.3.0-rc.10", false, true),
+            mk("v0.3.0-rc.35", false, true),
+        ];
+        let picked = select_latest(releases).expect("a release is selectable");
+        assert_eq!(picked.tag_name, "v0.3.0-rc.36");
+    }
+
+    #[test]
+    fn select_latest_drops_unparseable_tags_not_lexically_ranks_them() {
+        // A garbage tag sorts lexically AFTER "0.3.0-rc.36" but is
+        // not a valid version — it must be dropped, not selected.
+        let releases = vec![mk("nightly-zzz", false, true), mk("v0.3.0-rc.36", false, true)];
+        let picked = select_latest(releases).expect("the valid release wins");
+        assert_eq!(picked.tag_name, "v0.3.0-rc.36");
+    }
+
+    #[test]
+    fn select_latest_excludes_draft_releases() {
+        // A draft with a higher version is unpublished — not
+        // deliverable. The highest *non-draft* wins.
+        let releases = vec![
+            mk("v0.4.0", true, false), // draft, higher
+            mk("v0.3.0-rc.36", false, true),
+        ];
+        let picked = select_latest(releases).expect("non-draft selected");
+        assert_eq!(picked.tag_name, "v0.3.0-rc.36");
+    }
+
+    #[test]
+    fn select_latest_returns_none_when_no_usable_release() {
+        // All draft or all unparseable → nothing to select.
+        let releases = vec![mk("v9.9.9", true, false), mk("not-semver", false, true)];
+        assert!(select_latest(releases).is_none());
+    }
+
+    #[test]
+    fn select_latest_prefers_stable_over_prerelease_at_same_base() {
+        // semver orders 0.3.0 > 0.3.0-rc.36 (a prerelease is LESS
+        // than its release). If a stable ever ships, it wins.
+        let releases = vec![mk("v0.3.0-rc.36", false, true), mk("v0.3.0", false, false)];
+        let picked = select_latest(releases).expect("stable wins");
+        assert_eq!(picked.tag_name, "v0.3.0");
     }
 
     #[test]
@@ -313,58 +347,6 @@ mod tests {
     }
 
     #[test]
-    fn asset_for_target_picks_archive_not_signature() {
-        let release = ReleaseInfo {
-            tag_name: "v0.4.0".into(),
-            name: None,
-            body: None,
-            published_at: None,
-            draft: false,
-            prerelease: false,
-            assets: vec![
-                ReleaseAsset {
-                    name: "agentsso-aarch64-apple-darwin.tar.gz".into(),
-                    browser_download_url: "https://example.invalid/a.tar.gz".into(),
-                    size: 12_345,
-                },
-                ReleaseAsset {
-                    name: "agentsso-aarch64-apple-darwin.tar.gz.minisig".into(),
-                    browser_download_url: "https://example.invalid/a.tar.gz.minisig".into(),
-                    size: 100,
-                },
-                ReleaseAsset {
-                    name: "agentsso-aarch64-apple-darwin.tar.gz.sha256".into(),
-                    browser_download_url: "https://example.invalid/a.tar.gz.sha256".into(),
-                    size: 64,
-                },
-            ],
-        };
-        let asset = release.asset_for_target("aarch64-apple-darwin").unwrap();
-        assert_eq!(asset.name, "agentsso-aarch64-apple-darwin.tar.gz");
-
-        let sig = release.minisig_for(asset).unwrap();
-        assert_eq!(sig.name, "agentsso-aarch64-apple-darwin.tar.gz.minisig");
-    }
-
-    #[test]
-    fn asset_for_target_returns_none_when_target_missing() {
-        let release = ReleaseInfo {
-            tag_name: "v0.4.0".into(),
-            name: None,
-            body: None,
-            published_at: None,
-            draft: false,
-            prerelease: false,
-            assets: vec![ReleaseAsset {
-                name: "agentsso-x86_64-pc-windows-msvc.zip".into(),
-                browser_download_url: "https://example.invalid/a.zip".into(),
-                size: 12_345,
-            }],
-        };
-        assert!(release.asset_for_target("aarch64-apple-darwin").is_none());
-    }
-
-    #[test]
     fn api_base_url_with_explicit_override() {
         // Use the explicit-parameter seam rather than `set_var` —
         // the daemon crate forbids unsafe code, and Rust 2024 made
@@ -381,10 +363,30 @@ mod tests {
     }
 
     #[test]
-    fn repo_path_matches_install_sh() {
-        // install/install.sh:17-18 hardcodes botsdown/permitlayer.
-        // If the project ever moves orgs, both this constant AND the
-        // install scripts must update in lockstep.
-        assert_eq!(REPO_PATH, "/repos/botsdown/permitlayer");
+    fn repo_path_matches_minisign_trusted_install_source() {
+        // Supply-chain pin (UX-overhaul Story 3): the drift-detector
+        // MUST query the SAME repo the curl|sh installer trusts.
+        // install.sh is the minisign-trusted source; if `REPO_PATH`
+        // and install.sh's REPO_OWNER/REPO_NAME diverge, the updater
+        // tells operators "you're behind" against a repo that isn't
+        // the one they actually install from. Read install.sh at
+        // compile time and assert the derived path equals REPO_PATH
+        // — not a hardcoded mirror string that could itself drift.
+        let install_sh = include_str!("../../../../../install/install.sh");
+        let owner = install_sh
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("REPO_OWNER="))
+            .map(|v| v.trim().trim_matches('"'))
+            .expect("install.sh defines REPO_OWNER");
+        let name = install_sh
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("REPO_NAME="))
+            .map(|v| v.trim().trim_matches('"'))
+            .expect("install.sh defines REPO_NAME");
+        assert_eq!(
+            REPO_PATH,
+            format!("/repos/{owner}/{name}"),
+            "drift-detector repo must match the minisign-trusted install source"
+        );
     }
 }

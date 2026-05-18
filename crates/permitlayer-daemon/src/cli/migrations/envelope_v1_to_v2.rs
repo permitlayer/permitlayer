@@ -6,7 +6,9 @@
 //! flipped writers to emit only v2. v1 envelopes still parse via the
 //! [`decode_envelope`][1] read-fallback path, but to avoid carrying
 //! that fallback forever this migration rewrites every v1 envelope to
-//! v2 with `key_id = 0` once during `agentsso update --apply`.
+//! v2 with `key_id = 0` once, on the first boot of a binary new
+//! enough to register it (triggered from `cli::start::run` — see the
+//! migrations module docs for the UX-overhaul re-host rationale).
 //!
 //! # Atomicity model: directory-rename backup
 //!
@@ -18,9 +20,11 @@
 //! v2" or "does not exist" — never partial.
 //!
 //! Backup lifecycle:
-//! 1. Acquire [`VaultLock`] FIRST (before the idempotency probe — two
-//!    concurrent `update --apply` processes must serialize on the
-//!    lock, not split-brain on the probe).
+//! 1. Acquire [`VaultLock`] FIRST (before the idempotency probe — a
+//!    concurrent vault writer must serialize on the lock, not
+//!    split-brain on the probe). The daemon boot path releases its
+//!    own boot-time vault lock *before* invoking the migration
+//!    (see `cli::start::run`), so this acquire never self-deadlocks.
 //! 2. Idempotency probe: if every `.sealed` is already v2, return Ok.
 //! 3. Pre-flight: refuse if vault path is a symlink or non-directory;
 //!    refuse if backup path exists as anything other than absent.
@@ -49,11 +53,12 @@
 //! # Forward-only
 //!
 //! There is no v2 → v1 reverse migration. Reversibility is provided
-//! by Story 7.5's binary-rename rollback: an old binary that reads
+//! by Story 2's versioned-symlink rollback: an old binary that reads
 //! v2 envelopes fails closed with `StoreError::UnsupportedVersion`,
-//! and the orchestrator re-runs the old binary on the post-rollback
-//! vault — but the vault contents are still v2, so the operator must
-//! also restore the backup manually if they truly want to downgrade.
+//! and `setup` re-points the symlink at the prior binary on the
+//! post-rollback vault — but the vault contents are still v2, so the
+//! operator must also restore the backup manually if they truly want
+//! to downgrade.
 //!
 //! [1]: permitlayer_core::store::fs::credential_fs::decode_envelope
 
@@ -128,8 +133,9 @@ impl Migration for EnvelopeV1ToV2 {
             }
         }
 
-        // Step 2: acquire the vault lock. Two concurrent
-        // `update --apply` processes must serialize on the kernel
+        // Step 2: acquire the vault lock. A concurrent vault writer
+        // (a second booting daemon, operator tooling) must serialize
+        // with this migration on the kernel
         // lock so the idempotency probe + rename + rewrite sequence
         // can't interleave.
         let _lock = VaultLock::try_acquire(home).map_err(|e| match e {
@@ -151,8 +157,8 @@ impl Migration for EnvelopeV1ToV2 {
 
         // Step 3 (AC #9.1): idempotency probe. If every `.sealed`
         // file is already v2, return Ok(()) without touching
-        // anything. Runs UNDER the lock so concurrent
-        // `update --apply` processes serialize correctly.
+        // anything. Runs UNDER the lock so a concurrent vault writer
+        // serializes correctly.
         if vault_is_pure_v2(&vault_dir).map_err(|e| MigrationError::Io {
             id: MIGRATION_ID,
             ctx: "probe vault for v2 envelopes",

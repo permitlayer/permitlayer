@@ -2,15 +2,16 @@
 //! migration.
 //!
 //! The migration itself is unit-tested in
-//! `cli::update::migrations::envelope_v1_to_v2::tests`
+//! `cli::migrations::envelope_v1_to_v2::tests`
 //! (cryptographic round-trip via `Vault::seal` → manual v1 splice →
 //! `EnvelopeV1ToV2.apply` → `Vault::unseal`). This integration test
-//! complements that by verifying the **production daemon-boot path**
-//! tolerates a vault containing v1 envelopes (the
-//! `decode_envelope` v1 read-fallback) without the migration having
-//! run yet — the cross-boot grace window is what keeps the v0.3 →
-//! v0.4 upgrade safe even if a user runs the new binary BEFORE
-//! `agentsso update --apply`.
+//! complements that by verifying the **production daemon-boot path**:
+//! UX-overhaul Story 3 re-hosted the migration trigger onto
+//! `cli::start::run` (`cli::migrations::apply_pending`), so a daemon
+//! booting a v1 vault now migrates it to v2 BEFORE serving — this
+//! test pins that the boot path actually runs the migration (and
+//! that the `decode_envelope` v1 read-fallback still keeps a v1
+//! vault safe up to the moment the migration completes).
 //!
 //! Spec reference: `_bmad-output/implementation-artifacts/
 //! 7-6a-vault-lock-and-envelope-v2.md` line 151-152 ("integration
@@ -20,17 +21,17 @@
 //!
 //! ## What this exercises (and what it doesn't)
 //!
-//! - **Exercises**: `compute_active_key_id` returning `0` for a v1
-//!   envelope on disk; `try_build_proxy_service`'s `.sealed`-walk
-//!   detecting the credential and proceeding past the 501-stub
-//!   branch; the daemon boot completing without panic.
-//! - **Does NOT exercise**: the `agentsso update --apply` orchestrator
-//!   itself (which would require mocking GitHub Releases API + signing
-//!   a fake binary asset). The orchestrator's wiring to
-//!   `apply_pending` is verified by `migrations::tests::
-//!   production_registry_contains_envelope_v1_to_v2` and the
-//!   migration's own tests; the `run_apply` outer flow is covered by
-//!   `update_e2e.rs`.
+//! - **Exercises**: the boot-time `cli::migrations::apply_pending`
+//!   trigger actually rewriting a v1 vault to v2 (post-Story-3
+//!   re-host); `compute_active_key_id` returning `0` for a v1
+//!   envelope; `try_build_proxy_service`'s `.sealed`-walk detecting
+//!   the credential and proceeding past the 501-stub branch; clean
+//!   boot (no panic, no `UnsupportedVersion`).
+//! - **Does NOT exercise**: `agentsso update` (now a read-only drift
+//!   detector — no migration trigger lives there anymore; covered by
+//!   `update_e2e.rs`). The registry wiring is also verified by
+//!   `migrations::tests::production_registry_contains_envelope_v1_to_v2`
+//!   and the migration's own unit tests.
 
 // All top-level imports are used only by the cfg(not(windows))
 // helpers below; the surviving cross-platform test
@@ -129,18 +130,21 @@ fn stop_and_collect(mut child: Child) -> String {
     stderr
 }
 
-/// AC #6 + #12 (read-side only): the daemon boots cleanly against a
-/// vault containing a v1 envelope. `decode_envelope` synthesizes
-/// `key_id = 0` for v1, `compute_active_key_id` returns 0, and
-/// `try_build_proxy_service` detects the `.sealed` file and proceeds
-/// past the 501-stub branch.
+/// AC #6 + #12 + UX-overhaul Story 3 re-host: the daemon boots
+/// cleanly against a vault containing a v1 envelope AND migrates it
+/// to v2 on disk during boot.
 ///
-/// **Why this matters**: a user who upgrades the binary (v0.3 →
-/// v0.4) but has not yet run `agentsso update --apply` will have a
-/// vault full of v1 envelopes when the new daemon boots. Without the
-/// v1 read-fallback, the daemon would refuse to read those envelopes
-/// at first request — making the upgrade non-atomic (binary
-/// upgraded, data not). This test pins down the grace window.
+/// **Behavior change (UX-overhaul Story 3):** the v1→v2 migration
+/// trigger moved from the deleted `agentsso update --apply`
+/// orchestrator onto the daemon boot path (`cli::start::run` →
+/// `cli::migrations::apply_pending`). So a daemon booting against a
+/// v1 vault no longer merely tolerates v1 via the read-fallback — it
+/// rewrites every `.sealed` to v2 before serving the first request,
+/// and cleans up the `vault.pre-v2-backup/` on success. This test
+/// pins that down: boot completes, the on-disk envelope is now v2,
+/// and the backup directory is gone (proves `apply_pending` ran at
+/// boot, not lazily). The read-fallback still exists as
+/// defense-in-depth but is no longer the steady state.
 ///
 /// Cfg-gated to `not(windows)`: the test routes through
 /// `AGENTSSO_TEST_PASSPHRASE` which exercises `PassphraseKeyStore`'s
@@ -157,7 +161,11 @@ fn daemon_boots_cleanly_with_v1_envelope_in_vault() {
     std::fs::create_dir_all(home.path().join("config")).unwrap();
 
     // Seed a v1 envelope into the vault BEFORE the daemon boots.
-    write_v1_envelope_fixture(&home.path().join("vault"), "gmail", b"fake-token-v1");
+    let vault_dir = home.path().join("vault");
+    write_v1_envelope_fixture(&vault_dir, "gmail", b"fake-token-v1");
+    // Pre-condition: the on-disk envelope really is v1.
+    let before = std::fs::read(vault_dir.join("gmail.sealed")).unwrap();
+    assert_eq!(u16::from_le_bytes([before[0], before[1]]), 1, "fixture must seed a v1 envelope");
 
     let (child, port) = spawn_daemon_hermetic(
         home.path(),
@@ -169,16 +177,15 @@ fn daemon_boots_cleanly_with_v1_envelope_in_vault() {
         ],
     );
 
-    // Boot must complete within 10s — the v1 envelope on disk is
-    // not in the boot critical path; it's read lazily by the proxy
-    // when the first request lands.
+    // Boot must complete — the boot-time migration runs before the
+    // TCP bind, so a daemon that reached "ready" has already
+    // finished `apply_pending`.
     wait_for_daemon_ready(port, Duration::from_secs(60));
 
-    // Daemon is up; that's the assertion. Stop and collect.
+    // Daemon is up. Stop and collect.
     let stderr = stop_and_collect(child);
 
-    // Sanity: no panic, no UnsupportedVersion error in the boot
-    // log. (The v1 → v2 fallback is supposed to be silent.)
+    // Sanity: no panic, no UnsupportedVersion error during boot.
     assert!(
         !stderr.contains("UnsupportedVersion"),
         "v1 envelope on disk produced an UnsupportedVersion error during boot:\n{stderr}"
@@ -186,6 +193,21 @@ fn daemon_boots_cleanly_with_v1_envelope_in_vault() {
     assert!(
         !stderr.to_lowercase().contains("panic"),
         "daemon panicked while booting against a v1 vault:\n{stderr}"
+    );
+
+    // UX-overhaul Story 3: the boot-time migration must have
+    // rewritten the v1 envelope to v2 in place...
+    let after = std::fs::read(vault_dir.join("gmail.sealed")).unwrap();
+    assert_eq!(
+        u16::from_le_bytes([after[0], after[1]]),
+        2,
+        "boot-time migration must have rewritten the v1 envelope to v2;\nstderr:\n{stderr}"
+    );
+    // ...and cleaned up the backup on success (proves the migration
+    // ran to completion at boot, not a partial/abandoned attempt).
+    assert!(
+        !home.path().join("vault.pre-v2-backup").exists(),
+        "successful boot migration must remove vault.pre-v2-backup;\nstderr:\n{stderr}"
     );
 }
 

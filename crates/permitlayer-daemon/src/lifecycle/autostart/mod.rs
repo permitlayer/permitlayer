@@ -317,6 +317,13 @@ fn run_with_timeout(
 /// at this boundary so the failure mode is "your daemon path
 /// contains illegal characters" rather than "schtasks failed with
 /// cryptic error."
+//
+// macOS-conditional dead: on macOS the only callers are inside the
+// orphaned `macos::enable` path (see [`current_daemon_path`] note);
+// Linux/Windows `enable_with` still call it. `disable`/`status` —
+// the live macOS surface — don't write or render, so they don't use
+// this. Story 4 (`doctor`) owns the macOS-autostart disposition.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn require_utf8_path(p: &Path) -> std::io::Result<&str> {
     let s = p.to_str().ok_or_else(|| {
         std::io::Error::other(format!(
@@ -374,6 +381,19 @@ pub(crate) fn require_utf8_path(p: &Path) -> std::io::Result<&str> {
 ///   drift risk that Story 7.5's `agentsso update` is designed to
 ///   detect via [`AutostartStatus::Enabled::daemon_path`] vs runtime
 ///   `current_exe()` comparison.
+//
+// UX-overhaul epic: on macOS the user-LaunchAgent `enable` path
+// (the only macOS caller of `current_daemon_path`) lost its sole
+// invoker when `update --apply`'s autostart-path-drift rewrite was
+// deleted (Story 3). macOS now installs via the privileged root
+// LaunchDaemon (`install_macos.rs`, Story 2 `setup`), not this
+// user-LaunchAgent path — so this is *architecturally* unreachable
+// on macOS while remaining live on Linux/Windows backends (which
+// still call it from their `enable_with`). The macOS-conditional
+// allow expresses exactly that; Story 4 (`doctor`) owns deciding
+// what, if anything, of the macOS autostart surface `doctor` reuses
+// for its stale-registration / symlink-integrity checks.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn current_daemon_path() -> std::io::Result<PathBuf> {
     #[cfg(target_os = "linux")]
     {
@@ -412,9 +432,13 @@ pub fn current_daemon_path() -> std::io::Result<PathBuf> {
 }
 
 /// Enable autostart on the host platform. See module docs for the
-/// per-platform mechanism. OPT-IN: this is only invoked when the user
-/// explicitly opts in via `agentsso autostart enable` or the setup
-/// wizard prompt (which defaults to no).
+/// per-platform mechanism. OPT-IN.
+///
+/// macOS-orphaned (see [`current_daemon_path`] note): the macOS
+/// caller was `update --apply`'s autostart rewrite, deleted in the
+/// UX-overhaul epic. Live on Linux/Windows. Story 4 (`doctor`) owns
+/// the macOS-autostart-surface disposition.
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub fn enable() -> Result<EnableOutcome, AutostartError> {
     let exec = RealExec;
     let home = home_dir()?;
@@ -438,6 +462,9 @@ pub fn status() -> Result<AutostartStatus, AutostartError> {
 
 /// Outcome of a successful [`enable`] — surfaces side effects the CLI
 /// reports to the operator (e.g., "removed Story 7.2 .lnk" migrations).
+///
+/// macOS-orphaned with [`enable`] (see [`current_daemon_path`] note).
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnableOutcome {
     /// Autostart was registered. `mechanism` is the platform-native
@@ -476,7 +503,11 @@ pub enum DisableOutcome {
 // tests can wire a mock; the public free functions above pass
 // [`RealExec`].
 
+// macOS-orphaned with [`enable`] (see [`current_daemon_path`] note):
+// the macOS user-LaunchAgent enable path lost its only caller when
+// `update --apply` was deleted. Linux/Windows `enable_with` stay live.
 #[cfg(target_os = "macos")]
+#[allow(dead_code)]
 pub(crate) fn enable_with(
     exec: &impl Engine,
     home: &Path,
@@ -687,6 +718,13 @@ fn utf8_char_len(b: u8) -> usize {
 /// - On any error after the temp file is created, we explicitly remove
 ///   it so we don't orphan partial content (rendered plist / unit / Task
 ///   XML) on disk.
+//
+// macOS-conditional dead in the binary: macOS callers are all inside
+// the orphaned `macos::enable` path (see [`current_daemon_path`]
+// note); Linux/Windows backends still write their unit/Task XML
+// through this. Still exercised by this module's own tests on every
+// platform (so the helper is verified, not untested dead weight).
+#[cfg_attr(target_os = "macos", allow(dead_code))]
 pub(crate) fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     use std::io::Write as _;
     if let Some(parent) = path.parent() {

@@ -1,33 +1,38 @@
-//! Schema-migration framework for `agentsso update --apply`.
+//! On-disk schema-migration framework.
 //!
-//! At MVP the registry is intentionally empty: there are no schema
-//! bumps shipped today, but Story 7.5 commits to "migration scripts
-//! run automatically (stored inside the binary) and are tested +
-//! reversible" per epic AC #3 (epics.md:1910-1914). Shipping the
-//! framework now (rather than punting to a follow-up story) lets
-//! the first real schema bump — most likely a future
-//! [`SEALED_CREDENTIAL_VERSION`][1] increment for Story 7.6
-//! (rotate-key) or a future `AUDIT_SCHEMA_VERSION` bump for a
-//! breaking audit field change — slot in by appending one entry to
-//! [`registry`].
+//! **UX-overhaul epic (Story 3) re-host:** this framework was
+//! previously triggered from the deleted `agentsso update --apply`
+//! orchestrator. `agentsso update` is now a drift detector that
+//! performs no filesystem mutation. On-disk schema migration belongs
+//! on the daemon boot path — where the daemon, before serving any
+//! request, brings the persistent vault/credential schema up to the
+//! version the running binary understands. The trigger now lives in
+//! `cli::start::run` (see the `migrations::apply_pending` call after
+//! the boot-time vault-lock release, before the TCP bind).
 //!
-//! # Reversibility (per epic AC #3)
+//! The registry ships the first real migration today
+//! ([`envelope_v1_to_v2`]); a future [`SEALED_CREDENTIAL_VERSION`][1]
+//! increment or an `AUDIT_SCHEMA_VERSION` bump slots in by appending
+//! one entry to [`registry`].
 //!
-//! Migrations are forward-only at MVP. Reversibility is provided by
-//! Story 7.5's atomic-swap rollback path
-//! ([`super::swap::UpdateOrchestrator::rollback`]): on migration
-//! failure the orchestrator renames `<bin>.old` → `<bin>` and
-//! restarts the daemon on the old binary, which still understands
-//! the pre-migration on-disk schema. The "tested + reversible"
-//! requirement is satisfied by the empty-registry no-op smoke test
-//! plus integration coverage of the rollback path itself.
+//! # Reversibility
+//!
+//! Migrations are forward-only. Reversibility is provided by Story
+//! 2's versioned-symlink rollback: a failed upgrade re-points the
+//! `<helper-dir>/agentsso` symlink at the prior versioned binary and
+//! re-bootstraps it; the old binary still understands the
+//! pre-migration on-disk schema because [`apply_pending`] is invoked
+//! only by the *new* binary's boot path and is contractually
+//! idempotent (a migration that has already run is a no-op). If the
+//! new binary's first boot fails the migration, it refuses to serve
+//! (fail-closed) and `setup` rolls the symlink back.
 //!
 //! # Audit emission
 //!
-//! [`apply_pending`] returns a [`MigrationOutcome`] that the caller
-//! emits as the `update-migrations-checked` audit event (see
-//! [`super::audit_event_extras::migrations_checked`]). The
-//! `migrations_applied` field is `0` when the registry is empty.
+//! [`apply_pending`] returns a [`MigrationOutcome`] that the boot
+//! path emits as the `daemon-migrations-applied` audit event. The
+//! `migrations_applied` field is `0` when the registry has no
+//! pending work.
 //!
 //! [1]: permitlayer_credential::SEALED_CREDENTIAL_VERSION
 
@@ -109,8 +114,11 @@ impl MigrationOutcome {
     }
 }
 
-/// Errors that abort the update flow. Story 7.5's apply orchestrator
-/// catches these and triggers the binary-rename rollback path.
+/// Errors that abort the migration. The daemon boot path
+/// (`cli::start::run`) propagates these as a fail-closed
+/// `StartError` — the daemon refuses to serve a half-migrated
+/// vault, and Story 2's `setup` rolls the versioned symlink back to
+/// the prior binary.
 #[derive(Debug, Error)]
 #[allow(dead_code)] // Only `Custom` is constructed in tests today.
 pub(crate) enum MigrationError {
@@ -161,18 +169,21 @@ fn registry() -> Vec<Box<dyn Migration>> {
 
 /// Run any pending migrations.
 ///
-/// `from_version` and `to_version` are the running-binary version
-/// (`env!("CARGO_PKG_VERSION")`) and the target release version. They
-/// are stored on the audit event for forensic correlation; they do
-/// NOT gate which migrations run today (the framework is forward-
+/// `from_version`/`to_version` are forensic-correlation labels only;
+/// they do NOT gate which migrations run (the framework is forward-
 /// linear and idempotent — every registered migration's `apply` is
 /// invoked, and each migration decides for itself whether it has
-/// already run).
+/// already run). The daemon boot path passes
+/// `env!("CARGO_PKG_VERSION")` for both (the running binary is the
+/// only version in play — there is no separate "target release"
+/// since the apply/swap flow was deleted in the UX-overhaul epic).
 ///
 /// # Errors
 ///
-/// Returns the first migration that fails. The orchestrator MUST
-/// roll back the binary swap on `Err`.
+/// Returns the first migration that fails. The daemon boot path
+/// (`cli::start::run`) MUST treat `Err` as fail-closed — refuse to
+/// serve (via `StartError::SchemaMigrationFailed`) rather than run
+/// against a half-migrated vault.
 pub(crate) async fn apply_pending(
     home: &Path,
     _from_version: &str,
@@ -198,15 +209,15 @@ pub(crate) async fn apply_pending_with(
         // **Review patch P2 (F2 — Blind + Edge):** wrap the
         // migration's `apply` in `std::panic::catch_unwind` so a
         // panicking migration produces a `MigrationError::Custom`
-        // and the caller can roll back the binary swap.
+        // the boot path can surface as a fail-closed `StartError`.
         //
         // Without `catch_unwind`, a `migration.apply()` panic
         // would unwind through `apply_pending`'s future, propagate
-        // to `cli::update::run_apply`'s `?`, and bypass the
-        // rollback path entirely — leaving the daemon stopped,
-        // the new binary swapped in, and no rollback. This is
-        // exactly the failure mode the migration framework is
-        // supposed to prevent.
+        // to `cli::start::run`'s `?`, and bypass the structured
+        // refuse-to-serve path entirely — the daemon would crash
+        // mid-boot with a raw panic instead of a clean exit + an
+        // operator-facing diagnostic. This is exactly the failure
+        // mode the migration framework is supposed to prevent.
         //
         // `AssertUnwindSafe` is required because trait objects
         // aren't `UnwindSafe` by default. Migrations are pure
