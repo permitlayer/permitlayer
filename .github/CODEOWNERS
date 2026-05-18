@@ -23,6 +23,20 @@
 /Cargo.toml                         @botsdown
 /rust-toolchain.toml                @botsdown
 
+# Shipped policy seeds — the product's default security posture.
+#
+# UX-overhaul Story 1: `cli/default_policy.toml` is the bundle every
+# install runs (rewritten into `policies-managed/` on every daemon
+# boot via `sync_managed_policies`); the test fixture must stay
+# byte-equivalent to it (`epic9_bundled_and_fixture_policy_sets_are_identical`).
+# A change here changes the security posture of EVERY install. The
+# `bundled_seed_has_no_auto_approve_with_write_scope` CI invariant
+# blocks an autonomous-write policy from shipping (the `angie-*`
+# incident class), but a reviewer must still vet any scope/approval
+# change — this gate forces that human review.
+/crates/permitlayer-daemon/src/cli/default_policy.toml   @botsdown
+/test-fixtures/policies/default.toml                     @botsdown
+
 # `.github/` — protect CODEOWNERS itself, CI workflows, and repo governance.
 # A PR that could weaken review requirements must itself be reviewed.
 /.github/                           @botsdown

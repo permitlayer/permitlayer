@@ -441,7 +441,22 @@ pub(crate) fn reload_policies_with_diff_locked(
     reload_mutex: &Mutex<()>,
 ) -> Result<PolicySetDiff, PolicyCompileError> {
     let _guard = reload_mutex.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    let new_set = PolicySet::compile_from_dir(dir)?;
+    // UX-overhaul Story 1: reload MUST use the two-layer compile, not
+    // a single-dir compile of the operator layer. Reloading only the
+    // operator layer would (a) drop every managed/product policy on
+    // SIGHUP/HTTP-reload (the proxy would fall to all-deny), and (b)
+    // skip the fail-closed cross-layer override check, letting an
+    // unmarked operator collision slip in post-boot that boot itself
+    // would have rejected. `dir` is the operator `policies/`; the
+    // managed layer is its tested sibling `policies-managed/`.
+    //
+    // The managed layer is rewritten only at daemon `start`
+    // (`sync_managed_policies`), NOT on reload — a hot reload is for
+    // operator-policy changes; product content is immutable for the
+    // life of the process. We re-read it (read-only) so the merged
+    // set stays whole.
+    let managed_dir = permitlayer_core::paths::managed_policies_dir_for_operator(dir);
+    let new_set = PolicySet::compile_from_layers(managed_dir.as_deref(), dir)?;
     let diff = new_set.diff(&policy_set.load());
     policy_set.store(Arc::new(new_set));
     Ok(diff)

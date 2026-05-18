@@ -60,8 +60,29 @@ pub struct PolicySet {
     /// Map from policy name → the file path it was compiled from.
     /// Populated by `compile_from_dir` and `compile_from_str` so the
     /// control plane can answer `policy list` with real source paths.
-    /// Story 7.34 AC #3.
+    /// Story 7.34 AC #3. For an accepted cross-layer override the
+    /// origin is the **operator** file (the winning definition), so
+    /// reload/diff/`policy list` stay correct.
     origins: HashMap<String, PathBuf>,
+    /// UX-overhaul Story 1: accepted operator overrides of managed
+    /// (product) policies, in deterministic (sorted) order. Each is a
+    /// policy where an operator file carried an explicit
+    /// `override = "<name>"` marker matching a managed policy of the
+    /// same name. The daemon emits a `policy.operator_override` audit
+    /// event per entry and `doctor` surfaces them. Empty for the
+    /// single-layer `compile_from_dir`/`compile_from_str` paths.
+    accepted_overrides: Vec<OverrideRecord>,
+}
+
+/// One accepted cross-layer operator override (UX-overhaul Story 1).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OverrideRecord {
+    /// The policy name the operator intentionally shadowed.
+    pub name: String,
+    /// The managed (product) file whose policy was shadowed.
+    pub managed_path: PathBuf,
+    /// The operator file that won (the active definition).
+    pub operator_path: PathBuf,
 }
 
 /// One policy in the compiled IR.
@@ -138,6 +159,11 @@ impl CompiledPolicy {
             approval_mode: self.approval_mode.into(),
             rules,
             auto_approve_reads: self.auto_approve_reads,
+            // The override marker is an operator-file authoring
+            // concern consumed at compile time; the resolved
+            // in-memory policy carries no marker (round-tripping a
+            // compiled policy must not re-emit `override`).
+            r#override: None,
         }
     }
 }
@@ -296,6 +322,15 @@ impl PolicySet {
         self.origins.get(name)
     }
 
+    /// Accepted operator overrides of managed policies (UX-overhaul
+    /// Story 1), deterministically ordered by policy name. The daemon
+    /// emits one `policy.operator_override` audit event per entry and
+    /// `doctor` surfaces them. Empty for single-layer compiles.
+    #[must_use]
+    pub fn accepted_overrides(&self) -> &[OverrideRecord] {
+        &self.accepted_overrides
+    }
+
     /// Compile every `*.toml` file in `dir` into a single `PolicySet`.
     ///
     /// Files are processed in alphabetical order so error output is
@@ -315,59 +350,158 @@ impl PolicySet {
     /// Returns the first compile error encountered. Subsequent files
     /// are not processed — fail-fast is the point.
     pub fn compile_from_dir(dir: &Path) -> Result<Self, PolicyCompileError> {
-        if dir.exists() && !dir.is_dir() {
-            return Err(PolicyCompileError::NotADirectory { path: dir.to_path_buf() });
-        }
-        let entries = std::fs::read_dir(dir)
-            .map_err(|source| PolicyCompileError::Io { path: dir.to_path_buf(), source })?;
+        // Single-layer compile = the operator layer with no managed
+        // layer. Preserves every historical caller/test verbatim
+        // (intra-dir duplicate name still fatal; no override marker
+        // is meaningful without a managed layer to override).
+        Self::compile_from_layers(None, dir)
+    }
 
-        let mut toml_files: Vec<PathBuf> = Vec::new();
-        for entry in entries {
-            let entry = entry
-                .map_err(|source| PolicyCompileError::Io { path: dir.to_path_buf(), source })?;
-            let path = entry.path();
-            if !is_candidate_policy_file(&path) {
-                continue;
-            }
-            toml_files.push(path);
-        }
-        toml_files.sort();
-
+    /// UX-overhaul Story 1: the new compile core. Compile a **managed
+    /// (product)** layer and an **operator** layer into one set with
+    /// fail-closed cross-layer rules.
+    ///
+    /// - `managed_dir`: the shipped/bundled product layer
+    ///   (`policies-managed/`). `None` ⇒ single-layer mode (used by
+    ///   [`compile_from_dir`]); the managed set is empty.
+    /// - `operator_dir`: the operator-authored layer (`policies/`).
+    ///
+    /// Rules (all fail-closed — the prior draft's "log INFO and
+    /// shadow" was rejected by security review):
+    /// - Intra-layer duplicate policy name (within one dir) is
+    ///   **fatal** (`DuplicatePolicyName`), unchanged from before.
+    /// - A managed policy carrying an `override` marker is **fatal**
+    ///   (`OverrideMarkerInManagedLayer`) — the product never
+    ///   overrides.
+    /// - An operator policy whose `name` also exists in the managed
+    ///   layer is accepted **only** if it carries
+    ///   `override = "<its own name>"`; the operator definition then
+    ///   wins and an [`OverrideRecord`] is recorded. An unmarked
+    ///   same-name collision is **fatal**
+    ///   (`UnmarkedCrossLayerOverride`).
+    /// - An operator policy carrying `override = "<x>"` where `<x>`
+    ///   is not the policy's own name OR no managed policy named
+    ///   `<x>` exists is **fatal** (`DanglingOverrideMarker`).
+    /// - A non-colliding operator policy is added as-is.
+    ///
+    /// `origins` records the **winning** file (operator path for an
+    /// accepted override) so reload/diff/`policy list`/Story-4
+    /// reporting stay correct.
+    ///
+    /// # Errors
+    ///
+    /// First compile or layering-rule violation encountered.
+    pub fn compile_from_layers(
+        managed_dir: Option<&Path>,
+        operator_dir: &Path,
+    ) -> Result<Self, PolicyCompileError> {
         let mut set = Self::default();
         let mut origin_for_name: HashMap<String, PathBuf> = HashMap::new();
 
-        for path in &toml_files {
-            let text = std::fs::read_to_string(path)
-                .map_err(|source| PolicyCompileError::Io { path: path.clone(), source })?;
-            if text.starts_with('\u{feff}') {
-                return Err(PolicyCompileError::BomDetected { path: path.clone() });
-            }
-            let parsed = parse_file(&text, path)?;
-            if parsed.policies.is_empty() {
-                return Err(PolicyCompileError::EmptyPoliciesArray { path: path.clone() });
-            }
-            let mut seen_in_file: HashSet<String> = HashSet::new();
-            for raw in parsed.policies {
-                if !seen_in_file.insert(raw.name.clone()) {
-                    return Err(PolicyCompileError::DuplicatePolicyNameInFile {
+        // ── Managed layer ───────────────────────────────────────────
+        // Compiled first so it's the baseline the operator layer
+        // overrides. A managed policy that carries an `override`
+        // marker is a build-time bug → fatal.
+        if let Some(md) = managed_dir {
+            for (path, raw) in read_layer_policies_optional(md)? {
+                if raw.r#override.is_some() {
+                    return Err(PolicyCompileError::OverrideMarkerInManagedLayer {
                         name: raw.name,
-                        path: path.clone(),
+                        managed_path: path,
                     });
                 }
                 if let Some(first) = origin_for_name.get(&raw.name) {
                     return Err(PolicyCompileError::DuplicatePolicyName {
                         name: raw.name,
                         first: first.clone(),
-                        second: path.clone(),
+                        second: path,
                     });
                 }
-                let compiled = compile_one(raw, path)?;
+                let compiled = compile_one(raw, &path)?;
                 origin_for_name.insert(compiled.name.clone(), path.clone());
                 set.policies.insert(compiled.name.clone(), compiled);
             }
         }
+        // Snapshot the managed names so operator-layer collision
+        // checks reference the product layer specifically (not other
+        // operator files).
+        let managed_names: HashMap<String, PathBuf> = origin_for_name.clone();
 
+        // ── Operator layer ──────────────────────────────────────────
+        let mut overrides: Vec<OverrideRecord> = Vec::new();
+        let mut operator_seen: HashSet<String> = HashSet::new();
+        for (path, raw) in read_layer_policies(operator_dir)? {
+            // Intra-operator-layer duplicate (across operator files)
+            // stays fatal — unchanged invariant.
+            if !operator_seen.insert(raw.name.clone()) {
+                let first = origin_for_name.get(&raw.name).cloned().unwrap_or_else(|| path.clone());
+                return Err(PolicyCompileError::DuplicatePolicyName {
+                    name: raw.name,
+                    first,
+                    second: path,
+                });
+            }
+
+            let managed_hit = managed_names.get(&raw.name).cloned();
+            match (&raw.r#override, managed_hit) {
+                // Operator policy collides with a managed policy.
+                (Some(marker), Some(managed_path)) => {
+                    // Marker MUST equal the policy's own name (an
+                    // override targets itself across the layer).
+                    if marker != &raw.name {
+                        return Err(PolicyCompileError::DanglingOverrideMarker {
+                            name: raw.name.clone(),
+                            target: marker.clone(),
+                            operator_path: path,
+                        });
+                    }
+                    // Accepted override: operator definition wins.
+                    overrides.push(OverrideRecord {
+                        name: raw.name.clone(),
+                        managed_path,
+                        operator_path: path.clone(),
+                    });
+                    let compiled = compile_one(raw, &path)?;
+                    origin_for_name.insert(compiled.name.clone(), path.clone());
+                    set.policies.insert(compiled.name.clone(), compiled);
+                }
+                // Operator policy collides with managed BUT no marker
+                // → fail-closed (no silent shadow).
+                (None, Some(managed_path)) => {
+                    return Err(PolicyCompileError::UnmarkedCrossLayerOverride {
+                        name: raw.name,
+                        operator_path: path,
+                        managed_path,
+                    });
+                }
+                // Marker present but nothing in the managed layer to
+                // override (or marker != own name) → dangling.
+                (Some(marker), None) => {
+                    return Err(PolicyCompileError::DanglingOverrideMarker {
+                        name: raw.name.clone(),
+                        target: marker.clone(),
+                        operator_path: path,
+                    });
+                }
+                // Plain operator policy, no collision.
+                (None, None) => {
+                    if let Some(first) = origin_for_name.get(&raw.name) {
+                        return Err(PolicyCompileError::DuplicatePolicyName {
+                            name: raw.name,
+                            first: first.clone(),
+                            second: path,
+                        });
+                    }
+                    let compiled = compile_one(raw, &path)?;
+                    origin_for_name.insert(compiled.name.clone(), path.clone());
+                    set.policies.insert(compiled.name.clone(), compiled);
+                }
+            }
+        }
+
+        overrides.sort_by(|a, b| a.name.cmp(&b.name));
         set.origins = origin_for_name;
+        set.accepted_overrides = overrides;
         Ok(set)
     }
 
@@ -549,6 +683,103 @@ pub(crate) fn is_candidate_policy_file(path: &Path) -> bool {
         return false;
     };
     ext.eq_ignore_ascii_case("toml")
+}
+
+/// Read + parse every candidate policy file in one layer directory,
+/// returning `(file_path, policy)` pairs in deterministic
+/// (file-sorted, then in-file declaration) order.
+///
+/// Performs the per-file invariants that are layer-independent:
+/// directory-exists/is-a-dir, dotfile/lockfile skipping, BOM
+/// rejection, empty-`[[policies]]` rejection, and **intra-file**
+/// duplicate-name rejection. Cross-file and cross-layer name
+/// semantics are the caller's ([`PolicySet::compile_from_layers`])
+/// responsibility — that's where the managed/operator override
+/// rules live.
+///
+/// **Strict** directory contract, **unchanged from the historical
+/// `compile_from_dir`**: a path that exists but is not a directory
+/// is `NotADirectory`; a missing/unreadable directory surfaces as
+/// `Io`. This preserves the
+/// `compile_from_dir_reports_io_error_for_missing_dir` contract —
+/// `compile_from_dir` (public API) and the **operator** layer use
+/// this strict form: a missing operator `policies/` is a real
+/// misconfiguration the daemon should not paper over.
+///
+/// The **managed** layer uses [`read_layer_policies_optional`]
+/// instead: a `Some(managed_dir)` that does not yet exist on disk
+/// is the legitimate "no product bundle synced yet" state — it
+/// occurs on a control-plane reload before the first
+/// `sync_managed_policies` and in router unit tests that construct
+/// the handler without a full daemon boot. Treating that as `Io`
+/// (the bug that surfaced 8 control-plane test failures) is wrong;
+/// an absent managed layer is simply an empty managed layer. A
+/// managed path that exists-but-is-broken (not a dir, unreadable)
+/// is still a hard error there.
+fn read_layer_policies(
+    dir: &Path,
+) -> Result<Vec<(PathBuf, crate::policy::schema::TomlPolicy)>, PolicyCompileError> {
+    if dir.exists() && !dir.is_dir() {
+        return Err(PolicyCompileError::NotADirectory { path: dir.to_path_buf() });
+    }
+    let entries = std::fs::read_dir(dir)
+        .map_err(|source| PolicyCompileError::Io { path: dir.to_path_buf(), source })?;
+
+    let mut toml_files: Vec<PathBuf> = Vec::new();
+    for entry in entries {
+        let entry =
+            entry.map_err(|source| PolicyCompileError::Io { path: dir.to_path_buf(), source })?;
+        let path = entry.path();
+        if !is_candidate_policy_file(&path) {
+            continue;
+        }
+        toml_files.push(path);
+    }
+    toml_files.sort();
+
+    let mut out: Vec<(PathBuf, crate::policy::schema::TomlPolicy)> = Vec::new();
+    for path in toml_files {
+        let text = std::fs::read_to_string(&path)
+            .map_err(|source| PolicyCompileError::Io { path: path.clone(), source })?;
+        if text.starts_with('\u{feff}') {
+            return Err(PolicyCompileError::BomDetected { path: path.clone() });
+        }
+        let parsed = parse_file(&text, &path)?;
+        if parsed.policies.is_empty() {
+            return Err(PolicyCompileError::EmptyPoliciesArray { path: path.clone() });
+        }
+        let mut seen_in_file: HashSet<String> = HashSet::new();
+        for raw in parsed.policies {
+            if !seen_in_file.insert(raw.name.clone()) {
+                return Err(PolicyCompileError::DuplicatePolicyNameInFile {
+                    name: raw.name,
+                    path: path.clone(),
+                });
+            }
+            out.push((path.clone(), raw));
+        }
+    }
+    Ok(out)
+}
+
+/// Like [`read_layer_policies`] but treats a **missing** directory as
+/// an empty layer (returns `Ok(vec![])`) instead of `Io`.
+///
+/// Used ONLY for the managed layer in
+/// [`PolicySet::compile_from_layers`]: an absent `policies-managed/`
+/// means "no product bundle synced to disk yet", which is a valid
+/// state on a control-plane reload that races the first
+/// `sync_managed_policies`, and in router unit tests that build the
+/// handler without a full daemon boot. A managed path that EXISTS
+/// but is broken (not a directory, unreadable mid-scan) is still a
+/// hard error — only the does-not-exist case is downgraded to empty.
+fn read_layer_policies_optional(
+    dir: &Path,
+) -> Result<Vec<(PathBuf, crate::policy::schema::TomlPolicy)>, PolicyCompileError> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    read_layer_policies(dir)
 }
 
 fn parse_file(text: &str, path: &Path) -> Result<TomlPolicyFile, PolicyCompileError> {
@@ -2284,5 +2515,302 @@ mod tests {
             "[[policies]] header count must equal the {} policies the test enumerates",
             names.len()
         );
+    }
+
+    /// UX-overhaul Story 1 — the **actual** by-construction guard
+    /// against the `angie-*` incident class (an autonomous-write
+    /// policy leaking into the shipped product seed).
+    ///
+    /// Invariant: NO policy in the embedded/bundled default policy
+    /// set may have `approval-mode = "auto"` together with ANY write
+    /// scope in its scope allowlist. A policy that auto-approves AND
+    /// allows a write scope can send mail / mutate calendars /
+    /// delete Drive files with zero human gate — exactly the posture
+    /// `feedback_no_operator_config_in_shipped_defaults` exists to
+    /// prevent. This test is CI-blocking: it fails the build if such
+    /// a policy is ever (re-)introduced into `cli/default_policy.toml`
+    /// or `test-fixtures/policies/default.toml`.
+    ///
+    /// The write-scope set is the Google Workspace mutation surface
+    /// permitlayer brokers. A future connector adding a write scope
+    /// MUST extend this list in the same change (the CODEOWNERS gate
+    /// on the two policy files forces that review).
+    #[test]
+    fn bundled_seed_has_no_auto_approve_with_write_scope() {
+        // Any scope whose grant lets the agent MUTATE user data with
+        // no human approval when the policy is `approval-mode=auto`.
+        const WRITE_SCOPES: &[&str] =
+            &["gmail.send", "gmail.compose", "gmail.modify", "calendar.events", "drive.file"];
+        // Scope strings in policies are frequently fully-qualified
+        // Google OAuth URLs (e.g.
+        // `https://www.googleapis.com/auth/gmail.send`); match by
+        // suffix so both the short form and the URL form are caught.
+        let is_write_scope = |scope: &str| {
+            WRITE_SCOPES.iter().any(|w| scope == *w || scope.ends_with(&format!("/{w}")))
+        };
+
+        for (label, src) in [("bundled", BUNDLED_DEFAULT_TOML), ("fixture", FIXTURE_DEFAULT_TOML)] {
+            let set = PolicySet::compile_from_str(src, &p("default.toml"))
+                .unwrap_or_else(|e| panic!("{label} default policy must compile: {e:?}"));
+            for name in set.policy_names() {
+                let pol = set.get(&name).expect("named policy present");
+                if pol.approval_mode != ApprovalMode::Auto {
+                    continue;
+                }
+                let offending: Vec<&String> =
+                    pol.scope_allowlist.iter().filter(|s| is_write_scope(s)).collect();
+                assert!(
+                    offending.is_empty(),
+                    "{label} default policy {name:?} has approval-mode=auto AND write \
+                     scope(s) {offending:?} — an autonomous-write policy must NEVER ship \
+                     in the product seed (the angie-* incident class). Move operator-\
+                     specific autonomous-write tiers to host-local operator policy."
+                );
+            }
+        }
+    }
+
+    // ── UX-overhaul Story 1: two-layer compile ──────────────────────
+
+    /// Write `contents` to `<dir>/<name>.toml`, creating `dir`.
+    fn write_policy_file(dir: &Path, name: &str, contents: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(format!("{name}.toml")), contents).unwrap();
+    }
+
+    const MANAGED_GMAIL_RO: &str = r#"
+        [[policies]]
+        name = "gmail-read-only"
+        scopes = ["gmail.readonly"]
+        resources = ["*"]
+        approval-mode = "auto"
+    "#;
+
+    #[test]
+    fn layers_merge_managed_and_operator_disjoint_names() {
+        let tmp = tempfile::tempdir().unwrap();
+        let managed = tmp.path().join("policies-managed");
+        let operator = tmp.path().join("policies");
+        write_policy_file(&managed, "default", MANAGED_GMAIL_RO);
+        write_policy_file(
+            &operator,
+            "ops",
+            r#"
+            [[policies]]
+            name = "ops-calendar"
+            scopes = ["calendar.readonly"]
+            resources = ["*"]
+            approval-mode = "prompt"
+            "#,
+        );
+        let set = PolicySet::compile_from_layers(Some(&managed), &operator).unwrap();
+        assert!(set.get("gmail-read-only").is_some(), "managed policy present");
+        assert!(set.get("ops-calendar").is_some(), "operator policy present");
+        assert!(set.accepted_overrides().is_empty(), "no overrides for disjoint names");
+        // Origin tracks the actual file each came from.
+        assert!(set.origin("gmail-read-only").unwrap().ends_with("default.toml"));
+        assert!(set.origin("ops-calendar").unwrap().ends_with("ops.toml"));
+    }
+
+    #[test]
+    fn unmarked_cross_layer_collision_is_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let managed = tmp.path().join("policies-managed");
+        let operator = tmp.path().join("policies");
+        write_policy_file(&managed, "default", MANAGED_GMAIL_RO);
+        // Same name, NO override marker → fail-closed.
+        write_policy_file(
+            &operator,
+            "shadow",
+            r#"
+            [[policies]]
+            name = "gmail-read-only"
+            scopes = ["gmail.send"]
+            resources = ["*"]
+            approval-mode = "auto"
+            "#,
+        );
+        let err = PolicySet::compile_from_layers(Some(&managed), &operator).unwrap_err();
+        match err {
+            PolicyCompileError::UnmarkedCrossLayerOverride { name, .. } => {
+                assert_eq!(name, "gmail-read-only");
+            }
+            other => panic!("expected UnmarkedCrossLayerOverride, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn marked_override_wins_and_is_recorded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let managed = tmp.path().join("policies-managed");
+        let operator = tmp.path().join("policies");
+        write_policy_file(&managed, "default", MANAGED_GMAIL_RO);
+        write_policy_file(
+            &operator,
+            "shadow",
+            r#"
+            [[policies]]
+            name = "gmail-read-only"
+            override = "gmail-read-only"
+            scopes = ["gmail.readonly", "gmail.metadata"]
+            resources = ["primary"]
+            approval-mode = "prompt"
+            "#,
+        );
+        let set = PolicySet::compile_from_layers(Some(&managed), &operator).unwrap();
+        // Operator definition fully REPLACES the managed one:
+        // approval-mode is now the operator's `prompt`, not the
+        // managed `auto`.
+        let pol = set.get("gmail-read-only").expect("present");
+        assert_eq!(pol.approval_mode, ApprovalMode::Prompt);
+        // Origin points at the OPERATOR file (the winning def).
+        assert!(set.origin("gmail-read-only").unwrap().ends_with("shadow.toml"));
+        // Exactly one accepted override, recorded with both paths.
+        let ov = set.accepted_overrides();
+        assert_eq!(ov.len(), 1);
+        assert_eq!(ov[0].name, "gmail-read-only");
+        assert!(ov[0].managed_path.ends_with("default.toml"));
+        assert!(ov[0].operator_path.ends_with("shadow.toml"));
+    }
+
+    #[test]
+    fn override_marker_must_equal_own_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let managed = tmp.path().join("policies-managed");
+        let operator = tmp.path().join("policies");
+        write_policy_file(&managed, "default", MANAGED_GMAIL_RO);
+        // Marker names a DIFFERENT policy than this one → dangling.
+        write_policy_file(
+            &operator,
+            "shadow",
+            r#"
+            [[policies]]
+            name = "gmail-read-only"
+            override = "some-other-policy"
+            scopes = ["gmail.readonly"]
+            resources = ["*"]
+            approval-mode = "prompt"
+            "#,
+        );
+        let err = PolicySet::compile_from_layers(Some(&managed), &operator).unwrap_err();
+        assert!(
+            matches!(err, PolicyCompileError::DanglingOverrideMarker { .. }),
+            "expected DanglingOverrideMarker, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn override_marker_with_no_managed_target_is_dangling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let managed = tmp.path().join("policies-managed");
+        let operator = tmp.path().join("policies");
+        write_policy_file(&managed, "default", MANAGED_GMAIL_RO);
+        // override = own name, but NO managed policy of that name.
+        write_policy_file(
+            &operator,
+            "ops",
+            r#"
+            [[policies]]
+            name = "not-in-managed"
+            override = "not-in-managed"
+            scopes = ["calendar.readonly"]
+            resources = ["*"]
+            approval-mode = "prompt"
+            "#,
+        );
+        let err = PolicySet::compile_from_layers(Some(&managed), &operator).unwrap_err();
+        match err {
+            PolicyCompileError::DanglingOverrideMarker { name, target, .. } => {
+                assert_eq!(name, "not-in-managed");
+                assert_eq!(target, "not-in-managed");
+            }
+            other => panic!("expected DanglingOverrideMarker, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn override_marker_in_managed_layer_is_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let managed = tmp.path().join("policies-managed");
+        let operator = tmp.path().join("policies");
+        // The PRODUCT bundle must never override anything.
+        write_policy_file(
+            &managed,
+            "default",
+            r#"
+            [[policies]]
+            name = "gmail-read-only"
+            override = "gmail-read-only"
+            scopes = ["gmail.readonly"]
+            resources = ["*"]
+            approval-mode = "auto"
+            "#,
+        );
+        std::fs::create_dir_all(&operator).unwrap();
+        let err = PolicySet::compile_from_layers(Some(&managed), &operator).unwrap_err();
+        assert!(
+            matches!(err, PolicyCompileError::OverrideMarkerInManagedLayer { .. }),
+            "expected OverrideMarkerInManagedLayer, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn intra_operator_layer_duplicate_name_still_fatal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let managed = tmp.path().join("policies-managed");
+        let operator = tmp.path().join("policies");
+        write_policy_file(&managed, "default", MANAGED_GMAIL_RO);
+        write_policy_file(
+            &operator,
+            "a",
+            r#"
+            [[policies]]
+            name = "dup"
+            scopes = ["calendar.readonly"]
+            resources = ["*"]
+            approval-mode = "prompt"
+            "#,
+        );
+        write_policy_file(
+            &operator,
+            "b",
+            r#"
+            [[policies]]
+            name = "dup"
+            scopes = ["drive.readonly"]
+            resources = ["*"]
+            approval-mode = "prompt"
+            "#,
+        );
+        let err = PolicySet::compile_from_layers(Some(&managed), &operator).unwrap_err();
+        assert!(
+            matches!(err, PolicyCompileError::DuplicatePolicyName { .. }),
+            "expected DuplicatePolicyName, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn compile_from_dir_is_single_layer_equivalent() {
+        // Back-compat: compile_from_dir == compile_from_layers(None, dir).
+        let tmp = tempfile::tempdir().unwrap();
+        let operator = tmp.path().join("policies");
+        write_policy_file(&operator, "p", MANAGED_GMAIL_RO);
+        let via_dir = PolicySet::compile_from_dir(&operator).unwrap();
+        let via_layers = PolicySet::compile_from_layers(None, &operator).unwrap();
+        assert_eq!(via_dir.policy_names().len(), via_layers.policy_names().len());
+        assert!(via_dir.get("gmail-read-only").is_some());
+        assert!(via_layers.accepted_overrides().is_empty());
+    }
+
+    #[test]
+    fn empty_operator_layer_yields_only_managed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let managed = tmp.path().join("policies-managed");
+        let operator = tmp.path().join("policies");
+        write_policy_file(&managed, "default", MANAGED_GMAIL_RO);
+        std::fs::create_dir_all(&operator).unwrap(); // empty operator dir
+        let set = PolicySet::compile_from_layers(Some(&managed), &operator).unwrap();
+        assert_eq!(set.policy_names(), vec!["gmail-read-only".to_owned()]);
+        assert!(set.accepted_overrides().is_empty());
     }
 }

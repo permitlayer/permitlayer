@@ -219,9 +219,46 @@ pub fn agents_dir(home_override: Option<&Path>) -> PathBuf {
     daemon_state_dir(home_override).join("agents")
 }
 
-/// Policies directory — daemon-managed policy TOML files.
+/// Operator policy directory — operator-authored policy TOML files.
+///
+/// UX-overhaul Story 1: this is now the **operator layer only**. It
+/// is created empty and NEVER seeded with product content — the
+/// shipped/bundled policies live in [`managed_policies_dir`]. This
+/// split is what kills the frozen-policy-on-upgrade bug (the product
+/// bundle is rewritten every daemon start) and the operator-config-
+/// leak class (operator files can never reach the shipped product).
 pub fn policies_dir(home_override: Option<&Path>) -> PathBuf {
     daemon_state_dir(home_override).join("policies")
+}
+
+/// Managed policy directory — the product's shipped policy bundle,
+/// sibling to [`policies_dir`].
+///
+/// UX-overhaul Story 1: every daemon `start` atomically rewrites
+/// `<managed>/default.toml` from the `include_str!`-embedded bundle
+/// unconditionally (no first-run-only seed → no frozen policies on
+/// upgrade). Created root-owned `0700` with the same TOCTOU/symlink
+/// hardening proven in `install_macos.rs`; the managed *file* is
+/// `0644` (output-only product content, not a secret) so a non-root
+/// `doctor` can hash it for the Story-4 staleness check.
+pub fn managed_policies_dir(home_override: Option<&Path>) -> PathBuf {
+    daemon_state_dir(home_override).join("policies-managed")
+}
+
+/// Derive the managed-policy dir from an already-resolved operator
+/// policy dir (the sibling `policies-managed/`).
+///
+/// UX-overhaul Story 1: the reload path (`server::sighup`,
+/// `server::control`) carries only the operator `policies/` path
+/// through its plumbing. Rather than re-thread `home` everywhere or
+/// hand-roll `parent().join(...)` at each call site, this is the
+/// single tested place that knows the two layers are siblings under
+/// `daemon_state_dir`. Returns `None` only for a pathological
+/// operator dir with no parent (never the case for a real
+/// `<state>/policies`).
+#[must_use]
+pub fn managed_policies_dir_for_operator(operator_dir: &Path) -> Option<PathBuf> {
+    operator_dir.parent().map(|state| state.join("policies-managed"))
 }
 
 /// Plugins directory — drop-in plugin loader.
@@ -261,6 +298,7 @@ mod tests {
         let vault = vault_dir(Some(tmp));
         let agents = agents_dir(Some(tmp));
         let policies = policies_dir(Some(tmp));
+        let managed_policies = managed_policies_dir(Some(tmp));
         let plugins = plugins_dir(Some(tmp));
         let audit = audit_log_path(Some(tmp));
         let sock = control_socket_path(Some(tmp));
@@ -271,6 +309,10 @@ mod tests {
         assert_eq!(vault, tmp.join("vault"));
         assert_eq!(agents, tmp.join("agents"));
         assert_eq!(policies, tmp.join("policies"));
+        assert_eq!(managed_policies, tmp.join("policies-managed"));
+        // The sibling-derivation helper must agree with the direct
+        // resolver — the reload path relies on this equivalence.
+        assert_eq!(managed_policies_dir_for_operator(&policies), Some(managed_policies.clone()));
         assert_eq!(plugins, tmp.join("plugins"));
         assert_eq!(audit, tmp.join("logs").join("audit.log"));
         assert_eq!(sock, tmp.join("run").join("control.sock"));

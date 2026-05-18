@@ -281,6 +281,61 @@ pub enum PolicyCompileError {
         /// The file that held the policy.
         path: PathBuf,
     },
+
+    /// UX-overhaul Story 1: an operator-layer policy's `name` collides
+    /// with a managed (product) policy of the same name, but the
+    /// operator policy does NOT carry the explicit `override = "<name>"`
+    /// marker. Fail-closed: an accidental name clash must never
+    /// silently shadow shipped product policy. The operator must opt
+    /// in explicitly.
+    #[error(
+        "operator policy {name:?} ({operator_path}) shadows managed policy of the same \
+         name ({managed_path}) without an explicit `override = {name:?}` marker — refusing \
+         (add the marker to intentionally override, or rename the operator policy)"
+    )]
+    UnmarkedCrossLayerOverride {
+        /// The colliding policy name.
+        name: String,
+        /// The operator file that declared the colliding name.
+        operator_path: PathBuf,
+        /// The managed file that already owns the name.
+        managed_path: PathBuf,
+    },
+
+    /// UX-overhaul Story 1: an operator policy carries an
+    /// `override = "<target>"` marker, but `<target>` does not match a
+    /// policy name present in the managed layer (or does not match the
+    /// operator policy's own `name`). An override that points at
+    /// nothing is almost certainly a typo that would silently NOT
+    /// override — fail-closed so the operator notices.
+    #[error(
+        "operator policy {name:?} ({operator_path}) declares `override = {target:?}` but \
+         no managed policy named {target:?} exists (and the marker must equal the policy's \
+         own name) — refusing"
+    )]
+    DanglingOverrideMarker {
+        /// The operator policy's own name.
+        name: String,
+        /// The `override = "..."` value that resolved to nothing.
+        target: String,
+        /// The operator file that declared the marker.
+        operator_path: PathBuf,
+    },
+
+    /// UX-overhaul Story 1: a **managed-layer** (product/bundled)
+    /// policy file carries an `override = "..."` marker. The product
+    /// bundle never overrides anything — a marker here is a build-time
+    /// authoring mistake. Fatal so it cannot ship.
+    #[error(
+        "managed (product) policy {name:?} ({managed_path}) carries an `override` marker — \
+         the shipped bundle must never override; remove it"
+    )]
+    OverrideMarkerInManagedLayer {
+        /// The managed policy that wrongly carried a marker.
+        name: String,
+        /// The managed file.
+        managed_path: PathBuf,
+    },
 }
 
 impl PolicyCompileError {
@@ -316,6 +371,9 @@ impl PolicyCompileError {
             Self::InvalidScopeFormat { .. } => "InvalidScopeFormat",
             Self::DuplicateScopeInAllowlist { .. } => "DuplicateScopeInAllowlist",
             Self::MixedWildcardAndExplicitResources { .. } => "MixedWildcardAndExplicitResources",
+            Self::UnmarkedCrossLayerOverride { .. } => "UnmarkedCrossLayerOverride",
+            Self::DanglingOverrideMarker { .. } => "DanglingOverrideMarker",
+            Self::OverrideMarkerInManagedLayer { .. } => "OverrideMarkerInManagedLayer",
         }
     }
 }
