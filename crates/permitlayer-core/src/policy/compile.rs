@@ -2275,9 +2275,7 @@ mod tests {
         // explanatory comments, which is not a policy and differs
         // between the two files by design (the bundled file has more
         // prose). This is the real invariant: equal table-header count.
-        let header_count = |s: &str| {
-            s.lines().filter(|l| l.trim() == "[[policies]]").count()
-        };
+        let header_count = |s: &str| s.lines().filter(|l| l.trim() == "[[policies]]").count();
         let fixture_n = header_count(FIXTURE_DEFAULT_TOML);
         assert_eq!(
             fixture_n,
@@ -2288,7 +2286,8 @@ mod tests {
         // policy-set size we just walked, so a stray header (or a
         // commented-out block) can't pass silently.
         assert_eq!(
-            fixture_n, names.len(),
+            fixture_n,
+            names.len(),
             "[[policies]] header count must equal the {} policies the test enumerates",
             names.len()
         );
