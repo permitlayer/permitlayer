@@ -85,7 +85,7 @@ pub const MAX_PLAINTEXT_LEN: usize = 64 * 1024;
 /// envelope. In v2 (the current format) it's stamped by `Vault::seal`
 /// at construction. In v1 (legacy on-disk format), envelopes synthesize
 /// `key_id = 0` at decode time — the v1 → v2 migration in
-/// `permitlayer-daemon::cli::update::migrations::envelope_v1_to_v2`
+/// `permitlayer-daemon::cli::migrations::envelope_v1_to_v2`
 /// rewrites every v1 envelope to v2 with `key_id = 0`. After migration
 /// the on-disk format is uniformly v2.
 #[derive(ZeroizeOnDrop)]

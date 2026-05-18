@@ -345,28 +345,30 @@ fn uninstall_to_exit_code(result: anyhow::Result<()>) -> ExitCode {
     }
 }
 
-/// `agentsso update`-specific dispatch: typed markers for exit codes
-/// 3 (resource conflict — package-manager-managed binary, brew-
-/// services), 4 (auth/integrity — network failure, signature
-/// verification failure, archive-unsafe, disk-space), and 5 (swap
-/// or migration failure after rollback).
+/// `agentsso update`-specific dispatch (UX-overhaul Story 3). The
+/// command is a read-only drift detector now — no apply/swap path —
+/// so the exit-code surface narrowed to two markers:
 ///
-/// Same shape as [`uninstall_to_exit_code`] but with three exit-code
-/// markers instead of one. Story 7.5 AC #4 + the typed-marker
-/// pattern from Story 7.4 P10+P11.
+/// - **3** ([`cli::update::UpdateExitCode3`]) — caller asked for the
+///   removed `--apply`, or the binary is package-manager-managed;
+///   the command redirected to `brew upgrade && sudo agentsso setup`
+///   and changed nothing.
+/// - **4** ([`cli::update::UpdateExitCode4`]) — actionable
+///   non-success: version drift detected, or the latest-release
+///   query failed (host is not provably current). Scripts/`doctor`
+///   gate on non-zero.
+///
+/// Same downcast-through-anyhow shape as [`uninstall_to_exit_code`].
 fn update_to_exit_code(result: anyhow::Result<()>) -> ExitCode {
     match result {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             let exit_three = e.downcast_ref::<cli::update::UpdateExitCode3>().is_some();
             let exit_four = e.downcast_ref::<cli::update::UpdateExitCode4>().is_some();
-            let exit_five = e.downcast_ref::<cli::update::UpdateExitCode5>().is_some();
             let resolved_code = if exit_three {
                 3
             } else if exit_four {
                 4
-            } else if exit_five {
-                5
             } else {
                 1
             };

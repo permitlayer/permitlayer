@@ -11,8 +11,8 @@
 //! Story 7.6a bumped `SEALED_CREDENTIAL_VERSION` from 1 to 2 to add a
 //! `key_id: u8` field. Writes always emit v2; reads accept both v1 and
 //! v2 (v1 synthesizes `key_id = 0`). The
-//! `cli::update::migrations::envelope_v1_to_v2` migration rewrites
-//! every v1 envelope to v2 once.
+//! `cli::migrations::envelope_v1_to_v2` migration (run on daemon
+//! boot) rewrites every v1 envelope to v2 once.
 //!
 //! ## v2 (current — 24-byte fixed header)
 //! ```text
@@ -372,7 +372,7 @@ pub fn encode_envelope(sealed: &SealedCredential) -> Vec<u8> {
 /// hold the [`crate::VaultLock`] and MUST NOT route through
 /// [`CredentialFsStore::put`] (which would deadlock on lock
 /// re-acquire). Story 7.6b promoted this from a private helper in
-/// `cli::update::migrations::envelope_v1_to_v2` so rotation's reseal
+/// `cli::migrations::envelope_v1_to_v2` so rotation's reseal
 /// loop can reuse the discipline without duplicating it.
 ///
 /// On Unix, the tempfile is created with mode `0o600`. On a

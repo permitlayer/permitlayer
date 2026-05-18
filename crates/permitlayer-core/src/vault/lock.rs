@@ -7,7 +7,7 @@
 //! `rename(vault/, vault.bak/)` step). It serializes every writer of
 //! the vault — every CLI subcommand that mutates credentials
 //! (`agentsso setup`, `agentsso rotate-key`), the
-//! `cli::update::migrations` schema-upgrade path, and per-credential
+//! `cli::migrations` boot-time schema-upgrade path, and per-credential
 //! writes inside the running daemon (each `CredentialFsStore::put`
 //! acquires + releases its own scope).
 //!

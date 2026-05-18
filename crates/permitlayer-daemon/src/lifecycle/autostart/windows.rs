@@ -1,41 +1,22 @@
 //! Windows Task Scheduler backend for [`crate::lifecycle::autostart`].
 //!
-//! Registers a per-user task named `AgentSSO Daemon` via `schtasks`
-//! (built-in to Windows since XP — no extra dependency, no `windows-rs`
-//! crate weight). Triggered at logon of the current user; runs
-//! unelevated.
+//! The autostart-managed per-user task is named `AgentSSO Daemon`
+//! (registered via `schtasks`, built-in to Windows since XP — no extra
+//! dependency, no `windows-rs` crate weight). The `enable` path that
+//! registered the task + wrote its XML record was removed; this backend
+//! now only reports [`status`] and tears the task down via [`disable`].
 //!
-//! # Why Task Scheduler over Startup folder?
+//! # Startup-folder shortcut cleanup
 //!
 //! Story 7.2's `install.ps1 -Autostart` ships a Startup-folder
 //! shortcut at `%APPDATA%\Microsoft\Windows\Start Menu\Programs\Startup\agentsso.lnk`
-//! as install-time minimum. Task Scheduler is more robust:
-//! survives roaming-profile sync (the `.lnk` doesn't), supports retry-
-//! on-failure, can be set to ignore the OS's silent default kills.
-//! Story 7.2's shortcut is the install-time placeholder; Story 7.3's
-//! [`enable`] migrates it away (deletes the .lnk; registers the task).
-//!
-//! # Two silent-kill defaults this code overrides
-//!
-//! 1. **`ExecutionTimeLimit` defaults to `PT72H`** — after 3 days the OS
-//!    forcibly terminates the task. For a long-running daemon this is a
-//!    silent footgun ("works fine, then breaks at random after a long
-//!    weekend"). We render `<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>`
-//!    explicitly. Verified at
-//!    https://learn.microsoft.com/en-us/windows/win32/taskschd/tasksettings-executiontimelimit.
-//! 2. **`DisallowStartIfOnBatteries=true` + `StopIfGoingOnBatteries=true`**
-//!    are the laptop defaults — undocking silently kills the daemon. We
-//!    render both as `false` so the daemon keeps running on battery.
-//!
-//! Both pinned via the `insta` snapshot in tests so a future "tidy the
-//! XML" edit can't silently regress them.
+//! as install-time minimum. [`disable`] removes any stray `agentsso.lnk`
+//! alongside the Task Scheduler entry, and [`status`] surfaces a
+//! task + `.lnk` coexistence as [`AutostartStatus::Conflict`].
 
 use std::path::{Path, PathBuf};
 
-use super::{
-    AutostartError, AutostartStatus, DisableOutcome, EnableOutcome, Engine, current_daemon_path,
-    service_manager_failed, write_atomic,
-};
+use super::{AutostartError, AutostartStatus, DisableOutcome, Engine, service_manager_failed};
 
 const TASK_NAME: &str = "AgentSSO Daemon";
 const MECHANISM: &str = "task-scheduler";
@@ -95,176 +76,6 @@ pub(crate) fn startup_shortcut_path(home: &Path) -> PathBuf {
         .join("Programs")
         .join("Startup")
         .join("agentsso.lnk")
-}
-
-/// Render the Task Scheduler XML for the given daemon-binary path.
-///
-/// Hand-rendered (no `quick-xml` / `windows-rs` crate dep) per Story 7.3
-/// Dev Notes — the schema is stable and the snapshot test pins the
-/// load-bearing fields.
-pub(crate) fn render_task_xml(daemon_path: &Path, user_id: &str) -> String {
-    let daemon = xml_escape(&daemon_path.to_string_lossy());
-    let user = xml_escape(user_id);
-    let working_dir = xml_escape(
-        &daemon_path
-            .parent()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|| ".".into()),
-    );
-    // P9 (code review): the file is written as UTF-8 bytes by
-    // `write_atomic`; declare UTF-8 here so strict XML parsers don't
-    // reject the prologue/payload mismatch. schtasks accepts either
-    // declaration in practice but UTF-8 is honest.
-    format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
-  <RegistrationInfo>
-    <Description>permitlayer/agentsso daemon (per-user autostart)</Description>
-    <URI>\{task}</URI>
-  </RegistrationInfo>
-  <Triggers>
-    <LogonTrigger>
-      <Enabled>true</Enabled>
-      <UserId>{user}</UserId>
-    </LogonTrigger>
-  </Triggers>
-  <Principals>
-    <Principal id="Author">
-      <UserId>{user}</UserId>
-      <LogonType>InteractiveToken</LogonType>
-      <RunLevel>LeastPrivilege</RunLevel>
-    </Principal>
-  </Principals>
-  <Settings>
-    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>
-    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>
-    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>
-    <AllowHardTerminate>true</AllowHardTerminate>
-    <StartWhenAvailable>true</StartWhenAvailable>
-    <RunOnlyIfNetworkAvailable>false</RunOnlyIfNetworkAvailable>
-    <IdleSettings>
-      <StopOnIdleEnd>false</StopOnIdleEnd>
-      <RestartOnIdle>false</RestartOnIdle>
-    </IdleSettings>
-    <AllowStartOnDemand>true</AllowStartOnDemand>
-    <Enabled>true</Enabled>
-    <Hidden>false</Hidden>
-    <RunOnlyIfIdle>false</RunOnlyIfIdle>
-    <WakeToRun>false</WakeToRun>
-    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>
-    <Priority>7</Priority>
-    <RestartOnFailure>
-      <Interval>PT5M</Interval>
-      <Count>10</Count>
-    </RestartOnFailure>
-  </Settings>
-  <Actions Context="Author">
-    <Exec>
-      <Command>{daemon}</Command>
-      <Arguments>start</Arguments>
-      <WorkingDirectory>{cwd}</WorkingDirectory>
-    </Exec>
-  </Actions>
-</Task>
-"#,
-        task = TASK_NAME,
-        user = user,
-        daemon = daemon,
-        cwd = working_dir,
-    )
-}
-
-fn xml_escape(s: &str) -> String {
-    let mut buf = String::with_capacity(s.len());
-    for c in s.chars() {
-        match c {
-            '&' => buf.push_str("&amp;"),
-            '<' => buf.push_str("&lt;"),
-            '>' => buf.push_str("&gt;"),
-            '"' => buf.push_str("&quot;"),
-            '\'' => buf.push_str("&apos;"),
-            other => buf.push(other),
-        }
-    }
-    buf
-}
-
-/// Windows [`super::enable`] implementation. Migrates a leftover
-/// Story 7.2 Startup-folder `agentsso.lnk` away (per AC #6).
-///
-/// **P7 (code review):** the rendered XML is staged at a temp path and
-/// only renamed to the canonical `xml_record_path` AFTER `schtasks
-/// /Create` has succeeded. This prevents a state desync where a
-/// schtasks failure (corp policy block, AV interference, malformed XML
-/// per locale issues) would leave behind an orphan XML record that
-/// `status` would then misinterpret as "Enabled" even though the task
-/// was never actually registered.
-pub(crate) fn enable(exec: &impl Engine, home: &Path) -> Result<EnableOutcome, AutostartError> {
-    let xml_path = xml_record_path(home);
-    let daemon = current_daemon_path()?;
-    // P36: reject non-UTF-8 daemon paths. Task Scheduler XML is UTF-8
-    // (or UTF-16 LE w/ BOM) — both faithful but our renderer outputs
-    // UTF-8. Without this check, `to_string_lossy` would silently
-    // rewrite the path with U+FFFD and the registered task would fail
-    // to launch the daemon at logon.
-    super::require_utf8_path(&daemon)?;
-    let user = current_user_id()?;
-    let xml = render_task_xml(&daemon, &user);
-
-    // P7: stage the XML at a sibling temp path; do NOT write the
-    // canonical xml_record_path yet. schtasks /Create reads from this
-    // staged path; only on success do we rename to the final location
-    // (so `status` never sees an orphan XML file from a failed enable).
-    let staging = xml_path.with_file_name(format!(
-        "{}.staging.{}",
-        xml_path.file_name().unwrap_or_default().to_string_lossy(),
-        std::process::id()
-    ));
-    if let Some(parent) = staging.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(&staging, &xml)?;
-
-    // Detect prior state (for the right outcome variant).
-    let already_existed = task_registered(exec)?;
-    let shortcut = startup_shortcut_path(home);
-    let shortcut_existed = shortcut.exists();
-
-    // Register/refresh the task. `/F` forces overwrite if the entry
-    // already exists; idempotent across re-enables.
-    let staging_str = staging.to_string_lossy();
-    let xml_arg: &str = &staging_str;
-    let args = ["/Create", "/TN", TASK_NAME, "/XML", xml_arg, "/F"];
-    let out = exec.run("schtasks", &args)?;
-    if !out.status.success() {
-        // schtasks failed — clean up the staging file before bailing so
-        // we don't orphan a partial record.
-        let _ = std::fs::remove_file(&staging);
-        return Err(service_manager_failed("schtasks", &args, &out));
-    }
-
-    // schtasks succeeded — promote the staging file to the canonical
-    // record path so `status` can later read the embedded daemon path
-    // for Story 7.5 drift detection.
-    write_atomic(&xml_path, &xml)?;
-    let _ = std::fs::remove_file(&staging);
-
-    // Migrate Story 7.2 install-time shortcut (per AC #6).
-    if shortcut_existed {
-        // Best-effort delete; don't fail enable if the rm fails (the
-        // task is already registered + that's the load-bearing change).
-        let _ = std::fs::remove_file(&shortcut);
-        return Ok(EnableOutcome::MigratedFromStartupShortcut {
-            artifact_path: xml_path,
-            removed_shortcut: shortcut,
-        });
-    }
-
-    if already_existed {
-        Ok(EnableOutcome::AlreadyEnabled { artifact_path: xml_path })
-    } else {
-        Ok(EnableOutcome::Registered { mechanism: MECHANISM, artifact_path: xml_path })
-    }
 }
 
 /// Windows [`super::disable`] implementation. Idempotent; also removes
@@ -414,49 +225,6 @@ fn parse_command_path(xml: &str) -> Option<PathBuf> {
     Some(PathBuf::from(decoded))
 }
 
-/// Resolve the current user as `DOMAIN\user` for the Task Scheduler
-/// `<UserId>` element.
-///
-/// **P8 (code review):** the previous implementation fell back to the
-/// literal string `"INTERACTIVE"` when env vars were missing, with a
-/// comment claiming "schtasks will refuse with a clean error." That was
-/// not actually true — `INTERACTIVE` is a Windows well-known SID NAME
-/// that schtasks accepts in some contexts and silently registers the
-/// task against the wrong principal. We now refuse explicitly with a
-/// clean structured error so the operator knows what's wrong.
-fn current_user_id() -> std::io::Result<String> {
-    let username = std::env::var("USERNAME").map_err(|_| {
-        std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "cannot determine current user — USERNAME env var is not set; \
-             agentsso autostart enable must run from an interactive user session",
-        )
-    })?;
-    // **P57 (code review round 5, M9):** Task Scheduler's `<UserId>`
-    // expects `DOMAIN\user`, an SID, or a UPN. A bare username may
-    // bind the registered task to the wrong principal on a
-    // domain-joined host with `USERDOMAIN` not set. Prefer
-    // `USERDOMAIN`; fall back to `COMPUTERNAME` (always set on a
-    // sane Windows install) so the principal is at least
-    // `LOCALMACHINE\user`. If neither is set, refuse — schtasks
-    // would silently register against an undefined principal.
-    if let Ok(domain) = std::env::var("USERDOMAIN")
-        && !domain.is_empty()
-    {
-        Ok(format!("{domain}\\{username}"))
-    } else if let Ok(machine) = std::env::var("COMPUTERNAME")
-        && !machine.is_empty()
-    {
-        Ok(format!("{machine}\\{username}"))
-    } else {
-        Err(std::io::Error::new(
-            std::io::ErrorKind::Other,
-            "cannot determine current user principal — neither USERDOMAIN nor COMPUTERNAME \
-             is set; agentsso autostart enable must run from an interactive user session",
-        ))
-    }
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -464,95 +232,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn task_xml_renders_canonical_layout() {
-        // P1: replaced an `insta::assert_snapshot!` with explicit asserts.
-        // The cfg(target_os="windows") gating means snapshot files can
-        // only be generated on a Windows host; insta defaults to FAIL
-        // when the .snap is missing, so a macOS/Linux-developed PR +
-        // Windows CI runner that hasn't seen a snapshot yet would land
-        // red. Direct field-presence checks pin the same load-bearing
-        // invariants without the snapshot-file lifecycle problem.
-        let xml = render_task_xml(
-            Path::new(r"C:\Users\Maya\AppData\Local\Programs\agentsso\agentsso.exe"),
-            "MAYA-PC\\Maya",
-        );
-
-        // Top-level structure markers.
-        assert!(xml.contains("<Task version="), "missing <Task> root element");
-        assert!(xml.contains("<Triggers>"), "missing <Triggers>");
-        assert!(xml.contains("<Principals>"), "missing <Principals>");
-        assert!(xml.contains("<Actions"), "missing <Actions>");
-        assert!(xml.contains("<LogonTrigger>"), "missing logon trigger");
-
-        // Embedded paths + user (proves substitution worked).
-        assert!(
-            xml.contains(
-                r"<Command>C:\Users\Maya\AppData\Local\Programs\agentsso\agentsso.exe</Command>"
-            ),
-            "Command path missing or mangled: {xml}"
-        );
-        assert!(xml.contains("<UserId>MAYA-PC\\Maya</UserId>"), "UserId missing or wrong");
-        assert!(xml.contains("<Arguments>start</Arguments>"), "Arguments missing");
-    }
-
-    #[test]
-    fn task_xml_pins_silent_kill_overrides() {
-        let xml = render_task_xml(Path::new(r"C:\bin\agentsso.exe"), "MAYA-PC\\Maya");
-        // ExecutionTimeLimit MUST be PT0S — Task Scheduler default is
-        // PT72H, which silently kills the daemon after 3 days.
-        assert!(xml.contains("<ExecutionTimeLimit>PT0S</ExecutionTimeLimit>"));
-        // Battery defaults MUST be overridden — undocking otherwise
-        // silently kills the daemon.
-        assert!(xml.contains("<DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>"));
-        assert!(xml.contains("<StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>"));
-        // Restart-on-failure preserved.
-        assert!(xml.contains("<RestartOnFailure>"));
-    }
-
-    #[test]
     fn parse_command_path_round_trips() {
-        let xml = render_task_xml(Path::new(r"C:\bin\agentsso.exe"), "MAYA-PC\\Maya");
-        assert_eq!(parse_command_path(&xml), Some(PathBuf::from(r"C:\bin\agentsso.exe")));
-    }
-
-    #[test]
-    fn enable_writes_xml_and_calls_schtasks_create() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let mock = MockExec::default();
-        // First call: task_registered probe returns "task not found" (exit 1).
-        mock.push_reply(MockExec::fail(1, "ERROR: The system cannot find the file specified."));
-        // Second call: schtasks /Create /F succeeds.
-        mock.push_reply(MockExec::ok(""));
-
-        let outcome = enable(&mock, tmp.path()).unwrap();
-        assert!(matches!(outcome, EnableOutcome::Registered { mechanism: "task-scheduler", .. }));
-
-        let calls = mock.calls.borrow();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[1].1[0], "/Create");
-        assert!(calls[1].1.iter().any(|a| a == "/F"));
-    }
-
-    #[test]
-    fn enable_migrates_story_7_2_shortcut() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let shortcut = startup_shortcut_path(tmp.path());
-        std::fs::create_dir_all(shortcut.parent().unwrap()).unwrap();
-        std::fs::write(&shortcut, b"fake .lnk content").unwrap();
-
-        let mock = MockExec::default();
-        mock.push_reply(MockExec::fail(1, "task not found")); // task_registered probe
-        mock.push_reply(MockExec::ok("")); // schtasks /Create
-
-        let outcome = enable(&mock, tmp.path()).unwrap();
-        match &outcome {
-            EnableOutcome::MigratedFromStartupShortcut { removed_shortcut, .. } => {
-                assert_eq!(removed_shortcut, &shortcut);
-            }
-            other => panic!("expected MigratedFromStartupShortcut, got {other:?}"),
-        }
-        // The .lnk is gone.
-        assert!(!shortcut.exists());
+        // The enable path (which rendered this Task XML) was removed;
+        // this pins `parse_command_path` (still called by `status`)
+        // against the canonical on-disk Task XML shape it used to write.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Actions Context="Author">
+    <Exec>
+      <Command>C:\bin\agentsso.exe</Command>
+      <Arguments>start</Arguments>
+    </Exec>
+  </Actions>
+</Task>
+"#;
+        assert_eq!(parse_command_path(xml), Some(PathBuf::from(r"C:\bin\agentsso.exe")));
     }
 
     #[test]

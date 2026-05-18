@@ -1,4 +1,14 @@
-//! Download + verify + extract pipeline for `agentsso update --apply`.
+//! Release-artifact download + minisign verification + tarball
+//! extraction.
+//!
+//! Relocated from `cli/update/verify.rs` in the UX-overhaul epic
+//! (Story 3). `agentsso update` no longer performs in-place binary
+//! swaps — it is a drift detector now. The minisign-verify primitive
+//! survives here because Story 2's `sudo agentsso setup` stages and
+//! **minisign-verifies** the versioned daemon binary using
+//! [`verify_minisign`]. One trust root (`install/permitlayer.pub`)
+//! for the curl|sh installer, the PowerShell installer, and the
+//! privileged `setup` path.
 //!
 //! Goals — in order of cryptographic importance:
 //!
@@ -17,6 +27,18 @@
 //!    pattern is cheap insurance against a malicious or
 //!    misconfigured release.
 
+// Story 3 (this PR) relocated this module here but removed its only
+// caller (the deleted `update --apply` flow). Its consumer is Story
+// 2 of the SAME epic — `sudo agentsso setup` minisign-verifies the
+// staged versioned binary via [`verify_minisign`]. Story 2 is task
+// #3, explicitly blocked-by this task, so the dependency is a named,
+// already-owned story (not a hypothetical) — the only valid reason
+// to carry not-yet-wired code per the no-lazy-deferrals rule. The
+// unit tests below DO exercise the code now, so it is not untested
+// dead weight. Remove this attribute in Story 2 when `setup` calls
+// `verify_minisign`.
+#![allow(dead_code)]
+
 use std::path::{Component, Path, PathBuf};
 use std::time::Duration;
 
@@ -28,7 +50,7 @@ use anyhow::{Context, Result, anyhow};
 /// so any future key rotation is a one-file edit. Same key the
 /// curl|sh installer (install.sh:31) and PowerShell installer
 /// (install.ps1:67) embed.
-pub(crate) const EMBEDDED_PUBKEY: &str = include_str!("../../../../../install/permitlayer.pub");
+pub(crate) const EMBEDDED_PUBKEY: &str = include_str!("../../../../install/permitlayer.pub");
 
 /// Resolve the pubkey used for verification.
 ///

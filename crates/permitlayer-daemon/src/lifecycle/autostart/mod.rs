@@ -16,17 +16,15 @@
 //!
 //! # Cross-mechanism conflicts
 //!
-//! Three out-of-band autostart mechanisms exist that can race with this one:
+//! Out-of-band autostart mechanisms exist that can race with this one and
+//! are surfaced by [`status`] as [`AutostartStatus::Conflict`]:
 //! - macOS Homebrew's `brew services start agentsso` writes its OWN plist at
 //!   `~/Library/LaunchAgents/homebrew.mxcl.agentsso.plist` (Homebrew-controlled
-//!   namespace, fixed `homebrew.mxcl.*` prefix). Both enabled simultaneously
-//!   double-binds 127.0.0.1:3820. [`enable`] refuses with `BrewServicesActive`
-//!   when it detects this. See Story 7.1 Dev Notes "Cross-reference with Story
-//!   7.3 autostart".
+//!   namespace, fixed `homebrew.mxcl.*` prefix). Both active simultaneously
+//!   double-binds 127.0.0.1:3820.
 //! - Windows `install.ps1 -Autostart` (Story 7.2) drops a Startup-folder
-//!   shortcut named `agentsso.lnk`. [`enable`] on Windows removes any stray
-//!   `agentsso.lnk` before writing the Task Scheduler entry. See Story 7.2 Dev
-//!   Notes "Cross-story fences" item 1.
+//!   shortcut named `agentsso.lnk`. [`disable`] on Windows removes any stray
+//!   `agentsso.lnk` alongside the Task Scheduler entry.
 //! - Linux: no equivalent dual-mechanism risk — systemd-user is the only
 //!   user-level mechanism.
 
@@ -40,36 +38,15 @@ pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
-/// Errors that can occur during autostart enable / disable / status.
+/// Errors that can occur during autostart disable / status.
 ///
 /// Sealed enum — the variants reflect the operator-facing failure modes,
 /// not implementation transients (those bubble up via the `#[from]` IO
 /// arm). The CLI layer pattern-matches on these to render
 /// [`crate::design::render::error_block`] guidance.
-///
-/// `dead_code` allowed at the variant level: each `cfg`-gated platform
-/// backend constructs only its own subset (e.g., `SystemdUnavailable`
-/// is Linux-only), so cross-platform builds otherwise warn.
 #[derive(thiserror::Error, Debug)]
 #[non_exhaustive]
-#[allow(dead_code)]
 pub enum AutostartError {
-    /// macOS: `brew services` is currently managing the daemon. Enabling
-    /// autostart would double-bind 127.0.0.1:3820. See module docs.
-    #[error(
-        "Homebrew is already managing agentsso via `brew services start agentsso`; \
-         disable that first before enabling `agentsso autostart`"
-    )]
-    BrewServicesActive,
-
-    /// Linux: the host has no functioning user-systemd (e.g., WSL1, or
-    /// WSL2 without `systemd=true` in `/etc/wsl.conf`, or a minimal
-    /// container). [`enable`] cannot proceed; the user has to either
-    /// fix their systemd setup or use a wrapper script in a different
-    /// init system.
-    #[error("user-systemd is not available on this host: {detail}")]
-    SystemdUnavailable { detail: String },
-
     /// The platform's service-manager command failed. The wrapped
     /// [`std::process::Output`]'s `stderr` is exposed via the [`Display`]
     /// impl so operators see the underlying tool's error message.
@@ -83,36 +60,26 @@ pub enum AutostartError {
 
     /// The CLI is running on a target where this autostart code path
     /// has no implementation (today: anything that's not macOS / Linux
-    /// / Windows). Returned by the unsupported-target stub `enable`,
-    /// `disable`, `status` paths so the CLI can render a clean error.
+    /// / Windows). Returned by the unsupported-target stub `disable` /
+    /// `status` paths so the CLI can render a clean error.
+    ///
+    /// Constructed only by the `cfg(not(any(macos, linux, windows)))`
+    /// stub `disable_with` / `status_with`; on the three real platforms
+    /// that constructor is `cfg`-d out, so rustc sees no construction
+    /// site even though `cli::uninstall` exhaustively matches this
+    /// variant. Same cross-`cfg` shape as [`AutostartStatus::Conflict`]
+    /// below — scoped exactly to the platforms where the constructor is
+    /// absent.
+    #[cfg_attr(
+        any(target_os = "macos", target_os = "linux", target_os = "windows"),
+        allow(dead_code)
+    )]
     #[error("autostart is not supported on this platform ({platform})")]
     UnsupportedPlatform { platform: &'static str },
-
-    /// macOS-only (Story 7.16 Task 2): `agentsso autostart enable`
-    /// detected a `homebrew.mxcl.agentsso` plist on disk but its
-    /// `<Label>` or `<ProgramArguments>[0]` does NOT match what
-    /// Homebrew would have written for our brew formula. Likely
-    /// causes: operator hand-rolled a custom plist with the same
-    /// label, or installed a different agentsso binary out-of-band.
-    /// Refuse to migrate rather than silently delete the operator's
-    /// custom config.
-    #[error("brew-services migration refused: {message}")]
-    BrewMigrationRefused { message: String },
-
-    /// macOS-only (Story 7.16 Task 2): the brew-services migration
-    /// detected a plist to migrate but the `bootout` + plist-rename
-    /// dance hit an unrecoverable error (filesystem permissions,
-    /// disk full, etc.). Distinct from `Io` so the CLI can render a
-    /// migration-specific remediation block.
-    #[error("brew-services migration failed: {source}")]
-    BrewMigrationFailed {
-        #[source]
-        source: std::io::Error,
-    },
 }
 
-/// Output of [`status`] — what [`enable`] / [`disable`] would see if
-/// invoked right now.
+/// Output of [`status`] — what [`disable`] would see if invoked right
+/// now.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case", tag = "state")]
 pub enum AutostartStatus {
@@ -172,13 +139,13 @@ impl AutostartStatus {
 }
 
 /// The platform's service-manager exec boundary, factored out behind a
-/// trait so unit tests can drive enable / disable / status logic
-/// without invoking the real `launchctl` / `systemctl` / `schtasks`.
+/// trait so unit tests can drive disable / status logic without
+/// invoking the real `launchctl` / `systemctl` / `schtasks`.
 ///
 /// Not part of the public API — gated `pub(crate)` so the platform
 /// modules + their tests can mock it; CLI consumers go through the
-/// free functions [`enable`] / [`disable`] / [`status`] which use
-/// [`RealExec`] internally.
+/// free functions [`disable`] / [`status`] which use [`RealExec`]
+/// internally.
 pub(crate) trait Engine {
     /// Run the platform service-manager binary with the given args.
     /// Returns the raw [`Output`] so callers can inspect both stdout
@@ -194,10 +161,10 @@ pub(crate) trait Engine {
 /// **P37 (code review round 3):** wraps every spawn in a 30-second
 /// hard timeout so a misconfigured Homebrew (slow tap eval, stuck
 /// brew network call), a sluggish launchd, or a wedged systemctl
-/// can't hang `agentsso autostart enable` indefinitely. 30s is well
-/// above any reasonable service-manager response time but well below
-/// what an operator would consider "broken" — they'll Ctrl-C before
-/// then anyway.
+/// can't hang the autostart disable / status path indefinitely. 30s
+/// is well above any reasonable service-manager response time but
+/// well below what an operator would consider "broken" — they'll
+/// Ctrl-C before then anyway.
 pub(crate) struct RealExec;
 
 impl Engine for RealExec {
@@ -295,132 +262,6 @@ fn run_with_timeout(
     Ok(Output { status, stdout, stderr })
 }
 
-/// Reject paths that aren't valid UTF-8 *or* contain ASCII control
-/// characters with a clean structured error.
-///
-/// **P36 (code review round 3):** the per-platform XML/plist/unit
-/// renderers used `to_string_lossy()`, which silently replaces invalid
-/// UTF-8 bytes with U+FFFD. The rendered artifact then embeds a path
-/// the OS service manager can't resolve, and the operator sees an
-/// opaque "file not found" instead of a clear "your daemon path
-/// contains non-UTF-8 bytes". Pre-flight check at the public API
-/// boundary so the failure surfaces before we corrupt the artifact.
-///
-/// **P51 (code review round 5, M1+M5):** POSIX paths legally contain
-/// `\n`, `\r`, NUL, and other ASCII control bytes. A newline in the
-/// daemon path renders into the systemd unit as new directives
-/// (`ExecStart=/foo\nKill=true\n/bar/agentsso` would be a directive
-/// injection sink if `current_daemon_path` ever resolves a
-/// user-writable path). Plist / Task XML parsers will silently
-/// truncate at NUL or reject non-XML-1.0 control chars. Reject any
-/// byte `< 0x20` (excluding `\t` which IS legal in XML 1.0 text)
-/// at this boundary so the failure mode is "your daemon path
-/// contains illegal characters" rather than "schtasks failed with
-/// cryptic error."
-pub(crate) fn require_utf8_path(p: &Path) -> std::io::Result<&str> {
-    let s = p.to_str().ok_or_else(|| {
-        std::io::Error::other(format!(
-            "path contains non-UTF-8 bytes: {} — autostart cannot embed this path \
-             into the platform service-manager artifact (LaunchAgent plist / \
-             systemd unit / Task XML are all UTF-8 formats)",
-            p.display()
-        ))
-    })?;
-    if let Some(bad) = s.chars().find(|c| {
-        let v = *c as u32;
-        // Reject ASCII control chars (0x00-0x1F) except TAB (0x09).
-        // Allow LF (0x0A) and CR (0x0D)? No — they break systemd unit
-        // line parsing and inject directives. Reject everything below
-        // 0x20 except 0x09. Also reject DEL (0x7F).
-        (v < 0x20 && v != 0x09) || v == 0x7F
-    }) {
-        return Err(std::io::Error::other(format!(
-            "path contains illegal control character U+{:04X}: {} — autostart cannot \
-             embed this path into the platform service-manager artifact (newline \
-             injection / NUL truncation / XML 1.0 control-char rejection)",
-            bad as u32,
-            p.display()
-        )));
-    }
-    Ok(s)
-}
-
-/// Resolve the absolute path of the currently-running `agentsso` binary
-/// to embed in the platform service-manager artifact.
-///
-/// **P39 (code review round 4):** behavior on each platform:
-///
-/// - **macOS:** `std::env::current_exe()` reads `_NSGetExecutablePath`
-///   which returns the path the user invoked (preserving symlinks).
-///   `/opt/homebrew/bin/agentsso` (Homebrew's stable wrapper symlink)
-///   stays stable across `brew upgrade`; the underlying Cellar path
-///   `/opt/homebrew/Cellar/agentsso/<version>/bin/agentsso` does NOT.
-///   Empirically verified 2026-04-26 with a test binary + symlink.
-///   No fix needed on macOS.
-///
-/// - **Windows:** `current_exe()` uses `GetModuleFileNameW` which
-///   also returns the invocation path. Story 7.2's installer puts
-///   `agentsso.exe` at `%LOCALAPPDATA%\Programs\agentsso\` and
-///   overwrites in place on upgrade — same path, stable. No fix
-///   needed on Windows.
-///
-/// - **Linux:** `current_exe()` reads `/proc/self/exe` which the
-///   kernel ALWAYS canonicalizes through symlinks. So a Homebrew-on-
-///   Linux user invoking `/home/linuxbrew/.linuxbrew/bin/agentsso`
-///   gets back the canonicalized Cellar path that breaks on upgrade.
-///   We try to recover the invocation path from `argv[0]` first; if
-///   that's a relative path or not on PATH, we fall back to
-///   `current_exe()` (the canonicalized path) and accept the upgrade-
-///   drift risk that Story 7.5's `agentsso update` is designed to
-///   detect via [`AutostartStatus::Enabled::daemon_path`] vs runtime
-///   `current_exe()` comparison.
-pub fn current_daemon_path() -> std::io::Result<PathBuf> {
-    #[cfg(target_os = "linux")]
-    {
-        // Try to recover the path the user invoked us through, BEFORE
-        // /proc/self/exe canonicalizes the symlink chain.
-        if let Some(arg0) = std::env::args_os().next() {
-            let arg0_path = PathBuf::from(&arg0);
-            // If argv[0] is an absolute path AND it exists on disk,
-            // prefer it (preserves Homebrew's `/home/linuxbrew/.linuxbrew/bin/agentsso`
-            // wrapper-symlink path across `brew upgrade`).
-            if arg0_path.is_absolute() && arg0_path.exists() {
-                return Ok(arg0_path);
-            }
-            // If argv[0] is a bare command name (no slashes), look it
-            // up on PATH — the discovered path is what shells used to
-            // invoke us, which is what we want embedded.
-            if !arg0_path.to_string_lossy().contains('/')
-                && let Some(paths) = std::env::var_os("PATH")
-            {
-                for dir in std::env::split_paths(&paths) {
-                    let candidate = dir.join(&arg0_path);
-                    if candidate.exists() {
-                        return Ok(candidate);
-                    }
-                }
-            }
-        }
-        // Last-resort: canonicalized exe path (current_exe). Story 7.5
-        // owns recovery from any upgrade-drift this introduces.
-        std::env::current_exe()
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        std::env::current_exe()
-    }
-}
-
-/// Enable autostart on the host platform. See module docs for the
-/// per-platform mechanism. OPT-IN: this is only invoked when the user
-/// explicitly opts in via `agentsso autostart enable` or the setup
-/// wizard prompt (which defaults to no).
-pub fn enable() -> Result<EnableOutcome, AutostartError> {
-    let exec = RealExec;
-    let home = home_dir()?;
-    enable_with(&exec, &home)
-}
-
 /// Disable autostart on the host platform. Idempotent — succeeds with
 /// `DisableOutcome::AlreadyDisabled` if there's nothing to remove.
 pub fn disable() -> Result<DisableOutcome, AutostartError> {
@@ -434,24 +275,6 @@ pub fn status() -> Result<AutostartStatus, AutostartError> {
     let exec = RealExec;
     let home = home_dir()?;
     status_with(&exec, &home)
-}
-
-/// Outcome of a successful [`enable`] — surfaces side effects the CLI
-/// reports to the operator (e.g., "removed Story 7.2 .lnk" migrations).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum EnableOutcome {
-    /// Autostart was registered. `mechanism` is the platform-native
-    /// label (`launchd` / `systemd-user` / `task-scheduler`).
-    Registered { mechanism: &'static str, artifact_path: PathBuf },
-
-    /// Autostart was registered AND a stale Story 7.2 install-time
-    /// `agentsso.lnk` shortcut was migrated away. Windows only.
-    /// CLI prints a `→ migrating autostart` info line.
-    #[allow(dead_code)] // Constructed only by the windows backend.
-    MigratedFromStartupShortcut { artifact_path: PathBuf, removed_shortcut: PathBuf },
-
-    /// Autostart was already enabled — no-op. Idempotency.
-    AlreadyEnabled { artifact_path: PathBuf },
 }
 
 /// Outcome of a successful [`disable`].
@@ -477,14 +300,6 @@ pub enum DisableOutcome {
 // [`RealExec`].
 
 #[cfg(target_os = "macos")]
-pub(crate) fn enable_with(
-    exec: &impl Engine,
-    home: &Path,
-) -> Result<EnableOutcome, AutostartError> {
-    macos::enable(exec, home)
-}
-
-#[cfg(target_os = "macos")]
 pub(crate) fn disable_with(
     exec: &impl Engine,
     home: &Path,
@@ -501,14 +316,6 @@ pub(crate) fn status_with(
 }
 
 #[cfg(target_os = "linux")]
-pub(crate) fn enable_with(
-    exec: &impl Engine,
-    home: &Path,
-) -> Result<EnableOutcome, AutostartError> {
-    linux::enable(exec, home)
-}
-
-#[cfg(target_os = "linux")]
 pub(crate) fn disable_with(
     exec: &impl Engine,
     home: &Path,
@@ -522,14 +329,6 @@ pub(crate) fn status_with(
     home: &Path,
 ) -> Result<AutostartStatus, AutostartError> {
     linux::status(exec, home)
-}
-
-#[cfg(target_os = "windows")]
-pub(crate) fn enable_with(
-    exec: &impl Engine,
-    home: &Path,
-) -> Result<EnableOutcome, AutostartError> {
-    windows::enable(exec, home)
 }
 
 #[cfg(target_os = "windows")]
@@ -551,14 +350,6 @@ pub(crate) fn status_with(
 // Unsupported-target stubs. Anything not macOS/Linux/Windows (e.g., a
 // hypothetical FreeBSD target) gets a clean error rather than a build
 // break.
-#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-pub(crate) fn enable_with(
-    _exec: &impl Engine,
-    _home: &Path,
-) -> Result<EnableOutcome, AutostartError> {
-    Err(AutostartError::UnsupportedPlatform { platform: std::env::consts::OS })
-}
-
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub(crate) fn disable_with(
     _exec: &impl Engine,
@@ -676,70 +467,6 @@ fn utf8_char_len(b: u8) -> usize {
     }
 }
 
-/// Atomic file write — write to `<path>.tmp.<pid>`, fsync, rename.
-/// Same pattern as [`crate::lifecycle::pid::PidFile::acquire`]'s atomic
-/// PID write; lifted here so platform modules don't each reinvent it.
-///
-/// **P3 + P4 (code review):**
-/// - The temp file is `<path>.tmp.<pid>` (not just `<path>.tmp`), so two
-///   concurrent writers don't collide on the same temp path AND we can't
-///   accidentally clobber a user file literally named `agentsso.tmp`.
-/// - On any error after the temp file is created, we explicitly remove
-///   it so we don't orphan partial content (rendered plist / unit / Task
-///   XML) on disk.
-pub(crate) fn write_atomic(path: &Path, content: &str) -> std::io::Result<()> {
-    use std::io::Write as _;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let tmp_name = match path.file_name() {
-        Some(name) => format!("{}.tmp.{}", name.to_string_lossy(), std::process::id()),
-        None => {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "path has no filename",
-            ));
-        }
-    };
-    let tmp = path.with_file_name(tmp_name);
-
-    let result = (|| -> std::io::Result<()> {
-        // P26 (re-triage of D2): use `create_new(true)` so we refuse to
-        // open if the temp path already exists (e.g., a leftover from a
-        // crashed prior run, OR a symlink an attacker pre-planted to
-        // point our write at /etc/passwd or similar). Defense matches
-        // the parent dir's ownership/mode posture (~/.agentsso/ etc.
-        // are user-owned 0700) and adds a belt to the existing
-        // braces.
-        let mut f = std::fs::OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-        f.write_all(content.as_bytes())?;
-        f.sync_all()?;
-        drop(f);
-        std::fs::rename(&tmp, path)?;
-        // **P60 (code review round 5, M12):** fsync the parent
-        // directory so the rename itself is durable. Without this,
-        // a crash between rename and the OS's eventual dir-flush
-        // (default ext4 ordered mode) can lose the rename — old
-        // plist/unit reappears or new path goes missing on reboot.
-        // Best-effort: silently ignore filesystems that don't
-        // support directory fsync (Windows, some FUSE mounts).
-        if let Some(parent) = path.parent()
-            && let Ok(dir) = std::fs::File::open(parent)
-        {
-            let _ = dir.sync_all();
-        }
-        Ok(())
-    })();
-
-    if result.is_err() {
-        // Best-effort cleanup of the temp file on any failure — don't
-        // orphan partial content on disk. Ignore the cleanup error; the
-        // original error is what the caller cares about.
-        let _ = std::fs::remove_file(&tmp);
-    }
-    result
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -813,39 +540,6 @@ mod tests {
                 )
             })
         }
-    }
-
-    #[test]
-    fn current_daemon_path_returns_a_path() {
-        let p = current_daemon_path().unwrap();
-        // Whatever it is, it must be absolute (current_exe contract).
-        assert!(p.is_absolute(), "expected absolute path, got {}", p.display());
-    }
-
-    #[test]
-    fn write_atomic_creates_parent_dirs_and_file() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let target = tmp.path().join("nested/deeper/output.txt");
-        write_atomic(&target, "hello\n").unwrap();
-        let actual = std::fs::read_to_string(&target).unwrap();
-        assert_eq!(actual, "hello\n");
-        // **P62 (code review round 5, D2-promoted):** the previous
-        // assertion looked for `target.with_extension("tmp")` (i.e.,
-        // `output.tmp`), but the real code uses `<name>.tmp.<pid>`
-        // (P3 + P4 fix). The old check ALWAYS passed because that
-        // file never existed under any code path — false confidence.
-        // Walk the parent dir and assert that no sibling file starts
-        // with `<basename>.tmp.` so any future regression that stops
-        // cleaning up after a successful write is caught.
-        let parent = target.parent().unwrap();
-        let basename = target.file_name().unwrap().to_string_lossy();
-        let leaked: Vec<_> = std::fs::read_dir(parent)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .filter(|e| e.file_name().to_string_lossy().starts_with(&format!("{basename}.tmp.")))
-            .map(|e| e.path())
-            .collect();
-        assert!(leaked.is_empty(), "leaked tmp files: {leaked:?}");
     }
 
     #[test]

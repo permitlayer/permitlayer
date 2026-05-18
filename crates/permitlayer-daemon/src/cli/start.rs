@@ -1718,6 +1718,19 @@ pub(crate) enum StartError {
         /// unreadable / marker phase recorded.
         reason: String,
     },
+    /// UX-overhaul Story 3: an on-disk schema migration failed during
+    /// boot (the trigger moved here from the deleted `update --apply`
+    /// orchestrator — see `cli::migrations`). Fail-closed: a daemon
+    /// must never serve a half-migrated vault. The operator
+    /// remediation is migration-specific (often: restore the
+    /// `vault.pre-v2-backup/` the migration left behind, or roll the
+    /// versioned symlink back to the prior binary via
+    /// `sudo agentsso setup`). Exit code 2 (bootstrap family).
+    #[error("on-disk schema migration failed: {reason}")]
+    SchemaMigrationFailed {
+        /// The migration error's operator-facing message.
+        reason: String,
+    },
 }
 
 /// Append a structured-cause tail to a keystore-error banner ONLY for
@@ -1764,7 +1777,8 @@ impl StartError {
             | Self::ServeFailed { .. }
             | Self::TelemetryInit { .. }
             | Self::PluginRuntimeInit { .. }
-            | Self::PluginLoadFailed { .. } => 2,
+            | Self::PluginLoadFailed { .. }
+            | Self::SchemaMigrationFailed { .. } => 2,
             // Exit 3 — another process holds a coordination resource.
             Self::DaemonAlreadyRunning { .. }
             | Self::LaunchdManagedForegroundStart
@@ -2016,6 +2030,25 @@ impl StartError {
                    unaffected by removing the marker.\n\
                  - if the vault directory is unreadable, fix the filesystem perms\n\
                    (`chmod 0700 ~/.agentsso/vault/`) and try again.\n"
+            ),
+            Self::SchemaMigrationFailed { reason } => format!(
+                "error: on-disk schema migration failed ({reason})\n\
+                 \n\
+                 the daemon refuses to boot when it cannot bring the persistent\n\
+                 vault/credential schema up to the version this binary understands.\n\
+                 This is the fail-closed posture: serving a half-migrated vault\n\
+                 would corrupt credentials.\n\
+                 \n\
+                 remediation:\n\
+                 - read the reason above; a migration that left a backup names it\n\
+                   explicitly (typically `~/.agentsso/vault.pre-v2-backup/`).\n\
+                 - to retry: resolve the named condition, then re-run\n\
+                   `agentsso start` (migrations are idempotent — a vault already\n\
+                   at the current schema is a no-op).\n\
+                 - to roll back to the prior binary instead: re-point the install\n\
+                   to the previous version (`sudo agentsso setup` after\n\
+                   `brew` pins/downgrades the formula) — the old binary still\n\
+                   reads the pre-migration schema.\n"
             ),
         }
     }
@@ -2664,6 +2697,61 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         }
         Ok(_) => {}
         Err(e) => tracing::warn!(error = %e, "log retention sweep failed (non-fatal)"),
+    }
+
+    // 4b. Run any pending on-disk schema migrations (UX-overhaul
+    // Story 3 re-host). This trigger used to live in the deleted
+    // `agentsso update --apply` orchestrator; on-disk schema
+    // migration belongs on the boot path — the daemon brings the
+    // persistent vault/credential schema current BEFORE it serves
+    // a single request.
+    //
+    // Ordering is load-bearing:
+    //  - AFTER the boot-time `_vault_lock` was released (line ~2601):
+    //    the migration acquires its OWN `VaultLock`, and flock on
+    //    macOS is per-process — holding the boot lock here would
+    //    self-deadlock the migration's acquire. The lock module's
+    //    deadlock-prevention rule (vault/lock module docs) forbids
+    //    holding a VaultLock across a call that acquires one.
+    //  - AFTER tracing init: migration progress/errors are logged.
+    //  - AFTER the rotation-state pre-flight: a mixed-key_id vault is
+    //    already refused above; the v1→v2 migration only rewrites the
+    //    envelope wire format and does not touch `key_id`.
+    //  - BEFORE the TCP bind / proxy build: no request can read a
+    //    half-migrated credential.
+    //
+    // Fail-closed: a migration error refuses boot via
+    // `StartError::SchemaMigrationFailed` (exit 2). Migrations are
+    // idempotent, so a clean retry after the operator resolves the
+    // named condition is always safe.
+    match crate::cli::migrations::apply_pending(
+        &config.paths.home,
+        env!("CARGO_PKG_VERSION"),
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    {
+        Ok(outcome) => {
+            let applied = outcome.count();
+            if applied > 0 {
+                tracing::info!(
+                    target: "migrations",
+                    migrations_applied = applied,
+                    migration_ids = ?outcome.ids(),
+                    "on-disk schema migrations applied at boot"
+                );
+            } else {
+                tracing::debug!(target: "migrations", "no pending schema migrations");
+            }
+        }
+        Err(e) => {
+            tracing::error!(
+                target: "migrations",
+                error = %e,
+                "on-disk schema migration failed — refusing to boot (fail-closed)"
+            );
+            return Err(StartError::SchemaMigrationFailed { reason: e.to_string() });
+        }
     }
 
     // 5. Bind TCP listener.
