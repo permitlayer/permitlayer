@@ -23,15 +23,14 @@
 //!    `agentsso uninstall`-controlled binary and is removed via
 //!    [`BinaryRemover::remove_owned_target`].
 //!
-//! # Symmetry with the autostart module
+//! # Binary-path resolution
 //!
-//! Story 7.3's `lifecycle::autostart::current_daemon_path` performs
-//! the symmetric "what is the canonical path of MY binary?" lookup,
-//! including a Linux-only argv[0] recovery for Homebrew-on-Linux's
-//! `/proc/self/exe` symlink-canonicalization bug (Story 7.3 P39).
-//! We **deliberately do not** reuse that helper here — `uninstall`
-//! actually wants the canonicalized path. The autostart module needs
-//! to detect drift; uninstall needs to delete the real file.
+//! `uninstall` wants the canonicalized path of the currently-running
+//! binary so it can delete the real file (not a wrapper symlink). It
+//! resolves this directly via `std::env::current_exe()` rather than
+//! through any autostart helper — the autostart `current_daemon_path`
+//! helper (which preserved the invocation path for drift detection)
+//! was removed along with the autostart enable subsystem.
 
 use std::path::{Path, PathBuf};
 
