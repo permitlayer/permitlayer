@@ -46,10 +46,9 @@ These are the error codes you'll actually see and what they mean:
 
 | Code | Meaning | What you should do |
 |---|---|---|
-| `policy.denied` | Operator's policy rejected the call. Response includes a `rule_id`. | Don't retry. Surface the rule_id to the user. Suggest the operator amend `~/.agentsso/policies/`. |
-| `policy.approval_required` | Call needs human approval. The operator's terminal is showing a prompt. | Wait — the call will eventually return ~30s with the operator's decision. Don't retry. |
-| `policy.approval_timeout` | The operator did not respond within the prompt window. | Surface as "the operator did not approve in time"; offer to re-issue if appropriate. |
-| `policy.approval_unavailable` | The daemon has no way to prompt the operator (no controlling TTY). | This is an environment problem; tell the user the daemon must run in a foreground terminal or the policy needs `auto`/`deny`. |
+| `policy.denied` | Operator's policy rejected the call. Response includes a `rule_id`. | Don't retry. Surface the rule_id to the user. Tell the operator the agent's bound policy doesn't grant this scope — they re-run `agentsso quickstart <service> --read-write` for write access, or add a host-local operator-layer policy. |
+| `policy.approval_unavailable` | A `prompt`-mode policy rule was hit but the daemon has no way to ask a human (it runs headless — no controlling TTY). | Don't retry. The shipped policy tiers never prompt (see below), so this means the operator hand-authored a custom `prompt` policy on a headless daemon. Surface it: that policy needs `auto` or `deny`, not `prompt`. |
+| `policy.approval_required` / `policy.approval_timeout` | (Approval-flow codes. The daemon is headless by design and the shipped policies never prompt, so you will not see these in a normal deployment — only if an operator runs the daemon in a foreground terminal AND hand-authored a `prompt` policy.) | Treat like `policy.approval_unavailable`: don't retry; surface verbatim. |
 | `auth.invalid_token` | Your bearer is wrong, expired, or the agent record was removed. | Don't retry. Tell the operator to re-run `agentsso agent register`. |
 | `agent.not_found` | (Same situation, different surface.) | Same remediation. |
 | 5xx / network errors | Daemon is unreachable or crashed. | Retry once after a short delay. If still failing, tell the operator to check `agentsso start`. |
@@ -82,17 +81,27 @@ When you summarize a scrubbed response to the user:
 - Don't try to reconstruct the value from context.
 - Say something like: "the message contains a one-time code (redacted by permitlayer) — the operator can read it directly."
 
-## Approval prompts can take 30 seconds
+## There is no human in the loop — access is binary
 
-If a tool call hits a `prompt`-mode policy rule, the daemon blocks
-the response and asks the operator to press y/n on their terminal.
-This can take up to 30 seconds.
+permitlayer's daemon runs **headless** (a background system service
+with no controlling terminal). There is no approval prompt, no
+"wait for the operator to press y/n." Your access is fixed at the
+moment the operator ran `agentsso quickstart`:
 
-- Tool-call timeouts should be **at least 45 seconds** for permitlayer
-  calls.
-- A long-running call is not stuck — don't retry, don't cancel.
-- If the operator denies, you'll get `policy.denied` with a rule_id.
-- If the operator times out, you'll get `policy.approval_timeout`.
+- A scope your policy grants → the call works, immediately.
+- A scope it does not grant → `policy.denied` (HTTP 403), immediately.
+
+There is no in-between "pending approval" state for the shipped
+policy tiers. A call that's slow is slow for ordinary reasons
+(upstream Google latency, a large response) — not because a human is
+deciding. Don't special-case long calls as "waiting for approval";
+just use a normal generous timeout and surface real errors verbatim.
+
+(The `policy.approval_*` codes still exist for the rare operator who
+hand-authors a custom `prompt` policy and runs the daemon in a
+foreground terminal — but that is not the headless deployment this
+skill targets. If you see one, treat it as a misconfiguration to
+surface, not a state to wait on.)
 
 ## Audit
 
@@ -108,6 +117,6 @@ you'll lose trust if the audit log doesn't match your story.
 
 1. Trust the policy. Don't try to escalate it.
 2. Treat redactions as opaque. Don't claim to see through them.
-3. Wait out approval prompts patiently — they're a feature, not a bug.
+3. Access is binary and immediate — a denied scope won't become allowed by waiting or retrying.
 4. Surface error codes verbatim when explaining failures to the user.
 5. Be honest in summaries — the audit log is the ground truth.
