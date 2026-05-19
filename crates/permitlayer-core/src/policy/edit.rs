@@ -347,6 +347,116 @@ pub fn add_scopes_to_policy(
     Ok(ScopeMergeDiff { policy_name: policy_name.to_owned(), policy_path, before, added, after })
 }
 
+/// Two-layer scope merge — operator layer with a managed-layer
+/// no-op fallback (UX-overhaul C1 fix).
+///
+/// `agentsso quickstart <svc>` binds an agent to a shipped
+/// (managed-layer) policy by name — e.g. `gmail-read-only`. On a
+/// clean install the OPERATOR `policies/` dir is empty (Story 1: the
+/// product bundle lives in the sibling `policies-managed/`, never
+/// seeded into the operator layer). connect's scope-merge step then
+/// targets a policy that exists ONLY in the managed layer.
+/// [`add_scopes_to_policy`] scans the operator dir only, so it would
+/// return [`PolicyEditError::PolicyFileNotFound`] and connect would
+/// treat that as FATAL — breaking the flagship command on its
+/// primary path AFTER the user completed OAuth.
+///
+/// Decision (Option B — owner-approved): the managed bundle stays the
+/// single source of truth; this function does NOT seed operator-layer
+/// copies. When the target policy is absent from the operator layer
+/// but present in the managed layer AND every requested short-name
+/// scope is already in that managed policy's resolved scope set, the
+/// merge is a genuine NO-OP: return success with the managed policy's
+/// existing scopes, write nothing, create no operator file. The
+/// quickstart-bound `-read-only` / `-read-write` tiers carry their
+/// complete scope sets in the bundle, so connect's merge for a
+/// quickstart-bound tier always lands here as a no-op.
+///
+/// This does NOT silently broaden scope: if the request asks for a
+/// scope the managed policy lacks (and there is no operator-layer
+/// policy to extend), it returns a clear error — never a silent
+/// grant. Operator-layer policies are unaffected: if the policy
+/// exists in `operator_dir` it gets the real add-scopes merge exactly
+/// as before (the managed layer is consulted only on the
+/// operator-not-found path).
+///
+/// `managed_dir == None` ⇒ behaves exactly like
+/// [`add_scopes_to_policy`] (single-layer; no managed fallback).
+pub fn add_scopes_to_policy_layered(
+    operator_dir: &Path,
+    managed_dir: Option<&Path>,
+    policy_name: &str,
+    scopes_to_add: &[&str],
+) -> Result<ScopeMergeDiff, PolicyEditError> {
+    match add_scopes_to_policy(operator_dir, policy_name, scopes_to_add) {
+        Ok(diff) => Ok(diff),
+        Err(PolicyEditError::PolicyFileNotFound { path }) => {
+            // Not in the operator layer. Try the managed layer as a
+            // strict no-op: the policy must exist there AND already
+            // contain every requested scope.
+            let Some(managed_dir) = managed_dir else {
+                return Err(PolicyEditError::PolicyFileNotFound { path });
+            };
+            // A MISSING managed dir means "no managed layer synced yet"
+            // (valid on a control-plane reload that races the first
+            // `sync_managed_policies`, and in router unit tests that
+            // build the handler without a full daemon boot). Treat it
+            // exactly like operator-not-found: surface the original
+            // 404, NOT a parse error. Only a managed dir that EXISTS
+            // but is broken is a parse failure.
+            if !managed_dir.exists() {
+                return Err(PolicyEditError::PolicyFileNotFound { path });
+            }
+            let managed_set = PolicySet::compile_from_dir(managed_dir).map_err(|source| {
+                // A broken managed bundle is a parse failure, surfaced
+                // with the same uniform rendering as the daemon-start
+                // path — not a silent success.
+                PolicyEditError::ParseFailed { source }
+            })?;
+            let Some(managed_policy) = managed_set.get(policy_name) else {
+                // Genuinely unknown policy (not in operator OR managed).
+                return Err(PolicyEditError::PolicyFileNotFound { path });
+            };
+
+            // Every requested short-name scope must already be present
+            // in the managed policy's resolved allowlist. If any is
+            // missing we must NOT silently grant it — there is no
+            // operator-layer file to materialize here, and seeding one
+            // is explicitly rejected by Option B. Surface a clear
+            // not-found-shaped error so connect fails loudly rather
+            // than half-granting.
+            let missing: Vec<&str> = scopes_to_add
+                .iter()
+                .copied()
+                .filter(|s| !managed_policy.scope_allowlist.contains(*s))
+                .collect();
+            if !missing.is_empty() {
+                return Err(PolicyEditError::PolicyFileNotFound { path });
+            }
+
+            // No-op merge: the managed policy already covers every
+            // requested scope. Return its existing scopes; touch
+            // nothing on disk. `policy_path` points at the managed
+            // file that actually defines the policy (best-effort
+            // resolve; falls back to the legacy managed path).
+            let policy_path = resolve_policy_file(managed_dir, policy_name)
+                .map(|(p, _, _)| p)
+                .unwrap_or_else(|_| legacy_policy_path(managed_dir, policy_name));
+            let mut after: Vec<String> = managed_policy.scope_allowlist.iter().cloned().collect();
+            after.sort();
+            after.dedup();
+            Ok(ScopeMergeDiff {
+                policy_name: policy_name.to_owned(),
+                policy_path,
+                before: after.clone(),
+                added: Vec::new(),
+                after,
+            })
+        }
+        Err(other) => Err(other),
+    }
+}
+
 /// Serialize a `TomlPolicyFile` back to its on-disk representation.
 ///
 /// Uses `toml::to_string_pretty` directly on the typed `TomlPolicyFile`,
@@ -965,5 +1075,172 @@ action = "allow"
         assert_eq!(r.scopes.as_ref().unwrap(), &vec!["gmail.readonly".to_owned()]);
         assert_eq!(r.resources.as_ref().unwrap(), &vec!["primary".to_owned()]);
         assert_eq!(r.action, crate::policy::schema::TomlRuleAction::Allow);
+    }
+
+    // ── C1: two-layer scope merge (managed-only no-op) ──────────────
+
+    const MANAGED_TWO_TIERS: &str = r#"[[policies]]
+name = "gmail-read-only"
+scopes = ["gmail.readonly", "gmail.metadata"]
+resources = ["*"]
+approval-mode = "auto"
+auto-approve-reads = true
+
+[[policies]]
+name = "gmail-read-write"
+scopes = ["gmail.readonly", "gmail.metadata", "gmail.send", "gmail.compose", "gmail.modify"]
+resources = ["*"]
+approval-mode = "auto"
+auto-approve-reads = true
+"#;
+
+    /// The flagship C1 path: clean install (empty operator dir),
+    /// policy lives ONLY in the managed bundle, requested scopes are
+    /// already a subset → success no-op, nothing written, no operator
+    /// file created.
+    #[test]
+    fn layered_managed_only_subset_is_a_successful_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let operator = tmp.path().join("policies");
+        let managed = tmp.path().join("policies-managed");
+        std::fs::create_dir_all(&operator).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        write_named_policy_file(&managed, "default.toml", MANAGED_TWO_TIERS);
+
+        // connect for a quickstart `--read` bind requests exactly the
+        // read-only tier's scopes.
+        let diff = add_scopes_to_policy_layered(
+            &operator,
+            Some(&managed),
+            "gmail-read-only",
+            &["gmail.readonly", "gmail.metadata"],
+        )
+        .unwrap();
+
+        assert!(diff.is_no_op(), "managed-only subset merge must be a no-op");
+        assert_eq!(diff.added, Vec::<String>::new());
+        assert_eq!(diff.before, vec!["gmail.metadata", "gmail.readonly"]);
+        assert_eq!(diff.after, vec!["gmail.metadata", "gmail.readonly"]);
+        // No operator file was created — Option B: managed bundle
+        // stays the single source of truth.
+        assert!(
+            std::fs::read_dir(&operator).unwrap().next().is_none(),
+            "operator dir must remain empty (no seeded copy)"
+        );
+    }
+
+    /// `--read-write` quickstart: connect requests the full
+    /// read+write scope set; the managed `-read-write` tier already
+    /// carries all of them → no-op success.
+    #[test]
+    fn layered_managed_only_read_write_tier_is_a_noop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let operator = tmp.path().join("policies");
+        let managed = tmp.path().join("policies-managed");
+        std::fs::create_dir_all(&operator).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        write_named_policy_file(&managed, "default.toml", MANAGED_TWO_TIERS);
+
+        let diff = add_scopes_to_policy_layered(
+            &operator,
+            Some(&managed),
+            "gmail-read-write",
+            &["gmail.readonly", "gmail.metadata", "gmail.send", "gmail.compose", "gmail.modify"],
+        )
+        .unwrap();
+
+        assert!(diff.is_no_op());
+        assert_eq!(diff.added, Vec::<String>::new());
+        assert!(std::fs::read_dir(&operator).unwrap().next().is_none());
+    }
+
+    /// Must NOT silently broaden scope: a request for a scope the
+    /// managed policy lacks (and no operator policy to extend) is a
+    /// loud error, not a half-grant.
+    #[test]
+    fn layered_managed_policy_missing_scope_errors_not_silent_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let operator = tmp.path().join("policies");
+        let managed = tmp.path().join("policies-managed");
+        std::fs::create_dir_all(&operator).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        write_named_policy_file(&managed, "default.toml", MANAGED_TWO_TIERS);
+
+        // Ask the read-only tier for a WRITE scope it does not allow.
+        let err = add_scopes_to_policy_layered(
+            &operator,
+            Some(&managed),
+            "gmail-read-only",
+            &["gmail.send"],
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, PolicyEditError::PolicyFileNotFound { .. }),
+            "a managed policy lacking the requested scope must error (no silent grant), got {err:?}"
+        );
+        assert!(std::fs::read_dir(&operator).unwrap().next().is_none());
+    }
+
+    /// An operator-layer policy still gets the real add-scopes merge;
+    /// the managed layer is consulted ONLY on operator-not-found.
+    #[test]
+    fn layered_operator_policy_still_gets_real_merge() {
+        let tmp = tempfile::tempdir().unwrap();
+        let operator = tmp.path().join("policies");
+        let managed = tmp.path().join("policies-managed");
+        std::fs::create_dir_all(&operator).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        write_named_policy_file(&managed, "default.toml", MANAGED_TWO_TIERS);
+        // Operator authored their own policy of the same shape.
+        write_policy_file(
+            &operator,
+            "my-ops",
+            r#"[[policies]]
+name = "my-ops"
+scopes = ["x.read"]
+resources = ["*"]
+approval-mode = "auto"
+auto-approve-reads = true
+"#,
+        );
+
+        let diff = add_scopes_to_policy_layered(&operator, Some(&managed), "my-ops", &["x.write"])
+            .unwrap();
+        assert_eq!(diff.added, vec!["x.write"]);
+        assert_eq!(diff.after, vec!["x.read", "x.write"]);
+    }
+
+    /// Truly-unknown policy (in neither layer) still errors.
+    #[test]
+    fn layered_unknown_in_both_layers_errors() {
+        let tmp = tempfile::tempdir().unwrap();
+        let operator = tmp.path().join("policies");
+        let managed = tmp.path().join("policies-managed");
+        std::fs::create_dir_all(&operator).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        write_named_policy_file(&managed, "default.toml", MANAGED_TWO_TIERS);
+
+        let err = add_scopes_to_policy_layered(
+            &operator,
+            Some(&managed),
+            "does-not-exist",
+            &["gmail.readonly"],
+        )
+        .unwrap_err();
+        assert!(matches!(err, PolicyEditError::PolicyFileNotFound { .. }));
+    }
+
+    /// `managed_dir = None` ⇒ identical to single-layer
+    /// `add_scopes_to_policy` (managed fallback disabled).
+    #[test]
+    fn layered_without_managed_dir_is_single_layer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let operator = tmp.path().join("policies");
+        std::fs::create_dir_all(&operator).unwrap();
+
+        let err =
+            add_scopes_to_policy_layered(&operator, None, "gmail-read-only", &["gmail.readonly"])
+                .unwrap_err();
+        assert!(matches!(err, PolicyEditError::PolicyFileNotFound { .. }));
     }
 }

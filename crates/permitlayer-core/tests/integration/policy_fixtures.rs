@@ -6,20 +6,22 @@
 //! in a way that changes the behavior of any of the canonical
 //! requests below, the snapshot review will catch it.
 //!
-//! AC #9 decision category mapping (Story 4.1):
+//! Decision category mapping (headless model — no prompt):
 //!   read-allow                    → `decision_gmail_read_allowed`
 //!   out-of-scope-deny (as impl'd) → `decision_gmail_write_denied`
-//!                                   (rule-deny, not scope-deny — see Note)
-//!   write-prompt                  → `decision_calendar_write_prompts`
-//!   unknown-resource-deny         → `decision_calendar_other_resource_denied`
+//!                                   (default-deny, scope absent)
+//!   write-allow (read-write tier) → `decision_calendar_write_allowed`
+//!   unknown-resource-deny         → `decision_drive_other_resource_denied`
 //!   unmatched-policy-default-deny → `decision_unknown_policy_default_denies`
 //!
-//! Note: AC #9's literal text lists "out-of-scope-deny" but the
-//! `default.toml` fixture ships `gmail_write_denied` as an explicit
-//! rule-deny for the `gmail.modify` scope rather than a scope-allowlist
-//! miss. Spirit of the AC is met (five decision categories × five
-//! snapshots); the label drift is cosmetic. Tracked (and now closed)
-//! in `deferred-work.md:119` by Story 8.6 AC #7.
+//! UX-overhaul: the daemon is HEADLESS — there is no `prompt`
+//! disposition in the shipped bundle/fixture (it could only 503 on a
+//! headless daemon). The former `decision_calendar_write_prompts`
+//! snapshot is replaced by `decision_calendar_write_allowed`: a
+//! `-read-write` tier auto-grants the write scope. The legacy
+//! `calendar-prompt-on-write` example policy was deleted with the
+//! `prompt` purge; the unknown-resource-deny category now exercises
+//! `drive-research-scope-restricted` (which scopes to one folder ID).
 
 use std::path::PathBuf;
 
@@ -44,15 +46,19 @@ fn load_default_policy_set() -> PolicySet {
 #[test]
 fn default_fixture_compiles() {
     let set = load_default_policy_set();
-    // Epic 9 added six per-service tier policies on top of the
-    // original three (which are RETAINED unchanged — existing agents
-    // and policy/edit.rs tests bind to them by name).
-    assert_eq!(set.len(), 9);
-    // Original three (pre-Epic-9).
+    // Six per-service tier policies plus two retained originals
+    // (gmail-read-only + drive-research-scope-restricted). The legacy
+    // `calendar-prompt-on-write` example was deleted with the
+    // headless `prompt`-purge → 8 policies total.
+    assert_eq!(set.len(), 8);
+    // Retained originals.
     assert!(set.get("gmail-read-only").is_some());
-    assert!(set.get("calendar-prompt-on-write").is_some());
     assert!(set.get("drive-research-scope-restricted").is_some());
-    // Epic 9 per-service read-only / read-write tiers.
+    assert!(
+        set.get("calendar-prompt-on-write").is_none(),
+        "the legacy prompt-on-write example must NOT ship — the daemon is headless"
+    );
+    // Per-service read-only / read-write tiers.
     for name in [
         "gmail-read-write",
         "calendar-read-only",
@@ -61,7 +67,7 @@ fn default_fixture_compiles() {
         "drive-read-write",
         "gmail-read-only-tier",
     ] {
-        assert!(set.get(name).is_some(), "Epic 9 tier policy {name} must be present");
+        assert!(set.get(name).is_some(), "tier policy {name} must be present");
     }
 }
 
@@ -88,25 +94,31 @@ fn decision_gmail_write_denied() {
 }
 
 #[test]
-fn decision_calendar_write_prompts() {
+fn decision_calendar_write_allowed() {
+    // Headless model: the `-read-write` tier auto-grants the write
+    // scope (no prompt — `prompt` would only 503 on a headless
+    // daemon and is purged from the shipped bundle/fixture).
     let set = load_default_policy_set();
     let decision = set.evaluate(&EvalRequest {
-        policy_name: "calendar-prompt-on-write".to_owned(),
+        policy_name: "calendar-read-write".to_owned(),
         scope: "calendar.events".to_owned(),
         resource: Some("primary".to_owned()),
     });
-    insta::assert_json_snapshot!("calendar_write_prompts", decision);
+    insta::assert_json_snapshot!("calendar_write_allowed", decision);
 }
 
 #[test]
-fn decision_calendar_other_resource_denied() {
+fn decision_drive_other_resource_denied() {
+    // `drive-research-scope-restricted` scopes to exactly the
+    // `research-shared` folder ID; any other resource is denied by
+    // the resource allowlist (unknown-resource-deny category).
     let set = load_default_policy_set();
     let decision = set.evaluate(&EvalRequest {
-        policy_name: "calendar-prompt-on-write".to_owned(),
-        scope: "calendar.events".to_owned(),
-        resource: Some("family".to_owned()),
+        policy_name: "drive-research-scope-restricted".to_owned(),
+        scope: "drive.readonly".to_owned(),
+        resource: Some("some-other-folder".to_owned()),
     });
-    insta::assert_json_snapshot!("calendar_other_resource_denied", decision);
+    insta::assert_json_snapshot!("drive_other_resource_denied", decision);
 }
 
 #[test]

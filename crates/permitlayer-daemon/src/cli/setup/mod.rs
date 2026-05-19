@@ -26,21 +26,25 @@
 //!   `running`. Any post-cutover failure rolls the symlink back to
 //!   the prior versioned binary and re-bootstraps.
 //!
-//! ## Trust model (why no minisign-verify on the local binary)
+//! ## Trust model (why no signature-verify on the local binary)
 //!
-//! `setup` stages a copy of **this process's own `current_exe()`**.
-//! That binary was already minisign-verified at install time by the
-//! curl|sh installer (`install/install.sh`) or sha256-pinned by the
-//! Homebrew formula. There is no `.minisig` sidecar on disk for an
-//! *extracted* binary, and `release_verify::verify_minisign` checks a
-//! signature over a release **tarball**, not a bare binary — so it is
-//! not applicable here (see `release_verify.rs` module docs). The
-//! local fail-closed control is instead: (a) a content-hash
-//! idempotency gate — a pre-existing `agentsso-<V>` whose bytes
-//! differ from the staged copy is refused (tamper/corruption), never
-//! silently overwritten; and (b) the self-verify activation gate — a
-//! binary that won't run or reports the wrong version never becomes
-//! the active symlink target.
+//! `setup` stages a copy of **this process's own `current_exe()`** —
+//! the already-installed bare binary. The signature trust root lives
+//! at the *download* boundary, not here: the curl|sh installer
+//! (`install/install.sh`) and the PowerShell installer
+//! (`install/install.ps1`) minisign-verify the downloaded release
+//! **tarball** against `install/permitlayer.pub` before extracting it;
+//! the Homebrew formula sha256-pins the tarball. There is no
+//! `.minisig` sidecar on disk for an *extracted* bare binary, so the
+//! privileged `setup` path does NOT (and cannot) signature-verify the
+//! binary it stages. The local fail-closed control is instead:
+//! (a) a content-hash idempotency gate — a pre-existing `agentsso-<V>`
+//! whose bytes differ from the staged copy is refused
+//! (tamper/corruption), never silently overwritten; and (b) the
+//! self-verify activation gate — a binary that won't run or reports
+//! the wrong version never becomes the active symlink target. Neither
+//! is a signature check; the privileged path is content-hash-verified,
+//! not signature-verified.
 
 #[cfg(target_os = "macos")]
 use std::path::{Path, PathBuf};
@@ -260,31 +264,59 @@ async fn run_macos(args: SetupArgs) -> Result<()> {
     // (9) Record the prior symlink target for rollback, then do the
     // atomic symlink swap.
     let prior_target: Option<PathBuf> = std::fs::read_link(helper_path).ok();
-    // Legacy/regular-file migration: pre-symlink installs had a real
-    // binary at the helper path. Remove it so the symlink can be
-    // created (breaking change is acceptable — sole consumer is
-    // wiped+reinstalled — but handle it gracefully).
-    if helper_path.exists()
-        && prior_target.is_none()
-        && let Err(e) = std::fs::remove_file(helper_path)
-    {
-        eprint!(
-            "{}",
-            error_block(
-                "setup.legacy_helper_unremovable",
-                &format!(
-                    "a non-symlink binary exists at {} and could not be removed: {e}",
-                    helper_path.display()
-                ),
-                "manually remove it and re-run `sudo agentsso setup`",
-                None,
-            )
-        );
-        return Err(silent_cli_error("legacy helper not removable"));
+    // Legacy/regular-file migration: pre-symlink installs had a REAL
+    // binary at the helper path (not a symlink). We must move it out
+    // of the way so the stable symlink can be created — but step 7
+    // already booted the daemon out, so if any post-cutover step
+    // below fails we'd be left with a hard-down daemon and no binary
+    // to restore. So instead of `remove_file` (which is unrecoverable)
+    // we RENAME the legacy binary aside to a `.legacy-bak.<pid>`
+    // crumb; the restore path below renames it back + re-bootstraps.
+    // (The plain symlink-upgrade path keeps using `prior_target` +
+    // `rollback()` — only the legacy non-symlink migration needs the
+    // crumb because its `prior_target` is `None`.)
+    let mut legacy_bak: Option<PathBuf> = None;
+    if helper_path.exists() && prior_target.is_none() {
+        let bak = helper_dir.join(format!("agentsso.legacy-bak.{}", std::process::id()));
+        // Clear any stale crumb from a prior crashed run at this pid.
+        let _ = std::fs::remove_file(&bak);
+        if let Err(e) = std::fs::rename(helper_path, &bak) {
+            eprint!(
+                "{}",
+                error_block(
+                    "setup.legacy_helper_unremovable",
+                    &format!(
+                        "a non-symlink binary exists at {} and could not be moved aside: {e}",
+                        helper_path.display()
+                    ),
+                    "manually remove it and re-run `sudo agentsso setup`",
+                    None,
+                )
+            );
+            return Err(silent_cli_error("legacy helper not movable"));
+        }
+        legacy_bak = Some(bak);
     }
     if let Err(e) = atomic_symlink_swap(&versioned, helper_path, helper_dir) {
-        // Swap itself failed BEFORE the symlink moved → nothing to
-        // roll back (the old target, if any, is still in place).
+        // Swap failed BEFORE the symlink moved. For a plain upgrade
+        // the old symlink target is still in place (nothing to roll
+        // back). For the legacy migration the real binary was moved
+        // aside by us AND the daemon was already booted out at step 7
+        // — restore it + re-bootstrap so we don't leave a hard-down
+        // daemon behind.
+        if let Some(bak) = &legacy_bak {
+            return restore_legacy_and_rebootstrap(
+                &g,
+                bak,
+                helper_path,
+                &format!(
+                    "could not point {} at {}: {e}",
+                    helper_path.display(),
+                    versioned.display()
+                ),
+            )
+            .await;
+        }
         eprint!(
             "{}",
             error_block(
@@ -307,6 +339,15 @@ async fn run_macos(args: SetupArgs) -> Result<()> {
     let wrote = match im::write_launchdaemon_plist(operator_uid, &operator_username) {
         Ok(w) => w,
         Err(e) => {
+            if let Some(bak) = &legacy_bak {
+                return restore_legacy_and_rebootstrap(
+                    &g,
+                    bak,
+                    helper_path,
+                    &format!("plist write failed: {e}"),
+                )
+                .await;
+            }
             return rollback(
                 &g,
                 prior_target.as_deref(),
@@ -321,6 +362,15 @@ async fn run_macos(args: SetupArgs) -> Result<()> {
 
     // (11) Bootstrap.
     if let Err(e) = im::launchctl_bootstrap_system() {
+        if let Some(bak) = &legacy_bak {
+            return restore_legacy_and_rebootstrap(
+                &g,
+                bak,
+                helper_path,
+                &format!("launchctl bootstrap failed: {e}"),
+            )
+            .await;
+        }
         return rollback(
             &g,
             prior_target.as_deref(),
@@ -347,8 +397,19 @@ async fn run_macos(args: SetupArgs) -> Result<()> {
             );
         }
         Err(reason) => {
+            if let Some(bak) = &legacy_bak {
+                return restore_legacy_and_rebootstrap(&g, bak, helper_path, &reason).await;
+            }
             return rollback(&g, prior_target.as_deref(), helper_path, helper_dir, &reason).await;
         }
+    }
+
+    // Setup succeeded. The legacy binary is no longer needed — drop
+    // the `.legacy-bak` crumb. Best-effort; a stale crumb left by a
+    // crash between here and the `rename` is swept by
+    // `gc_old_versions` on the next run.
+    if let Some(bak) = &legacy_bak {
+        let _ = std::fs::remove_file(bak);
     }
 
     // (13) GC old versioned binaries — keep current + the single most
@@ -521,6 +582,123 @@ async fn poll_recovered_version(timeout: Duration) -> Option<String> {
     None
 }
 
+/// Legacy-migration recovery: restore the legacy real binary that was
+/// renamed aside to `bak` back to `helper_path`, then re-bootstrap the
+/// old daemon. Used ONLY on the pre-symlink-install migration path,
+/// where step 7's bootout already brought the daemon down and there is
+/// no `prior_target` symlink for [`rollback`] to restore. Emits a
+/// TRUTHFUL structured error stating exactly what was (or wasn't)
+/// recovered — never the "old target still in place" claim, which is
+/// false once the legacy binary has been moved.
+#[cfg(target_os = "macos")]
+async fn restore_legacy_and_rebootstrap(
+    g: &Glyphs,
+    bak: &Path,
+    helper_path: &Path,
+    cause: &str,
+) -> Result<()> {
+    use crate::cli::service::install_macos as im;
+
+    eprintln!("{} setup failed: {cause}", g.warn);
+    eprintln!(
+        "{} restoring the prior (pre-symlink) binary {} → {}",
+        g.arrow,
+        bak.display(),
+        helper_path.display()
+    );
+    // The symlink swap may or may not have created a symlink at
+    // `helper_path`; remove whatever is there so the rename can
+    // re-establish the real binary.
+    let _ = std::fs::remove_file(helper_path);
+    let restored = std::fs::rename(bak, helper_path).is_ok();
+    if restored {
+        // bootout-then-bootstrap to bring the restored binary's daemon
+        // back (step 7 already booted the old one out).
+        let _ = im::bootout_daemon();
+        let rebootstrapped = im::launchctl_bootstrap_system().is_ok();
+        if rebootstrapped {
+            match poll_recovered_version(Duration::from_secs(5)).await {
+                Some(recovered) => {
+                    eprint!(
+                        "{}",
+                        error_block(
+                            "setup.rolled_back",
+                            &format!(
+                                "setup failed ({cause}); the prior pre-symlink binary was \
+                                 restored to {} and re-bootstrapped (daemon {recovered} is \
+                                 back and answering)",
+                                helper_path.display()
+                            ),
+                            "investigate the failure cause above, then re-run \
+                             `sudo agentsso setup`",
+                            None,
+                        )
+                    );
+                }
+                None => {
+                    eprint!(
+                        "{}",
+                        error_block(
+                            "setup.rollback_incomplete",
+                            &format!(
+                                "setup failed ({cause}); the prior pre-symlink binary was \
+                                 restored to {} and re-bootstrapped, but the control plane \
+                                 did not confirm the daemon is back within 5s — it may still \
+                                 be starting",
+                                helper_path.display()
+                            ),
+                            "check /Library/Logs/permitlayer/daemon.log and \
+                             `sudo launchctl print system/dev.permitlayer.daemon`; if the \
+                             daemon is down, re-run `sudo agentsso setup`",
+                            None,
+                        )
+                    );
+                }
+            }
+        } else {
+            eprint!(
+                "{}",
+                error_block(
+                    "setup.rollback_incomplete",
+                    &format!(
+                        "setup failed ({cause}); the prior pre-symlink binary was restored \
+                         to {} but re-bootstrap failed — the daemon may be down",
+                        helper_path.display()
+                    ),
+                    "manually run `sudo launchctl bootstrap system \
+                     /Library/LaunchDaemons/dev.permitlayer.daemon.plist` and check \
+                     /Library/Logs/permitlayer/daemon.log",
+                    None,
+                )
+            );
+        }
+    } else {
+        // Restore itself failed — the daemon is down and the legacy
+        // binary could not be put back. Be explicit; the staged
+        // versioned binary is intact, so the recovery is a re-run.
+        eprint!(
+            "{}",
+            error_block(
+                "setup.failed_no_rollback",
+                &format!(
+                    "setup failed ({cause}) AND the prior pre-symlink binary could not be \
+                     restored from {} — the daemon is down. The staged versioned binary is \
+                     intact under {}",
+                    bak.display(),
+                    helper_path
+                        .parent()
+                        .unwrap_or(Path::new("/Library/PrivilegedHelperTools"))
+                        .display()
+                ),
+                "check /Library/Logs/permitlayer/daemon.log, then re-run \
+                 `sudo agentsso setup`",
+                None,
+            )
+        );
+    }
+    Err(silent_cli_error("setup failed (see rollback report)"))
+}
+
 /// Roll the symlink back to `prior_target` and re-bootstrap. Emits a
 /// structured error and returns the silent-cli error so the caller
 /// just `return rollback(...).await`.
@@ -639,6 +817,17 @@ fn gc_old_versions(g: &Glyphs, helper_dir: &Path, current_version: &str) {
         let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
+        // Sweep a stale `agentsso.legacy-bak.<pid>` crumb left behind
+        // if a prior run crashed between the legacy rename-aside and
+        // the success cleanup. Safe to delete unconditionally here:
+        // any in-flight setup holds the install-lock, so a crumb seen
+        // now is necessarily orphaned.
+        if name.starts_with("agentsso.legacy-bak.") {
+            if std::fs::remove_file(&path).is_ok() {
+                println!("  {} gc: removed stale legacy-binary crumb {}", g.check, path.display());
+            }
+            continue;
+        }
         let Some(ver_str) = name.strip_prefix("agentsso-") else {
             continue;
         };

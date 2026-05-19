@@ -2352,15 +2352,17 @@ mod tests {
     const BUNDLED_DEFAULT_TOML: &str =
         include_str!("../../../permitlayer-daemon/src/cli/default_policy.toml");
 
-    /// AC #5/#6: the shipped fixture compiles and contains exactly the
-    /// 3 original + 6 Epic-9 per-service tier policies = 9.
+    /// The shipped fixture compiles and contains exactly the 2
+    /// retained originals + 6 per-service tier policies = 8. The
+    /// legacy `calendar-prompt-on-write` example was deleted with the
+    /// headless `prompt`-purge (it could only 503 on a headless
+    /// daemon).
     #[test]
     fn epic9_default_toml_compiles_with_all_policies() {
         let set = PolicySet::compile_from_str(FIXTURE_DEFAULT_TOML, &p("default.toml"))
             .expect("expanded default.toml must compile");
         for name in [
             "gmail-read-only",
-            "calendar-prompt-on-write",
             "drive-research-scope-restricted",
             "gmail-read-write",
             "calendar-read-only",
@@ -2371,7 +2373,11 @@ mod tests {
         ] {
             assert!(set.get(name).is_some(), "policy {name} must be present");
         }
-        assert_eq!(set.len(), 9, "expected exactly 9 policies in the shipped default.toml");
+        assert!(
+            set.get("calendar-prompt-on-write").is_none(),
+            "the legacy prompt-on-write example must NOT ship — the daemon is headless"
+        );
+        assert_eq!(set.len(), 8, "expected exactly 8 policies in the shipped default.toml");
     }
 
     /// AC #2: every `{svc}-read-only` tier denies its service's write
@@ -2401,25 +2407,24 @@ mod tests {
         }
     }
 
-    /// AC #3: every `{svc}-read-write` tier ALLOWS a representative read
-    /// scope and PROMPTS a representative write scope (prompt-on-write
-    /// default posture — the charter's hard requirement).
+    /// Headless model: every `{svc}-read-write` tier ALLOWS a
+    /// representative read scope AND auto-grants (ALLOWS) a
+    /// representative write scope. The pre-overhaul prompt-on-write
+    /// posture is gone — on a headless daemon `prompt` can only 503,
+    /// so `-read-write` tiers are deliberate autonomous-write grants
+    /// (`approval-mode = "auto"`, write scopes allowed by an explicit
+    /// `allow-{svc}-writes` rule).
     #[test]
-    fn epic9_read_write_tiers_allow_reads_prompt_writes() {
+    fn epic9_read_write_tiers_allow_reads_and_writes() {
         let set = PolicySet::compile_from_str(FIXTURE_DEFAULT_TOML, &p("default.toml")).unwrap();
-        // (policy, read_scope, write_scope, expected prompt rule id)
+        // (policy, read_scope, write_scope)
         let cases = [
-            ("gmail-read-write", "gmail.readonly", "gmail.send", "prompt-gmail-writes"),
-            ("gmail-read-write", "gmail.metadata", "gmail.modify", "prompt-gmail-writes"),
-            (
-                "calendar-read-write",
-                "calendar.readonly",
-                "calendar.events",
-                "prompt-calendar-writes",
-            ),
-            ("drive-read-write", "drive.readonly", "drive.file", "prompt-drive-writes"),
+            ("gmail-read-write", "gmail.readonly", "gmail.send"),
+            ("gmail-read-write", "gmail.metadata", "gmail.modify"),
+            ("calendar-read-write", "calendar.readonly", "calendar.events"),
+            ("drive-read-write", "drive.readonly", "drive.file"),
         ];
-        for (policy, read_scope, write_scope, prompt_rule) in cases {
+        for (policy, read_scope, write_scope) in cases {
             let read_req = EvalRequest {
                 policy_name: policy.to_owned(),
                 scope: read_scope.to_owned(),
@@ -2434,15 +2439,12 @@ mod tests {
                 scope: write_scope.to_owned(),
                 resource: Some("anything".to_owned()),
             };
-            match set.evaluate(&write_req) {
-                Decision::Prompt { rule_id, policy_name } => {
-                    assert_eq!(rule_id, prompt_rule, "{policy} write must hit {prompt_rule}");
-                    assert_eq!(policy_name, policy);
-                }
-                other => {
-                    panic!("{policy}+{write_scope}: expected Prompt, got {other:?}")
-                }
-            }
+            assert!(
+                matches!(set.evaluate(&write_req), Decision::Allow),
+                "{policy}: write scope {write_scope} must be ALLOWED (headless auto-grant, \
+                 no prompt) — got {:?}",
+                set.evaluate(&write_req)
+            );
         }
     }
 
@@ -2459,7 +2461,6 @@ mod tests {
             PolicySet::compile_from_str(BUNDLED_DEFAULT_TOML, &p("bundled.toml")).unwrap();
         let names = [
             "gmail-read-only",
-            "calendar-prompt-on-write",
             "drive-research-scope-restricted",
             "gmail-read-write",
             "calendar-read-only",
@@ -2517,54 +2518,68 @@ mod tests {
         );
     }
 
-    /// UX-overhaul Story 1 — the **actual** by-construction guard
-    /// against the `angie-*` incident class (an autonomous-write
-    /// policy leaking into the shipped product seed).
+    /// UX-overhaul leak-defense — the headless-model bright line.
     ///
-    /// Invariant: NO policy in the embedded/bundled default policy
-    /// set may have `approval-mode = "auto"` together with ANY write
-    /// scope in its scope allowlist. A policy that auto-approves AND
-    /// allows a write scope can send mail / mutate calendars /
-    /// delete Drive files with zero human gate — exactly the posture
-    /// `feedback_no_operator_config_in_shipped_defaults` exists to
-    /// prevent. This test is CI-blocking: it fails the build if such
-    /// a policy is ever (re-)introduced into `cli/default_policy.toml`
-    /// or `test-fixtures/policies/default.toml`.
+    /// The daemon is HEADLESS: there is no human-in-the-loop approval
+    /// and no terminal prompt. A `prompt` disposition can therefore
+    /// ONLY ever return HTTP 503 (`policy.approval_unavailable`) at
+    /// request time. A `prompt` policy that ships in the bundle is a
+    /// latent, silent break: `quickstart --read-write` would bind an
+    /// agent that 503s on every write while claiming it can write,
+    /// and `doctor` false-WARNs on it.
     ///
-    /// The write-scope set is the Google Workspace mutation surface
-    /// permitlayer brokers. A future connector adding a write scope
-    /// MUST extend this list in the same change (the CODEOWNERS gate
-    /// on the two policy files forces that review).
+    /// Invariant (CI-BLOCKING): NO policy in the embedded/bundled
+    /// default set — and its mirrored fixture — may use the `prompt`
+    /// disposition at ANY layer: not `approval-mode = "prompt"` and
+    /// not a per-rule `action = "prompt"`. This is the new
+    /// bright-line leak-defense: a future accidental `prompt` policy
+    /// that would silently 503 on the headless daemon fails the
+    /// build. (It replaces the old "no auto+write" invariant, which
+    /// is now intentionally violated by design — the `-read-write`
+    /// tiers grant autonomous write under `approval-mode = "auto"`,
+    /// the only disposition this headless product ships.) The
+    /// CODEOWNERS gate on the two policy files forces review of any
+    /// change here.
     #[test]
-    fn bundled_seed_has_no_auto_approve_with_write_scope() {
-        // Any scope whose grant lets the agent MUTATE user data with
-        // no human approval when the policy is `approval-mode=auto`.
-        const WRITE_SCOPES: &[&str] =
-            &["gmail.send", "gmail.compose", "gmail.modify", "calendar.events", "drive.file"];
-        // Scope strings in policies are frequently fully-qualified
-        // Google OAuth URLs (e.g.
-        // `https://www.googleapis.com/auth/gmail.send`); match by
-        // suffix so both the short form and the URL form are caught.
-        let is_write_scope = |scope: &str| {
-            WRITE_SCOPES.iter().any(|w| scope == *w || scope.ends_with(&format!("/{w}")))
-        };
-
+    fn bundled_seed_has_no_prompt_disposition() {
         for (label, src) in [("bundled", BUNDLED_DEFAULT_TOML), ("fixture", FIXTURE_DEFAULT_TOML)] {
+            // Parse the typed TOML directly so we see the authored
+            // dispositions (compile lowers them; the typed view is the
+            // exact bright line operators write).
+            let file: TomlPolicyFile = toml::from_str(src)
+                .unwrap_or_else(|e| panic!("{label} default policy must parse: {e:?}"));
+            for pol in &file.policies {
+                assert_ne!(
+                    pol.approval_mode,
+                    super::super::schema::TomlApprovalMode::Prompt,
+                    "{label} default policy {:?} has approval-mode = \"prompt\" — the daemon \
+                     is HEADLESS, prompt can only 503 at request time. Use \"auto\" (granted \
+                     scopes work) or deny via absent scope.",
+                    pol.name
+                );
+                for rule in &pol.rules {
+                    assert_ne!(
+                        rule.action,
+                        TomlRuleAction::Prompt,
+                        "{label} default policy {:?} rule {:?} has action = \"prompt\" — the \
+                         daemon is HEADLESS, prompt can only 503. Use \"allow\" or \"deny\".",
+                        pol.name,
+                        rule.id
+                    );
+                }
+            }
+            // Also assert the compiled set agrees (defense-in-depth:
+            // catches a future schema/lowering change that could
+            // reintroduce a prompt path the typed view misses).
             let set = PolicySet::compile_from_str(src, &p("default.toml"))
                 .unwrap_or_else(|e| panic!("{label} default policy must compile: {e:?}"));
             for name in set.policy_names() {
                 let pol = set.get(&name).expect("named policy present");
-                if pol.approval_mode != ApprovalMode::Auto {
-                    continue;
-                }
-                let offending: Vec<&String> =
-                    pol.scope_allowlist.iter().filter(|s| is_write_scope(s)).collect();
-                assert!(
-                    offending.is_empty(),
-                    "{label} default policy {name:?} has approval-mode=auto AND write \
-                     scope(s) {offending:?} — an autonomous-write policy must NEVER ship \
-                     in the product seed (the angie-* incident class). Move operator-\
-                     specific autonomous-write tiers to host-local operator policy."
+                assert_ne!(
+                    pol.approval_mode,
+                    ApprovalMode::Prompt,
+                    "{label} compiled policy {name:?} resolves to approval-mode=prompt — \
+                     forbidden on the headless daemon"
                 );
             }
         }

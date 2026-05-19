@@ -11,9 +11,14 @@
 //! - `--read-write` → bind the agent to the shipped `<svc>-read-write` policy
 //!
 //! There is no third option, no `none`, no tier name the operator types,
-//! and no danger-confirmation string. The legacy `approval-mode` field
-//! in shipped policies is dead metadata for this deployment — policies
-//! are bound BY NAME and `approval-mode` is ignored.
+//! and no danger-confirmation string. Quickstart binds the agent BY
+//! NAME to a shipped policy; every shipped policy uses
+//! `approval-mode = "auto"` (the only disposition this headless
+//! product ships — `prompt` is purged from the bundle because on a
+//! headless daemon it could only ever 503). So a `-read-only` tier
+//! grants reads only (writes denied by absent scope) and a
+//! `-read-write` tier additionally grants that service's write scopes,
+//! auto-approved with no gate.
 //!
 //! ## Flow
 //!

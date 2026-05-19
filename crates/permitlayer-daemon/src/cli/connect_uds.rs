@@ -93,7 +93,7 @@ enum DaemonDownReason {
 ///
 /// Failure renders a structured `connect.daemon_must_run` error block
 /// with three remediation branches per AC #7:
-/// - helper binary missing → `sudo agentsso service install`
+/// - helper binary missing → `sudo agentsso setup`
 /// - helper present but launchd shows not-running → `sudo launchctl kickstart`
 /// - socket connect fails with EACCES → group membership remediation
 ///
@@ -263,7 +263,7 @@ fn launchd_daemon_running() -> Option<bool> {
         Ok(o) => {
             // Non-zero exit. Two cases of interest:
             // - Exit ~113 ("Service not loaded") — operator hasn't run
-            //   `agentsso service install`, OR launchctl bootstrap
+            //   `sudo agentsso setup`, OR launchctl bootstrap
             //   failed. In either case the kickstart remediation will
             //   fail with the same error; treat as probe-unavailable
             //   so we surface the "probe failed" diagnostic instead.
@@ -286,11 +286,11 @@ fn launchd_daemon_running() -> Option<bool> {
 /// Render the structured `connect.daemon_must_run` error block.
 fn render_daemon_must_run(endpoint: &ControlEndpoint, reason: &DaemonDownReason) {
     let remediation = match reason {
-        DaemonDownReason::NotInstalled => "sudo agentsso service install\n\
+        DaemonDownReason::NotInstalled => "sudo agentsso setup\n\
              \n\
              # The privileged helper binary is not installed at\n\
              # /Library/PrivilegedHelperTools/agentsso. Run\n\
-             # `sudo agentsso service install` to install it and\n\
+             # `sudo agentsso setup` to install it and\n\
              # register the LaunchDaemon."
             .to_owned(),
         DaemonDownReason::NotRunningLaunchd => {
@@ -341,7 +341,7 @@ fn render_daemon_must_run(endpoint: &ControlEndpoint, reason: &DaemonDownReason)
              # control token (HTTP {status}). Either the token in\n\
              # ~/.agentsso/control.token (or AGENTSSO_CONTROL_TOKEN env)\n\
              # is wrong, or it has been rotated by the daemon. Re-run\n\
-             # `sudo agentsso service install` to re-provision the\n\
+             # `sudo agentsso setup` to re-provision the\n\
              # token, then re-try."
         ),
         DaemonDownReason::Unclassified => format!(

@@ -246,7 +246,7 @@ pub(crate) fn error_block_daemon_unreachable_endpoint_classified(
     let (msg, remediation): (String, &str) = match kind {
         Some(std::io::ErrorKind::NotFound) => (
             format!("daemon not running (during {verb}): no socket at {endpoint}"),
-            "start the daemon: `sudo agentsso service install` (one-time setup) followed by `sudo launchctl bootstrap system /Library/LaunchDaemons/dev.permitlayer.daemon.plist`, OR `agentsso start` for ad-hoc dev use",
+            "start the daemon: `sudo agentsso setup` (one-time install/upgrade/repair), OR `agentsso start` for ad-hoc dev use",
         ),
         Some(std::io::ErrorKind::PermissionDenied) => (
             format!("permission denied reaching daemon at {endpoint} (during {verb})"),

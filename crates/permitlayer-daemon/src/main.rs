@@ -227,20 +227,21 @@ async fn main() -> ExitCode {
 
     // Story 7.27 — legacy `agentsso autostart` interceptor.
     //
-    // The `autostart` subcommand was replaced by
-    // `agentsso service install/uninstall/status` in rc.22 (Sprint
-    // Change Proposal 2026-05-10, "burn the boats" direction).
-    // Operators (or scripts) still typing `agentsso autostart enable`
-    // get a structured remediation block instead of clap's terse
-    // "unrecognized subcommand" error.
+    // The `autostart` subcommand was replaced by `setup` (one-time
+    // install/upgrade/repair) plus `agentsso service uninstall/status`
+    // (Sprint Change Proposal 2026-05-10, "burn the boats" direction;
+    // `service install` itself was demoted to a redirect in the
+    // UX-overhaul epic). Operators (or scripts) still typing
+    // `agentsso autostart enable` get a structured remediation block
+    // instead of clap's terse "unrecognized subcommand" error.
     if first_subcommand_arg.as_deref() == Some("autostart") {
         eprint!(
             "{}",
             crate::design::render::error_block(
                 "autostart.removed",
-                "`agentsso autostart` was replaced by `agentsso service install/uninstall/status` \
-                 in rc.22",
-                "sudo agentsso service install   # one-time setup, root required\n  \
+                "`agentsso autostart` was replaced by `sudo agentsso setup` (install) plus \
+                 `agentsso service uninstall/status`",
+                "sudo agentsso setup             # one-time install/upgrade/repair, root required\n  \
                  agentsso service status         # report state (no root)\n  \
                  sudo agentsso service uninstall # teardown, root required",
                 None,

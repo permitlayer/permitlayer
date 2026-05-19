@@ -26,10 +26,13 @@ use crate::common::{DaemonTestConfig, start_daemon, wait_for_health};
 /// (`cli/default_policy.toml`, mirrored to `policies-managed/` every
 /// boot) compiles to. Pinned by the core
 /// `epic9_bundled_and_fixture_policy_sets_are_identical` /
-/// `bundled_seed_has_no_auto_approve_with_write_scope` invariants;
-/// if the product bundle's policy count ever changes, that core test
-/// fails first and this constant is updated in lockstep.
-const MANAGED_COUNT: i64 = 9;
+/// `bundled_seed_has_no_prompt_disposition` invariants; if the
+/// product bundle's policy count ever changes, that core test fails
+/// first and this constant is updated in lockstep. (8 = 2 retained
+/// originals + 6 per-service tiers; the legacy
+/// `calendar-prompt-on-write` example was deleted with the headless
+/// `prompt`-purge.)
+const MANAGED_COUNT: i64 = 8;
 
 const POLICY_A: &str = r#"
 [[policies]]

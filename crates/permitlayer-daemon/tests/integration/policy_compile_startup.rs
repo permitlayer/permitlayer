@@ -85,16 +85,18 @@ fn happy_path_writes_managed_layer_empty_operator_and_boots() {
         plain.contains("policies compiled (two-layer: managed + operator)"),
         "daemon stdout should contain the two-layer 'policies compiled' log line. Got: {plain}"
     );
-    // The managed bundle ships 9 policies: the original 3
-    // (gmail-read-only, calendar-prompt-on-write,
-    // drive-research-scope-restricted) plus the 6 Epic 9 per-service
-    // tier templates (gmail/calendar/drive read-only + read-write,
-    // incl. the gmail-read-only-tier alias). With an EMPTY operator
-    // layer the merged count must be exactly 9 — asserting the daemon
-    // actually compiled the managed bundle, not just wrote it.
+    // The managed bundle ships 8 policies: 2 retained originals
+    // (gmail-read-only, drive-research-scope-restricted) plus the 6
+    // per-service tier templates (gmail/calendar/drive read-only +
+    // read-write, incl. the gmail-read-only-tier alias). The legacy
+    // `calendar-prompt-on-write` example was deleted with the
+    // headless `prompt`-purge (it could only 503 on a headless
+    // daemon). With an EMPTY operator layer the merged count must be
+    // exactly 8 — asserting the daemon actually compiled the managed
+    // bundle, not just wrote it.
     assert!(
-        plain.contains("policies_loaded=9"),
-        "daemon should have compiled exactly 9 policies from the managed bundle. Got: {plain}"
+        plain.contains("policies_loaded=8"),
+        "daemon should have compiled exactly 8 policies from the managed bundle. Got: {plain}"
     );
     // No operator overrides on a clean first boot (empty operator).
     assert!(
