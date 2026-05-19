@@ -1483,7 +1483,14 @@ jobs:
             echo "::error::daemon did not bind 127.0.0.1:3820 within 30s"
             exit 1
           fi
-          agentsso policy validate "$HOME/.agentsso/policies/default.toml"
+          # UX-overhaul (Story 1 two-layer model): the shipped bundle
+          # lives in the MANAGED layer `policies-managed/default.toml`
+          # (written by the daemon on every boot). The operator
+          # `policies/` dir is created EMPTY and is no longer seeded —
+          # so the pre-epic `policies/default.toml` path no longer
+          # exists and this validate would `policy.file_not_found`
+          # (exit 2). Validate the managed bundle that actually ships.
+          agentsso policy validate "$HOME/.agentsso/policies-managed/default.toml"
           agentsso agent register release-inspector \
             --policy gmail-read-only \
             --token-out "$RUNNER_TEMP/release-inspector.token"
