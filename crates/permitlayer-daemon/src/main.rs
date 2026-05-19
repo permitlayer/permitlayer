@@ -53,6 +53,13 @@ enum Commands {
     Credentials(cli::credentials::CredentialsArgs),
     /// Inspect and validate loaded policies (Story 7.34)
     Policy(cli::policy::PolicyArgs),
+    /// Connect ONE agent to ONE Google service in a single command
+    /// (UX-overhaul Story 5). Picks the shipped read-only / read-write
+    /// policy by the `--read` / `--read-write` flag (the daemon is
+    /// headless — no approval, no prompt), auto-creates the agent,
+    /// then composes the `connect` OAuth + seal + verify + scope-merge
+    /// + rebind + OpenClaw-snippet flow. Idempotent on re-runs.
+    Quickstart(cli::quickstart::QuickstartArgs),
     /// Manage user-facing configuration
     Config(cli::config::ConfigArgs),
     /// Tail the audit log live (historical query ships in Story 5.2)
@@ -278,6 +285,12 @@ async fn main() -> ExitCode {
         Some(Commands::Status(args)) => anyhow_to_exit_code(cli::status::run(args).await),
         Some(Commands::Reload) => anyhow_to_exit_code(cli::reload::run().await),
         Some(Commands::Connect(args)) => connect_to_exit_code(cli::connect::run(args).await),
+        // Quickstart reuses connect::run (which emits ConnectExitCode2/3
+        // markers) and itself uses connect::exit2() for the
+        // unknown-service / access-unspecified cases, so it routes
+        // through the SAME dispatcher as connect — `anyhow_to_exit_code`
+        // would collapse those exit-2 cases to exit 1.
+        Some(Commands::Quickstart(args)) => connect_to_exit_code(cli::quickstart::run(args).await),
         // `credentials_refresh_to_exit_code` is shape-compatible with
         // `list`/`status` outcomes (the typed-marker downcast is a
         // no-op for those variants). Only `refresh` ever produces

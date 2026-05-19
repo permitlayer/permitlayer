@@ -66,6 +66,7 @@ mod policy_compile_startup;
 mod policy_enforcement_e2e;
 mod policy_reload_e2e;
 mod policy_validate_e2e;
+mod quickstart_e2e;
 mod rotate_key_crash_resume_e2e;
 mod rotate_key_e2e;
 mod scrub_explain_warnings;
