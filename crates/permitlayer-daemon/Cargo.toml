@@ -122,13 +122,14 @@ reqwest.workspace = true
 url.workspace = true
 notify.workspace = true
 csv.workspace = true
-# Story 7.5 — `agentsso update`. minisign-verify for ed25519 release
-# signature verification (same `install/permitlayer.pub` key that
-# install.sh + install.ps1 use); flate2 + tar for unpacking the
-# `dist`-produced `.tar.gz` archives; semver for version comparison.
-minisign-verify = { workspace = true }
-flate2 = "1.0"
-tar = { workspace = true }
+# `agentsso update` is a drift detector (UX-overhaul Story 3) and
+# `setup`/`doctor` resolve versioned binaries by filename — both need
+# semver for version comparison. The minisign-verify / flate2 / tar
+# release-tarball verification primitives were removed with the dead
+# `release_verify` module: the signature trust root lives at the
+# *download* boundary (install.sh / install.ps1 verify the tarball);
+# the privileged `setup`/`doctor` path is content-hash-verified, never
+# signature-verified, so the daemon binary carries no minisign code.
 semver = { workspace = true }
 
 [target.'cfg(target_os = "macos")'.dependencies]
@@ -164,12 +165,6 @@ async-trait.workspace = true
 # Story 7.5 update_e2e — mock GitHub Releases API for the in-place
 # update flow's integration test.
 mockito = { workspace = true }
-# Story 7.5 review patch P22 (F26): test-only minisign signer for
-# building the signed fixture archive served by the apply-flow
-# integration test. Same trust-root family as `minisign-verify`
-# (production-side dep at workspace level); zero impact on release
-# builds since this is dev-deps only.
-minisign = "0.9"
 # Story 7.11 round-1 review-extra (used by agent_rebind_e2e to read
 # the on-disk agent TOML for byte-compare assertions).
 toml = { workspace = true }

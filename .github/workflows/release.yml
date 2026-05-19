@@ -940,7 +940,7 @@ jobs:
           # (…/download/v<version>/…) and/or a `version "<version>"`
           # stanza. Require the exact tagged version to appear in the
           # download URL path — the load-bearing reference brew uses.
-          if ! grep -Eq "releases/download/v${EXPECTED_VERSION}/" "$FORMULA"; then
+          if ! grep -Fq "releases/download/v${EXPECTED_VERSION}/" "$FORMULA"; then
             echo "::error::tap Formula/agentsso.rb does not reference v${EXPECTED_VERSION} in its download URL — the tap is STALE for tag ${TAG}"
             echo "--- Formula/agentsso.rb (url/version lines) ---"
             grep -nE 'url |version ' "$FORMULA" || true

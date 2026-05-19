@@ -16,6 +16,11 @@
 #     explicitly — default-deny applies to anything not listed.
 #   - `resources = ["*"]` means "any resource". Use explicit values
 #     like `["primary"]` to narrow to specific calendars, labels, etc.
+#
+# Headless daemon: the only shipped disposition is `approval-mode =
+# "auto"` (granted scopes work, no gate). `prompt` is intentionally
+# unsupported (it can only 503 here). This file is kept policy-set
+# identical with crates/permitlayer-daemon/src/cli/default_policy.toml.
 
 # -----------------------------------------------------------------
 # Policy: gmail-read-only
@@ -37,9 +42,8 @@ resources = ["*"]
 # Default disposition for requests that match the allowlist but
 # don't hit any rule below. `auto` means auto-approve.
 approval-mode = "auto"
-# Positive framing (AR28): auto-approve read-style scopes even if
-# a rule below would otherwise prompt. Story 4.5 consumes this
-# flag; Story 4.1 stores it for forward compatibility.
+# Auto-approve read-style scopes (.readonly / .metadata). On this
+# headless deployment all granted scopes auto-approve anyway.
 auto-approve-reads = true
 
 # No explicit rules needed. The scope allowlist above is the
@@ -47,41 +51,6 @@ auto-approve-reads = true
 # the default-deny fallback. A rule that tried to name specific
 # "deny" scopes would be rejected at compile time because those
 # scopes aren't in the allowlist (see RuleScopeWidensPolicyAllowlist).
-
-# -----------------------------------------------------------------
-# Policy: calendar-prompt-on-write
-#
-# Use this for an agent that should freely read your calendar but
-# get explicit human approval before creating, editing, or deleting
-# an event. Only the primary calendar is in scope.
-# -----------------------------------------------------------------
-[[policies]]
-name = "calendar-prompt-on-write"
-scopes = ["calendar.readonly", "calendar.events"]
-# Only the primary calendar. Family/work calendars are blocked.
-resources = ["primary"]
-# Writes fall into the policy-level prompt disposition unless a
-# more specific rule below carves them out.
-approval-mode = "prompt"
-auto-approve-reads = true
-
-# Explicit allow for read scopes. Needed because the policy-level
-# default is `prompt`, which would otherwise prompt on reads too.
-[[policies.rules]]
-id = "allow-calendar-reads"
-scopes = ["calendar.readonly"]
-action = "allow"
-
-# Write scope (calendar.events) falls through to this rule and
-# gets an explicit prompt. Without this rule the policy-level
-# `approval-mode = "prompt"` default would do the same thing, but
-# the explicit rule ID makes 403 responses and audit events
-# greppable — you can search for `prompt-calendar-writes` to find
-# every human approval this policy surfaced.
-[[policies.rules]]
-id = "prompt-calendar-writes"
-scopes = ["calendar.events"]
-action = "prompt"
 
 # -----------------------------------------------------------------
 # Policy: drive-research-scope-restricted
@@ -102,25 +71,26 @@ approval-mode = "auto"
 auto-approve-reads = true
 
 # =================================================================
-# Epic 9 — per-service read-only / read-write tier templates.
+# Per-service read-only / read-write tier templates.
 #
 # Pick a tier by NAMING one of these policies when you bind an agent
 # (read-vs-write is a policy choice, not a different connector or
-# OAuth grant). The `-read-write` tiers default to PROMPT-ON-WRITE:
-# every read auto-approves; every write surfaces a terminal approval
-# prompt. The `[[policies]]` blocks below are kept byte-identical
-# with crates/permitlayer-daemon/src/cli/default_policy.toml (only
-# the surrounding comments differ).
+# OAuth grant). The `-read-write` tiers grant that service's write
+# scopes and auto-approve them — this daemon is HEADLESS, there is
+# no write gate. The `[[policies]]` blocks below are kept
+# byte-identical with
+# crates/permitlayer-daemon/src/cli/default_policy.toml (only the
+# surrounding comments differ).
 # =================================================================
 
 # -----------------------------------------------------------------
-# Policy: gmail-read-write (prompt-on-write)
+# Policy: gmail-read-write
 # -----------------------------------------------------------------
 [[policies]]
 name = "gmail-read-write"
 scopes = ["gmail.readonly", "gmail.metadata", "gmail.send", "gmail.compose", "gmail.modify"]
 resources = ["*"]
-approval-mode = "prompt"
+approval-mode = "auto"
 auto-approve-reads = true
 
 [[policies.rules]]
@@ -129,9 +99,9 @@ scopes = ["gmail.readonly", "gmail.metadata"]
 action = "allow"
 
 [[policies.rules]]
-id = "prompt-gmail-writes"
+id = "allow-gmail-writes"
 scopes = ["gmail.send", "gmail.compose", "gmail.modify"]
-action = "prompt"
+action = "allow"
 
 # -----------------------------------------------------------------
 # Policy: calendar-read-only
@@ -144,13 +114,13 @@ approval-mode = "auto"
 auto-approve-reads = true
 
 # -----------------------------------------------------------------
-# Policy: calendar-read-write (prompt-on-write)
+# Policy: calendar-read-write
 # -----------------------------------------------------------------
 [[policies]]
 name = "calendar-read-write"
 scopes = ["calendar.readonly", "calendar.events"]
 resources = ["*"]
-approval-mode = "prompt"
+approval-mode = "auto"
 auto-approve-reads = true
 
 [[policies.rules]]
@@ -159,9 +129,9 @@ scopes = ["calendar.readonly"]
 action = "allow"
 
 [[policies.rules]]
-id = "prompt-calendar-writes"
+id = "allow-calendar-writes"
 scopes = ["calendar.events"]
-action = "prompt"
+action = "allow"
 
 # -----------------------------------------------------------------
 # Policy: drive-read-only
@@ -174,13 +144,13 @@ approval-mode = "auto"
 auto-approve-reads = true
 
 # -----------------------------------------------------------------
-# Policy: drive-read-write (prompt-on-write)
+# Policy: drive-read-write
 # -----------------------------------------------------------------
 [[policies]]
 name = "drive-read-write"
 scopes = ["drive.readonly", "drive.file"]
 resources = ["*"]
-approval-mode = "prompt"
+approval-mode = "auto"
 auto-approve-reads = true
 
 [[policies.rules]]
@@ -189,15 +159,15 @@ scopes = ["drive.readonly"]
 action = "allow"
 
 [[policies.rules]]
-id = "prompt-drive-writes"
+id = "allow-drive-writes"
 scopes = ["drive.file"]
-action = "prompt"
+action = "allow"
 
 # -----------------------------------------------------------------
 # Policy: gmail-read-only-tier
 #
 # (Mirror of the historical `gmail-read-only` under the consistent
-# Epic 9 `{svc}-read-only` naming. The original `gmail-read-only` is
+# `{svc}-read-only` naming. The original `gmail-read-only` is
 # retained above for backward compatibility — existing agents +
 # policy/edit.rs tests bind to it by name.)
 # -----------------------------------------------------------------

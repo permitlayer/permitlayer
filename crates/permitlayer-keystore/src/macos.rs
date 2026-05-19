@@ -279,9 +279,9 @@ fn read_or_mint_master_key(account: &str) -> Result<crate::MasterKeyOutcome, Key
         return Err(KeyStoreError::PlatformError {
             backend: BACKEND,
             message: "minting the master key in /Library/Keychains/System.keychain requires \
-                      root. The LaunchDaemon installed by `sudo agentsso service install` \
+                      root. The LaunchDaemon installed by `sudo agentsso setup` \
                       runs the daemon as root automatically; manual `agentsso start` from a \
-                      user shell will fail here. Re-run via `sudo agentsso service install` \
+                      user shell will fail here. Re-run via `sudo agentsso setup` \
                       (or `sudo agentsso start` for ad-hoc dev use)."
                 .into(),
         });

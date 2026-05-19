@@ -10,13 +10,15 @@
 //! report is human-rendered by default and machine-readable with
 //! `--json`.
 //!
-//! ## Trust model (why `--fix` cannot minisign-verify the binary)
+//! ## Trust model (why `--fix` cannot signature-verify the binary)
 //!
 //! Identical to `cli::setup`'s documented Decision A (see
-//! `cli/setup/mod.rs:29`). `release_verify::verify_minisign` checks a
-//! detached signature over a release **tarball**; there is no
-//! `.minisig` sidecar on disk for an *installed*, extracted bare
-//! daemon binary, so it is not applicable to `doctor --fix` either.
+//! `cli/setup/mod.rs` "Trust model"). The signature trust root is at
+//! the *download* boundary — the curl|sh / PowerShell installers
+//! minisign-verify the release **tarball**; there is no `.minisig`
+//! sidecar on disk for an *installed*, extracted bare daemon binary,
+//! so signature verification is not applicable to `doctor --fix`
+//! either. The privileged path is content-hash-verified.
 //!
 //! The substitute fail-closed control is a **binary-integrity gate**
 //! evaluated ONCE before any `--fix` mutation (Decision A):
@@ -936,6 +938,17 @@ fn write_managed_tmp(tmp: &Path) -> std::io::Result<()> {
 /// RELOAD is intentionally NOT performed (NeverAutomatic) — the
 /// operator must run `agentsso reload`.
 fn fix_managed_policy_staleness(ctx: &DoctorCtx) -> FixOutcome {
+    // F3 (fast-follow): refuse cleanly when not root, for parity with
+    // the other privileged fixes. The managed-policy dir is root-owned
+    // 0700 on macOS (paths.rs); without this guard a non-root
+    // `doctor --fix` would fail with a late, opaque EACCES on the
+    // create_dir_all / rename instead of the standard refusal.
+    #[cfg(target_os = "macos")]
+    {
+        if !is_root() {
+            return refuse_non_root();
+        }
+    }
     let dir = permitlayer_core::paths::managed_policies_dir(Some(&ctx.home));
     let target = dir.join("default.toml");
     let old = sha256_file(&target).ok().unwrap_or_else(|| "(absent)".to_owned());

@@ -17,40 +17,19 @@
 #   - `resources = ["*"]` means "any resource". Use explicit values
 #     like `["primary"]` to narrow to specific calendars, labels, etc.
 #
-# How approval prompts work (policies with `approval-mode = "prompt"`):
+# Access model (headless daemon — no approval, no prompt):
 #
-# When an agent request matches a prompt-required rule, permitlayer
-# blocks the request and shows an approval prompt on the terminal
-# running `agentsso start`. The operator sees the agent name, the
-# scope, the resource, and the rule ID, then presses one of:
-#
-#   y       — allow this one request
-#   n       — deny this one request
-#   a       — always allow this rule (remembered for the session)
-#   never   — never allow this rule (remembered for the session)
-#
-# If no keystroke arrives within the configured timeout (default 30s,
-# configured via `[approval] timeout_seconds` in `daemon.toml` or
-# overridden by the `AGENTSSO_APPROVAL__TIMEOUT_SECONDS` env var —
-# note the DOUBLE underscore between `APPROVAL` and `TIMEOUT_SECONDS`,
-# matching figment's nested-section convention used elsewhere in
-# `daemon.toml`), the request is denied with HTTP 403
-# `policy.approval_timeout` (a distinct error code from
-# `policy.approval_required` so agents can implement smart retry on
-# AFK timeouts vs deliberate operator denials). Press ENTER with no
-# arrow key to accept the default cursor position, which is "deny" —
-# reflexive enter keeps you safe. The `a` and `never` decisions are
-# cleared when you run `agentsso reload`, receive SIGHUP, or restart
-# the daemon, so edits to this file always take effect (and reload
-# clears the cache BEFORE attempting to recompile, so a failing
-# reload still evicts stale cached decisions).
-#
-# If the daemon has no controlling TTY (e.g., started from a systemd
-# user unit with stdin redirected from /dev/null), approval prompts
-# are structurally unavailable — every prompt-required request will
-# return HTTP 503 `policy.approval_unavailable`. Either run
-# `agentsso start` in a foreground terminal or change affected
-# policies' `approval-mode` to `auto` or `deny`.
+# This daemon runs HEADLESS. There is no human-in-the-loop approval
+# and no terminal prompt: a request is either ALLOWED because its
+# scope is granted (`approval-mode = "auto"`, the only disposition
+# this product ships) or DENIED because the scope is absent from the
+# policy's allowlist (default-deny) or an explicit `deny` rule. The
+# `prompt` disposition is intentionally unsupported here — on a
+# headless daemon it can only ever return HTTP 503, so the shipped
+# bundle never uses it. Choose access by NAMING a policy when you
+# bind an agent: a `-read-only` tier grants reads only; a
+# `-read-write` tier additionally grants that service's write scopes
+# (no gate — pick it deliberately).
 
 # -----------------------------------------------------------------
 # Policy: gmail-read-only
@@ -70,13 +49,12 @@ scopes = ["gmail.readonly", "gmail.metadata"]
 # to restrict to, say, only the Inbox.
 resources = ["*"]
 # Default disposition for requests that match the allowlist but
-# don't hit any rule below. `auto` means auto-approve.
+# don't hit any rule below. `auto` means auto-approve (the only
+# disposition this headless product ships).
 approval-mode = "auto"
-# Positive framing (AR28): when combined with `approval-mode =
-# "prompt"`, this flag auto-approves scopes ending in `.readonly`
-# or `.metadata` WITHOUT showing a prompt. Writes still prompt.
-# Safe to leave set under `approval-mode = "auto"` — the flag only
-# has runtime effect when the policy is otherwise prompting.
+# Auto-approve read-style scopes (.readonly / .metadata). On this
+# headless deployment all granted scopes auto-approve anyway; the
+# flag is retained for forward compatibility / clarity of intent.
 auto-approve-reads = true
 
 # No explicit rules needed. The scope allowlist above is the
@@ -84,50 +62,6 @@ auto-approve-reads = true
 # the default-deny fallback. A rule that tried to name specific
 # "deny" scopes would be rejected at compile time because those
 # scopes aren't in the allowlist (see RuleScopeWidensPolicyAllowlist).
-
-# -----------------------------------------------------------------
-# Policy: calendar-prompt-on-write
-#
-# Use this for an agent that should freely read your calendar but
-# get explicit human approval before creating, editing, or deleting
-# an event. Only the primary calendar is in scope.
-# -----------------------------------------------------------------
-[[policies]]
-name = "calendar-prompt-on-write"
-scopes = ["calendar.readonly", "calendar.events"]
-# Only the primary calendar. Family/work calendars are blocked.
-resources = ["primary"]
-# Writes fall into the policy-level prompt disposition unless a
-# more specific rule below carves them out. When the request hits
-# the terminal prompt, the operator can press `a` to remember the
-# decision for the current session — subsequent calendar writes to
-# the `primary` calendar from this agent will pass through without
-# re-prompting until the daemon is restarted, reloaded, or the
-# operator presses `never` to remember a denial instead.
-approval-mode = "prompt"
-# auto-approve-reads = true means scopes ending in .readonly or
-# .metadata skip the prompt entirely. The explicit read rule below
-# would also cover calendar.readonly, but setting the flag makes
-# the intent grep-visible at the policy level.
-auto-approve-reads = true
-
-# Explicit allow for read scopes. Needed because the policy-level
-# default is `prompt`, which would otherwise prompt on reads too.
-[[policies.rules]]
-id = "allow-calendar-reads"
-scopes = ["calendar.readonly"]
-action = "allow"
-
-# Write scope (calendar.events) falls through to this rule and
-# gets an explicit prompt. Without this rule the policy-level
-# `approval-mode = "prompt"` default would do the same thing, but
-# the explicit rule ID makes 403 responses and audit events
-# greppable — you can search for `prompt-calendar-writes` to find
-# every human approval this policy surfaced.
-[[policies.rules]]
-id = "prompt-calendar-writes"
-scopes = ["calendar.events"]
-action = "prompt"
 
 # -----------------------------------------------------------------
 # Policy: drive-research-scope-restricted
@@ -148,56 +82,51 @@ approval-mode = "auto"
 auto-approve-reads = true
 
 # =================================================================
-# Epic 9 — per-service read-only / read-write tier templates.
+# Per-service read-only / read-write tier templates.
 #
-# These six policies give every built-in service (Gmail, Calendar,
-# Drive) a coherent pair of tiers. You choose how much access an
-# agent has by NAMING one of these policies when you bind the agent
-# — read-vs-write is a policy decision enforced at request time, NOT
-# a different connector, install, or OAuth grant.
-#
-# The `-read-only` tiers list only read scopes; the compile-time
-# allowlist makes any write structurally impossible (a write scope
-# is rejected with HTTP 403 default-deny-scope-out-of-allowlist).
-#
-# The `-read-write` tiers default to PROMPT-ON-WRITE: every read
-# auto-approves (scopes ending in .readonly/.metadata skip the
-# prompt via auto-approve-reads), and every WRITE surfaces the
-# terminal approval prompt described in the "How approval prompts
-# work" section at the top of this file (y / n / a / never; ENTER =
-# deny; timeout = HTTP 403 policy.approval_timeout). Search the
-# `prompt-{svc}-writes` rule IDs in 403 bodies / audit events to
-# find every human approval a tier surfaced.
+# Pick a tier by NAMING one of these policies when you bind an agent
+# (read-vs-write is a policy choice, not a different connector or
+# OAuth grant). The `-read-only` tiers list only read scopes; the
+# compile-time allowlist makes any write structurally impossible (a
+# write scope is rejected with HTTP 403
+# default-deny-scope-out-of-allowlist). The `-read-write` tiers
+# additionally grant that service's write scopes and auto-approve
+# them — this daemon is HEADLESS, there is no write gate, so a
+# `-read-write` tier is a deliberate grant of autonomous write.
 #
 # SECURITY: an agent on a `-read-write` tier can send mail,
 # permanently modify the inbox, and create/delete/move calendar
-# events. Read tools can still expose message bodies, attachments,
-# and 2FA codes — that read-exfiltration residual risk is accepted
-# with eyes open and documented in
+# events with NO human gate. Read tools can also expose message
+# bodies, attachments, and 2FA codes — that read-exfiltration
+# residual risk is accepted with eyes open and documented in
 # docs/user-guide/connector-tiers.md and the threat-model it links.
-# The scrub engine is NOT expanded to redact this.
+# The scrub engine is NOT expanded to redact this. Bind a
+# `-read-write` tier only when autonomous write is intended.
 #
 # The [[policies]] blocks below are byte-identical with
 # test-fixtures/policies/default.toml (only comments differ); an
-# integration test asserts the two files' policy sets are equal.
+# integration test asserts the two files' policy sets are equal, and
+# a CI-blocking leak-test asserts NO policy here uses the `prompt`
+# disposition (it would silently 503 on this headless daemon).
 # =================================================================
 
 # -----------------------------------------------------------------
-# Policy: gmail-read-write (prompt-on-write)
+# Policy: gmail-read-write
 #
 # Reads (gmail.readonly / gmail.metadata, incl. all settings reads)
-# auto-approve. Writes — send (gmail.send), draft create/update/send
+# and writes — send (gmail.send), draft create/update/send
 # (gmail.compose), and inbox modify/trash/untrash (gmail.modify) —
-# prompt. NOTE: there is no gmail.settings.basic scope (all Gmail
-# settings reads use gmail.readonly) and no permanent-delete tool
-# (gmail.messages.delete is intentionally not shipped — it would
-# require the broad mail.google.com scope).
+# are all granted and auto-approved (headless, no gate). NOTE: there
+# is no gmail.settings.basic scope (all Gmail settings reads use
+# gmail.readonly) and no permanent-delete tool (gmail.messages.delete
+# is intentionally not shipped — it would require the broad
+# mail.google.com scope).
 # -----------------------------------------------------------------
 [[policies]]
 name = "gmail-read-write"
 scopes = ["gmail.readonly", "gmail.metadata", "gmail.send", "gmail.compose", "gmail.modify"]
 resources = ["*"]
-approval-mode = "prompt"
+approval-mode = "auto"
 auto-approve-reads = true
 
 [[policies.rules]]
@@ -206,9 +135,9 @@ scopes = ["gmail.readonly", "gmail.metadata"]
 action = "allow"
 
 [[policies.rules]]
-id = "prompt-gmail-writes"
+id = "allow-gmail-writes"
 scopes = ["gmail.send", "gmail.compose", "gmail.modify"]
-action = "prompt"
+action = "allow"
 
 # -----------------------------------------------------------------
 # Policy: calendar-read-only
@@ -225,18 +154,19 @@ approval-mode = "auto"
 auto-approve-reads = true
 
 # -----------------------------------------------------------------
-# Policy: calendar-read-write (prompt-on-write)
+# Policy: calendar-read-write
 #
-# Reads auto-approve; event create/update/patch/delete/move/quickAdd
-# (calendar.events) prompt. Spans all calendars (resources = ["*"]);
-# narrow to resources = ["primary"] if you want to restrict to the
-# primary calendar like the calendar-prompt-on-write example above.
+# Reads and event create/update/patch/delete/move/quickAdd
+# (calendar.events) are all granted and auto-approved (headless, no
+# gate). Spans all calendars (resources = ["*"]); narrow to
+# resources = ["primary"] if you want to restrict to the primary
+# calendar.
 # -----------------------------------------------------------------
 [[policies]]
 name = "calendar-read-write"
 scopes = ["calendar.readonly", "calendar.events"]
 resources = ["*"]
-approval-mode = "prompt"
+approval-mode = "auto"
 auto-approve-reads = true
 
 [[policies.rules]]
@@ -245,9 +175,9 @@ scopes = ["calendar.readonly"]
 action = "allow"
 
 [[policies.rules]]
-id = "prompt-calendar-writes"
+id = "allow-calendar-writes"
 scopes = ["calendar.events"]
-action = "prompt"
+action = "allow"
 
 # -----------------------------------------------------------------
 # Policy: drive-read-only
@@ -263,18 +193,19 @@ approval-mode = "auto"
 auto-approve-reads = true
 
 # -----------------------------------------------------------------
-# Policy: drive-read-write (prompt-on-write)
+# Policy: drive-read-write
 #
-# Reads auto-approve; create/update/copy/delete (drive.file) prompt.
-# Note drive.file limits writes to files this app created or opened,
-# and drive.files.delete is PERMANENT (bypasses trash) — the prompt
-# is the safety gate.
+# Reads and create/update/copy/delete (drive.file) are all granted
+# and auto-approved (headless, no gate). Note drive.file limits
+# writes to files this app created or opened, and drive.files.delete
+# is PERMANENT (bypasses trash) — there is no prompt gate, so bind
+# this tier only when autonomous write is intended.
 # -----------------------------------------------------------------
 [[policies]]
 name = "drive-read-write"
 scopes = ["drive.readonly", "drive.file"]
 resources = ["*"]
-approval-mode = "prompt"
+approval-mode = "auto"
 auto-approve-reads = true
 
 [[policies.rules]]
@@ -283,17 +214,17 @@ scopes = ["drive.readonly"]
 action = "allow"
 
 [[policies.rules]]
-id = "prompt-drive-writes"
+id = "allow-drive-writes"
 scopes = ["drive.file"]
-action = "prompt"
+action = "allow"
 
 # -----------------------------------------------------------------
 # Policy: gmail-read-only-tier
 #
-# The Gmail read-only tier under the consistent Epic 9
-# `{svc}-read-only` naming. The original `gmail-read-only` policy is
-# retained above unchanged for backward compatibility (existing
-# agents and policy-edit tests bind to it by name); this is the
+# The Gmail read-only tier under the consistent `{svc}-read-only`
+# naming. The original `gmail-read-only` policy is retained above
+# unchanged for backward compatibility (existing agents and
+# policy-edit tests bind to it by name); this is the
 # naming-consistent alias for new setups.
 # -----------------------------------------------------------------
 [[policies]]

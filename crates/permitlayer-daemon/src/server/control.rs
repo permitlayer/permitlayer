@@ -3983,13 +3983,22 @@ pub(crate) async fn policy_scopes_handler(
     let _policy_edit_guard = state.policy_edit_mutex.lock().await;
 
     let policies_dir = state.policies_dir.clone();
+    // C1 fix: the target policy may exist ONLY in the managed
+    // (shipped) layer — `agentsso quickstart` binds agents to
+    // managed-bundle policies by name and the operator dir is empty
+    // on a clean install. Resolve the managed sibling dir the same
+    // way boot/reload do so the editor can treat a managed-only,
+    // already-covered scope set as a successful no-op instead of
+    // failing the whole connect/quickstart flow after OAuth.
+    let managed_dir = permitlayer_core::paths::managed_policies_dir_for_operator(&policies_dir);
     let policy_name_for_blocking = policy_name.clone();
     let short_names_for_blocking: Vec<String> = payload.short_names.clone();
     let edit_result = tokio::task::spawn_blocking(move || {
         let short_name_refs: Vec<&str> =
             short_names_for_blocking.iter().map(String::as_str).collect();
-        permitlayer_core::policy::edit::add_scopes_to_policy(
+        permitlayer_core::policy::edit::add_scopes_to_policy_layered(
             &policies_dir,
+            managed_dir.as_deref(),
             &policy_name_for_blocking,
             &short_name_refs,
         )

@@ -1983,7 +1983,7 @@ impl StartError {
                  - on macOS (rc.22+): the daemon writes the master key to\n\
                    System.keychain under `dev.permitlayer.master-key`; on first\n\
                    boot it expects root privileges (run via `sudo agentsso\n\
-                   service install` rather than `agentsso start` directly).\n\
+                   setup` rather than `agentsso start` directly).\n\
                  - on macOS (rc.21 and earlier): the login keychain is locked —\n\
                    unlock it and retry. After `brew upgrade agentsso`, the new\n\
                    binary's codesign hash invalidates the keychain ACL on the\n\
@@ -3743,7 +3743,7 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
             // Production path: requires root + `permitlayer-clients`
             // group. The typed "missing group" error from
             // `bind_control_listener` tells operators to run
-            // `sudo agentsso service install` first.
+            // `sudo agentsso setup` first.
             bind_control_listener(&sock_path, "permitlayer-clients")
                 .map_err(|source| StartError::BindFailed { addr: bind_addr, source })?
         };

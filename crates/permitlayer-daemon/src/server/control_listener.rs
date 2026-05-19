@@ -298,7 +298,7 @@ fn apply_control_socket_perms(path: &Path, group_name: &str) -> io::Result<()> {
                 io::ErrorKind::NotFound,
                 format!(
                     "macOS group `{group_name}` does not exist — \
-                     run `sudo agentsso service install` first"
+                     run `sudo agentsso setup` first"
                 ),
             )
         })?;
