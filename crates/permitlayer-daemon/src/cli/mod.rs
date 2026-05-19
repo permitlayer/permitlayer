@@ -11,6 +11,7 @@ pub mod connect;
 pub mod connect_uds;
 pub mod connectors;
 pub mod credentials;
+pub mod doctor;
 pub mod kill;
 pub mod logs;
 pub mod migrations;
