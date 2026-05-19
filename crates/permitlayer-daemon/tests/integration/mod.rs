@@ -54,6 +54,7 @@ mod credentials_refresh_daemon_conflict;
 mod credentials_status;
 mod daemon_lifecycle;
 mod device_flow_e2e;
+mod doctor_e2e;
 mod envelope_v1_to_v2_e2e;
 mod kill_resume_e2e;
 mod kill_switch_e2e;

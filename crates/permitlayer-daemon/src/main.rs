@@ -78,6 +78,14 @@ enum Commands {
     /// over the control plane (rolls back on failure). Replaces
     /// `agentsso service install`.
     Setup(cli::setup::SetupArgs),
+    /// Diagnose (and with `--fix` repair the safe subset of) a
+    /// privileged macOS install — version drift, stale launchd
+    /// registration, symlink topology, managed-policy staleness,
+    /// daemon liveness, no-TTY prompt traps, missing daemon binary,
+    /// operator-layer compile (UX-overhaul Story 4). `--json` emits a
+    /// machine-readable report; `--restart-ok` (inert without
+    /// `--fix`) permits daemon-bouncing repairs.
+    Doctor(cli::doctor::DoctorArgs),
     /// Manage the daemon as a macOS system service. `install` is now
     /// `agentsso setup` (this verb redirects). `uninstall`
     /// (root-required teardown) + `status` (no-root state report)
@@ -287,6 +295,7 @@ async fn main() -> ExitCode {
         Some(Commands::Agent(args)) => anyhow_to_exit_code(cli::agent::run(args).await),
         Some(Commands::Connectors(args)) => anyhow_to_exit_code(cli::connectors::run(args).await),
         Some(Commands::Setup(args)) => anyhow_to_exit_code(cli::setup::run(args).await),
+        Some(Commands::Doctor(args)) => anyhow_to_exit_code(cli::doctor::run(args).await),
         Some(Commands::Service(args)) => anyhow_to_exit_code(cli::service::run(args).await),
         Some(Commands::Uninstall(args)) => uninstall_to_exit_code(cli::uninstall::run(args).await),
         Some(Commands::Update(args)) => update_to_exit_code(cli::update::run(args).await),
