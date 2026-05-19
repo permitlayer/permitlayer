@@ -206,14 +206,28 @@ fn quickstart_read_and_read_write_are_mutually_exclusive() {
 // register+bind happens first — without the wall-clock hang.
 // --------------------------------------------------------------------------
 
-/// Issue `GET /v1/control/agent/list` and return the parsed JSON. On
-/// macOS control routes are UDS-only (Story 7.27); elsewhere TCP
-/// loopback. The token is read from `<home>/control.token`.
-fn agent_list(home: &std::path::Path, port: u16) -> serde_json::Value {
-    let token = std::fs::read_to_string(home.join("control.token"))
-        .expect("control.token readable")
-        .trim()
-        .to_owned();
+/// Issue `GET /v1/control/agent/list` and return the parsed JSON, or
+/// `None` on ANY transient failure (control token not yet written,
+/// UDS not yet bound, short read, non-JSON body). On macOS control
+/// routes are UDS-only (Story 7.27); elsewhere TCP loopback. The token
+/// is read from `<home>/control.token`.
+///
+/// This helper is called in a poll loop against a freshly-spawned
+/// daemon on heavily-parallel CI runners (notably `macos-15-intel`,
+/// which is documented-slow under full nextest load). Every step here
+/// races daemon startup — the token file is minted DURING daemon boot,
+/// the UDS is bound DURING boot, etc. A single `.expect()`/`.unwrap()`
+/// on a transient (token-not-yet-there, connect race, partial read)
+/// would abort the whole poll instead of retrying. So this returns
+/// `None` for every recoverable condition and the caller keeps polling
+/// until its deadline; it only ever yields `Some(json)` on a clean
+/// round-trip.
+fn agent_list(home: &std::path::Path, port: u16) -> Option<serde_json::Value> {
+    let token = std::fs::read_to_string(home.join("control.token")).ok()?;
+    let token = token.trim().to_owned();
+    if token.is_empty() {
+        return None;
+    }
     let request = format!(
         "GET /v1/control/agent/list HTTP/1.1\r\nHost: localhost\r\n\
          X-Agentsso-Control: {token}\r\nConnection: close\r\n\r\n"
@@ -225,24 +239,23 @@ fn agent_list(home: &std::path::Path, port: u16) -> serde_json::Value {
             use std::os::unix::net::UnixStream;
             let _ = port;
             let sock = home.join("run").join("control.sock");
-            let mut stream = UnixStream::connect(&sock)
-                .unwrap_or_else(|e| panic!("connect UDS at {}: {e}", sock.display()));
-            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            stream.write_all(request.as_bytes()).unwrap();
+            let mut stream = UnixStream::connect(&sock).ok()?;
+            stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+            stream.write_all(request.as_bytes()).ok()?;
             let mut buf = Vec::new();
-            stream.read_to_end(&mut buf).expect("read agent list over UDS");
+            stream.read_to_end(&mut buf).ok()?;
             String::from_utf8_lossy(&buf).into_owned()
         }
         #[cfg(not(target_os = "macos"))]
         {
             let _ = home;
             let mut stream = TcpStream::connect_timeout(
-                &format!("127.0.0.1:{port}").parse().unwrap(),
+                &format!("127.0.0.1:{port}").parse().ok()?,
                 Duration::from_secs(2),
             )
-            .expect("connect daemon TCP");
-            stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-            stream.write_all(request.as_bytes()).unwrap();
+            .ok()?;
+            stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+            stream.write_all(request.as_bytes()).ok()?;
             let mut buf = Vec::new();
             let _ = stream.read_to_end(&mut buf);
             String::from_utf8_lossy(&buf).into_owned()
@@ -250,34 +263,39 @@ fn agent_list(home: &std::path::Path, port: u16) -> serde_json::Value {
     };
 
     let body = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("").trim();
-    serde_json::from_str(body)
-        .unwrap_or_else(|e| panic!("agent list body not JSON: {e}; raw={raw}"))
+    serde_json::from_str(body).ok()
 }
 
-/// Poll the agent list until `agent` appears bound to `expected_policy`,
-/// or the deadline elapses. Returns the matched binding's policy name.
-fn wait_for_agent_bound(
-    home: &std::path::Path,
-    port: u16,
-    agent: &str,
-    expected_policy: &str,
-) -> Option<String> {
-    let deadline = Instant::now() + Duration::from_secs(20);
+/// Poll the agent list until `agent` appears, or the deadline elapses.
+/// Returns the observed binding's `policy_name` (the caller asserts it
+/// equals the expected policy — see `assert_quickstart_registers_then_oauth`).
+fn wait_for_agent_bound(home: &std::path::Path, port: u16, agent: &str) -> Option<String> {
+    // 90s, not 20s: this races a freshly-spawned daemon on
+    // heavily-parallel CI. `macos-15-intel` is documented-slow under
+    // full nextest load (syspolicyd queue depth + 56 fragmented test
+    // binaries) — daemon spawn + health + the quickstart child's own
+    // cold start + kill-switch probe + require_daemon_running + the
+    // register round-trip legitimately exceeded the old 20s window
+    // there (the post-merge CI failure on the rc.37 tag-target). The
+    // child is SIGTERM'd by the caller the instant this returns, so a
+    // generous ceiling costs nothing on the common (fast) path and
+    // only buys headroom on the slow runner. `agent_list` returning
+    // None (token/UDS/boot race) is a transient — keep polling.
+    let deadline = Instant::now() + Duration::from_secs(90);
     while Instant::now() < deadline {
-        let list = agent_list(home, port);
-        if let Some(agents) = list.get("agents").and_then(|a| a.as_array()) {
+        if let Some(list) = agent_list(home, port)
+            && let Some(agents) = list.get("agents").and_then(|a| a.as_array())
+        {
             for a in agents {
                 if a.get("name").and_then(|n| n.as_str()) == Some(agent) {
-                    let pol = a
+                    // Binding is atomic at register time; return the
+                    // observed policy and let the caller assert once
+                    // (asserting inside the poll is needlessly fragile).
+                    return a
                         .get("policy_name")
                         .and_then(|p| p.as_str())
-                        .unwrap_or_default()
-                        .to_owned();
-                    assert_eq!(
-                        pol, expected_policy,
-                        "agent {agent} must be bound to {expected_policy}, got {pol}"
-                    );
-                    return Some(pol);
+                        .map(str::to_owned)
+                        .or_else(|| Some(String::new()));
                 }
             }
         }
@@ -363,16 +381,16 @@ fn assert_quickstart_registers_then_oauth(service: &str, write: bool) {
 
     // Register+bind must complete (and the flow must advance into
     // connect's OAuth stage, which is where the child now blocks).
-    let bound = wait_for_agent_bound(home.path(), port, &agent, &expected_policy);
+    let bound = wait_for_agent_bound(home.path(), port, &agent);
 
     terminate(&mut child);
     drop(daemon);
 
     assert_eq!(
-        bound,
-        Some(expected_policy.clone()),
+        bound.as_deref(),
+        Some(expected_policy.as_str()),
         "quickstart must register `{agent}` bound to `{expected_policy}` BEFORE \
-         connect's OAuth stage"
+         connect's OAuth stage (observed binding: {bound:?})"
     );
 }
 
