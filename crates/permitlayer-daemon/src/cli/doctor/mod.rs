@@ -715,6 +715,12 @@ async fn fix_stale_launchd() -> FixOutcome {
     if let Err(e) = im::bootout_daemon() {
         return FixOutcome::Failed { err: format!("bootout failed: {e:#}") };
     }
+    // rc.40: the bootout→bootstrap race on long-uptime daemons
+    // (launchd domain-release lag → `Bootstrap failed: 5:
+    // Input/output error`) is mitigated inside
+    // `launchctl_bootstrap_system` itself (substring-classified retry
+    // up to 3× with 250/500/1000ms backoff, always-log-stderr).
+    // doctor inherits the fix automatically — no retry logic here.
     if let Err(e) = im::launchctl_bootstrap_system() {
         return FixOutcome::Failed { err: format!("re-bootstrap failed: {e:#}") };
     }

@@ -1298,38 +1298,157 @@ pub(crate) fn bootout_daemon() -> Result<()> {
     Ok(())
 }
 
+/// Substring launchctl emits in stderr when its service-domain
+/// takedown after `bootout` hasn't fully completed by the time
+/// `bootstrap` re-registers the same label. Empirically observed on
+/// macOS 14/15 when the bootout-bootstrap pair fires against a
+/// long-uptime daemon (rc.39 → rc.40 in-place upgrade with 23h+
+/// uptime reproduced this live); `launchctl bootstrap` returns this
+/// before any plist parsing happens. See module-level note at
+/// `xml_escape` (~line 750) for the *other* known cause of
+/// `Bootstrap failed: 5` (control-char injection into the plist),
+/// which `xml_escape` already mitigates structurally — this
+/// substring matches the post-bootout-race shape specifically.
+const BOOTSTRAP_EIO_SUBSTRING: &str = "Bootstrap failed: 5: Input/output error";
+
+/// Classifier: does this `launchctl bootstrap` stderr match the
+/// post-bootout-race EIO shape we retry on? Pure fn so the truth
+/// table is unit-testable.
+///
+/// We match the **exact** documented substring. A future macOS
+/// version that renders the error differently (e.g. `Bootstrap
+/// failed: 5: I/O error`, `Bootstrap failed: 6: …`, or a
+/// `Permission denied`-flavored 5) is deliberately **not** retried —
+/// silently retrying a different failure class would hide real bugs.
+/// If the wording shifts, the always-logged stderr (see
+/// [`launchctl_bootstrap_system`]) gives a forensic trail to update
+/// the classifier from.
+#[cfg(any(test, target_os = "macos"))]
+fn should_retry_bootstrap_eio(stderr: &str) -> bool {
+    stderr.contains(BOOTSTRAP_EIO_SUBSTRING)
+}
+
+/// Closure-form inner of [`launchctl_bootstrap_system`] — production
+/// callers thread the real `Command::new("/bin/launchctl") …` invocation
+/// through the public wrapper below; tests inject a closure returning
+/// `(success: bool, stderr: String)` and a sleep stub so the retry
+/// behavior pins deterministically without spawning a real launchctl
+/// or sleeping in wall-clock time. Mirrors
+/// `permitlayer-keystore/src/keyring_shared.rs::read_after_write_with_retry_inner`,
+/// the codebase's canonical closure-form retry shape.
+///
+/// Retry policy on the post-bootout-race EIO substring only:
+/// **up to 4 total attempts (1 initial + 3 retries) with 250ms /
+/// 500ms / 1000ms backoff = 1.75s worst-case before exhaustion.** Any
+/// other stderr is one-shot fail-loud (returns immediately) so a real
+/// plist / permissions / domain-disabled failure is not silently
+/// delayed. **Every attempt's stderr is logged at `warn`** regardless
+/// of retry classification — when the substring matcher silently
+/// misses on a future macOS wording shift, the forensic trail still
+/// exists.
+#[cfg(any(test, target_os = "macos"))]
+fn launchctl_bootstrap_system_inner<F, S>(mut invoke: F, mut sleep: S) -> Result<()>
+where
+    F: FnMut() -> Result<(bool, String)>,
+    S: FnMut(Duration),
+{
+    // One entry per inter-attempt gap; the final attempt gets no
+    // further sleep — exhaustion follows immediately. Total worst-case
+    // wall budget = 250 + 500 + 1000 = 1750ms across 4 attempts.
+    const BACKOFFS: &[Duration] =
+        &[Duration::from_millis(250), Duration::from_millis(500), Duration::from_millis(1000)];
+
+    let mut last_stderr = String::new();
+    let max_attempts = BACKOFFS.len() + 1;
+    // Iterate the backoffs as `Some(backoff)` for the first N attempts
+    // and `None` for the final attempt (no sleep after exhaustion).
+    let backoff_iter = BACKOFFS.iter().copied().map(Some).chain(std::iter::once(None));
+    for (attempt_idx, backoff) in backoff_iter.enumerate() {
+        let attempt_num = attempt_idx + 1;
+        let (ok, stderr) = invoke().context("failed to invoke /bin/launchctl bootstrap")?;
+        if ok {
+            if attempt_idx > 0 {
+                tracing::info!(
+                    target: "install",
+                    attempt = attempt_num,
+                    "launchctl bootstrap succeeded after retry",
+                );
+            }
+            return Ok(());
+        }
+        // Always log the full stderr on every failed attempt. This is
+        // the durable diagnostic: if a future macOS renders the error
+        // differently and `should_retry_bootstrap_eio` silently misses,
+        // the operator/dev still has the raw text in the logs.
+        tracing::warn!(
+            target: "install",
+            attempt = attempt_num,
+            max_attempts = max_attempts,
+            stderr = %stderr,
+            "launchctl bootstrap attempt failed",
+        );
+        last_stderr = stderr;
+        if !should_retry_bootstrap_eio(&last_stderr) {
+            // Non-EIO failure: one-shot fail-loud, do not delay.
+            break;
+        }
+        match backoff {
+            Some(delay) => sleep(delay),
+            None => {
+                tracing::warn!(
+                    target: "install",
+                    max_attempts = max_attempts,
+                    "launchctl bootstrap EIO retry exhausted",
+                );
+            }
+        }
+    }
+    // Fell through (one-shot non-EIO failure, or EIO retries exhausted).
+    // Reproduce the original error block + plutil diagnostic.
+    let plutil = Command::new("/usr/bin/plutil").arg(PLIST_PATH).output();
+    let plutil_msg = match plutil {
+        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+        Err(_) => "(plutil unavailable)".to_owned(),
+    };
+    eprint!(
+        "{}",
+        error_block(
+            "service.install.bootstrap_failed",
+            &format!(
+                "`launchctl bootstrap system {PLIST_PATH}` failed: {last_stderr}\n\n\
+                 plutil: {plutil_msg}"
+            ),
+            "check the plist syntax + try `sudo launchctl bootstrap system <plist>` manually",
+            None,
+        )
+    );
+    Err(silent_cli_error("launchctl bootstrap failed"))
+}
+
 /// `launchctl bootstrap system /Library/LaunchDaemons/...`. Body
 /// extracted verbatim from `bootstrap_daemon`'s bootstrap block
 /// (including the plutil diagnostic) so a future `cli/setup` module
 /// can reuse it.
+///
+/// **EIO-retry note (rc.40):** on a long-uptime daemon, `bootstrap`
+/// immediately following a `bootout` can return `Bootstrap failed: 5:
+/// Input/output error` because launchd's service-domain release lags
+/// the bootout exit. We retry that specific stderr substring up to
+/// 3× (250/500/1000ms backoff) — never any other failure class. See
+/// [`launchctl_bootstrap_system_inner`] for the closure-form testable
+/// body and `BOOTSTRAP_EIO_SUBSTRING` for the classifier.
 pub(crate) fn launchctl_bootstrap_system() -> Result<()> {
-    let out = Command::new("/bin/launchctl")
-        .args(["bootstrap", "system", PLIST_PATH])
-        .output()
-        .context("failed to invoke /bin/launchctl bootstrap")?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        // `plutil` for diagnostic.
-        let plutil = Command::new("/usr/bin/plutil").arg(PLIST_PATH).output();
-        let plutil_msg = match plutil {
-            Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
-            Err(_) => "(plutil unavailable)".to_owned(),
-        };
-        eprint!(
-            "{}",
-            error_block(
-                "service.install.bootstrap_failed",
-                &format!(
-                    "`launchctl bootstrap system {PLIST_PATH}` failed: {stderr}\n\n\
-                     plutil: {plutil_msg}"
-                ),
-                "check the plist syntax + try `sudo launchctl bootstrap system <plist>` manually",
-                None,
-            )
-        );
-        return Err(silent_cli_error("launchctl bootstrap failed"));
-    }
-    Ok(())
+    launchctl_bootstrap_system_inner(
+        || {
+            let out = Command::new("/bin/launchctl")
+                .args(["bootstrap", "system", PLIST_PATH])
+                .output()
+                .context("failed to invoke /bin/launchctl bootstrap")?;
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            Ok((out.status.success(), stderr))
+        },
+        std::thread::sleep,
+    )
 }
 
 /// Pure parser for `launchctl print system/<label>` stdout. Returns
@@ -1496,5 +1615,128 @@ mod tests {
         // depends on the host machine; on CI the 300-499 range is
         // typically empty.
         let _ = find_free_gid_in_range(300, 499);
+    }
+
+    // ── rc.40: launchctl bootstrap EIO retry ──────────────────────
+
+    #[test]
+    fn should_retry_bootstrap_eio_matches_only_exact_substring() {
+        // The exact observed wording — retry.
+        assert!(should_retry_bootstrap_eio("Bootstrap failed: 5: Input/output error"));
+        // Same substring embedded in a longer stderr — retry.
+        assert!(should_retry_bootstrap_eio(
+            "launchctl bootstrap failed:\nBootstrap failed: 5: Input/output error\n"
+        ));
+        // Plausible future wording shifts — DO NOT retry. The
+        // classifier must fail closed so a real bug isn't silently
+        // delayed. When the wording shifts the always-logged stderr
+        // gives a forensic trail to update the matcher from.
+        assert!(!should_retry_bootstrap_eio("Bootstrap failed: 5: I/O error"));
+        assert!(!should_retry_bootstrap_eio("Bootstrap failed: 5: Permission denied"));
+        assert!(!should_retry_bootstrap_eio("Bootstrap failed: 6: Input/output error"));
+        assert!(!should_retry_bootstrap_eio("bootstrap failed: 5: Input/output error")); // case
+        // Other launchctl errors — DO NOT retry.
+        assert!(!should_retry_bootstrap_eio("Could not find specified service"));
+        assert!(!should_retry_bootstrap_eio("service is disabled"));
+        assert!(!should_retry_bootstrap_eio(""));
+    }
+
+    #[test]
+    fn launchctl_bootstrap_inner_succeeds_on_first_attempt() {
+        let calls = std::cell::RefCell::new(0usize);
+        let sleeps = std::cell::RefCell::new(Vec::<Duration>::new());
+        let result = launchctl_bootstrap_system_inner(
+            || {
+                *calls.borrow_mut() += 1;
+                Ok((true, String::new()))
+            },
+            |d| sleeps.borrow_mut().push(d),
+        );
+        assert!(result.is_ok());
+        assert_eq!(*calls.borrow(), 1, "should succeed in one call, no retry");
+        assert!(sleeps.borrow().is_empty(), "no sleep when first call wins");
+    }
+
+    #[test]
+    fn launchctl_bootstrap_inner_retries_eio_then_succeeds_within_budget() {
+        let calls = std::cell::RefCell::new(0usize);
+        let sleeps = std::cell::RefCell::new(Vec::<Duration>::new());
+        // EIO twice, then ok on attempt 3.
+        let result = launchctl_bootstrap_system_inner(
+            || {
+                let mut n = calls.borrow_mut();
+                *n += 1;
+                if *n < 3 {
+                    Ok((false, "Bootstrap failed: 5: Input/output error\n".to_owned()))
+                } else {
+                    Ok((true, String::new()))
+                }
+            },
+            |d| sleeps.borrow_mut().push(d),
+        );
+        assert!(result.is_ok(), "should succeed after 2 EIO retries");
+        assert_eq!(*calls.borrow(), 3, "3 attempts (initial + 2 retries)");
+        // Backoff schedule honored: 250ms before attempt 2, 500ms before attempt 3.
+        assert_eq!(
+            sleeps.borrow().as_slice(),
+            &[Duration::from_millis(250), Duration::from_millis(500)],
+        );
+    }
+
+    #[test]
+    fn launchctl_bootstrap_inner_exhausts_after_max_attempts_on_persistent_eio() {
+        let calls = std::cell::RefCell::new(0usize);
+        let sleeps = std::cell::RefCell::new(Vec::<Duration>::new());
+        let result = launchctl_bootstrap_system_inner(
+            || {
+                *calls.borrow_mut() += 1;
+                Ok((false, "Bootstrap failed: 5: Input/output error".to_owned()))
+            },
+            |d| sleeps.borrow_mut().push(d),
+        );
+        assert!(result.is_err(), "persistent EIO must exhaust to Err");
+        // 4 attempts total (1 initial + 3 retries = BACKOFFS.len() + 1).
+        assert_eq!(*calls.borrow(), 4, "exactly BACKOFFS.len() + 1 calls");
+        // Full backoff schedule consumed: 250/500/1000ms (no sleep
+        // after the final failed attempt — exhaustion is immediate).
+        assert_eq!(
+            sleeps.borrow().as_slice(),
+            &[Duration::from_millis(250), Duration::from_millis(500), Duration::from_millis(1000),],
+        );
+    }
+
+    #[test]
+    fn launchctl_bootstrap_inner_no_retry_on_non_eio_stderr() {
+        let calls = std::cell::RefCell::new(0usize);
+        let sleeps = std::cell::RefCell::new(Vec::<Duration>::new());
+        // A real plist / permissions / domain-disabled failure — one-shot.
+        let result = launchctl_bootstrap_system_inner(
+            || {
+                *calls.borrow_mut() += 1;
+                Ok((false, "Bootstrap failed: 37: Operation not permitted".to_owned()))
+            },
+            |d| sleeps.borrow_mut().push(d),
+        );
+        assert!(result.is_err(), "non-EIO failure should error immediately");
+        assert_eq!(*calls.borrow(), 1, "no retry on non-EIO");
+        assert!(sleeps.borrow().is_empty(), "no sleep on non-EIO");
+    }
+
+    #[test]
+    fn launchctl_bootstrap_inner_propagates_invoke_io_error() {
+        // The closure itself errored (e.g. /bin/launchctl missing) —
+        // surface immediately, no retry.
+        let calls = std::cell::RefCell::new(0usize);
+        let sleeps = std::cell::RefCell::new(Vec::<Duration>::new());
+        let result: Result<()> = launchctl_bootstrap_system_inner(
+            || {
+                *calls.borrow_mut() += 1;
+                Err(anyhow::anyhow!("simulated invoke failure"))
+            },
+            |d| sleeps.borrow_mut().push(d),
+        );
+        assert!(result.is_err());
+        assert_eq!(*calls.borrow(), 1, "invoke error short-circuits, no retry");
+        assert!(sleeps.borrow().is_empty());
     }
 }
