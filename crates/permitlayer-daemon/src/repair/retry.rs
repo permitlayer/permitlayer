@@ -52,6 +52,20 @@ pub(crate) const TRANSIENT_FAST: &[Duration] =
 pub(crate) const LAUNCHCTL_RACE: &[Duration] =
     &[Duration::from_millis(250), Duration::from_millis(500), Duration::from_millis(1000)];
 
+/// Install-lock contention schedule (250/500/1000/1000/2000 ms;
+/// ~4.75s total). Used by `cli/service/install_macos.rs`'s install-lock
+/// acquisition (Epic 10 row 14): when a concurrent setup/install holds
+/// the `flock(2)`, wait this budget out before refusing rather than
+/// failing immediately. A concurrent install is a transient condition
+/// — the kernel releases the lock when the other process exits.
+pub(crate) const INSTALL_LOCK_WAIT: &[Duration] = &[
+    Duration::from_millis(250),
+    Duration::from_millis(500),
+    Duration::from_millis(1000),
+    Duration::from_millis(1000),
+    Duration::from_millis(2000),
+];
+
 /// Apply ±20% uniform jitter to a scheduled delay. Public for tests
 /// only; production code goes through [`with_backoff`] /
 /// [`with_backoff_async`].

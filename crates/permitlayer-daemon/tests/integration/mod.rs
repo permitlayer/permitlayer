@@ -72,6 +72,7 @@ mod rotate_key_e2e;
 mod scope_merge_managed_only_e2e;
 mod scrub_explain_warnings;
 mod setup_e2e;
+mod setup_self_heal_e2e;
 mod status_connections_e2e;
 mod uninstall_e2e;
 mod update_e2e;

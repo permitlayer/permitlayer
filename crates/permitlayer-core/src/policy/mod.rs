@@ -35,8 +35,8 @@ pub mod eval;
 pub mod schema;
 
 pub use compile::{
-    CompiledPolicy, CompiledRule, OverrideRecord, PolicySet, PolicySetDiff, ResourceMatcher,
-    RuleAction,
+    CompiledPolicy, CompiledRule, OverrideRecord, PolicyDecl, PolicySet, PolicySetDiff,
+    ResourceMatcher, RuleAction, read_policy_decls_by_file,
 };
 pub use error::PolicyCompileError;
 pub use eval::{ApprovalMode, Decision, EvalRequest};
