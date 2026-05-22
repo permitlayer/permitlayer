@@ -130,7 +130,6 @@ pub(crate) fn atomic_replace_owned_file(src: &Path, dst: &Path, mode: u32) -> io
     }
 
     let tmp = tempfile::NamedTempFile::new_in(parent)?;
-    let tmp_path = tmp.path().to_owned();
     {
         let mut src_file = std::fs::File::open(src)?;
         let mut tmp_handle = tmp.as_file();
@@ -138,10 +137,13 @@ pub(crate) fn atomic_replace_owned_file(src: &Path, dst: &Path, mode: u32) -> io
         tmp_handle.sync_all()?;
     }
 
+    // `mode` only applies on unix; Windows uses ACLs. `tmp.path()` is
+    // referenced only here, so binding it outside would be unused on
+    // non-unix under `-D warnings`.
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&tmp_path, std::fs::Permissions::from_mode(mode))?;
+        std::fs::set_permissions(tmp.path(), std::fs::Permissions::from_mode(mode))?;
     }
     #[cfg(not(unix))]
     {
