@@ -1328,16 +1328,37 @@ fn should_retry_bootstrap_eio(stderr: &str) -> bool {
     stderr.contains(BOOTSTRAP_EIO_SUBSTRING)
 }
 
+/// Extended classifier (Story 10.1): in addition to the EIO
+/// post-bootout-race substring, retry on launchctl's "in use" /
+/// "Operation in progress" substrings — both indicate a transient
+/// service-domain race (the daemon's prior instance is still
+/// releasing the label). Same caveat as `should_retry_bootstrap_eio`:
+/// fail closed on any wording we don't recognize; the always-logged
+/// stderr is the forensic trail for future Apple wording shifts.
+#[cfg(any(test, target_os = "macos"))]
+fn should_retry_bootstrap_transient(stderr: &str) -> bool {
+    should_retry_bootstrap_eio(stderr)
+        || stderr.contains("in use")
+        || stderr.contains("Operation in progress")
+}
+
 /// Closure-form inner of [`launchctl_bootstrap_system`] — production
 /// callers thread the real `Command::new("/bin/launchctl") …` invocation
 /// through the public wrapper below; tests inject a closure returning
 /// `(success: bool, stderr: String)` and a sleep stub so the retry
 /// behavior pins deterministically without spawning a real launchctl
-/// or sleeping in wall-clock time. Mirrors
-/// `permitlayer-keystore/src/keyring_shared.rs::read_after_write_with_retry_inner`,
-/// the codebase's canonical closure-form retry shape.
+/// or sleeping in wall-clock time.
 ///
-/// Retry policy on the post-bootout-race EIO substring only:
+/// Story 10.1 refactor: the inline retry loop is replaced by
+/// [`crate::repair::retry::with_backoff`] using the
+/// [`crate::repair::retry::LAUNCHCTL_RACE`] schedule (same 250/500/1000ms
+/// values the original local `BACKOFFS` const used — non-jittered
+/// because the unit tests assert exact observed delays). The
+/// classifier ([`should_retry_bootstrap_transient`]) is extended to
+/// also retry on `"in use"` / `"Operation in progress"` substrings
+/// alongside the rc.40 EIO precedent.
+///
+/// Retry policy on transient substrings only:
 /// **up to 4 total attempts (1 initial + 3 retries) with 250ms /
 /// 500ms / 1000ms backoff = 1.75s worst-case before exhaustion.** Any
 /// other stderr is one-shot fail-loud (returns immediately) so a real
@@ -1347,27 +1368,42 @@ fn should_retry_bootstrap_eio(stderr: &str) -> bool {
 /// misses on a future macOS wording shift, the forensic trail still
 /// exists.
 #[cfg(any(test, target_os = "macos"))]
-fn launchctl_bootstrap_system_inner<F, S>(mut invoke: F, mut sleep: S) -> Result<()>
+fn launchctl_bootstrap_system_inner<F, S>(mut invoke: F, sleep: S) -> Result<()>
 where
     F: FnMut() -> Result<(bool, String)>,
     S: FnMut(Duration),
 {
-    // One entry per inter-attempt gap; the final attempt gets no
-    // further sleep — exhaustion follows immediately. Total worst-case
-    // wall budget = 250 + 500 + 1000 = 1750ms across 4 attempts.
-    const BACKOFFS: &[Duration] =
-        &[Duration::from_millis(250), Duration::from_millis(500), Duration::from_millis(1000)];
+    use crate::repair::retry::{LAUNCHCTL_RACE, RetryDecision, with_backoff};
 
-    let mut last_stderr = String::new();
-    let max_attempts = BACKOFFS.len() + 1;
-    // Iterate the backoffs as `Some(backoff)` for the first N attempts
-    // and `None` for the final attempt (no sleep after exhaustion).
-    let backoff_iter = BACKOFFS.iter().copied().map(Some).chain(std::iter::once(None));
-    for (attempt_idx, backoff) in backoff_iter.enumerate() {
-        let attempt_num = attempt_idx + 1;
-        let (ok, stderr) = invoke().context("failed to invoke /bin/launchctl bootstrap")?;
+    // The bootstrap call's outcome enum, threaded through with_backoff
+    // so the retry primitive can decide retry-vs-final without losing
+    // the stderr trail or the per-attempt log.
+    enum BootstrapErr {
+        /// `(false, stderr)` from invoke — launchctl ran and refused.
+        /// The retry classifier reads `stderr` to decide.
+        Refused(String),
+        /// `Err(_)` from invoke — couldn't even spawn launchctl.
+        /// Always terminal (no retry).
+        InvokeFailed(anyhow::Error),
+    }
+
+    let max_attempts = LAUNCHCTL_RACE.len() + 1;
+    let attempt_counter = std::cell::Cell::new(0usize);
+    let last_stderr: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+
+    let op = || -> std::result::Result<(), BootstrapErr> {
+        let attempt_num = attempt_counter.get() + 1;
+        attempt_counter.set(attempt_num);
+        let (ok, stderr) = match invoke() {
+            Ok(t) => t,
+            Err(e) => {
+                return Err(BootstrapErr::InvokeFailed(
+                    e.context("failed to invoke /bin/launchctl bootstrap"),
+                ));
+            }
+        };
         if ok {
-            if attempt_idx > 0 {
+            if attempt_num > 1 {
                 tracing::info!(
                     target: "install",
                     attempt = attempt_num,
@@ -1378,8 +1414,8 @@ where
         }
         // Always log the full stderr on every failed attempt. This is
         // the durable diagnostic: if a future macOS renders the error
-        // differently and `should_retry_bootstrap_eio` silently misses,
-        // the operator/dev still has the raw text in the logs.
+        // differently and `should_retry_bootstrap_transient` silently
+        // misses, the operator/dev still has the raw text in the logs.
         tracing::warn!(
             target: "install",
             attempt = attempt_num,
@@ -1387,42 +1423,63 @@ where
             stderr = %stderr,
             "launchctl bootstrap attempt failed",
         );
-        last_stderr = stderr;
-        if !should_retry_bootstrap_eio(&last_stderr) {
-            // Non-EIO failure: one-shot fail-loud, do not delay.
-            break;
+        *last_stderr.borrow_mut() = stderr.clone();
+        Err(BootstrapErr::Refused(stderr))
+    };
+
+    let classify = |err: &BootstrapErr| match err {
+        BootstrapErr::InvokeFailed(_) => RetryDecision::Final,
+        BootstrapErr::Refused(stderr) => {
+            if should_retry_bootstrap_transient(stderr) {
+                RetryDecision::Retry
+            } else {
+                RetryDecision::Final
+            }
         }
-        match backoff {
-            Some(delay) => sleep(delay),
-            None => {
+    };
+
+    let outcome = with_backoff(op, classify, LAUNCHCTL_RACE, sleep);
+
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(BootstrapErr::InvokeFailed(e)) => Err(e),
+        Err(BootstrapErr::Refused(_)) => {
+            // Either the classifier said Final (non-transient stderr)
+            // or we exhausted the schedule on persistent transients.
+            // If we ran every scheduled attempt, log the "retry
+            // exhausted" warn for parity with the pre-refactor
+            // behavior — the budget being burned is what matters, not
+            // the classification of the FINAL stderr (a 3-transient +
+            // 1-non-transient run still exhausted the schedule).
+            let final_stderr = last_stderr.borrow().clone();
+            if attempt_counter.get() == max_attempts {
                 tracing::warn!(
                     target: "install",
                     max_attempts = max_attempts,
                     "launchctl bootstrap EIO retry exhausted",
                 );
             }
+            // Reproduce the original error block + plutil diagnostic.
+            let plutil = Command::new("/usr/bin/plutil").arg(PLIST_PATH).output();
+            let plutil_msg = match plutil {
+                Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+                Err(_) => "(plutil unavailable)".to_owned(),
+            };
+            eprint!(
+                "{}",
+                error_block(
+                    "service.install.bootstrap_failed",
+                    &format!(
+                        "`launchctl bootstrap system {PLIST_PATH}` failed: {final_stderr}\n\n\
+                         plutil: {plutil_msg}"
+                    ),
+                    "check the plist syntax + try `sudo launchctl bootstrap system <plist>` manually",
+                    None,
+                )
+            );
+            Err(silent_cli_error("launchctl bootstrap failed"))
         }
     }
-    // Fell through (one-shot non-EIO failure, or EIO retries exhausted).
-    // Reproduce the original error block + plutil diagnostic.
-    let plutil = Command::new("/usr/bin/plutil").arg(PLIST_PATH).output();
-    let plutil_msg = match plutil {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
-        Err(_) => "(plutil unavailable)".to_owned(),
-    };
-    eprint!(
-        "{}",
-        error_block(
-            "service.install.bootstrap_failed",
-            &format!(
-                "`launchctl bootstrap system {PLIST_PATH}` failed: {last_stderr}\n\n\
-                 plutil: {plutil_msg}"
-            ),
-            "check the plist syntax + try `sudo launchctl bootstrap system <plist>` manually",
-            None,
-        )
-    );
-    Err(silent_cli_error("launchctl bootstrap failed"))
 }
 
 /// `launchctl bootstrap system /Library/LaunchDaemons/...`. Body
@@ -1639,6 +1696,43 @@ mod tests {
         assert!(!should_retry_bootstrap_eio("Could not find specified service"));
         assert!(!should_retry_bootstrap_eio("service is disabled"));
         assert!(!should_retry_bootstrap_eio(""));
+    }
+
+    // ── Story 10.1: extended classifier (EIO + "in use" + "Operation in progress") ──
+
+    #[test]
+    fn should_retry_bootstrap_transient_includes_eio() {
+        // The original EIO substring still retries via the extended
+        // classifier. (Regression guard for the rc.40 precedent.)
+        assert!(should_retry_bootstrap_transient("Bootstrap failed: 5: Input/output error"));
+        assert!(should_retry_bootstrap_transient(
+            "launchctl bootstrap failed:\nBootstrap failed: 5: Input/output error\n"
+        ));
+    }
+
+    #[test]
+    fn should_retry_bootstrap_transient_classifies_in_use_substring() {
+        // launchctl can return "in use" when the prior service's
+        // domain release lags. Treat as transient.
+        assert!(should_retry_bootstrap_transient("Bootstrap failed: service in use"));
+        assert!(should_retry_bootstrap_transient("the requested service is in use by another job"));
+    }
+
+    #[test]
+    fn should_retry_bootstrap_transient_classifies_operation_in_progress_substring() {
+        assert!(should_retry_bootstrap_transient("Bootstrap failed: Operation in progress"));
+    }
+
+    #[test]
+    fn should_retry_bootstrap_transient_is_terminal_on_unrelated_errors() {
+        // Future wording shifts and unrelated failures must NOT
+        // retry. Same fail-closed posture as
+        // `should_retry_bootstrap_eio`.
+        assert!(!should_retry_bootstrap_transient("Bootstrap failed: 5: I/O error"));
+        assert!(!should_retry_bootstrap_transient("Bootstrap failed: 37: Operation not permitted"));
+        assert!(!should_retry_bootstrap_transient("Could not find specified service"));
+        assert!(!should_retry_bootstrap_transient("service is disabled"));
+        assert!(!should_retry_bootstrap_transient(""));
     }
 
     #[test]
