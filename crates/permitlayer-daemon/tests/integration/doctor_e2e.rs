@@ -134,6 +134,8 @@ fn doctor_json_shape_and_summary_consistency() {
 
     // Every documented check id is present exactly once.
     let ids: Vec<&str> = checks.iter().map(|c| c["id"].as_str().unwrap()).collect();
+    // Story 10.3: daemon_binary_missing was collapsed into
+    // symlink_integrity; legacy_seed_snapshot_present took its slot.
     for expected in [
         "version_drift",
         "stale_launchd",
@@ -141,8 +143,8 @@ fn doctor_json_shape_and_summary_consistency() {
         "managed_policy_staleness",
         "daemon_not_running",
         "no_tty_prompt_trap",
-        "daemon_binary_missing",
         "operator_layer_compile",
+        "legacy_seed_snapshot_present",
     ] {
         assert_eq!(
             ids.iter().filter(|i| **i == expected).count(),

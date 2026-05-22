@@ -21,6 +21,7 @@ mod cli;
 mod config;
 mod design;
 mod lifecycle;
+mod repair;
 mod server;
 mod telemetry;
 

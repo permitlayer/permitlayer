@@ -782,6 +782,62 @@ fn read_layer_policies_optional(
     read_layer_policies(dir)
 }
 
+/// A single policy declaration as read (uncompiled) from an operator
+/// `*.toml` file: its `name` and its cross-layer `override` marker (if
+/// any). Returned by [`read_policy_decls_by_file`].
+///
+/// The override marker is what distinguishes a **legitimate marked
+/// override** of a managed policy (compiles cleanly — the operator
+/// definition intentionally wins) from an **unmarked legacy seed** (the
+/// `UnmarkedCrossLayerOverride` crashloop the Epic 10 heal targets). A
+/// detector that only looks at `name` cannot tell them apart and would
+/// archive valid operator config; it must consult `override_marker`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PolicyDecl {
+    /// The declared policy `name`.
+    pub name: String,
+    /// The `override = "<target>"` marker, if the declaration carries one.
+    pub override_marker: Option<String>,
+}
+
+/// Read the policy **declarations per file** in `dir`, without
+/// compiling. Returns one entry per `*.toml` file (in sorted order),
+/// each carrying the file path and the [`PolicyDecl`]s it declares (a
+/// single file may declare multiple policies).
+///
+/// This is the canonical declaration-extraction path — it shares
+/// [`read_layer_policies`]'s parsing, dotfile/lockfile skipping, BOM
+/// rejection, and per-file duplicate-name detection. Callers that need
+/// to reason about operator files vs managed-bundle names (e.g. the
+/// Epic 10 legacy-seed shadow detector in `cli/setup`, which must
+/// distinguish an *unmarked* shadow from a *marked* override using the
+/// EXACT same parsing the compiler uses) should use this rather than
+/// rolling a second TOML parser that could drift.
+///
+/// A missing `dir` surfaces as [`PolicyCompileError::Io`]; use
+/// [`PolicySet::compile_from_dir`]'s error semantics as the reference.
+///
+/// # Errors
+///
+/// Returns the first parse / structural error encountered (same
+/// fail-fast as [`read_layer_policies`]).
+pub fn read_policy_decls_by_file(
+    dir: &Path,
+) -> Result<Vec<(PathBuf, Vec<PolicyDecl>)>, PolicyCompileError> {
+    let raw = read_layer_policies(dir)?;
+    // Group consecutive (path, decl) entries by path, preserving the
+    // sorted file order `read_layer_policies` guarantees.
+    let mut out: Vec<(PathBuf, Vec<PolicyDecl>)> = Vec::new();
+    for (path, policy) in raw {
+        let decl = PolicyDecl { name: policy.name, override_marker: policy.r#override };
+        match out.last_mut() {
+            Some((last_path, decls)) if *last_path == path => decls.push(decl),
+            _ => out.push((path, vec![decl])),
+        }
+    }
+    Ok(out)
+}
+
 fn parse_file(text: &str, path: &Path) -> Result<TomlPolicyFile, PolicyCompileError> {
     toml::from_str::<TomlPolicyFile>(text).map_err(|err| {
         let line = err.span().map(|span| byte_offset_to_line(text, span.start));
@@ -2625,6 +2681,82 @@ mod tests {
         // Origin tracks the actual file each came from.
         assert!(set.origin("gmail-read-only").unwrap().ends_with("default.toml"));
         assert!(set.origin("ops-calendar").unwrap().ends_with("ops.toml"));
+    }
+
+    #[test]
+    fn read_policy_decls_by_file_groups_decls_per_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // Single-policy file.
+        write_policy_file(dir, "default", MANAGED_GMAIL_RO);
+        // Multi-policy file (two names, same file).
+        write_policy_file(
+            dir,
+            "bundle",
+            r#"
+            [[policies]]
+            name = "calendar-ro"
+            scopes = ["calendar.readonly"]
+            resources = ["*"]
+            approval-mode = "auto"
+
+            [[policies]]
+            name = "drive-ro"
+            scopes = ["drive.readonly"]
+            resources = ["*"]
+            approval-mode = "auto"
+            "#,
+        );
+        // A dotfile must be skipped (editor lockfile discipline).
+        std::fs::write(dir.join(".#default.toml"), b"junk").unwrap();
+
+        let by_file = read_policy_decls_by_file(dir).unwrap();
+        // Sorted by path: bundle.toml before default.toml.
+        assert_eq!(by_file.len(), 2, "two real files, dotfile skipped: {by_file:?}");
+        assert!(by_file[0].0.ends_with("bundle.toml"));
+        let bundle_names: Vec<&str> = by_file[0].1.iter().map(|d| d.name.as_str()).collect();
+        assert_eq!(bundle_names, vec!["calendar-ro", "drive-ro"]);
+        assert!(by_file[1].0.ends_with("default.toml"));
+        assert_eq!(by_file[1].1.len(), 1);
+        assert_eq!(by_file[1].1[0].name, "gmail-read-only");
+        assert_eq!(by_file[1].1[0].override_marker, None, "no override marker on these fixtures");
+    }
+
+    #[test]
+    fn read_policy_decls_by_file_surfaces_override_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        // A marked cross-layer override: name collides with a managed
+        // name but carries `override = "<own name>"` → legitimate, NOT
+        // a legacy seed.
+        write_policy_file(
+            dir,
+            "ops",
+            r#"
+            [[policies]]
+            name = "gmail-read-only"
+            override = "gmail-read-only"
+            scopes = ["gmail.readonly"]
+            resources = ["*"]
+            approval-mode = "auto"
+            "#,
+        );
+        let by_file = read_policy_decls_by_file(dir).unwrap();
+        assert_eq!(by_file.len(), 1);
+        assert_eq!(by_file[0].1[0].name, "gmail-read-only");
+        assert_eq!(
+            by_file[0].1[0].override_marker.as_deref(),
+            Some("gmail-read-only"),
+            "the override marker must be surfaced so the legacy-seed detector can spare it"
+        );
+    }
+
+    #[test]
+    fn read_policy_decls_by_file_missing_dir_is_io_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist");
+        let err = read_policy_decls_by_file(&missing).unwrap_err();
+        assert!(matches!(err, PolicyCompileError::Io { .. }), "got {err:?}");
     }
 
     #[test]

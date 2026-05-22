@@ -681,56 +681,131 @@ fn acquire_install_lock() -> Result<InstallLock> {
 /// the holder process exits (graceful or SIGKILL), the kernel
 /// releases the fd, which releases the flock. No reclaim heuristic
 /// needed.
+/// Outcome of a single non-blocking lock attempt against one candidate
+/// path. Drives the retry/refuse/next-candidate decision in
+/// [`acquire_install_lock_with_retry`].
+#[cfg(any(test, target_os = "macos"))]
+enum LockAttempt {
+    /// Lock acquired.
+    Acquired(InstallLock),
+    /// `EWOULDBLOCK` — a concurrent install holds the lock. Transient;
+    /// the retry budget should wait it out.
+    Contended,
+    /// Open or non-EWOULDBLOCK lock failure — move to the next
+    /// candidate path. Carries the error for the final diagnostic.
+    OpenFailed(std::io::Error),
+}
+
 fn acquire_install_lock_inner(_force: bool) -> Result<InstallLock> {
-    use std::os::unix::fs::OpenOptionsExt;
     // `/var/run/permitlayer/` may not exist on a fresh install. Try
     // there first (preferred — root-only-writable so the lock is
     // tamper-resistant); fall back to /tmp/.
     let primary = PathBuf::from("/var/run/permitlayer/.install.lock");
     let fallback = PathBuf::from("/tmp/.permitlayer-install.lock");
-
     if let Some(parent) = primary.parent() {
         let _ = std::fs::create_dir_all(parent);
     }
+    acquire_install_lock_with_retry(
+        &[primary.clone(), fallback.clone()],
+        try_install_lock_once,
+        crate::repair::retry::INSTALL_LOCK_WAIT,
+        std::thread::sleep,
+    )
+}
 
+/// One non-blocking `flock(2)` attempt against `candidate`. Production
+/// implementation; tests inject a stub of the same shape.
+#[cfg(any(test, target_os = "macos"))]
+fn try_install_lock_once(candidate: &Path) -> LockAttempt {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = match std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(candidate)
+    {
+        Ok(f) => f,
+        Err(e) => return LockAttempt::OpenFailed(e),
+    };
+    match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
+        Ok(flock) => LockAttempt::Acquired(InstallLock { _flock: Some(flock) }),
+        Err((_returned_file, nix::errno::Errno::EWOULDBLOCK)) => LockAttempt::Contended,
+        Err((_returned_file, errno)) => {
+            LockAttempt::OpenFailed(std::io::Error::from_raw_os_error(errno as i32))
+        }
+    }
+}
+
+/// Acquire the install lock with bounded retry on contention (row 14).
+///
+/// For each candidate path in order: a `Contended` (`EWOULDBLOCK`)
+/// outcome is retried per `schedule` (a concurrent install is
+/// transient — the kernel releases the lock when the other process
+/// exits); an `OpenFailed` moves to the next candidate; `Acquired`
+/// returns. If every candidate is contended through the whole
+/// schedule, emit the structured `service.install.concurrent_install`
+/// refusal. If every candidate `OpenFailed`, return the diagnostic.
+///
+/// `try_lock` is injected so unit tests can drive the contention path
+/// without holding a real kernel flock.
+#[cfg(any(test, target_os = "macos"))]
+fn acquire_install_lock_with_retry<L, S>(
+    candidates: &[PathBuf],
+    mut try_lock: L,
+    schedule: &[Duration],
+    mut sleep: S,
+) -> Result<InstallLock>
+where
+    L: FnMut(&Path) -> LockAttempt,
+    S: FnMut(Duration),
+{
     let mut last_open_err: Option<std::io::Error> = None;
-    for candidate in [&primary, &fallback] {
-        let file = match std::fs::OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .mode(0o600)
-            .open(candidate)
-        {
-            Ok(f) => f,
-            Err(e) => {
-                last_open_err = Some(e);
-                continue;
-            }
-        };
-        match nix::fcntl::Flock::lock(file, nix::fcntl::FlockArg::LockExclusiveNonblock) {
-            Ok(flock) => return Ok(InstallLock { _flock: Some(flock) }),
-            Err((_returned_file, nix::errno::Errno::EWOULDBLOCK)) => {
-                eprint!(
-                    "{}",
-                    error_block(
-                        "service.install.concurrent_install",
-                        &format!(
-                            "another `agentsso service install` is in progress (lock at {})",
-                            candidate.display()
-                        ),
-                        "wait for the other install to finish (the kernel releases the lock automatically when it exits)",
-                        None,
-                    )
-                );
-                return Err(silent_cli_error("concurrent install detected"));
-            }
-            Err((_returned_file, errno)) => {
-                last_open_err = Some(std::io::Error::from_raw_os_error(errno as i32));
-                continue;
+    // Record the path(s) actually observed as contended so the refusal
+    // points the operator at the lock they're really blocked on — not
+    // just the first candidate (which may have only OpenFailed).
+    let mut contended_paths: Vec<PathBuf> = Vec::new();
+    for candidate in candidates {
+        // Attempt up to `schedule.len() + 1` times on this candidate,
+        // sleeping the scheduled (jittered) delay between contended
+        // attempts.
+        let max_attempts = schedule.len() + 1;
+        for attempt in 0..max_attempts {
+            match try_lock(candidate) {
+                LockAttempt::Acquired(lock) => return Ok(lock),
+                LockAttempt::OpenFailed(e) => {
+                    last_open_err = Some(e);
+                    break; // try the next candidate path
+                }
+                LockAttempt::Contended => {
+                    if !contended_paths.contains(candidate) {
+                        contended_paths.push(candidate.clone());
+                    }
+                    if attempt == schedule.len() {
+                        break; // schedule exhausted on this candidate
+                    }
+                    sleep(crate::repair::retry::jittered(schedule[attempt]));
+                }
             }
         }
+    }
+
+    if !contended_paths.is_empty() {
+        let where_ =
+            contended_paths.iter().map(|p| p.display().to_string()).collect::<Vec<_>>().join(", ");
+        eprint!(
+            "{}",
+            error_block(
+                "service.install.concurrent_install",
+                &format!(
+                    "another `agentsso setup` / `service install` is in progress (lock at {where_})"
+                ),
+                "wait for the other install to finish (the kernel releases the lock automatically when it exits), then re-run",
+                None,
+            )
+        );
+        return Err(silent_cli_error("concurrent install detected"));
     }
     Err(anyhow::anyhow!(
         "could not acquire install lock at any of /var/run/permitlayer/, /tmp/: {}",
@@ -1173,6 +1248,40 @@ pub(crate) fn stage_file_atomic(from: &Path, dest: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Pure builder for the LaunchDaemon plist XML body. Extracted from
+/// [`write_launchdaemon_plist`] so the rendered output (including
+/// `ThrottleInterval`, Story 10.2 row-of-AC #17) is unit-testable
+/// without root (the real write does chown root:wheel which needs
+/// privilege). `operator_username` is XML-escaped here.
+#[cfg(any(test, target_os = "macos"))]
+fn launchdaemon_plist_body(operator_uid: u32, operator_username: &str) -> String {
+    let operator_username_escaped = xml_escape(operator_username);
+    format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{DAEMON_LABEL}</string>
+  <key>ProgramArguments</key>
+    <array><string>{PRIVILEGED_HELPER_PATH}</string><string>start</string><string>--allow-foreground</string></array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
+  <key>ThrottleInterval</key><integer>30</integer>
+  <key>StandardOutPath</key><string>/Library/Logs/permitlayer/daemon.log</string>
+  <key>StandardErrorPath</key><string>/Library/Logs/permitlayer/daemon.log</string>
+  <key>ProcessType</key><string>Background</string>
+  <key>SessionCreate</key><true/>
+  <key>EnvironmentVariables</key>
+    <dict>
+      <key>PERMITLAYER_OPERATOR_UID</key><string>{operator_uid}</string>
+      <key>PERMITLAYER_OPERATOR_USER</key><string>{operator_username_escaped}</string>
+    </dict>
+</dict>
+</plist>
+"#
+    )
+}
+
 /// Build the LaunchDaemon plist XML and write it to `PLIST_PATH`,
 /// chown root:wheel, chmod 0644. Per Story 7.27 AC #10.
 ///
@@ -1194,30 +1303,7 @@ pub(crate) fn write_launchdaemon_plist(operator_uid: u32, operator_username: &st
     // `O'Brien`), and OD-imported accounts can carry `<`. Interpolating
     // raw produces invalid XML which `launchctl bootstrap` rejects
     // with an unhelpful "Bootstrap failed: 5: Input/output error".
-    let operator_username_escaped = xml_escape(operator_username);
-    let body = format!(
-        r#"<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>{DAEMON_LABEL}</string>
-  <key>ProgramArguments</key>
-    <array><string>{PRIVILEGED_HELPER_PATH}</string><string>start</string><string>--allow-foreground</string></array>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>
-  <key>StandardOutPath</key><string>/Library/Logs/permitlayer/daemon.log</string>
-  <key>StandardErrorPath</key><string>/Library/Logs/permitlayer/daemon.log</string>
-  <key>ProcessType</key><string>Background</string>
-  <key>SessionCreate</key><true/>
-  <key>EnvironmentVariables</key>
-    <dict>
-      <key>PERMITLAYER_OPERATOR_UID</key><string>{operator_uid}</string>
-      <key>PERMITLAYER_OPERATOR_USER</key><string>{operator_username_escaped}</string>
-    </dict>
-</dict>
-</plist>
-"#
-    );
+    let body = launchdaemon_plist_body(operator_uid, operator_username);
     // Compare-then-write: if the on-disk plist already matches `body`
     // byte-for-byte, skip the tmp+chown+chmod+rename entirely. A
     // re-run of `service install` with identical operator identity
@@ -1254,48 +1340,192 @@ fn bootstrap_daemon() -> Result<()> {
 /// in use. Body extracted verbatim from `bootstrap_daemon`'s bootout
 /// block so a future `cli/setup` module can reuse it.
 pub(crate) fn bootout_daemon() -> Result<()> {
-    // Best-effort bootout (covers re-install case). Story 7.27 review
-    // fix: inspect bootout exit code. launchctl bootout exit codes
-    // include 0 (success), 36 / `Could not find specified service`
-    // (no such service — fine), 9216 / `Boot-out failed: 113` /
-    // `Operation in progress` (service in use — bad).
-    let bootout = Command::new("/bin/launchctl")
-        .args(["bootout", &format!("system/{DAEMON_LABEL}")])
-        .output();
-    if let Ok(out) = bootout {
-        let stderr = String::from_utf8_lossy(&out.stderr);
-        let code = out.status.code().unwrap_or(0);
-        // Round-3 review fix (R3-C4-P10) doc-only: the exit-code
-        // magic numbers `36` and `3` are best-effort across macOS
-        // versions — `launchctl bootout`'s exit code is the mach
-        // error number on modern macOS and the substring-match on
-        // stderr ("Could not find specified service" / "service
-        // not loaded") is the reliable signal. Keep the magic
-        // numbers as additional safety net but treat the
-        // substring as the source of truth.
-        let not_loaded = !out.status.success()
-            && (stderr.contains("Could not find specified service")
-                || stderr.contains("service not loaded")
-                || code == 36
-                || code == 3);
-        if !out.status.success() && !not_loaded {
-            eprint!(
-                "{}",
-                error_block(
-                    "service.install.bootout_in_use",
-                    &format!(
-                        "`launchctl bootout system/{DAEMON_LABEL}` failed (exit {code}): {stderr}",
-                    ),
-                    &format!(
-                        "an existing daemon may still be using the label; manually run `sudo launchctl bootout system/{DAEMON_LABEL}` and retry, or `sudo launchctl kickstart -k system/{DAEMON_LABEL}` to force-restart"
-                    ),
-                    None,
-                )
-            );
-            return Err(silent_cli_error("launchctl bootout failed (service in use)"));
-        }
+    bootout_daemon_inner(
+        // bootout
+        || {
+            let out = Command::new("/bin/launchctl")
+                .args(["bootout", &format!("system/{DAEMON_LABEL}")])
+                .output()
+                .context("failed to invoke /bin/launchctl bootout")?;
+            Ok((
+                out.status.success(),
+                out.status.code().unwrap_or(0),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            ))
+        },
+        // kickstart -k
+        || {
+            let out = Command::new("/bin/launchctl")
+                .args(["kickstart", "-k", &format!("system/{DAEMON_LABEL}")])
+                .output()
+                .context("failed to invoke /bin/launchctl kickstart")?;
+            Ok((
+                out.status.success(),
+                out.status.code().unwrap_or(0),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            ))
+        },
+        // print (poll for process exit)
+        || {
+            let out = Command::new("/bin/launchctl")
+                .args(["print", &format!("system/{DAEMON_LABEL}")])
+                .output()
+                .context("failed to invoke /bin/launchctl print")?;
+            Ok((
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            ))
+        },
+        std::thread::sleep,
+        // Production poll budget: up to 5s waiting for the prior
+        // process to exit before the EPERM-fallback final retry.
+        Duration::from_secs(5),
+        // Production poll interval between `launchctl print` checks.
+        Duration::from_millis(250),
+    )
+}
+
+/// Classify whether a `launchctl bootout` stderr/exit indicates the
+/// service simply wasn't loaded (which is success for our purposes).
+/// The substring is the source of truth; exit codes 36/3 are an
+/// additional best-effort net across macOS versions.
+#[cfg(any(test, target_os = "macos"))]
+fn bootout_not_loaded(success: bool, code: i32, stderr: &str) -> bool {
+    !success
+        && (stderr.contains("Could not find specified service")
+            || stderr.contains("service not loaded")
+            || code == 36
+            || code == 3)
+}
+
+/// Does this bootout stderr indicate the service is still in use (the
+/// transient race the kickstart heal addresses)?
+///
+/// Matches ONLY the transient-in-use wording. We deliberately do NOT
+/// match the bare `"Boot-out failed"` prefix — that prefix also fronts
+/// genuine permission failures (`"Boot-out failed: 1: Operation not
+/// permitted"`) which must fail-loud, not enter the kickstart heal.
+/// The real in-use case (`"Boot-out failed: 113"`) co-reports
+/// `"Operation in progress"`, which IS matched here.
+///
+/// The in-use match is the specific phrase `"in use"` PRECEDED by
+/// "service"/"is"/"currently" wording rather than a bare `"in use"`
+/// substring — a bare two-word match could catch unrelated future
+/// launchctl text (or a path containing "in use") and route a
+/// non-transient failure into the kickstart heal.
+#[cfg(any(test, target_os = "macos"))]
+fn bootout_in_use(stderr: &str) -> bool {
+    stderr.contains("Operation in progress")
+        || stderr.contains("service is in use")
+        || stderr.contains("currently in use")
+        || stderr.contains("is in use by")
+}
+
+/// Closure-form inner of [`bootout_daemon`] — production threads real
+/// `Command::new("/bin/launchctl") …` invocations through the public
+/// wrapper; tests inject closures returning `(success, exit_code,
+/// stderr)` (and `(stdout, stderr)` for `print`) plus a sleep stub.
+///
+/// Epic 10 Story 10.2 (row 10): on a `bootout` that fails "in use" /
+/// "Operation in progress" (the prior daemon's service domain hasn't
+/// released yet), heal rather than refuse:
+///
+/// 1. **kickstart heal**: `launchctl kickstart -k system/<label>`
+///    force-restarts the job, then retry `bootout` once.
+/// 2. **EPERM fallback** (macOS 14.4+ protected-list growth — Apple's
+///    undocumented protected-label list can expand to include our
+///    label, making `kickstart -k` return EPERM): fall through to the
+///    slower path — poll `launchctl print` for process exit (≤5s),
+///    then a final `bootout` retry.
+///
+/// Any other bootout failure is one-shot fail-loud (today's refusal).
+#[cfg(any(test, target_os = "macos"))]
+#[allow(clippy::too_many_arguments)]
+fn bootout_daemon_inner<B, K, P, S>(
+    mut bootout: B,
+    mut kickstart: K,
+    mut print: P,
+    mut sleep: S,
+    poll_budget: Duration,
+    poll_interval: Duration,
+) -> Result<()>
+where
+    B: FnMut() -> Result<(bool, i32, String)>,
+    K: FnMut() -> Result<(bool, i32, String)>,
+    P: FnMut() -> Result<(String, String)>,
+    S: FnMut(Duration),
+{
+    let (ok, code, stderr) = bootout()?;
+    if ok || bootout_not_loaded(ok, code, &stderr) {
+        return Ok(());
     }
-    Ok(())
+    if !bootout_in_use(&stderr) {
+        // A real failure (permissions, malformed domain, etc.) — refuse.
+        return bootout_refuse(code, &stderr);
+    }
+
+    // ── Heal path 1: kickstart -k then retry bootout. ──
+    tracing::warn!(target: "install", event = "bootout_in_use", stderr = %stderr, "bootout failed in-use; trying kickstart -k");
+    let (k_ok, k_code, k_stderr) = kickstart()?;
+    let kickstart_eperm = !k_ok
+        && (k_code == 1
+            || k_stderr.contains("Operation not permitted")
+            || k_stderr.contains("not permitted"));
+    if !kickstart_eperm {
+        // kickstart accepted (or failed non-EPERM): retry bootout once.
+        sleep(poll_interval);
+        let (r_ok, r_code, r_stderr) = bootout()?;
+        if r_ok || bootout_not_loaded(r_ok, r_code, &r_stderr) {
+            tracing::info!(target: "install", event = "bootout_kickstart_ok", "launchctl bootout retried after kickstart");
+            return Ok(());
+        }
+        // Fall through to the poll path as a last resort.
+    }
+
+    // ── Heal path 2 (EPERM fallback): poll for process exit, then a
+    //    final bootout retry. The poll budget is iteration-bounded
+    //    (budget / interval) rather than wall-clock so unit tests with
+    //    a tiny budget terminate deterministically without busy-looping. ──
+    tracing::warn!(target: "install", event = "bootout_kickstart_eperm", "kickstart -k denied (macOS 14.4+ protected list?); polling for process exit");
+    let max_polls = (poll_budget.as_millis() / poll_interval.as_millis().max(1)).max(1) as usize;
+    let mut gone = false;
+    for _ in 0..max_polls {
+        let (stdout, stderr) = print()?;
+        // Absent ⇒ the prior instance has exited; safe to proceed.
+        if stdout.contains("Could not find specified service")
+            || stderr.contains("Could not find specified service")
+        {
+            gone = true;
+            break;
+        }
+        sleep(poll_interval);
+    }
+    if gone {
+        let (f_ok, f_code, f_stderr) = bootout()?;
+        if f_ok || bootout_not_loaded(f_ok, f_code, &f_stderr) {
+            tracing::info!(target: "install", event = "bootout_poll_ok", "launchctl bootout via poll-and-retry");
+            return Ok(());
+        }
+        return bootout_refuse(f_code, &f_stderr);
+    }
+    bootout_refuse(code, &stderr)
+}
+
+/// Emit the structured `service.install.bootout_in_use` refusal.
+#[cfg(any(test, target_os = "macos"))]
+fn bootout_refuse(code: i32, stderr: &str) -> Result<()> {
+    eprint!(
+        "{}",
+        error_block(
+            "service.install.bootout_in_use",
+            &format!("`launchctl bootout system/{DAEMON_LABEL}` failed (exit {code}): {stderr}"),
+            &format!(
+                "an existing daemon may still be using the label; manually run `sudo launchctl bootout system/{DAEMON_LABEL}` and retry, or `sudo launchctl kickstart -k system/{DAEMON_LABEL}` to force-restart"
+            ),
+            None,
+        )
+    );
+    Err(silent_cli_error("launchctl bootout failed (service in use)"))
 }
 
 /// Substring launchctl emits in stderr when its service-domain
@@ -1328,16 +1558,37 @@ fn should_retry_bootstrap_eio(stderr: &str) -> bool {
     stderr.contains(BOOTSTRAP_EIO_SUBSTRING)
 }
 
+/// Extended classifier (Story 10.1): in addition to the EIO
+/// post-bootout-race substring, retry on launchctl's "in use" /
+/// "Operation in progress" substrings — both indicate a transient
+/// service-domain race (the daemon's prior instance is still
+/// releasing the label). Same caveat as `should_retry_bootstrap_eio`:
+/// fail closed on any wording we don't recognize; the always-logged
+/// stderr is the forensic trail for future Apple wording shifts.
+#[cfg(any(test, target_os = "macos"))]
+fn should_retry_bootstrap_transient(stderr: &str) -> bool {
+    should_retry_bootstrap_eio(stderr)
+        || stderr.contains("in use")
+        || stderr.contains("Operation in progress")
+}
+
 /// Closure-form inner of [`launchctl_bootstrap_system`] — production
 /// callers thread the real `Command::new("/bin/launchctl") …` invocation
 /// through the public wrapper below; tests inject a closure returning
 /// `(success: bool, stderr: String)` and a sleep stub so the retry
 /// behavior pins deterministically without spawning a real launchctl
-/// or sleeping in wall-clock time. Mirrors
-/// `permitlayer-keystore/src/keyring_shared.rs::read_after_write_with_retry_inner`,
-/// the codebase's canonical closure-form retry shape.
+/// or sleeping in wall-clock time.
 ///
-/// Retry policy on the post-bootout-race EIO substring only:
+/// Story 10.1 refactor: the inline retry loop is replaced by
+/// [`crate::repair::retry::with_backoff`] using the
+/// [`crate::repair::retry::LAUNCHCTL_RACE`] schedule (same 250/500/1000ms
+/// values the original local `BACKOFFS` const used — non-jittered
+/// because the unit tests assert exact observed delays). The
+/// classifier ([`should_retry_bootstrap_transient`]) is extended to
+/// also retry on `"in use"` / `"Operation in progress"` substrings
+/// alongside the rc.40 EIO precedent.
+///
+/// Retry policy on transient substrings only:
 /// **up to 4 total attempts (1 initial + 3 retries) with 250ms /
 /// 500ms / 1000ms backoff = 1.75s worst-case before exhaustion.** Any
 /// other stderr is one-shot fail-loud (returns immediately) so a real
@@ -1347,27 +1598,42 @@ fn should_retry_bootstrap_eio(stderr: &str) -> bool {
 /// misses on a future macOS wording shift, the forensic trail still
 /// exists.
 #[cfg(any(test, target_os = "macos"))]
-fn launchctl_bootstrap_system_inner<F, S>(mut invoke: F, mut sleep: S) -> Result<()>
+fn launchctl_bootstrap_system_inner<F, S>(mut invoke: F, sleep: S) -> Result<()>
 where
     F: FnMut() -> Result<(bool, String)>,
     S: FnMut(Duration),
 {
-    // One entry per inter-attempt gap; the final attempt gets no
-    // further sleep — exhaustion follows immediately. Total worst-case
-    // wall budget = 250 + 500 + 1000 = 1750ms across 4 attempts.
-    const BACKOFFS: &[Duration] =
-        &[Duration::from_millis(250), Duration::from_millis(500), Duration::from_millis(1000)];
+    use crate::repair::retry::{LAUNCHCTL_RACE, RetryDecision, with_backoff};
 
-    let mut last_stderr = String::new();
-    let max_attempts = BACKOFFS.len() + 1;
-    // Iterate the backoffs as `Some(backoff)` for the first N attempts
-    // and `None` for the final attempt (no sleep after exhaustion).
-    let backoff_iter = BACKOFFS.iter().copied().map(Some).chain(std::iter::once(None));
-    for (attempt_idx, backoff) in backoff_iter.enumerate() {
-        let attempt_num = attempt_idx + 1;
-        let (ok, stderr) = invoke().context("failed to invoke /bin/launchctl bootstrap")?;
+    // The bootstrap call's outcome enum, threaded through with_backoff
+    // so the retry primitive can decide retry-vs-final without losing
+    // the stderr trail or the per-attempt log.
+    enum BootstrapErr {
+        /// `(false, stderr)` from invoke — launchctl ran and refused.
+        /// The retry classifier reads `stderr` to decide.
+        Refused(String),
+        /// `Err(_)` from invoke — couldn't even spawn launchctl.
+        /// Always terminal (no retry).
+        InvokeFailed(anyhow::Error),
+    }
+
+    let max_attempts = LAUNCHCTL_RACE.len() + 1;
+    let attempt_counter = std::cell::Cell::new(0usize);
+    let last_stderr: std::cell::RefCell<String> = std::cell::RefCell::new(String::new());
+
+    let op = || -> std::result::Result<(), BootstrapErr> {
+        let attempt_num = attempt_counter.get() + 1;
+        attempt_counter.set(attempt_num);
+        let (ok, stderr) = match invoke() {
+            Ok(t) => t,
+            Err(e) => {
+                return Err(BootstrapErr::InvokeFailed(
+                    e.context("failed to invoke /bin/launchctl bootstrap"),
+                ));
+            }
+        };
         if ok {
-            if attempt_idx > 0 {
+            if attempt_num > 1 {
                 tracing::info!(
                     target: "install",
                     attempt = attempt_num,
@@ -1378,8 +1644,8 @@ where
         }
         // Always log the full stderr on every failed attempt. This is
         // the durable diagnostic: if a future macOS renders the error
-        // differently and `should_retry_bootstrap_eio` silently misses,
-        // the operator/dev still has the raw text in the logs.
+        // differently and `should_retry_bootstrap_transient` silently
+        // misses, the operator/dev still has the raw text in the logs.
         tracing::warn!(
             target: "install",
             attempt = attempt_num,
@@ -1387,42 +1653,63 @@ where
             stderr = %stderr,
             "launchctl bootstrap attempt failed",
         );
-        last_stderr = stderr;
-        if !should_retry_bootstrap_eio(&last_stderr) {
-            // Non-EIO failure: one-shot fail-loud, do not delay.
-            break;
+        *last_stderr.borrow_mut() = stderr.clone();
+        Err(BootstrapErr::Refused(stderr))
+    };
+
+    let classify = |err: &BootstrapErr| match err {
+        BootstrapErr::InvokeFailed(_) => RetryDecision::Final,
+        BootstrapErr::Refused(stderr) => {
+            if should_retry_bootstrap_transient(stderr) {
+                RetryDecision::Retry
+            } else {
+                RetryDecision::Final
+            }
         }
-        match backoff {
-            Some(delay) => sleep(delay),
-            None => {
+    };
+
+    let outcome = with_backoff(op, classify, LAUNCHCTL_RACE, sleep);
+
+    match outcome {
+        Ok(()) => Ok(()),
+        Err(BootstrapErr::InvokeFailed(e)) => Err(e),
+        Err(BootstrapErr::Refused(_)) => {
+            // Either the classifier said Final (non-transient stderr)
+            // or we exhausted the schedule on persistent transients.
+            // If we ran every scheduled attempt, log the "retry
+            // exhausted" warn for parity with the pre-refactor
+            // behavior — the budget being burned is what matters, not
+            // the classification of the FINAL stderr (a 3-transient +
+            // 1-non-transient run still exhausted the schedule).
+            let final_stderr = last_stderr.borrow().clone();
+            if attempt_counter.get() == max_attempts {
                 tracing::warn!(
                     target: "install",
                     max_attempts = max_attempts,
                     "launchctl bootstrap EIO retry exhausted",
                 );
             }
+            // Reproduce the original error block + plutil diagnostic.
+            let plutil = Command::new("/usr/bin/plutil").arg(PLIST_PATH).output();
+            let plutil_msg = match plutil {
+                Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
+                Err(_) => "(plutil unavailable)".to_owned(),
+            };
+            eprint!(
+                "{}",
+                error_block(
+                    "service.install.bootstrap_failed",
+                    &format!(
+                        "`launchctl bootstrap system {PLIST_PATH}` failed: {final_stderr}\n\n\
+                         plutil: {plutil_msg}"
+                    ),
+                    "check the plist syntax + try `sudo launchctl bootstrap system <plist>` manually",
+                    None,
+                )
+            );
+            Err(silent_cli_error("launchctl bootstrap failed"))
         }
     }
-    // Fell through (one-shot non-EIO failure, or EIO retries exhausted).
-    // Reproduce the original error block + plutil diagnostic.
-    let plutil = Command::new("/usr/bin/plutil").arg(PLIST_PATH).output();
-    let plutil_msg = match plutil {
-        Ok(o) => String::from_utf8_lossy(&o.stdout).into_owned(),
-        Err(_) => "(plutil unavailable)".to_owned(),
-    };
-    eprint!(
-        "{}",
-        error_block(
-            "service.install.bootstrap_failed",
-            &format!(
-                "`launchctl bootstrap system {PLIST_PATH}` failed: {last_stderr}\n\n\
-                 plutil: {plutil_msg}"
-            ),
-            "check the plist syntax + try `sudo launchctl bootstrap system <plist>` manually",
-            None,
-        )
-    );
-    Err(silent_cli_error("launchctl bootstrap failed"))
 }
 
 /// `launchctl bootstrap system /Library/LaunchDaemons/...`. Body
@@ -1541,24 +1828,31 @@ mod tests {
 
     #[test]
     fn write_launchdaemon_plist_renders_expected_shape() {
-        // Write to a tempdir override path by hooking into a smaller
-        // helper signature. We exercise the body-formatting + plutil
-        // shape via a stripped-down sibling test.
-        let body = format!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>{DAEMON_LABEL}</string>
-  <key>ProgramArguments</key>
-    <array><string>{PRIVILEGED_HELPER_PATH}</string><string>start</string><string>--allow-foreground</string></array>
-  <key>SessionCreate</key><true/>
-</dict>
-</plist>
-"#
-        );
+        // Exercise the REAL body builder (pure fn — no root needed).
+        let body = launchdaemon_plist_body(501, "austinlowry");
         assert!(body.contains("dev.permitlayer.daemon"));
         assert!(body.contains("SessionCreate"));
         assert!(body.contains("--allow-foreground"));
+        assert!(body.contains("PERMITLAYER_OPERATOR_UID</key><string>501</string>"));
+        assert!(body.contains("austinlowry"));
+    }
+
+    #[test]
+    fn launchdaemon_plist_has_throttle_interval_30() {
+        // Story 10.2 AC #17: restart-storm protection.
+        let body = launchdaemon_plist_body(0, "root");
+        assert!(
+            body.contains("<key>ThrottleInterval</key><integer>30</integer>"),
+            "plist must declare ThrottleInterval=30"
+        );
+    }
+
+    #[test]
+    fn launchdaemon_plist_xml_escapes_username() {
+        // An account name with XML metachars must be escaped.
+        let body = launchdaemon_plist_body(501, "O'Brien & <co>");
+        assert!(!body.contains("O'Brien & <co>"), "raw metachars must not appear");
+        assert!(body.contains("&amp;"), "ampersand escaped");
     }
 
     #[test]
@@ -1639,6 +1933,246 @@ mod tests {
         assert!(!should_retry_bootstrap_eio("Could not find specified service"));
         assert!(!should_retry_bootstrap_eio("service is disabled"));
         assert!(!should_retry_bootstrap_eio(""));
+    }
+
+    // ── Story 10.1: extended classifier (EIO + "in use" + "Operation in progress") ──
+
+    #[test]
+    fn should_retry_bootstrap_transient_includes_eio() {
+        // The original EIO substring still retries via the extended
+        // classifier. (Regression guard for the rc.40 precedent.)
+        assert!(should_retry_bootstrap_transient("Bootstrap failed: 5: Input/output error"));
+        assert!(should_retry_bootstrap_transient(
+            "launchctl bootstrap failed:\nBootstrap failed: 5: Input/output error\n"
+        ));
+    }
+
+    #[test]
+    fn should_retry_bootstrap_transient_classifies_in_use_substring() {
+        // launchctl can return "in use" when the prior service's
+        // domain release lags. Treat as transient.
+        assert!(should_retry_bootstrap_transient("Bootstrap failed: service in use"));
+        assert!(should_retry_bootstrap_transient("the requested service is in use by another job"));
+    }
+
+    #[test]
+    fn should_retry_bootstrap_transient_classifies_operation_in_progress_substring() {
+        assert!(should_retry_bootstrap_transient("Bootstrap failed: Operation in progress"));
+    }
+
+    #[test]
+    fn should_retry_bootstrap_transient_is_terminal_on_unrelated_errors() {
+        // Future wording shifts and unrelated failures must NOT
+        // retry. Same fail-closed posture as
+        // `should_retry_bootstrap_eio`.
+        assert!(!should_retry_bootstrap_transient("Bootstrap failed: 5: I/O error"));
+        assert!(!should_retry_bootstrap_transient("Bootstrap failed: 37: Operation not permitted"));
+        assert!(!should_retry_bootstrap_transient("Could not find specified service"));
+        assert!(!should_retry_bootstrap_transient("service is disabled"));
+        assert!(!should_retry_bootstrap_transient(""));
+    }
+
+    // ── Story 10.2 row 10: bootout_daemon_inner kickstart heal ──────
+
+    /// Bootout closure result helper: (success, exit_code, stderr).
+    fn ok_bootout() -> Result<(bool, i32, String)> {
+        Ok((true, 0, String::new()))
+    }
+    fn fail_bootout(stderr: &str) -> Result<(bool, i32, String)> {
+        Ok((false, 5, stderr.to_owned()))
+    }
+
+    #[test]
+    fn bootout_inner_succeeds_normal_case() {
+        let sleeps = std::cell::RefCell::new(Vec::<Duration>::new());
+        let r = bootout_daemon_inner(
+            ok_bootout,
+            || panic!("kickstart must not run on clean bootout"),
+            || panic!("print must not run on clean bootout"),
+            |d| sleeps.borrow_mut().push(d),
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+        );
+        assert!(r.is_ok());
+        assert!(sleeps.borrow().is_empty());
+    }
+
+    #[test]
+    fn bootout_inner_succeeds_when_not_loaded() {
+        let r = bootout_daemon_inner(
+            || Ok((false, 36, "Could not find specified service".to_owned())),
+            || panic!("kickstart must not run when not loaded"),
+            || panic!("print must not run when not loaded"),
+            |_| {},
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+        );
+        assert!(r.is_ok(), "not-loaded is success for our purposes");
+    }
+
+    #[test]
+    fn bootout_inner_refuses_on_non_transient_failure() {
+        let r = bootout_daemon_inner(
+            || Ok((false, 5, "Boot-out failed: 1: Operation not permitted".to_owned())),
+            || panic!("kickstart must not run on a non-in-use failure"),
+            || panic!("print must not run on a non-in-use failure"),
+            |_| {},
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+        );
+        // "Operation not permitted" is not an in-use substring → refuse.
+        assert!(r.is_err());
+    }
+
+    #[test]
+    fn bootout_inner_kickstart_recovers_in_use() {
+        // First bootout fails in-use; kickstart ok; retry bootout ok.
+        let bootout_calls = std::cell::RefCell::new(0usize);
+        let r = bootout_daemon_inner(
+            || {
+                let mut n = bootout_calls.borrow_mut();
+                *n += 1;
+                if *n == 1 {
+                    fail_bootout("Boot-out failed: 113: Operation in progress")
+                } else {
+                    ok_bootout()
+                }
+            },
+            || Ok((true, 0, String::new())), // kickstart ok
+            || panic!("print path must not fire when kickstart recovers"),
+            |_| {},
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+        );
+        assert!(r.is_ok());
+        assert_eq!(*bootout_calls.borrow(), 2, "bootout retried once after kickstart");
+    }
+
+    #[test]
+    fn bootout_inner_kickstart_eperm_falls_through_to_poll_and_retry() {
+        // bootout in-use; kickstart EPERM; print eventually reports
+        // the service gone; final bootout ok.
+        let bootout_calls = std::cell::RefCell::new(0usize);
+        let print_calls = std::cell::RefCell::new(0usize);
+        let r = bootout_daemon_inner(
+            || {
+                let mut n = bootout_calls.borrow_mut();
+                *n += 1;
+                if *n == 1 { fail_bootout("the service is in use") } else { ok_bootout() }
+            },
+            || Ok((false, 1, "Operation not permitted".to_owned())), // kickstart EPERM
+            || {
+                let mut n = print_calls.borrow_mut();
+                *n += 1;
+                // Service still present on first poll, gone on the second.
+                if *n == 1 {
+                    Ok(("state = running\npid = 42".to_owned(), String::new()))
+                } else {
+                    Ok((String::new(), "Could not find specified service".to_owned()))
+                }
+            },
+            |_| {},
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+        );
+        assert!(r.is_ok(), "poll-and-retry path should recover");
+        assert!(*print_calls.borrow() >= 2, "polled until the service was gone");
+        assert_eq!(*bootout_calls.borrow(), 2, "final bootout retried after process exit");
+    }
+
+    #[test]
+    fn bootout_inner_all_paths_exhausted_refuses() {
+        // bootout always in-use; kickstart EPERM; print never reports
+        // gone within budget → refuse.
+        let r = bootout_daemon_inner(
+            || fail_bootout("Operation in progress"),
+            || Ok((false, 1, "Operation not permitted".to_owned())),
+            || Ok(("state = running\npid = 42".to_owned(), String::new())),
+            |_| {},
+            // Tiny budget/interval → 10 bounded polls, all "still present"
+            // → exhaustion, deterministically and instantly.
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+        );
+        assert!(r.is_err(), "exhausting every heal path must refuse");
+    }
+
+    // ── Story 10.2 row 14: install-lock retry on contention ─────────
+
+    #[test]
+    fn install_lock_acquires_on_first_attempt() {
+        let sleeps = std::cell::RefCell::new(Vec::<Duration>::new());
+        let candidates = vec![PathBuf::from("/tmp/x.lock")];
+        let r = acquire_install_lock_with_retry(
+            &candidates,
+            |_| LockAttempt::Acquired(InstallLock { _flock: None }),
+            crate::repair::retry::INSTALL_LOCK_WAIT,
+            |d| sleeps.borrow_mut().push(d),
+        );
+        assert!(r.is_ok());
+        assert!(sleeps.borrow().is_empty(), "no wait when the lock is free");
+    }
+
+    #[test]
+    fn install_lock_retries_then_acquires_after_contention() {
+        let attempts = std::cell::RefCell::new(0usize);
+        let sleeps = std::cell::RefCell::new(Vec::<Duration>::new());
+        let candidates = vec![PathBuf::from("/tmp/x.lock")];
+        let r = acquire_install_lock_with_retry(
+            &candidates,
+            |_| {
+                let mut n = attempts.borrow_mut();
+                *n += 1;
+                // Contended twice, then acquired.
+                if *n < 3 {
+                    LockAttempt::Contended
+                } else {
+                    LockAttempt::Acquired(InstallLock { _flock: None })
+                }
+            },
+            crate::repair::retry::INSTALL_LOCK_WAIT,
+            |d| sleeps.borrow_mut().push(d),
+        );
+        assert!(r.is_ok(), "should acquire after the holder releases");
+        assert_eq!(*attempts.borrow(), 3);
+        assert_eq!(sleeps.borrow().len(), 2, "two waits before the third attempt");
+    }
+
+    #[test]
+    fn install_lock_refuses_after_persistent_contention() {
+        let sleeps = std::cell::RefCell::new(Vec::<Duration>::new());
+        let candidates = vec![PathBuf::from("/tmp/x.lock")];
+        let r = acquire_install_lock_with_retry(
+            &candidates,
+            |_| LockAttempt::Contended,
+            crate::repair::retry::INSTALL_LOCK_WAIT,
+            |d| sleeps.borrow_mut().push(d),
+        );
+        assert!(r.is_err(), "persistent contention must refuse");
+        // schedule.len() waits = one per inter-attempt gap.
+        assert_eq!(sleeps.borrow().len(), crate::repair::retry::INSTALL_LOCK_WAIT.len());
+    }
+
+    #[test]
+    fn install_lock_falls_through_to_next_candidate_on_open_failure() {
+        let candidates =
+            vec![PathBuf::from("/var/run/permitlayer/.install.lock"), PathBuf::from("/tmp/x.lock")];
+        let seen = std::cell::RefCell::new(Vec::<PathBuf>::new());
+        let r = acquire_install_lock_with_retry(
+            &candidates,
+            |p| {
+                seen.borrow_mut().push(p.to_path_buf());
+                if p.starts_with("/var/run") {
+                    LockAttempt::OpenFailed(std::io::Error::from_raw_os_error(13)) // EACCES
+                } else {
+                    LockAttempt::Acquired(InstallLock { _flock: None })
+                }
+            },
+            crate::repair::retry::INSTALL_LOCK_WAIT,
+            |_| {},
+        );
+        assert!(r.is_ok(), "fallback candidate should acquire");
+        assert_eq!(seen.borrow().len(), 2, "tried primary then fallback");
     }
 
     #[test]
