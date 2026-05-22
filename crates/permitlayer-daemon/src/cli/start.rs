@@ -3924,6 +3924,11 @@ const DEFAULT_POLICY_TOML: &str = include_str!("default_policy.toml");
 /// compile failure as "no managed names": that would fail OPEN — a
 /// real shadow would go undetected and crashloop the daemon after a
 /// "successful" setup. The caller surfaces the error instead.
+///
+/// macOS-gated: the sole caller is the macOS-only legacy-seed shadow
+/// heal (`setup::detect_and_heal_legacy_seed_shadow`), so on Linux this
+/// is dead under CI's `-D warnings` (`project_noncfg_consts_dead_on_linux`).
+#[cfg(target_os = "macos")]
 pub(crate) fn embedded_managed_policy_names() -> Result<Vec<String>, PolicyCompileError> {
     // Fully-qualified: this module already imports a different
     // `PolicySet` (`permitlayer_proxy::middleware::PolicySet`) at the

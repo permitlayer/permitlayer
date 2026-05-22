@@ -21,6 +21,9 @@
 //!   retry.
 
 use std::io;
+// Only the `#[cfg(unix)]` `open_append_with_mode` uses `.mode()`; the
+// import would be E0433 ("no `unix` in `os`") on Windows otherwise.
+#[cfg(unix)]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
