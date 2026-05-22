@@ -401,13 +401,50 @@ fn symlink_decide(
     }
 }
 
+/// Three-state on-disk read of `<managed>/default.toml` for the
+/// staleness check (Story 10.3 Bug 2). Distinguishes a genuinely
+/// absent file (ENOENT) from one that exists but is unreadable from
+/// the current vantage (EACCES — e.g. a non-root `doctor` against the
+/// root-owned `policies-managed/` dir). Collapsing both into `None`
+/// (the pre-10.3 `sha256_file(..).ok()`) made doctor lie "missing"
+/// when the file was probably fine, just opaque.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OnDisk {
+    /// File read successfully; carries its sha256.
+    Present(String),
+    /// File is genuinely absent (ENOENT) or a transient/other read
+    /// error that is indistinguishable from absent for this purpose.
+    Absent,
+    /// File exists but is unreadable from this vantage (EACCES).
+    Unreadable,
+}
+
+/// Classify a `sha256_file` result into [`OnDisk`]. A
+/// `PermissionDenied` error means the file is there but opaque
+/// (`Unreadable`); every other error (`NotFound`/`Transient`/`Other`)
+/// is treated as `Absent`.
+fn classify_on_disk(res: std::io::Result<String>) -> OnDisk {
+    use crate::repair::fs_repair::{IoKind, classify_io_kind};
+    match res {
+        Ok(h) => OnDisk::Present(h),
+        Err(e) => match classify_io_kind(&e) {
+            IoKind::PermissionDenied => OnDisk::Unreadable,
+            IoKind::NotFound | IoKind::Transient | IoKind::Other => OnDisk::Absent,
+        },
+    }
+}
+
 /// Managed-policy staleness decision (check #4). `on_disk` is the
-/// sha256 of `<managed>/default.toml` (None ⇒ file absent),
-/// `embedded` is the sha256 of [`EMBEDDED_MANAGED_BUNDLE`].
-fn staleness_decide(on_disk: Option<&str>, embedded: &str) -> (Severity, bool) {
+/// three-state read of `<managed>/default.toml`; `embedded` is the
+/// sha256 of [`EMBEDDED_MANAGED_BUNDLE`]. `Unreadable` (EACCES) is a
+/// WARN — the file is probably fine, just opaque from a non-root
+/// vantage — and NOT auto-fixable.
+fn staleness_decide(on_disk: &OnDisk, embedded: &str) -> (Severity, bool) {
     match on_disk {
-        Some(h) if h == embedded => (Severity::Pass, false),
-        _ => (Severity::Fail, true), // absent or stale — file rewrite is safe
+        OnDisk::Present(h) if h == embedded => (Severity::Pass, false),
+        OnDisk::Present(_) => (Severity::Fail, true), // stale — file rewrite is safe
+        OnDisk::Absent => (Severity::Fail, true),     // absent — file write is safe
+        OnDisk::Unreadable => (Severity::Warn, false), // EACCES — opaque, re-run as sudo
     }
 }
 
@@ -421,6 +458,39 @@ fn prompt_trap_decide(is_launchdaemon: bool, has_prompt_policy: bool) -> (Severi
         (Severity::Warn, false)
     } else {
         (Severity::Pass, false)
+    }
+}
+
+/// Operator-layer compile dir-EACCES decision (operator_layer_compile
+/// check, Bug 3).
+/// When `compile_from_layers` fails with an I/O error whose path is a
+/// DIRECTORY, the `{file}:{line}` framing is wrong (a dir has no
+/// line). Returns `Some((severity, detail, remediation))` for the dir
+/// cases, or `None` to fall through to the existing file-oriented
+/// rendering (path is a real policy file, or not statable as a dir).
+fn operator_compile_dir_io_decide(
+    is_dir: bool,
+    source: &std::io::Error,
+    path: &Path,
+) -> Option<(Severity, String, Option<String>)> {
+    use crate::repair::fs_repair::{IoKind, classify_io_kind};
+    if !is_dir {
+        return None; // file path → today's `file:line` behavior
+    }
+    match classify_io_kind(source) {
+        IoKind::PermissionDenied => Some((
+            Severity::Warn,
+            format!(
+                "directory {}/ is unreadable as non-root — re-run as `sudo agentsso doctor`",
+                path.display()
+            ),
+            Some("sudo agentsso doctor".to_owned()),
+        )),
+        IoKind::NotFound | IoKind::Transient | IoKind::Other => Some((
+            Severity::Fail,
+            format!("directory {}/ is unreadable: {source}", path.display()),
+            Some(format!("ensure {}/ is readable, then `agentsso reload`", path.display())),
+        )),
     }
 }
 
@@ -584,8 +654,8 @@ fn check_specs() -> [CheckSpec; 8] {
         CheckSpec { id: "managed_policy_staleness", fix_class: FixClass::SafeAutomatic },
         CheckSpec { id: "daemon_not_running", fix_class: FixClass::GatedByRestartOk },
         CheckSpec { id: "no_tty_prompt_trap", fix_class: FixClass::NeverAutomatic },
-        CheckSpec { id: "daemon_binary_missing", fix_class: FixClass::NeverAutomatic },
         CheckSpec { id: "operator_layer_compile", fix_class: FixClass::NeverAutomatic },
+        CheckSpec { id: "legacy_seed_snapshot_present", fix_class: FixClass::SafeAutomatic },
     ]
 }
 
@@ -748,7 +818,11 @@ fn detect_symlink_integrity(_ctx: &DoctorCtx) -> CheckReport {
                  symlink to a versioned agentsso-<V> binary"
             ),
             (Some(t), false, _) => {
-                format!("symlink resolves to {} but that file is missing", t.display())
+                format!(
+                    "symlink resolves to {} but that file is missing — the daemon binary is \
+                     not installed",
+                    t.display()
+                )
             }
             (Some(t), true, Some(m)) if m & 0o111 == 0 => {
                 format!("symlink target {} exists but is not executable", t.display())
@@ -877,20 +951,23 @@ fn managed_default_path(home: &Path) -> PathBuf {
 
 fn detect_managed_policy_staleness(ctx: &DoctorCtx) -> CheckReport {
     let target = managed_default_path(&ctx.home);
-    let on_disk = sha256_file(&target).ok();
+    let on_disk = classify_on_disk(sha256_file(&target));
     let embedded = sha256_str(EMBEDDED_MANAGED_BUNDLE);
-    let (severity, fixable) = staleness_decide(on_disk.as_deref(), &embedded);
-    // Drive the message off the on-disk hash directly (no impossible
-    // match arm — staleness only ever yields Pass or Fail).
+    let (severity, fixable) = staleness_decide(&on_disk, &embedded);
     let detail = match &on_disk {
-        Some(h) if *h == embedded => {
+        OnDisk::Present(h) if *h == embedded => {
             format!("{} matches the bundle embedded in this binary", target.display())
         }
-        Some(_) => format!(
+        OnDisk::Present(_) => format!(
             "{} differs from the bundle embedded in this binary (stale managed policy)",
             target.display()
         ),
-        None => format!("{} is missing (managed bundle not synced)", target.display()),
+        OnDisk::Absent => format!("{} is missing (managed bundle not synced)", target.display()),
+        OnDisk::Unreadable => format!(
+            "{} unreadable as non-root — re-run as `sudo agentsso doctor` to verify the \
+             managed bundle",
+            target.display()
+        ),
     };
     CheckReport {
         id: "managed_policy_staleness",
@@ -899,16 +976,18 @@ fn detect_managed_policy_staleness(ctx: &DoctorCtx) -> CheckReport {
         detail,
         auto_fixable: fixable,
         fix_class: FixClass::SafeAutomatic,
-        remediation: if severity == Severity::Pass {
-            None
-        } else {
-            // The RELOAD is NeverAutomatic and NOT performed here —
-            // the file rewrite is the only safe-automatic part.
-            Some(
+        remediation: match severity {
+            Severity::Pass => None,
+            // EACCES: the actionable step is to re-run privileged, not
+            // to rewrite the (probably-fine) file.
+            Severity::Warn => Some("sudo agentsso doctor".to_owned()),
+            // The RELOAD is NeverAutomatic and NOT performed here — the
+            // file rewrite is the only safe-automatic part.
+            Severity::Fail => Some(
                 "sudo agentsso doctor --fix   (rewrites the file; then run `agentsso reload` \
                  to apply it to the running daemon)"
                     .to_owned(),
-            )
+            ),
         },
         fix_outcome: None,
     }
@@ -1179,58 +1258,6 @@ fn url_path_encode(s: &str) -> String {
     out
 }
 
-// ── Check 7: daemon_binary_missing (macOS-only) ─────────────────────
-
-fn detect_daemon_binary_missing(_ctx: &DoctorCtx) -> CheckReport {
-    #[cfg(target_os = "macos")]
-    {
-        let helper = std::path::Path::new(PRIVILEGED_HELPER_PATH);
-        let resolved = std::fs::read_link(helper).ok();
-        let (severity, detail) = match &resolved {
-            None => (
-                Severity::Fail,
-                format!(
-                    "{PRIVILEGED_HELPER_PATH} does not resolve to a versioned binary \
-                     (no symlink) — the daemon binary is not installed"
-                ),
-            ),
-            Some(t) => {
-                let (exists, mode) = stat_target(t);
-                if !exists {
-                    (Severity::Fail, format!("daemon binary {} is missing", t.display()))
-                } else if mode.map(|m| m & 0o111 == 0).unwrap_or(true) {
-                    (Severity::Fail, format!("daemon binary {} is not executable", t.display()))
-                } else {
-                    (Severity::Pass, format!("daemon binary present + executable: {}", t.display()))
-                }
-            }
-        };
-        CheckReport {
-            id: "daemon_binary_missing",
-            title: "daemon binary present + executable",
-            severity,
-            detail,
-            auto_fixable: false,
-            fix_class: FixClass::NeverAutomatic,
-            remediation: if severity == Severity::Pass {
-                None
-            } else {
-                Some("sudo agentsso setup".to_owned())
-            },
-            fix_outcome: None,
-        }
-    }
-    #[cfg(not(target_os = "macos"))]
-    {
-        CheckReport::pass(
-            "daemon_binary_missing",
-            "daemon binary present + executable",
-            "skipped (macOS-only check)",
-            FixClass::NeverAutomatic,
-        )
-    }
-}
-
 // ── Check 8: operator_layer_compile (cross-platform) ────────────────
 
 fn detect_operator_layer_compile(ctx: &DoctorCtx) -> CheckReport {
@@ -1313,6 +1340,42 @@ fn detect_operator_layer_compile(ctx: &DoctorCtx) -> CheckReport {
             }
         }
         Err(e) => {
+            // Bug 3 (Story 10.3): a `PolicyCompileError::Io` whose
+            // `path` is a DIRECTORY (the operator `policies/` dir
+            // itself, e.g. EACCES on `read_dir`) must NOT be rendered
+            // as a fake `file:line` — the operator `policies/` dir is
+            // distinct from Bug 2's managed `policies-managed/` dir
+            // (AC #4 covers the latter; both EACCES paths are real and
+            // reachable), so this is defense-in-depth, not redundant.
+            if let PolicyCompileError::Io { path, source } = &e {
+                // If the stat itself is EACCES we can't prove dir-ness,
+                // but the operator-layer reader's `Io` error comes from
+                // a `read_dir` on the policies dir — treat an
+                // unstattable-due-to-EACCES path as a dir so the
+                // EACCES case still WARNs instead of falling through to
+                // the fake `file:line` rendering Bug 3 set out to fix.
+                let is_dir = match std::fs::symlink_metadata(path) {
+                    Ok(m) => m.is_dir(),
+                    Err(stat_err) => matches!(
+                        crate::repair::fs_repair::classify_io_kind(&stat_err),
+                        crate::repair::fs_repair::IoKind::PermissionDenied
+                    ),
+                };
+                if let Some((severity, detail, remediation)) =
+                    operator_compile_dir_io_decide(is_dir, source, path)
+                {
+                    return CheckReport {
+                        id: "operator_layer_compile",
+                        title: "operator policy layer compiles",
+                        severity,
+                        detail,
+                        auto_fixable: false,
+                        fix_class: FixClass::NeverAutomatic,
+                        remediation,
+                        fix_outcome: None,
+                    };
+                }
+            }
             // EXHAUSTIVE match over the `#[non_exhaustive]` enum so a
             // new variant is a compile-visible TODO here; the `_` arm
             // only catches FUTURE variants, never the ones that exist
@@ -1369,6 +1432,259 @@ fn detect_operator_layer_compile(ctx: &DoctorCtx) -> CheckReport {
                 fix_outcome: None,
             }
         }
+    }
+}
+
+// ── Check: legacy_seed_snapshot_present + GC (Story 10.3) ───────────
+//
+// Story 10.2's `repair::archive::rename_aside_to_snapshot` moves a
+// shadowing legacy-seed operator policy aside into
+// `policies/.legacy-seed-snapshot-<UTC>/` rather than deleting it
+// (operator-recoverable). This check surfaces those dirs (Warn, since
+// they are mildly actionable recoverable-but-GC-able state) and
+// `doctor --fix` GCs the ones older than 30 days.
+
+/// Snapshot dir-name prefix (mirrors `repair::archive`).
+const SNAPSHOT_PREFIX: &str = ".legacy-seed-snapshot-";
+/// Timestamp format embedded in the snapshot dir name (mirrors
+/// `repair::archive::SNAPSHOT_TIMESTAMP_FORMAT`). The trailing `Z` is a
+/// literal — the time is UTC by construction (`chrono::Utc::now()`).
+const SNAPSHOT_TS_FORMAT: &str = "%Y-%m-%dT%H-%M-%SZ";
+/// Retention window: snapshots strictly older than this are GC-able.
+const SNAPSHOT_MAX_AGE_DAYS: i64 = 30;
+
+/// Parse the UTC timestamp out of a `.legacy-seed-snapshot-<ts>` dir
+/// name. `None` if the prefix is absent or the timestamp is
+/// unparseable (an unrecognized dir name is never GC'd).
+///
+/// `repair::archive::create_unique_snapshot_dir` appends a `-1`..`-99`
+/// collision suffix when two heals land in the same UTC second
+/// (`archive.rs`), producing `.legacy-seed-snapshot-<ts>-<n>`. We strip
+/// that trailing `-<digits>` before parsing so a collision-suffixed
+/// snapshot still ages out — otherwise it would be unparseable forever
+/// and never GC'd.
+fn parse_snapshot_timestamp(dir_name: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    use chrono::{NaiveDateTime, TimeZone, Utc};
+    let ts = dir_name.strip_prefix(SNAPSHOT_PREFIX)?;
+    let ts = strip_collision_suffix(ts);
+    let naive = NaiveDateTime::parse_from_str(ts, SNAPSHOT_TS_FORMAT).ok()?;
+    Some(Utc.from_utc_datetime(&naive))
+}
+
+/// Strip a trailing `-<digits>` collision suffix (mirrors
+/// `repair::archive::create_unique_snapshot_dir`'s `-1`..`-99`). The
+/// base timestamp itself ends in `Z`, never a digit, so a trailing
+/// `-<digits>` is unambiguously the suffix and never part of the
+/// timestamp.
+fn strip_collision_suffix(ts: &str) -> &str {
+    match ts.rsplit_once('-') {
+        Some((base, suffix))
+            if !suffix.is_empty() && suffix.bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            base
+        }
+        _ => ts,
+    }
+}
+
+/// Pure staleness decision: is the snapshot named `dir_name` older
+/// than `max_age` relative to `now`? An unparseable name → `false`
+/// (never GC an unrecognized dir — fail-safe for the destructive op).
+fn snapshot_is_stale(
+    dir_name: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    max_age: chrono::Duration,
+) -> bool {
+    match parse_snapshot_timestamp(dir_name) {
+        Some(created) => now.signed_duration_since(created) > max_age,
+        None => false,
+    }
+}
+
+/// Pure age-in-days of a snapshot relative to `now` (for the detail
+/// line). `None` if the name is unparseable.
+fn snapshot_age_days(dir_name: &str, now: chrono::DateTime<chrono::Utc>) -> Option<i64> {
+    parse_snapshot_timestamp(dir_name).map(|created| now.signed_duration_since(created).num_days())
+}
+
+/// Result of enumerating the operator `policies/` dir for snapshots.
+/// `Unreadable` (EACCES on `read_dir`) is distinct from an empty
+/// `Listed` so the check can WARN "re-run as sudo" rather than falsely
+/// reporting "no snapshots" — the same EACCES-honesty discipline as
+/// Bug 2 (`OnDisk`) and Bug 3 (`operator_compile_dir_io_decide`).
+enum SnapshotListing {
+    /// The dir was readable; carries the `(name, path)` pairs (possibly
+    /// empty when there are genuinely no snapshots).
+    Listed(Vec<(String, PathBuf)>),
+    /// The dir exists but is unreadable from this vantage (EACCES).
+    Unreadable,
+}
+
+/// Enumerate `.legacy-seed-snapshot-*` entries under the operator
+/// `policies/` dir. A missing/transient-error dir is treated as
+/// `Listed(empty)` (no false finding); a `PermissionDenied` dir is
+/// `Unreadable` so the caller can WARN rather than lie "no snapshots".
+/// Uses `symlink_metadata` (not `Path::is_dir`, which follows symlinks)
+/// so a planted `.legacy-seed-snapshot-*` SYMLINK is skipped — the
+/// archive only ever creates real dirs, and `remove_dir_all` on a
+/// symlink-to-dir would error and fail the whole GC.
+fn list_snapshot_dirs(policies_dir: &Path) -> SnapshotListing {
+    let entries = match std::fs::read_dir(policies_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            return match crate::repair::fs_repair::classify_io_kind(&e) {
+                crate::repair::fs_repair::IoKind::PermissionDenied => SnapshotListing::Unreadable,
+                _ => SnapshotListing::Listed(Vec::new()),
+            };
+        }
+    };
+    let mut out = Vec::new();
+    for e in entries.flatten() {
+        let path = e.path();
+        // symlink_metadata does NOT follow symlinks — a symlink here is
+        // not a real snapshot dir and must not be GC'd.
+        let is_real_dir = std::fs::symlink_metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
+        if !is_real_dir {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if name.starts_with(SNAPSHOT_PREFIX) {
+            out.push((name.to_owned(), path));
+        }
+    }
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    SnapshotListing::Listed(out)
+}
+
+fn detect_legacy_seed_snapshot_present(ctx: &DoctorCtx) -> CheckReport {
+    let policies = permitlayer_core::paths::policies_dir(Some(&ctx.home));
+    let snapshots = match list_snapshot_dirs(&policies) {
+        SnapshotListing::Unreadable => {
+            // EACCES on the operator policies dir — don't lie "no
+            // snapshots"; WARN to re-run privileged (mirrors Bug 2/3).
+            return CheckReport {
+                id: "legacy_seed_snapshot_present",
+                title: "legacy-seed snapshot cleanup",
+                severity: Severity::Warn,
+                detail: format!(
+                    "{} is unreadable as non-root — re-run as `sudo agentsso doctor` to check \
+                     for legacy-seed snapshots",
+                    policies.display()
+                ),
+                auto_fixable: false,
+                fix_class: FixClass::SafeAutomatic,
+                remediation: Some("sudo agentsso doctor".to_owned()),
+                fix_outcome: None,
+            };
+        }
+        SnapshotListing::Listed(s) => s,
+    };
+    if snapshots.is_empty() {
+        return CheckReport::pass(
+            "legacy_seed_snapshot_present",
+            "legacy-seed snapshot cleanup",
+            "no legacy-seed snapshots present",
+            FixClass::SafeAutomatic,
+        );
+    }
+    let now = chrono::Utc::now();
+    let max_age = chrono::Duration::days(SNAPSHOT_MAX_AGE_DAYS);
+    // Only advertise auto-fixable when at least one snapshot is
+    // actually stale — otherwise `--fix` would Skip and the Warn would
+    // persist, advertising a fix that does nothing.
+    let any_stale = snapshots.iter().any(|(name, _)| snapshot_is_stale(name, now, max_age));
+    let names: Vec<String> = snapshots
+        .iter()
+        .map(|(name, _)| match snapshot_age_days(name, now) {
+            Some(days) => format!("{name} ({days}d old)"),
+            None => format!("{name} (age unknown)"),
+        })
+        .collect();
+    let detail = format!(
+        "{} legacy-seed snapshot dir(s) under {}: {}",
+        snapshots.len(),
+        policies.display(),
+        names.join(", ")
+    );
+    let remediation = if any_stale {
+        Some(format!(
+            "sudo agentsso doctor --fix   (removes snapshots older than {SNAPSHOT_MAX_AGE_DAYS} \
+             days)"
+        ))
+    } else {
+        Some(format!(
+            "no action needed yet — these are within the {SNAPSHOT_MAX_AGE_DAYS}-day recovery \
+             window; `doctor --fix` will remove them once they age out"
+        ))
+    };
+    CheckReport {
+        id: "legacy_seed_snapshot_present",
+        title: "legacy-seed snapshot cleanup",
+        severity: Severity::Warn,
+        detail,
+        auto_fixable: any_stale,
+        fix_class: FixClass::SafeAutomatic,
+        remediation,
+        fix_outcome: None,
+    }
+}
+
+/// `doctor --fix` GC for legacy-seed snapshots: `remove_dir_all` every
+/// snapshot dir strictly older than [`SNAPSHOT_MAX_AGE_DAYS`]; leave
+/// the rest (operator-recoverable window). Routes through the
+/// `may_apply_fix` gate via the index-aligned apply loop, so it gets
+/// the same integrity-gate enforcement as every other fix.
+fn fix_snapshot_gc(ctx: &DoctorCtx) -> FixOutcome {
+    let policies = permitlayer_core::paths::policies_dir(Some(&ctx.home));
+    let snapshots = match list_snapshot_dirs(&policies) {
+        SnapshotListing::Unreadable => {
+            return FixOutcome::Refused {
+                why: format!(
+                    "{} is unreadable — re-run as: sudo agentsso doctor --fix",
+                    policies.display()
+                ),
+            };
+        }
+        SnapshotListing::Listed(s) => s,
+    };
+    let now = chrono::Utc::now();
+    let max_age = chrono::Duration::days(SNAPSHOT_MAX_AGE_DAYS);
+
+    let mut removed = 0usize;
+    let mut retained = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    for (name, path) in &snapshots {
+        if snapshot_is_stale(name, now, max_age) {
+            match std::fs::remove_dir_all(path) {
+                Ok(()) => removed += 1,
+                // A concurrent delete (benign race) leaves nothing to
+                // remove — idempotent success, not a failure.
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => removed += 1,
+                Err(e) => errors.push(format!("{name}: {e}")),
+            }
+        } else {
+            retained += 1;
+        }
+    }
+
+    if !errors.is_empty() {
+        return FixOutcome::Failed {
+            err: format!("failed to remove {} snapshot(s): {}", errors.len(), errors.join("; ")),
+        };
+    }
+    if removed == 0 {
+        return FixOutcome::Skipped {
+            why: format!(
+                "no snapshots older than {SNAPSHOT_MAX_AGE_DAYS} days ({retained} within the \
+                 recovery window)"
+            ),
+        };
+    }
+    FixOutcome::Repaired {
+        old: format!("{} legacy-seed snapshot(s) present", removed + retained),
+        new: format!("removed {removed} (>{SNAPSHOT_MAX_AGE_DAYS}d); {retained} retained"),
     }
 }
 
@@ -1444,8 +1760,8 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
         detect_managed_policy_staleness(&ctx),
         detect_daemon_not_running(&ctx),
         detect_no_tty_prompt_trap(&ctx).await,
-        detect_daemon_binary_missing(&ctx),
         detect_operator_layer_compile(&ctx),
+        detect_legacy_seed_snapshot_present(&ctx),
     ];
 
     // --fix pass: for every non-passing check, consult the SINGLE
@@ -1521,10 +1837,7 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
 /// gate is the only authorization path.
 async fn apply_fix(id: &str, ctx: &DoctorCtx) -> FixOutcome {
     match id {
-        "version_drift"
-        | "daemon_binary_missing"
-        | "no_tty_prompt_trap"
-        | "operator_layer_compile" => {
+        "version_drift" | "no_tty_prompt_trap" | "operator_layer_compile" => {
             // NeverAutomatic — the gate already refused; this is
             // defense-in-depth (must never be reached for these).
             FixOutcome::Refused { why: "never auto-fixable".to_owned() }
@@ -1551,6 +1864,7 @@ async fn apply_fix(id: &str, ctx: &DoctorCtx) -> FixOutcome {
             }
         }
         "daemon_not_running" => fix_daemon_not_running().await,
+        "legacy_seed_snapshot_present" => fix_snapshot_gc(ctx),
         other => FixOutcome::Refused { why: format!("no fix dispatch for check '{other}'") },
     }
 }
@@ -1700,7 +2014,38 @@ fn render_human(reports: &[CheckReport], ctx: &DoctorCtx, pass: usize, warn: usi
     }
 
     println!();
+    // Bug 4 (Story 10.3): a positive-affordance line on an all-green
+    // system — doctor's "nothing to do" signal. A present legacy-seed
+    // snapshot is a Warn (so `warn >= 1`), which correctly suppresses
+    // this line: there IS pending cleanup. When the daemon is
+    // unreachable `daemon_version` is None and `daemon_not_running`
+    // Fails, so this branch is never reached without a `Some(v)`.
+    if let Some(line) =
+        healthy_summary_line(warn, fail, ctx.daemon_version.as_deref(), &ctx.endpoint, g.check)
+    {
+        println!("{line}");
+    }
     println!("{} summary: {} pass · {} warn · {} fail", g.arrow, pass, warn, fail);
+}
+
+/// Bug 4: build the all-green positive line, or `None` when it should
+/// be suppressed (any warn/fail, or daemon unreachable). Pure so the
+/// "emitted iff all-green + daemon up" rule is unit-testable without
+/// capturing stdout.
+fn healthy_summary_line(
+    warn: usize,
+    fail: usize,
+    daemon_version: Option<&str>,
+    endpoint: &ControlEndpoint,
+    check_glyph: &str,
+) -> Option<String> {
+    if warn == 0 && fail == 0 {
+        daemon_version.map(|ver| {
+            format!("{check_glyph} agentsso is healthy; daemon {ver} ready on {endpoint}")
+        })
+    } else {
+        None
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
@@ -1748,11 +2093,73 @@ mod tests {
     fn staleness_decide_truth_table() {
         let embedded = sha256_str(EMBEDDED_MANAGED_BUNDLE);
         // Equal hashes → Pass.
-        assert_eq!(staleness_decide(Some(&embedded), &embedded), (Severity::Pass, false));
+        assert_eq!(
+            staleness_decide(&OnDisk::Present(embedded.clone()), &embedded),
+            (Severity::Pass, false)
+        );
         // Different hash → Fail (fixable).
-        assert_eq!(staleness_decide(Some("deadbeef"), &embedded), (Severity::Fail, true));
+        assert_eq!(
+            staleness_decide(&OnDisk::Present("deadbeef".to_owned()), &embedded),
+            (Severity::Fail, true)
+        );
         // Absent on disk → Fail (fixable).
-        assert_eq!(staleness_decide(None, &embedded), (Severity::Fail, true));
+        assert_eq!(staleness_decide(&OnDisk::Absent, &embedded), (Severity::Fail, true));
+    }
+
+    // ── Bug 2: EACCES (Unreadable) is a non-fixable WARN, not a
+    //    "missing" Fail. The file is probably fine, just opaque from a
+    //    non-root vantage — rewriting it is the wrong remediation. ────
+    #[test]
+    fn staleness_decide_treats_unreadable_as_warn() {
+        let embedded = sha256_str(EMBEDDED_MANAGED_BUNDLE);
+        assert_eq!(staleness_decide(&OnDisk::Unreadable, &embedded), (Severity::Warn, false));
+    }
+
+    // ── classify_on_disk: EACCES → Unreadable, ENOENT/other → Absent,
+    //    Ok → Present. (Bug 2 root cause — pre-10.3 `.ok()` collapsed
+    //    EACCES into the "missing" bucket.) ──────────────────────────
+    #[test]
+    fn classify_on_disk_distinguishes_eacces_from_enoent() {
+        use std::io::{Error, ErrorKind};
+        assert_eq!(classify_on_disk(Ok("abc".to_owned())), OnDisk::Present("abc".to_owned()));
+        assert_eq!(
+            classify_on_disk(Err(Error::from(ErrorKind::PermissionDenied))),
+            OnDisk::Unreadable
+        );
+        assert_eq!(classify_on_disk(Err(Error::from(ErrorKind::NotFound))), OnDisk::Absent);
+        // A transient/other error is indistinguishable from absent for
+        // this purpose (we cannot prove the file is there).
+        assert_eq!(classify_on_disk(Err(Error::from(ErrorKind::Other))), OnDisk::Absent);
+    }
+
+    // ── Bug 3: operator_layer_compile dir-EACCES → Warn, dir-other →
+    //    Fail, file → fall through (None). ────────────────────────────
+    #[test]
+    fn operator_compile_unreadable_dir_is_warn() {
+        use std::io::{Error, ErrorKind};
+        let dir = Path::new("/x/policies");
+        // dir + EACCES → Warn "re-run as sudo".
+        let (sev, detail, rem) =
+            operator_compile_dir_io_decide(true, &Error::from(ErrorKind::PermissionDenied), dir)
+                .expect("dir+EACCES yields a dir decision");
+        assert_eq!(sev, Severity::Warn);
+        assert!(detail.contains("unreadable as non-root"));
+        assert_eq!(rem.as_deref(), Some("sudo agentsso doctor"));
+        // dir + other I/O → Fail "directory unreadable".
+        let (sev, detail, _) =
+            operator_compile_dir_io_decide(true, &Error::from(ErrorKind::Other), dir)
+                .expect("dir+other yields a dir decision");
+        assert_eq!(sev, Severity::Fail);
+        assert!(detail.contains("is unreadable:"));
+        // file path (is_dir=false) → None (today's file:line behavior).
+        assert!(
+            operator_compile_dir_io_decide(
+                false,
+                &Error::from(ErrorKind::PermissionDenied),
+                Path::new("/x/policies/bad.toml"),
+            )
+            .is_none()
+        );
     }
 
     // ── prompt_trap_decide truth table ──────────────────────────────
@@ -1820,23 +2227,40 @@ mod tests {
         let by_id = |id: &str| -> FixClass {
             specs.iter().find(|s| s.id == id).expect("check id exists").fix_class
         };
-        // #1 version_drift, #7 daemon_binary_missing → NeverAutomatic.
+        // version_drift → NeverAutomatic.
         assert_eq!(by_id("version_drift"), FixClass::NeverAutomatic);
-        assert_eq!(by_id("daemon_binary_missing"), FixClass::NeverAutomatic);
-        // #2 stale_launchd, #5 daemon_not_running → GatedByRestartOk.
+        // stale_launchd, daemon_not_running → GatedByRestartOk.
         assert_eq!(by_id("stale_launchd"), FixClass::GatedByRestartOk);
         assert_eq!(by_id("daemon_not_running"), FixClass::GatedByRestartOk);
-        // #4 managed_policy_staleness → SafeAutomatic (file rewrite
-        // only; the RELOAD is NeverAutomatic and not performed).
+        // managed_policy_staleness → SafeAutomatic (file rewrite only;
+        // the RELOAD is NeverAutomatic and not performed).
         assert_eq!(by_id("managed_policy_staleness"), FixClass::SafeAutomatic);
-        // #3 symlink_integrity → SafeAutomatic.
+        // symlink_integrity → SafeAutomatic.
         assert_eq!(by_id("symlink_integrity"), FixClass::SafeAutomatic);
-        // #6 no_tty_prompt_trap, #8 operator_layer_compile →
-        // NeverAutomatic.
+        // no_tty_prompt_trap, operator_layer_compile → NeverAutomatic.
         assert_eq!(by_id("no_tty_prompt_trap"), FixClass::NeverAutomatic);
         assert_eq!(by_id("operator_layer_compile"), FixClass::NeverAutomatic);
-        // There are exactly 8 checks.
-        assert_eq!(specs.len(), 8);
+        // legacy_seed_snapshot_present → SafeAutomatic (the destructive
+        // >30d GC routes through the same may_apply_fix gate).
+        assert_eq!(by_id("legacy_seed_snapshot_present"), FixClass::SafeAutomatic);
+        // Concrete membership (Story 10.3: daemon_binary_missing OUT,
+        // legacy_seed_snapshot_present IN) — assert the exact id set so
+        // this test documents intent, not a bare count.
+        let mut ids: Vec<&str> = specs.iter().map(|s| s.id).collect();
+        ids.sort_unstable();
+        assert_eq!(
+            ids,
+            [
+                "daemon_not_running",
+                "legacy_seed_snapshot_present",
+                "managed_policy_staleness",
+                "no_tty_prompt_trap",
+                "operator_layer_compile",
+                "stale_launchd",
+                "symlink_integrity",
+                "version_drift",
+            ]
+        );
     }
 
     // ── Decision-C1 parity: embedded bundle non-empty + compiles ────
@@ -1856,6 +2280,27 @@ mod tests {
             set.accepted_overrides().is_empty(),
             "single-dir compile has no cross-layer overrides"
         );
+    }
+
+    // ── Bug 4: the all-green positive line is emitted iff warn==0 &&
+    //    fail==0 && daemon reachable; suppressed otherwise. ───────────
+    #[test]
+    fn summary_line_emitted_on_all_green() {
+        use std::net::SocketAddr;
+        let ep = ControlEndpoint::Tcp("127.0.0.1:8723".parse::<SocketAddr>().unwrap());
+        // All-green + daemon up → line emitted (NoColor glyph for
+        // stability — mirrors the existing NoColor-gated patterns).
+        let line = healthy_summary_line(0, 0, Some("0.3.0-rc.41"), &ep, "[ok]")
+            .expect("all-green + daemon up emits the positive line");
+        assert!(line.contains("agentsso is healthy"));
+        assert!(line.contains("0.3.0-rc.41"));
+        assert!(line.contains("127.0.0.1:8723"));
+        // Any warn → suppressed (e.g. a present legacy-seed snapshot).
+        assert!(healthy_summary_line(1, 0, Some("0.3.0-rc.41"), &ep, "[ok]").is_none());
+        // Any fail → suppressed.
+        assert!(healthy_summary_line(0, 1, Some("0.3.0-rc.41"), &ep, "[ok]").is_none());
+        // Daemon unreachable (None) → suppressed even at 0/0.
+        assert!(healthy_summary_line(0, 0, None, &ep, "[ok]").is_none());
     }
 
     #[test]
@@ -1891,5 +2336,211 @@ mod tests {
         assert_eq!(Severity::Pass.to_outcome(), Outcome::Ok);
         assert_eq!(Severity::Warn.to_outcome(), Outcome::Blocked);
         assert_eq!(Severity::Fail.to_outcome(), Outcome::Error);
+    }
+
+    // ── Story 10.3 snapshot GC: pure helpers (fixed `now`) ───────────
+
+    fn fixed_now() -> chrono::DateTime<chrono::Utc> {
+        use chrono::{TimeZone, Utc};
+        // 2026-06-01T00:00:00Z
+        Utc.with_ymd_and_hms(2026, 6, 1, 0, 0, 0).unwrap()
+    }
+
+    fn snapshot_name(ts: &str) -> String {
+        format!(".legacy-seed-snapshot-{ts}")
+    }
+
+    #[test]
+    fn parse_snapshot_timestamp_round_trips_archive_format() {
+        use chrono::{TimeZone, Utc};
+        let dir = snapshot_name("2026-05-20T13-45-09Z");
+        assert_eq!(
+            parse_snapshot_timestamp(&dir),
+            Some(Utc.with_ymd_and_hms(2026, 5, 20, 13, 45, 9).unwrap())
+        );
+        // No prefix → None.
+        assert_eq!(parse_snapshot_timestamp("2026-05-20T13-45-09Z"), None);
+        // Unparseable timestamp → None.
+        assert_eq!(parse_snapshot_timestamp(&snapshot_name("garbage")), None);
+    }
+
+    // ── Review F1: the archive's same-second collision suffix
+    //    (`-1`..`-99`, see repair::archive::create_unique_snapshot_dir)
+    //    must still parse, or a suffixed snapshot would never GC. ──────
+    #[test]
+    fn parse_snapshot_timestamp_strips_collision_suffix() {
+        use chrono::{TimeZone, Utc};
+        let expected = Utc.with_ymd_and_hms(2026, 5, 20, 13, 45, 9).unwrap();
+        // `-1` and `-99` collision suffixes both parse to the base ts.
+        assert_eq!(
+            parse_snapshot_timestamp(&snapshot_name("2026-05-20T13-45-09Z-1")),
+            Some(expected)
+        );
+        assert_eq!(
+            parse_snapshot_timestamp(&snapshot_name("2026-05-20T13-45-09Z-99")),
+            Some(expected)
+        );
+        // A trailing non-numeric token is NOT a collision suffix → None.
+        assert_eq!(parse_snapshot_timestamp(&snapshot_name("2026-05-20T13-45-09Z-x")), None);
+        // strip_collision_suffix only removes a trailing `-<digits>`.
+        assert_eq!(strip_collision_suffix("2026-05-20T13-45-09Z"), "2026-05-20T13-45-09Z");
+        assert_eq!(strip_collision_suffix("2026-05-20T13-45-09Z-7"), "2026-05-20T13-45-09Z");
+    }
+
+    // ── Review F1: a collision-suffixed stale snapshot ages out. ─────
+    #[test]
+    fn snapshot_is_stale_handles_collision_suffix() {
+        let now = fixed_now();
+        let max = chrono::Duration::days(30);
+        // 40 days old + `-1` suffix → still stale (would be GC'd).
+        assert!(snapshot_is_stale(&snapshot_name("2026-04-22T00-00-00Z-1"), now, max));
+        assert_eq!(snapshot_age_days(&snapshot_name("2026-04-22T00-00-00Z-1"), now), Some(40));
+    }
+
+    #[test]
+    fn snapshot_is_stale_truth_table() {
+        let now = fixed_now();
+        let max = chrono::Duration::days(30);
+        // 40 days old (2026-04-22) → stale.
+        assert!(snapshot_is_stale(&snapshot_name("2026-04-22T00-00-00Z"), now, max));
+        // 5 days old (2026-05-27) → fresh.
+        assert!(!snapshot_is_stale(&snapshot_name("2026-05-27T00-00-00Z"), now, max));
+        // Exactly 30 days (2026-05-02) → NOT stale (strict `>`).
+        assert!(!snapshot_is_stale(&snapshot_name("2026-05-02T00-00-00Z"), now, max));
+        // Unparseable name → never stale (fail-safe for the destructive op).
+        assert!(!snapshot_is_stale(&snapshot_name("nope"), now, max));
+        assert!(!snapshot_is_stale("not-a-snapshot", now, max));
+    }
+
+    #[test]
+    fn snapshot_age_days_computes_age() {
+        let now = fixed_now();
+        assert_eq!(snapshot_age_days(&snapshot_name("2026-05-27T00-00-00Z"), now), Some(5));
+        assert_eq!(snapshot_age_days(&snapshot_name("2026-04-22T00-00-00Z"), now), Some(40));
+        assert_eq!(snapshot_age_days(&snapshot_name("garbage"), now), None);
+    }
+
+    // ── Story 10.3 GC: stale removed, fresh kept (live tempdir) ──────
+    #[test]
+    fn fix_snapshot_gc_removes_stale_keeps_fresh() {
+        // A real `policies/` tempdir with one stale + one fresh
+        // backdated-name snapshot. The age decision uses Utc::now()
+        // inside fix_snapshot_gc; the backdated names make the stale
+        // one unambiguously >30d old regardless of when the test runs.
+        let home = tempfile::tempdir().unwrap();
+        let policies = permitlayer_core::paths::policies_dir(Some(home.path()));
+        std::fs::create_dir_all(&policies).unwrap();
+
+        // Stale: year 2000 → far older than 30 days.
+        let stale = policies.join(snapshot_name("2000-01-01T00-00-00Z"));
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("default.toml"), b"x").unwrap();
+        // Fresh: far-future name → never older than 30 days.
+        let fresh = policies.join(snapshot_name("2999-01-01T00-00-00Z"));
+        std::fs::create_dir_all(&fresh).unwrap();
+        // A non-snapshot dir must be left untouched.
+        let other = policies.join("not-a-snapshot");
+        std::fs::create_dir_all(&other).unwrap();
+
+        let ctx = test_ctx(home.path().to_path_buf());
+        let outcome = fix_snapshot_gc(&ctx);
+        match outcome {
+            FixOutcome::Repaired { .. } => {}
+            other => panic!("expected Repaired, got {other:?}"),
+        }
+        assert!(!stale.exists(), "stale snapshot must be removed");
+        assert!(fresh.exists(), "fresh snapshot must be retained");
+        assert!(other.exists(), "non-snapshot dir must be untouched");
+    }
+
+    #[test]
+    fn fix_snapshot_gc_skips_when_none_stale() {
+        let home = tempfile::tempdir().unwrap();
+        let policies = permitlayer_core::paths::policies_dir(Some(home.path()));
+        std::fs::create_dir_all(&policies).unwrap();
+        std::fs::create_dir_all(policies.join(snapshot_name("2999-01-01T00-00-00Z"))).unwrap();
+
+        let ctx = test_ctx(home.path().to_path_buf());
+        assert!(matches!(fix_snapshot_gc(&ctx), FixOutcome::Skipped { .. }));
+    }
+
+    #[test]
+    fn detect_legacy_seed_snapshot_pass_when_none() {
+        let home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(permitlayer_core::paths::policies_dir(Some(home.path()))).unwrap();
+        let ctx = test_ctx(home.path().to_path_buf());
+        let r = detect_legacy_seed_snapshot_present(&ctx);
+        assert_eq!(r.severity, Severity::Pass);
+        assert!(!r.auto_fixable);
+    }
+
+    // A stale (year-2000) snapshot → Warn AND auto_fixable (there is
+    // something `--fix` will actually remove).
+    #[test]
+    fn detect_legacy_seed_snapshot_warn_and_fixable_when_stale() {
+        let home = tempfile::tempdir().unwrap();
+        let policies = permitlayer_core::paths::policies_dir(Some(home.path()));
+        std::fs::create_dir_all(policies.join(snapshot_name("2000-01-01T00-00-00Z"))).unwrap();
+        let ctx = test_ctx(home.path().to_path_buf());
+        let r = detect_legacy_seed_snapshot_present(&ctx);
+        assert_eq!(r.severity, Severity::Warn);
+        assert!(r.auto_fixable, "a stale snapshot is auto-fixable");
+        assert_eq!(r.fix_class, FixClass::SafeAutomatic);
+    }
+
+    // ── Review F6: a present-but-fresh (<30d) snapshot is Warn but
+    //    NOT auto_fixable — `--fix` would be a no-op, so doctor must
+    //    not advertise a fix that does nothing. ────────────────────────
+    #[test]
+    fn detect_legacy_seed_snapshot_warn_not_fixable_when_all_fresh() {
+        let home = tempfile::tempdir().unwrap();
+        let policies = permitlayer_core::paths::policies_dir(Some(home.path()));
+        std::fs::create_dir_all(policies.join(snapshot_name("2999-01-01T00-00-00Z"))).unwrap();
+        let ctx = test_ctx(home.path().to_path_buf());
+        let r = detect_legacy_seed_snapshot_present(&ctx);
+        assert_eq!(r.severity, Severity::Warn);
+        assert!(!r.auto_fixable, "an all-fresh snapshot set is NOT auto-fixable");
+    }
+
+    // ── Review F3: a SYMLINK named like a snapshot is skipped (not a
+    //    real snapshot dir; symlink_metadata does not follow it). ──────
+    #[cfg(unix)]
+    #[test]
+    fn list_snapshot_dirs_skips_symlinks() {
+        let home = tempfile::tempdir().unwrap();
+        let policies = permitlayer_core::paths::policies_dir(Some(home.path()));
+        std::fs::create_dir_all(&policies).unwrap();
+        // A real stale snapshot dir + a symlink masquerading as one.
+        std::fs::create_dir_all(policies.join(snapshot_name("2000-01-01T00-00-00Z"))).unwrap();
+        let outside = home.path().join("outside-target");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, policies.join(snapshot_name("2000-02-02T00-00-00Z")))
+            .unwrap();
+        match list_snapshot_dirs(&policies) {
+            SnapshotListing::Listed(v) => {
+                assert_eq!(v.len(), 1, "only the real dir is listed; the symlink is skipped");
+                assert!(v[0].0.contains("2000-01-01"));
+            }
+            SnapshotListing::Unreadable => panic!("readable dir must not be Unreadable"),
+        }
+    }
+
+    /// Minimal `DoctorCtx` for tempdir-based detect/GC tests. The only
+    /// fields the snapshot check + GC read are `home`; everything else
+    /// is inert. (No daemon, no env mutation.)
+    fn test_ctx(home: PathBuf) -> DoctorCtx {
+        use std::net::SocketAddr;
+        DoctorCtx {
+            home,
+            endpoint: ControlEndpoint::Tcp("127.0.0.1:8723".parse::<SocketAddr>().unwrap()),
+            control_token: None,
+            daemon_version: None,
+            cli_version: "0.0.0-test",
+            restart_ok: false,
+            fix: false,
+            audit: None,
+            fix_integrity_gate_passed: false,
+            fix_integrity_gate_reason: String::new(),
+        }
     }
 }
