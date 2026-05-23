@@ -207,6 +207,52 @@ remediation. See the
 [install guide's troubleshooting section](install.md#troubleshooting)
 for the daemon-stopped and master-key paths.
 
+## `sudo agentsso setup` refused — what now?
+
+`agentsso setup` is self-healing: it repairs the common refusal
+conditions (a wedged LaunchDaemon, a stale binary, a broken version
+symlink) itself rather than handing you commands to run. So most of the
+manual `launchctl bootout`/`bootstrap` dance above is a fallback for
+when you are *not* using `setup`. When `setup` does refuse, the message
+tells you exactly what to do — and it will **never** tell you to
+`sudo rm` a file. The refusals you may see:
+
+- **`setup.requires_root`** — you ran `agentsso setup` without `sudo`.
+  On an interactive terminal `setup` re-elevates itself; if it can't
+  (or `AGENTSSO_NO_SUDO_ELEVATE=1` is set), re-run with `sudo`.
+- **`setup.heal_needs_decision`** — a legacy operator policy shadows a
+  shipped policy and `setup` is non-interactive (so it can't prompt).
+  This is the only refusal that needs *your* decision. Re-run with the
+  flag that matches your intent (both archive the shadow recoverably
+  and then continue — neither asks you to delete anything):
+  - `sudo agentsso setup --upgrade` — keep all your config, just move
+    the daemon-crashing shadow aside. **This is the routine answer.**
+  - `sudo agentsso setup --fresh-install` — archive the shadow **and**
+    wipe operator state for a clean slate (destructive; deliberate
+    resets only).
+  The archived file lands in
+  `/Library/Application Support/permitlayer/policies/.legacy-seed-snapshot-<timestamp>/`,
+  recoverable for ~30 days. `agentsso doctor` reports any present
+  snapshot; `sudo agentsso doctor --fix` garbage-collects snapshots
+  older than 30 days.
+- **`setup.versioned_binary_mismatch`** — a *different* binary of the
+  same version is already staged (same version, different bytes —
+  possible tamper, or a corrupted prior install). `setup` refuses to
+  silently overwrite. Re-run with `--replace-binary` if you know it's
+  a corrupted prior install; the message also shows a `codesign
+  --verify` command to investigate first.
+- **`setup.fresh_install_wipe_failed` / `setup.legacy_helper_unremovable`**
+  — a path `setup` needed to clear is held by something else (a running
+  process with it open, a locked/immutable file, or a permissions
+  issue). The per-path error names the cause; resolve the holder, then
+  re-run. `setup` already retried transient I/O before refusing.
+
+If `setup` rolled back after a post-cutover failure
+(`setup.rolled_back` / `setup.rollback_incomplete` /
+`setup.failed_no_rollback`), the message states whether the prior
+daemon was restored. Check `/Library/Logs/permitlayer/daemon.log`,
+then re-run `sudo agentsso setup`.
+
 ## See also
 
 - [Cross-user / multi-machine setup runbook](multi-user-setup.md) —

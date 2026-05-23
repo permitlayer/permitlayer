@@ -73,10 +73,12 @@ pub struct SetupArgs {
     #[arg(long, conflicts_with = "upgrade")]
     pub fresh_install: bool,
 
-    /// Answer No to every destructive heal: preserve all operator
-    /// state. If a heal would otherwise be required, setup refuses
-    /// with a structured error rather than silently skipping it.
-    /// Mutually exclusive with `--fresh-install`.
+    /// Preserve all operator state (vault, agents, policies) — but
+    /// still archive a daemon-crashing legacy-seed shadow aside,
+    /// recoverably, so the install proceeds (Story 10.4). The explicit
+    /// flag is the consent for that non-destructive archive; everything
+    /// else the operator authored is kept. Mutually exclusive with
+    /// `--fresh-install` (which ALSO wipes operator state).
     #[arg(long)]
     pub upgrade: bool,
 
@@ -373,7 +375,10 @@ async fn run_macos(args: SetupArgs) -> Result<()> {
                 error_block(
                     "setup.fresh_install_wipe_failed",
                     &format!("--fresh-install could not remove some operator state:\n{stuck}"),
-                    "remove the listed paths manually and re-run `sudo agentsso setup --fresh-install`",
+                    "these paths are held by something setup can't clear (a running process \
+                     with them open, an immutable flag, or a permissions issue) — check the \
+                     per-path error above, resolve the holder, then re-run \
+                     `sudo agentsso setup --fresh-install`",
                     None,
                 )
             );
@@ -443,24 +448,60 @@ async fn run_macos(args: SetupArgs) -> Result<()> {
     // persistent EACCES escalate via chmod 0o644 + one retry), then let
     // the pure `decide_versioned_binary` pick the action.
     let versioned_exists = versioned.exists();
+    // HEAL (Story 10.4): if an EXISTING versioned binary can't be hashed
+    // even after the chmod-retry, that slot is setup-owned staging state
+    // we are about to (re)write with the same version's bytes anyway —
+    // an unreadable/corrupt prior stage is not an operator decision, so
+    // self-heal by re-staging rather than refusing with a manual-removal
+    // instruction. An UNREADABLE slot sets `force_restage`, which routes
+    // straight to an atomic re-stage (below) REGARDLESS of
+    // `--replace-binary` — it's setup-owned, not a tamper decision. The
+    // genuine tamper case (slot is READABLE but its bytes differ from the
+    // staged source) is unaffected: it still flows through
+    // `decide_versioned_binary` and its Refuse-unless-`--replace-binary`
+    // arm.
+    let mut force_restage = false;
     let hashes_differ = if versioned_exists {
-        let existing_hash = sha256_file_with_retry_chmod(&versioned).map_err(|e| {
-            eprint!(
-                "{}",
-                error_block(
-                    "setup.versioned_unreadable",
-                    &format!("could not hash existing {}: {e}", versioned.display()),
-                    "remove the file and re-run `sudo agentsso setup`",
-                    None,
-                )
-            );
-            silent_cli_error("versioned binary unreadable")
-        })?;
-        existing_hash != staged_hash
+        match sha256_file_with_retry_chmod(&versioned) {
+            Ok(existing_hash) => existing_hash != staged_hash,
+            Err(e) => {
+                // The setup-owned slot is unreadable; we re-stage it
+                // (it's about to be overwritten with the same version's
+                // bytes anyway). Surface a loud line (stderr, like the
+                // other heal notices) AND record the heal in the setup
+                // journal (epic-AC #7). `home` isn't bound in this block,
+                // so resolve it best-effort just for the journal line.
+                eprintln!(
+                    "  {} existing versioned binary at {} was unreadable ({e}) — re-staging",
+                    g.warn,
+                    versioned.display()
+                );
+                if let Ok(home) = crate::cli::agentsso_home() {
+                    let _ = crate::repair::journal::record(
+                        &home,
+                        "versioned_binary_stage",
+                        crate::repair::journal::JournalResult::Ok,
+                        &[
+                            ("heal", "restage_unreadable"),
+                            ("path", &versioned.display().to_string()),
+                        ],
+                    );
+                }
+                force_restage = true;
+                true
+            }
+        }
     } else {
         false
     };
-    match decide_versioned_binary(versioned_exists, hashes_differ, args.replace_binary) {
+    // An unreadable existing slot heals by re-staging regardless of the
+    // `--replace-binary` flag (it's setup-owned, not a tamper decision).
+    let action = if force_restage {
+        VersionedBinaryAction::Replace
+    } else {
+        decide_versioned_binary(versioned_exists, hashes_differ, args.replace_binary)
+    };
+    match action {
         VersionedBinaryAction::Stage => {
             im::stage_file_atomic(&source, &versioned)?;
             println!("  {} staged {}", g.check, versioned.display());
@@ -547,10 +588,14 @@ async fn run_macos(args: SetupArgs) -> Result<()> {
                 error_block(
                     "setup.legacy_helper_unremovable",
                     &format!(
-                        "a non-symlink binary exists at {} and could not be moved aside: {e}",
+                        "a non-symlink binary exists at {} and could not be moved aside after \
+                         retry: {e}",
                         helper_path.display()
                     ),
-                    "manually remove it and re-run `sudo agentsso setup`",
+                    "setup tried to rename this legacy binary aside (with retry) and the OS \
+                     refused — something is holding it (a running process with it open, or a \
+                     locked/immutable file). check the error above, clear the holder, then \
+                     re-run `sudo agentsso setup`",
                     None,
                 )
             );
@@ -723,15 +768,22 @@ enum LegacySeedOutcome {
 /// filesystem state. The caller resolves `stdin_tty` and (only when
 /// needed) the TTY prompt result, then delegates here.
 ///
-/// Precedence: `--fresh-install` (Yes-to-all) and `--upgrade`
-/// (No-to-all) are mutually exclusive at the clap layer, so at most one
-/// is set. A flag always wins over the TTY prompt.
+/// Precedence: `--fresh-install` and `--upgrade` both archive the
+/// daemon-crashing shadow (Story 10.4: `--upgrade` no longer refuses —
+/// it preserves operator config but archives the shadow so the on-screen
+/// remedy makes progress instead of looping). They are mutually
+/// exclusive at the clap layer, so at most one is set, and they differ
+/// elsewhere: `--fresh-install` ALSO wipes operator state, `--upgrade`
+/// preserves everything except the shadow. A flag always wins over the
+/// TTY prompt.
 #[cfg(target_os = "macos")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LegacySeedDecision {
     /// Archive the shadowing files aside.
     Archive,
-    /// Refuse with `setup.heal_needs_decision`.
+    /// Refuse with `setup.heal_needs_decision` (only the non-TTY,
+    /// no-flag path — the operator must pick `--upgrade` or
+    /// `--fresh-install`, both of which now make progress).
     Refuse,
     /// TTY + no flag: the caller must run the interactive prompt and
     /// re-decide based on the operator's Yes/No.
@@ -805,14 +857,21 @@ fn decide_versioned_binary(
 
 #[cfg(target_os = "macos")]
 fn decide_legacy_seed(fresh_install: bool, upgrade: bool, stdin_tty: bool) -> LegacySeedDecision {
-    if fresh_install {
+    if fresh_install || upgrade {
+        // Story 10.4 (decision B): both flags archive the shadow. The
+        // explicit flag IS the operator's consent (no prompt). They
+        // differ only in that `--fresh-install` also wipes operator
+        // state; the archive of the daemon-crashing shadow is common to
+        // both. `--upgrade` was previously `Refuse`, which made the
+        // on-screen remedy loop (heal_needs_decision listed `--upgrade`,
+        // but `--upgrade` reproduced the same refusal).
         LegacySeedDecision::Archive
-    } else if upgrade {
-        LegacySeedDecision::Refuse
     } else if stdin_tty {
         LegacySeedDecision::Prompt
     } else {
-        // Non-TTY + no flag.
+        // Non-TTY + no flag: the only genuine human-decision path. The
+        // refusal copy points at `--upgrade` / `--fresh-install`, both
+        // of which now make progress.
         LegacySeedDecision::Refuse
     }
 }
@@ -830,11 +889,16 @@ fn decide_legacy_seed(fresh_install: bool, upgrade: bool, stdin_tty: bool) -> Le
 /// marker (a *marked* override is legitimate config — see
 /// [`find_shadowing_files`]).
 ///
-/// **Three-state posture** (rev-5 plan § C):
+/// **Posture** (rev-5 plan § C, amended by Story 10.4):
 /// - TTY + no flag → prompt (default Yes); on Yes archive, on No refuse.
-/// - TTY/non-TTY + `--fresh-install` → archive silently.
-/// - TTY/non-TTY + `--upgrade` → refuse (`setup.heal_needs_decision`).
-/// - Non-TTY + no flag → refuse (`setup.heal_needs_decision`).
+/// - TTY/non-TTY + `--fresh-install` → archive the shadow (and wipe
+///   operator state elsewhere); a LOUD audit line names what moved.
+/// - TTY/non-TTY + `--upgrade` → archive the shadow, preserve all other
+///   operator state, continue; a LOUD audit line names what moved.
+///   (Story 10.4: was `refuse`, which made the on-screen remedy loop.)
+/// - Non-TTY + no flag → refuse (`setup.heal_needs_decision`) — the only
+///   remaining refuse path; its copy points at `--upgrade`/`--fresh-install`,
+///   both of which now make progress.
 ///
 /// Archival is non-destructive: files move to
 /// `policies/.legacy-seed-snapshot-<isotime>/` (operator-recoverable),
@@ -903,7 +967,9 @@ async fn detect_and_heal_legacy_seed_shadow(
             error_block(
                 "setup.operator_policies_unparseable",
                 &format!("could not read operator policies in {}: {e}", policies.display()),
-                "fix or remove the offending policy file, then re-run `sudo agentsso setup`",
+                "the error above names the policy file and the parse problem — fix the TOML \
+                 syntax in that file, then re-run `sudo agentsso setup` (the policy is your \
+                 own config; setup will not delete it for you)",
                 None,
             )
         );
@@ -922,7 +988,14 @@ async fn detect_and_heal_legacy_seed_shadow(
 
     // Decide: archive or refuse, per the three-state posture.
     let stdin_tty = std::io::stdin().is_terminal();
-    let archive: bool = match decide_legacy_seed(args.fresh_install, args.upgrade, stdin_tty) {
+    // `flag_driven_archive` is the no-prompt flag path (`--upgrade` /
+    // `--fresh-install`). It gets a LOUD post-archive notice (AC #11)
+    // because, unlike the TTY-Prompt path, it never showed the operator
+    // the file list before mutating — a scripted run must still leave an
+    // obvious audit trail of what was moved aside.
+    let decision = decide_legacy_seed(args.fresh_install, args.upgrade, stdin_tty);
+    let flag_driven_archive = decision == LegacySeedDecision::Archive;
+    let archive: bool = match decision {
         LegacySeedDecision::Archive => true,
         LegacySeedDecision::Refuse => false,
         LegacySeedDecision::Prompt => {
@@ -954,9 +1027,10 @@ async fn detect_and_heal_legacy_seed_shadow(
                     "found {n} policy file(s) duplicated from older agentsso versions:\n{file_lines}\n\n\
                      setup won't make destructive changes without an explicit choice."
                 ),
-                "re-run as one of:\n  \
-                 sudo agentsso setup --fresh-install   # archive these and start clean\n  \
-                 sudo agentsso setup --upgrade         # preserve everything (remove the files manually)",
+                "re-run as one of (both move the listed file(s) into a recoverable \
+                 policies/.legacy-seed-snapshot-<isotime>/ dir, then continue):\n  \
+                 sudo agentsso setup --upgrade         # keep all your config; just archive the shadow(s)\n  \
+                 sudo agentsso setup --fresh-install   # archive the shadow(s) AND wipe operator state for a clean slate",
                 None,
             )
         );
@@ -1011,8 +1085,9 @@ async fn detect_and_heal_legacy_seed_shadow(
                      would still crash the daemon:\n{stuck}",
                     moved.len()
                 ),
-                "remove the listed file(s) manually (they are recoverable from the snapshot dir) \
-                 and re-run `sudo agentsso setup`",
+                "the listed file(s) are blocking the daemon; archiving them did not complete \
+                 (likely a filesystem-permission issue on policies/). re-run \
+                 `sudo agentsso setup --upgrade` to retry the archive",
                 None,
             )
         );
@@ -1031,7 +1106,25 @@ async fn detect_and_heal_legacy_seed_shadow(
         crate::repair::journal::JournalResult::Ok,
         &[("n", &moved.len().to_string()), ("snapshot_dir", &snapshot_dir.display().to_string())],
     );
-    let _ = g; // glyph reserved for any future inline heal log
+    // LOUD audit trail for the no-prompt flag path (AC #11): `--upgrade`
+    // / `--fresh-install` archived operator-observable state WITHOUT a
+    // pre-prompt, so a scripted run must still see exactly what moved and
+    // where it can be recovered. The TTY-Prompt path already showed the
+    // file list before archiving, so it does not need this.
+    if flag_driven_archive {
+        let moved_lines = moved
+            .iter()
+            .map(|(orig, _)| format!("    {}", orig.display()))
+            .collect::<Vec<_>>()
+            .join("\n");
+        eprintln!(
+            "{} archived {} legacy-seed shadow file(s) into {} (recoverable for ~30 days):\n{}",
+            g.warn,
+            moved.len(),
+            snapshot_dir.display(),
+            moved_lines
+        );
+    }
     Ok(LegacySeedOutcome::Healed { count: moved.len(), snapshot_dir })
 }
 
@@ -1502,6 +1595,67 @@ fn gc_old_versions(g: &Glyphs, helper_dir: &Path, current_version: &str) {
     }
 }
 
+// Story 10.4 AC #4.2: a cross-platform source-scan gate asserting no
+// operator-facing refusal remediation in this file instructs a manual
+// `sudo rm` / "remove … manually". This is the cheapest durable guard
+// against the anti-pattern creeping back. It is NOT macOS-gated (it
+// scans source text, not behavior) so it runs on every CI platform.
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod refusal_copy_gate {
+    /// The full source of this module.
+    const SELF_SRC: &str = include_str!("mod.rs");
+
+    /// Robust marker: this module's `mod` line is the cut point. Built
+    /// at runtime (not a literal of the whole phrase) so it can't itself
+    /// be the first textual match.
+    fn module_decl_marker() -> String {
+        format!("mod {}", "refusal_copy_gate")
+    }
+
+    #[test]
+    fn no_remediation_copy_instructs_manual_rm() {
+        // Only scan PRODUCTION source — stop at this test module, whose
+        // own source contains these phrases as string literals and would
+        // self-trip. Cut at this module's `mod` declaration line. Fail
+        // loudly (not vacuously pass) if the marker is ever absent.
+        let marker = module_decl_marker();
+        let cut = SELF_SRC.find(&marker).expect("refusal_copy_gate module marker must be present");
+        let prod_src = &SELF_SRC[..cut];
+        // AC #4.2 pattern: `sudo rm` | `rm -` | "manually remove" |
+        // "remove … manually" (any-order). Code-comment lines (`//`) are
+        // skipped — the explanatory comments that mention these phrases
+        // are not operator-facing remediation copy.
+        let simple = ["sudo rm", "rm -", "manually remove"];
+        for (lineno, raw) in prod_src.lines().enumerate() {
+            if raw.trim_start().starts_with("//") {
+                continue;
+            }
+            let lower = raw.to_lowercase();
+            // "remove … manually" in either word order on the same line.
+            let remove_then_manually =
+                lower.find("remove").is_some_and(|i| lower[i..].contains("manual"));
+            assert!(
+                !remove_then_manually,
+                "refusal-copy gate (AC #4.2): line {} has a 'remove … manually' \
+                 instruction in non-comment source:\n  {}",
+                lineno + 1,
+                raw.trim()
+            );
+            for pat in simple {
+                assert!(
+                    !lower.contains(pat),
+                    "refusal-copy gate (AC #4.2): line {} contains forbidden \
+                     manual-removal phrase {:?} in non-comment source:\n  {}",
+                    lineno + 1,
+                    pat,
+                    raw.trim()
+                );
+            }
+        }
+    }
+}
+
 #[cfg(all(test, target_os = "macos"))]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -1540,10 +1694,14 @@ mod tests {
         assert_eq!(decide_legacy_seed(true, false, false), LegacySeedDecision::Archive);
     }
 
+    // Story 10.4 (decision B): `--upgrade` now ARCHIVES (was Refuse).
+    // This is the key behavior-change pin — `--upgrade` preserves
+    // operator config but archives the daemon-crashing shadow so the
+    // on-screen remedy makes progress instead of looping.
     #[test]
-    fn legacy_seed_upgrade_refuses_regardless_of_tty() {
-        assert_eq!(decide_legacy_seed(false, true, true), LegacySeedDecision::Refuse);
-        assert_eq!(decide_legacy_seed(false, true, false), LegacySeedDecision::Refuse);
+    fn legacy_seed_upgrade_archives_regardless_of_tty() {
+        assert_eq!(decide_legacy_seed(false, true, true), LegacySeedDecision::Archive);
+        assert_eq!(decide_legacy_seed(false, true, false), LegacySeedDecision::Archive);
     }
 
     #[test]
@@ -1551,6 +1709,9 @@ mod tests {
         assert_eq!(decide_legacy_seed(false, false, true), LegacySeedDecision::Prompt);
     }
 
+    // The ONLY remaining Refuse path: non-TTY with no flag. Both flags
+    // (--upgrade / --fresh-install) now make progress, so the
+    // heal_needs_decision remedy can never loop.
     #[test]
     fn legacy_seed_non_tty_no_flag_refuses() {
         assert_eq!(decide_legacy_seed(false, false, false), LegacySeedDecision::Refuse);
