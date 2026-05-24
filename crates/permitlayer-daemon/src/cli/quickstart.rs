@@ -280,8 +280,18 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
     };
 
     // ── Step 5 — register the agent bound to the resolved policy ────
+    // Story 10.7: `None` means the agent already existed — quickstart
+    // EXTENDS it (Step 6's connect path resolves the agent's current
+    // policy + adds the new service's scopes, bearer preserved) rather
+    // than aborting. A fresh registration returns `Some(bearer)`.
     let policy = policy_for(&service, write);
     let bearer = register_agent_capture_bearer(&handle, &agent_name, policy, &home).await?;
+    if bearer.is_none() {
+        println!(
+            "  agent '{agent_name}' already exists \u{2014} extending it with {service} \
+             (bearer token unchanged)"
+        );
+    }
 
     // ── Step 6 — drive the existing connect orchestration ───────────
     //
@@ -298,7 +308,10 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
         device_flow: false,
         device_flow_timeout: 120,
         force: false,
-        bearer_token: Some(bearer),
+        // Story 10.7: pass the fresh bearer for a new agent, or `None`
+        // for an existing one — connect resolves the existing token and
+        // emits the snippet either way.
+        bearer_token: bearer,
         mcp_config_out: args.mcp_config_out.clone(),
         allow_root: args.allow_root,
     })
@@ -473,12 +486,22 @@ async fn probe_kill_state_or_exit() -> Result<()> {
 /// error_block on a non-`ok` status, and on success extract
 /// `bearer_token` (the exact field `agent.rs` reads) into memory ONLY
 /// — quickstart never writes it.
+/// Register the agent and capture its bearer token for the snippet.
+///
+/// Story 10.7 (idempotency): returns `Ok(None)` when the agent ALREADY
+/// exists (`agent.duplicate_name`) instead of aborting with a
+/// "remove it first" remediation. The caller then skips the
+/// fresh-register output and proceeds to the connect-extend path
+/// (Step 6), which resolves the agent's current policy, adds the new
+/// service's scopes (materializing a per-agent policy if needed,
+/// Story 10.5/10.6), rebinds with the bearer PRESERVED, and emits the
+/// snippet. `Ok(Some(bearer))` is a freshly-registered agent.
 async fn register_agent_capture_bearer(
     handle: &crate::cli::connect_uds::ConnectControlHandle,
     agent: &str,
     policy: &str,
     home: &std::path::Path,
-) -> Result<String> {
+) -> Result<Option<String>> {
     let body = serde_json::json!({
         "name": agent,
         "policy_name": policy,
@@ -542,8 +565,16 @@ async fn register_agent_capture_bearer(
     if status == Some("error") {
         let code = parsed["code"].as_str().unwrap_or("agent.unknown_error").to_owned();
         let message = parsed["message"].as_str().unwrap_or("(no message provided)").to_owned();
+        // Story 10.7: an already-registered agent is NOT an error for
+        // quickstart — it means "extend this agent." Return Ok(None) so
+        // the caller proceeds to the connect-extend path (which adds the
+        // new service's scopes, preserving the existing bearer) instead
+        // of telling the operator to destroy + recreate the agent.
+        if code == "agent.duplicate_name" {
+            tracing::debug!(agent, "quickstart: agent exists — extending instead of re-registering");
+            return Ok(None);
+        }
         let remediation = match code.as_str() {
-            "agent.duplicate_name" => format!("agentsso agent remove {agent}"),
             "agent.unknown_policy" => format!(
                 "the shipped policy '{policy}' is missing from {}/policies — run \
                  sudo agentsso setup to restage the managed bundle",
@@ -584,7 +615,7 @@ async fn register_agent_capture_bearer(
         );
         return Err(silent_cli_error("quickstart: agent register missing bearer token"));
     }
-    Ok(bearer)
+    Ok(Some(bearer))
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
