@@ -571,7 +571,10 @@ async fn register_agent_capture_bearer(
         // new service's scopes, preserving the existing bearer) instead
         // of telling the operator to destroy + recreate the agent.
         if code == "agent.duplicate_name" {
-            tracing::debug!(agent, "quickstart: agent exists — extending instead of re-registering");
+            tracing::debug!(
+                agent,
+                "quickstart: agent exists — extending instead of re-registering"
+            );
             return Ok(None);
         }
         let remediation = match code.as_str() {
