@@ -448,6 +448,11 @@ pub(crate) struct CredentialsVerifyStructuredError {
 #[derive(Debug, Serialize)]
 pub(crate) struct PolicyScopesRequest<'a> {
     pub short_names: &'a [&'a str],
+    /// Story 10.6: the agent being extended. The daemon materializes a
+    /// per-agent operator policy under this name when the agent's bound
+    /// policy is a managed tier that can't be extended in place.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub agent_name: Option<&'a str>,
 }
 
 #[allow(dead_code)]
