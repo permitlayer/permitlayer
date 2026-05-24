@@ -138,6 +138,17 @@ pub enum PolicyEditError {
         #[source]
         source: toml::ser::Error,
     },
+
+    /// Story 10.5: the per-agent materialization target name is unsafe
+    /// to use as a policy file name — empty, contains a path separator
+    /// or `..` (path-traversal), or equals the managed policy name it
+    /// would materialize from (which would shadow the managed tier).
+    /// The agent name must be a single safe path component distinct
+    /// from the managed policy. (Defense-in-depth: callers SHOULD
+    /// validate agent names upstream, but this layer turns the name
+    /// into a filesystem path, so it refuses unsafe input.)
+    #[error("invalid materialization target name {name:?}: {reason}")]
+    InvalidMaterializeName { name: String, reason: &'static str },
 }
 
 fn legacy_policy_path(policies_dir: &Path, policy_name: &str) -> PathBuf {
@@ -388,6 +399,71 @@ pub fn add_scopes_to_policy_layered(
     policy_name: &str,
     scopes_to_add: &[&str],
 ) -> Result<ScopeMergeDiff, PolicyEditError> {
+    // Delegate with no materialization target → preserves the original
+    // Option-B strict behavior (managed-only + missing scope ⇒ 404). The
+    // connect/quickstart path (Story 10.6) calls the materializing
+    // variant with the agent name instead.
+    add_scopes_to_policy_materializing(operator_dir, managed_dir, policy_name, None, scopes_to_add)
+}
+
+/// Story 10.5 — per-agent materialization. Like
+/// [`add_scopes_to_policy_layered`], but when `materialize_as` is
+/// `Some(agent)` AND the target policy exists only in the managed layer
+/// AND a requested scope is missing from it, materialize a PER-AGENT
+/// operator policy (named `agent`, seeded from the managed policy's
+/// source) and add the requested scopes to it — instead of returning
+/// `PolicyFileNotFound`. This is the documented reversal of the C1
+/// "Option B" decision for the cross-service extend case only
+/// (`sprint-change-proposal-2026-05-23.md`): per-agent, not an override
+/// of the shared managed name, so there is no shared-state leak and no
+/// collision with the legacy-seed shadow-heal.
+///
+/// With `materialize_as = None` the behavior is identical to the
+/// pre-10.5 layered merge (strict managed-only no-op-or-404).
+pub fn add_scopes_to_policy_materializing(
+    operator_dir: &Path,
+    managed_dir: Option<&Path>,
+    policy_name: &str,
+    materialize_as: Option<&str>,
+    scopes_to_add: &[&str],
+) -> Result<ScopeMergeDiff, PolicyEditError> {
+    // Story 10.5 — validate the materialization target BEFORE it can
+    // become a filesystem path or a managed-tier shadow. The agent name
+    // flows into `legacy_policy_path(operator_dir, agent)` =
+    // `operator_dir/<agent>.toml`, so an unvalidated name like `../x` or
+    // `a/b` would write outside the operator dir (path traversal), and a
+    // name equal to `policy_name` would materialize an operator file
+    // under the managed tier's name (the shadow this design forbids).
+    if let Some(agent) = materialize_as {
+        let invalid = if agent.is_empty() {
+            Some("empty name")
+        } else if agent.contains('/') || agent.contains('\\') {
+            Some("contains a path separator")
+        } else if agent == "." || agent == ".." || agent.contains("..") {
+            Some("contains a path-traversal component")
+        } else if agent == policy_name {
+            Some("equals the managed policy name (would shadow the managed tier)")
+        } else {
+            None
+        };
+        if let Some(reason) = invalid {
+            return Err(PolicyEditError::InvalidMaterializeName { name: agent.to_owned(), reason });
+        }
+    }
+    // If a materialization target is given and a policy by THAT name
+    // already exists in the operator layer, accrete in place (the agent
+    // was already extended once). Try it first so re-runs are idempotent.
+    if let Some(agent) = materialize_as
+        && agent != policy_name
+    {
+        match add_scopes_to_policy(operator_dir, agent, scopes_to_add) {
+            Ok(diff) => return Ok(diff),
+            Err(PolicyEditError::PolicyFileNotFound { .. }) => {
+                // Fall through to the managed-layer / materialize path.
+            }
+            Err(other) => return Err(other),
+        }
+    }
     match add_scopes_to_policy(operator_dir, policy_name, scopes_to_add) {
         Ok(diff) => Ok(diff),
         Err(PolicyEditError::PolicyFileNotFound { path }) => {
@@ -431,7 +507,23 @@ pub fn add_scopes_to_policy_layered(
                 .filter(|s| !managed_policy.scope_allowlist.contains(*s))
                 .collect();
             if !missing.is_empty() {
-                return Err(PolicyEditError::PolicyFileNotFound { path });
+                // Story 10.5: a requested scope is missing from the
+                // managed tier. If we were given a per-agent
+                // materialization target, materialize an operator-layer
+                // copy of this managed policy UNDER THE AGENT NAME and
+                // add the scopes there (the connect/quickstart
+                // "add a service" path). Otherwise preserve the strict
+                // Option-B 404 (no silent broadening of a shared tier).
+                let Some(agent) = materialize_as else {
+                    return Err(PolicyEditError::PolicyFileNotFound { path });
+                };
+                return materialize_per_agent_policy(
+                    operator_dir,
+                    managed_dir,
+                    policy_name,
+                    agent,
+                    scopes_to_add,
+                );
             }
 
             // No-op merge: the managed policy already covers every
@@ -454,6 +546,63 @@ pub fn add_scopes_to_policy_layered(
             })
         }
         Err(other) => Err(other),
+    }
+}
+
+/// Story 10.5 — materialize a PER-AGENT operator policy from a managed
+/// tier, then add the requested scopes to it.
+///
+/// Copies the managed policy's SOURCE `[[policies]]` entry (preserving
+/// resources / approval-mode / rules exactly — reconstructing from the
+/// resolved `Policy` would be lossy for the resource matcher), rewrites
+/// its `name` to `agent`, writes it atomically into `operator_dir` as
+/// `<agent>.toml`, then delegates to [`add_scopes_to_policy`] to add the
+/// new scopes (reusing its round-trip-validate + atomic-write path).
+///
+/// The materialized name is the AGENT name, never the managed policy
+/// name, so it does not shadow the managed tier and never trips Story
+/// 10.2's legacy-seed shadow-heal (`find_shadowing_files` only flags
+/// operator files declaring a *managed* name without an override
+/// marker).
+fn materialize_per_agent_policy(
+    operator_dir: &Path,
+    managed_dir: &Path,
+    managed_policy_name: &str,
+    agent: &str,
+    scopes_to_add: &[&str],
+) -> Result<ScopeMergeDiff, PolicyEditError> {
+    // Pull the managed policy's source TOML entry. `resolve_policy_file`
+    // returns the parsed file + the target index; we OWN that file, so
+    // move the entry out rather than clone (TomlPolicy is not Clone).
+    let (_managed_path, mut managed_file, idx) =
+        resolve_policy_file(managed_dir, managed_policy_name)?;
+    let mut policy = managed_file.policies.swap_remove(idx);
+    // Re-key under the agent name so it's a distinct, per-agent operator
+    // policy — NOT an override of the managed tier.
+    policy.name = agent.to_owned();
+    let materialized = TomlPolicyFile { policies: vec![policy] };
+    let serialized = toml_serialize_policy_file(&materialized)?;
+
+    let target_path = legacy_policy_path(operator_dir, agent);
+    // Round-trip validate BEFORE writing (mirror add_scopes_to_policy):
+    // a managed policy re-keyed to a new name must still compile.
+    PolicySet::compile_from_str(&serialized, &target_path)
+        .map_err(|source| PolicyEditError::CompileFailedAfterEdit { source })?;
+    write_atomic(&target_path, serialized.as_bytes())?;
+
+    // Now add the requested scopes to the freshly-materialized operator
+    // policy (idempotent + validated + atomic). The diff this returns
+    // describes the agent policy + the added scopes. If this fails AFTER
+    // we wrote the seed file, remove the seed so we don't leave a
+    // per-agent policy that carries only the managed scopes and silently
+    // lacks the scope the operator just granted (a retry would otherwise
+    // accrete onto a half-materialized file — cleaner to fail atomically).
+    match add_scopes_to_policy(operator_dir, agent, scopes_to_add) {
+        Ok(diff) => Ok(diff),
+        Err(e) => {
+            let _ = std::fs::remove_file(&target_path);
+            Err(e)
+        }
     }
 }
 
@@ -1179,6 +1328,267 @@ auto-approve-reads = true
             "a managed policy lacking the requested scope must error (no silent grant), got {err:?}"
         );
         assert!(std::fs::read_dir(&operator).unwrap().next().is_none());
+    }
+
+    // ── Story 10.5: per-agent materialization ──────────────────────
+
+    /// `materialize_as = None` preserves the strict Option-B 404 — the
+    /// existing `add_scopes_to_policy_layered` behavior is unchanged.
+    #[test]
+    fn materializing_none_keeps_strict_404() {
+        let tmp = tempfile::tempdir().unwrap();
+        let operator = tmp.path().join("policies");
+        let managed = tmp.path().join("policies-managed");
+        std::fs::create_dir_all(&operator).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        write_named_policy_file(&managed, "default.toml", MANAGED_TWO_TIERS);
+        let err = add_scopes_to_policy_materializing(
+            &operator,
+            Some(&managed),
+            "gmail-read-only",
+            None,
+            &["gmail.send"],
+        )
+        .unwrap_err();
+        assert!(matches!(err, PolicyEditError::PolicyFileNotFound { .. }));
+        assert!(std::fs::read_dir(&operator).unwrap().next().is_none());
+    }
+
+    /// The flagship 10.5 path: agent on managed `gmail-read-only`, add a
+    /// scope the tier lacks (a different service) WITH a per-agent
+    /// target → materialize an operator policy named after the agent,
+    /// carrying the managed tier's scopes + the new one. Managed dir
+    /// untouched; the operator file is named for the agent (not the
+    /// managed policy → no shadow).
+    #[test]
+    fn materializing_creates_per_agent_policy_on_missing_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let operator = tmp.path().join("policies");
+        let managed = tmp.path().join("policies-managed");
+        std::fs::create_dir_all(&operator).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        write_named_policy_file(&managed, "default.toml", MANAGED_TWO_TIERS);
+
+        // Agent "angie" is bound to gmail-read-only; add a write scope
+        // the read-only tier lacks. Materialize under the agent name.
+        let diff = add_scopes_to_policy_materializing(
+            &operator,
+            Some(&managed),
+            "gmail-read-only",
+            Some("angie"),
+            &["gmail.send"],
+        )
+        .unwrap();
+
+        assert_eq!(diff.policy_name, "angie");
+        assert!(diff.added.contains(&"gmail.send".to_owned()));
+        // Operator file is named for the AGENT, not the managed policy.
+        let agent_file = operator.join("angie.toml");
+        assert!(agent_file.exists(), "per-agent operator policy must be materialized");
+        assert!(
+            !operator.join("gmail-read-only.toml").exists(),
+            "must NOT materialize under the managed name (no shadow)"
+        );
+        let parsed: TomlPolicyFile =
+            toml::from_str(&std::fs::read_to_string(&agent_file).unwrap()).unwrap();
+        let p = &parsed.policies[0];
+        assert_eq!(p.name, "angie");
+        // Carries the managed tier's scopes + the new one.
+        assert!(p.scopes.contains(&"gmail.readonly".to_owned()));
+        assert!(p.scopes.contains(&"gmail.metadata".to_owned()));
+        assert!(p.scopes.contains(&"gmail.send".to_owned()));
+        // Managed dir is pristine (no operator copy seeded there).
+        let managed_after = std::fs::read_to_string(managed.join("default.toml")).unwrap();
+        assert_eq!(managed_after, MANAGED_TWO_TIERS, "managed bundle must be untouched");
+    }
+
+    /// Idempotency + accretion: a SECOND extend for the same agent
+    /// accretes into the existing per-agent operator policy (no second
+    /// materialize, no managed re-read needed).
+    #[test]
+    fn materializing_second_extend_accretes_in_place() {
+        let tmp = tempfile::tempdir().unwrap();
+        let operator = tmp.path().join("policies");
+        let managed = tmp.path().join("policies-managed");
+        std::fs::create_dir_all(&operator).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        write_named_policy_file(&managed, "default.toml", MANAGED_TWO_TIERS);
+
+        // First extend materializes.
+        add_scopes_to_policy_materializing(
+            &operator,
+            Some(&managed),
+            "gmail-read-only",
+            Some("angie"),
+            &["gmail.send"],
+        )
+        .unwrap();
+        // Second extend (another write scope) accretes in place.
+        let diff = add_scopes_to_policy_materializing(
+            &operator,
+            Some(&managed),
+            "gmail-read-only",
+            Some("angie"),
+            &["gmail.compose"],
+        )
+        .unwrap();
+        assert_eq!(diff.policy_name, "angie");
+        assert!(diff.added.contains(&"gmail.compose".to_owned()));
+        let parsed: TomlPolicyFile =
+            toml::from_str(&std::fs::read_to_string(operator.join("angie.toml")).unwrap()).unwrap();
+        let scopes = &parsed.policies[0].scopes;
+        for s in ["gmail.readonly", "gmail.metadata", "gmail.send", "gmail.compose"] {
+            assert!(scopes.contains(&s.to_owned()), "missing {s} after accretion");
+        }
+        // Re-running with an already-present scope is a no-op.
+        let noop = add_scopes_to_policy_materializing(
+            &operator,
+            Some(&managed),
+            "gmail-read-only",
+            Some("angie"),
+            &["gmail.send"],
+        )
+        .unwrap();
+        assert!(noop.is_no_op());
+    }
+
+    /// With a per-agent target, a managed tier that ALREADY covers every
+    /// requested scope is still a no-op — do NOT materialize when nothing
+    /// would be added.
+    #[test]
+    fn materializing_noop_when_managed_covers_all() {
+        let tmp = tempfile::tempdir().unwrap();
+        let operator = tmp.path().join("policies");
+        let managed = tmp.path().join("policies-managed");
+        std::fs::create_dir_all(&operator).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        write_named_policy_file(&managed, "default.toml", MANAGED_TWO_TIERS);
+        let diff = add_scopes_to_policy_materializing(
+            &operator,
+            Some(&managed),
+            "gmail-read-only",
+            Some("angie"),
+            &["gmail.readonly"],
+        )
+        .unwrap();
+        assert!(diff.is_no_op(), "covered request must not materialize");
+        assert!(
+            std::fs::read_dir(&operator).unwrap().next().is_none(),
+            "no operator file when nothing would be added"
+        );
+    }
+
+    /// Review H1: an agent name that would escape the operator dir as a
+    /// path (separator / `..`) is rejected — no traversal write.
+    #[test]
+    fn materializing_rejects_unsafe_agent_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let operator = tmp.path().join("policies");
+        let managed = tmp.path().join("policies-managed");
+        std::fs::create_dir_all(&operator).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        write_named_policy_file(&managed, "default.toml", MANAGED_TWO_TIERS);
+        for bad in ["../escape", "a/b", "..", "", "x/../y"] {
+            let err = add_scopes_to_policy_materializing(
+                &operator,
+                Some(&managed),
+                "gmail-read-only",
+                Some(bad),
+                &["gmail.send"],
+            )
+            .unwrap_err();
+            assert!(
+                matches!(err, PolicyEditError::InvalidMaterializeName { .. }),
+                "agent name {bad:?} must be rejected, got {err:?}"
+            );
+        }
+        // Nothing was written anywhere under operator.
+        assert!(std::fs::read_dir(&operator).unwrap().next().is_none());
+    }
+
+    /// Review H2: an agent name equal to the managed policy name is
+    /// rejected — materializing under the managed name would shadow the
+    /// tier (the invariant this design forbids).
+    #[test]
+    fn materializing_rejects_agent_name_equal_to_managed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let operator = tmp.path().join("policies");
+        let managed = tmp.path().join("policies-managed");
+        std::fs::create_dir_all(&operator).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        write_named_policy_file(&managed, "default.toml", MANAGED_TWO_TIERS);
+        let err = add_scopes_to_policy_materializing(
+            &operator,
+            Some(&managed),
+            "gmail-read-only",
+            Some("gmail-read-only"), // == managed name
+            &["gmail.send"],
+        )
+        .unwrap_err();
+        assert!(matches!(err, PolicyEditError::InvalidMaterializeName { .. }));
+        assert!(
+            !operator.join("gmail-read-only.toml").exists(),
+            "must not materialize a shadow under the managed name"
+        );
+    }
+
+    /// Review A4 / AC #4: with NO materialize target, a managed policy
+    /// missing the requested scope still errors (no silent grant) — the
+    /// Option-B contract is preserved alongside the new path.
+    #[test]
+    fn materializing_none_missing_scope_no_silent_grant() {
+        let tmp = tempfile::tempdir().unwrap();
+        let operator = tmp.path().join("policies");
+        let managed = tmp.path().join("policies-managed");
+        std::fs::create_dir_all(&operator).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        write_named_policy_file(&managed, "default.toml", MANAGED_TWO_TIERS);
+        let err = add_scopes_to_policy_materializing(
+            &operator,
+            Some(&managed),
+            "gmail-read-only",
+            None,
+            &["gmail.send"], // not in read-only tier
+        )
+        .unwrap_err();
+        assert!(matches!(err, PolicyEditError::PolicyFileNotFound { .. }));
+        assert!(std::fs::read_dir(&operator).unwrap().next().is_none());
+    }
+
+    /// Review L5: prove the second extend does NOT re-read the managed
+    /// layer — delete the managed dir entirely before the second call;
+    /// in-place accretion on the per-agent operator policy must still
+    /// succeed.
+    #[test]
+    fn materializing_second_extend_does_not_touch_managed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let operator = tmp.path().join("policies");
+        let managed = tmp.path().join("policies-managed");
+        std::fs::create_dir_all(&operator).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        write_named_policy_file(&managed, "default.toml", MANAGED_TWO_TIERS);
+        add_scopes_to_policy_materializing(
+            &operator,
+            Some(&managed),
+            "gmail-read-only",
+            Some("angie"),
+            &["gmail.send"],
+        )
+        .unwrap();
+        // Nuke the managed layer — the second extend must not need it.
+        std::fs::remove_dir_all(&managed).unwrap();
+        let diff = add_scopes_to_policy_materializing(
+            &operator,
+            Some(&managed),
+            "gmail-read-only",
+            Some("angie"),
+            &["gmail.compose"],
+        )
+        .unwrap();
+        assert!(diff.added.contains(&"gmail.compose".to_owned()));
+        let parsed: TomlPolicyFile =
+            toml::from_str(&std::fs::read_to_string(operator.join("angie.toml")).unwrap()).unwrap();
+        assert!(parsed.policies[0].scopes.contains(&"gmail.compose".to_owned()));
     }
 
     /// An operator-layer policy still gets the real add-scopes merge;
