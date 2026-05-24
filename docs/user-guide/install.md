@@ -77,6 +77,42 @@ macOS may display a "Background item added" notification. If
 **System Settings → General → Login Items → Allow in the
 Background** and confirm permitlayer is enabled.
 
+### `agentsso setup` — the self-healing install/upgrade verb
+
+`sudo agentsso setup` is the recommended one-command install **and**
+upgrade path. It is idempotent: run it on a fresh machine to install,
+and run it again after every `brew upgrade agentsso` to roll the new
+binary into place. Unlike a bare `service install`, `setup` detects and
+repairs the common refusal conditions itself (re-staging the privileged
+binary, re-pointing the version symlink, re-bootstrapping a wedged
+LaunchDaemon) rather than handing you a list of `launchctl` commands to
+run by hand.
+
+The one decision `setup` cannot make for you is what to do with a
+**legacy operator policy that shadows a shipped (managed) policy** —
+older releases seeded operator policies that now collide with the
+managed bundle and would crash the daemon on boot. On an interactive
+terminal `setup` prompts you (default Yes) before archiving the shadow
+aside. For non-interactive / scripted runs, pass one of:
+
+| Flag | Effect |
+|------|--------|
+| (none, interactive TTY) | Prompts before archiving any shadowing policy; archives on Yes. |
+| `--upgrade` | Preserve **all** your operator config; archive only the daemon-crashing shadow(s) aside, then continue. Use this for routine upgrades. |
+| `--fresh-install` | Archive the shadow(s) **and** wipe operator state (vault, agents, policies) for a clean slate. Destructive — only for a deliberate reset. |
+
+In every case the archived shadow is **moved, not deleted** — into
+`/Library/Application Support/permitlayer/policies/.legacy-seed-snapshot-<timestamp>/`,
+recoverable for ~30 days (`agentsso doctor --fix` garbage-collects
+snapshots older than 30 days). `setup` never asks you to `sudo rm` a
+file: if a path is in the way, it either heals it or tells you exactly
+what is holding it.
+
+```sh
+sudo agentsso setup              # install, or upgrade with an interactive prompt
+sudo agentsso setup --upgrade    # scripted upgrade: keep config, archive shadows, continue
+```
+
 To add additional operators to the control-plane group:
 
 ```sh
@@ -264,11 +300,13 @@ Other common failures:
 - **Stale binary after `brew upgrade agentsso`**: the privileged
   helper copy at `/Library/PrivilegedHelperTools/agentsso` is what
   the LaunchDaemon executes; `brew upgrade` only refreshes
-  `/opt/homebrew/bin/agentsso`. Re-run `sudo agentsso service
-  install` after every `brew upgrade` to copy the new binary into
-  place and kick the LaunchDaemon. The master key in System.keychain
-  is preserved (`-A` ACL is independent of the binary's codesign
-  hash), so sealed credentials survive the upgrade.
+  `/opt/homebrew/bin/agentsso`. Re-run `sudo agentsso setup` after
+  every `brew upgrade` to roll the new binary into place and
+  re-bootstrap the LaunchDaemon (`setup` is the self-healing
+  install/upgrade verb — see [above](#agentsso-setup--the-self-healing-installupgrade-verb)).
+  The master key in System.keychain is preserved (`-A` ACL is
+  independent of the binary's codesign hash), so sealed credentials
+  survive the upgrade.
 
 ### `agentsso connect` returns a permission error
 

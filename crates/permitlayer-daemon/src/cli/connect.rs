@@ -1279,7 +1279,13 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
     // CLI POSTs the short-name diff to `/v1/control/policy/{name}/scopes`
     // and the daemon owns the file-write + ArcSwap reload. No-op merges
     // surface as `reloaded: false` in the response.
-    let scopes_req = super::connect_uds::PolicyScopesRequest { short_names: &short_names };
+    // Story 10.6: pass the agent name so the daemon materializes a
+    // per-agent operator policy (Story 10.5) when `agent_policy_name` is
+    // a managed tier that can't gain the new service's scopes in place.
+    let scopes_req = super::connect_uds::PolicyScopesRequest {
+        short_names: &short_names,
+        agent_name: Some(args.agent.as_str()),
+    };
     let policy_outcome =
         super::connect_uds::post_policy_scopes(&control_handle, &agent_policy_name, &scopes_req)
             .await;
@@ -1409,19 +1415,35 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
 
     // ── Step 6 — rebind ────────────────────────────────────────────
     //
-    // Re-binding the agent to its own current policy is a server-side
-    // no-op (Story 7.11 round-1 P5 short-circuit). We POST anyway so
-    // that the agent's `last_seen_at` updates and any registry-cache
-    // staleness gets cleared. If the rebind fails we emit a
-    // structured error and exit 3.
-    match post_rebind(&home, &args.agent, &agent_policy_name).await {
+    // Story 10.6: rebind to the policy the scope-merge actually wrote —
+    // `policy_resp.policy_name`. When the daemon materialized a per-agent
+    // operator policy (Story 10.5), this is the AGENT name (≠ the managed
+    // tier the agent was on), so the rebind moves the agent onto its new
+    // per-agent policy. For an in-place accrete or a managed no-op it
+    // equals `agent_policy_name`, so the rebind is the same server-side
+    // no-op as before (Story 7.11 P5 short-circuit) — we POST anyway to
+    // refresh `last_seen_at` / clear registry-cache staleness. The bearer
+    // token is preserved across the rebind (7.11/7.36). On failure we
+    // emit a structured error and exit 3.
+    let rebind_target = &policy_resp.policy_name;
+    match post_rebind(&home, &args.agent, rebind_target).await {
         Ok(()) => {
             if interactive {
                 let check = styled("\u{2713}", theme.tokens().accent, color_support);
                 println!(
                     "  {check} agent '{}' \u{00b7} bound to policy '{}'",
-                    args.agent, agent_policy_name
+                    args.agent, rebind_target
                 );
+                // Story 10.6: if the daemon materialized a per-agent
+                // policy, the bound policy name changed from the managed
+                // tier — say so explicitly so the identity change is not
+                // silent.
+                if rebind_target != &agent_policy_name {
+                    println!(
+                        "    (extended into a per-agent policy '{}' — was on managed tier '{}')",
+                        rebind_target, agent_policy_name
+                    );
+                }
                 // Story 7.36 AC #1: tell the operator the bearer was
                 // NOT touched, so a later token problem isn't misread
                 // as connect having orphaned it.
@@ -1429,7 +1451,8 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
             } else {
                 tracing::info!(
                     agent = %args.agent,
-                    policy = %agent_policy_name,
+                    policy = %rebind_target,
+                    prior_policy = %agent_policy_name,
                     bearer_preserved = true,
                     "rebind ok; bearer token preserved (policy-only change)"
                 );

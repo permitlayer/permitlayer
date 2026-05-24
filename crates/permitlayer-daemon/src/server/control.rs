@@ -3866,6 +3866,13 @@ pub(crate) struct PolicyScopesAddRequest {
     /// (e.g. `["gmail.readonly", "gmail.modify"]`). NOT full Google
     /// scope URIs — the CLI maps URIs to shorts before sending.
     pub short_names: Vec<String>,
+    /// Story 10.6: the agent being extended. When present AND the named
+    /// policy is a managed single-service tier lacking a requested
+    /// scope, the editor materializes a PER-AGENT operator policy under
+    /// this name (Story 10.5) instead of refusing. Absent (older
+    /// clients) → strict managed-only no-op-or-404 behavior.
+    #[serde(default)]
+    pub agent_name: Option<String>,
 }
 
 /// Response body for `POST /v1/control/policy/{policy_name}/scopes`.
@@ -3993,13 +4000,19 @@ pub(crate) async fn policy_scopes_handler(
     let managed_dir = permitlayer_core::paths::managed_policies_dir_for_operator(&policies_dir);
     let policy_name_for_blocking = policy_name.clone();
     let short_names_for_blocking: Vec<String> = payload.short_names.clone();
+    // Story 10.6: thread the agent name so the editor can materialize a
+    // per-agent operator policy (Story 10.5) when the agent's bound
+    // policy is a managed tier lacking a requested scope. Absent →
+    // `materialize_as = None` → unchanged strict managed-only behavior.
+    let materialize_as_for_blocking: Option<String> = payload.agent_name.clone();
     let edit_result = tokio::task::spawn_blocking(move || {
         let short_name_refs: Vec<&str> =
             short_names_for_blocking.iter().map(String::as_str).collect();
-        permitlayer_core::policy::edit::add_scopes_to_policy_layered(
+        permitlayer_core::policy::edit::add_scopes_to_policy_materializing(
             &policies_dir,
             managed_dir.as_deref(),
             &policy_name_for_blocking,
+            materialize_as_for_blocking.as_deref(),
             &short_name_refs,
         )
     })
@@ -4163,7 +4176,12 @@ pub(crate) async fn policy_scopes_handler(
     (
         StatusCode::OK,
         Json(PolicyScopesAddResponse {
-            policy_name,
+            // Story 10.6: report the policy the merge ACTUALLY wrote —
+            // `diff.policy_name`. When the editor materialized a
+            // per-agent policy (Story 10.5) this is the AGENT name, not
+            // the URL `policy_name` (the managed tier). connect rebinds
+            // the agent to this, so it must be the materialized name.
+            policy_name: diff.policy_name,
             before: diff.before,
             added: diff.added,
             after: diff.after,
@@ -4228,6 +4246,7 @@ fn policy_edit_error_code(err: &permitlayer_core::policy::edit::PolicyEditError)
         PolicyEditError::CompileFailedAfterEdit { .. } => "policy.compile_failed_after_edit",
         PolicyEditError::Io { .. } => "policy.io_failed",
         PolicyEditError::SerializeFailed { .. } => "policy.serialize_failed",
+        PolicyEditError::InvalidMaterializeName { .. } => "policy.invalid_agent_name",
     }
 }
 
@@ -4289,6 +4308,12 @@ fn policy_edit_error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             "policy.serialize_failed",
             format!("policy TOML serialize failed: {source}"),
+            Some(request_id.to_owned()),
+        ),
+        PolicyEditError::InvalidMaterializeName { name, reason } => agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "policy.invalid_agent_name",
+            format!("cannot materialize a per-agent policy for {name:?}: {reason}"),
             Some(request_id.to_owned()),
         ),
     }
@@ -7919,6 +7944,25 @@ auto-approve-reads = true
         r
     }
 
+    /// Story 10.6: scopes request carrying the agent name (enables
+    /// per-agent materialization on a managed-only tier).
+    fn post_policy_scopes_for_agent(
+        policy_name: &str,
+        agent: &str,
+        short_names: &[&str],
+    ) -> Request<Body> {
+        let body = serde_json::json!({ "short_names": short_names, "agent_name": agent });
+        let mut r = Request::builder()
+            .method(Method::POST)
+            .uri(format!("/v1/control/policy/{policy_name}/scopes"))
+            .header("content-type", "application/json")
+            .header("x-agentsso-control", test_control_token_header())
+            .body(Body::from(serde_json::to_vec(&body).unwrap()))
+            .unwrap();
+        r.extensions_mut().insert(ConnectInfo(loopback_v4()));
+        r
+    }
+
     #[tokio::test]
     async fn policy_scopes_handler_multi_policy_default_toml_noops_for_seeded_gmail() {
         let home_tmp = tempfile::tempdir().unwrap();
@@ -7973,6 +8017,69 @@ auto-approve-reads = true
             parsed.policies.iter().find(|p| p.name == "calendar-prompt-on-write").unwrap();
         assert_eq!(calendar.resources, vec!["primary"]);
         assert_eq!(calendar.rules.len(), 1);
+    }
+
+    /// Story 10.6: posting with `agent_name` against a managed-only
+    /// tier that lacks the requested scope materializes a PER-AGENT
+    /// operator policy (Story 10.5) and returns its name — instead of a
+    /// 404. The managed bundle lives ONLY in the sibling
+    /// `policies-managed/` dir; the operator dir starts empty.
+    #[tokio::test]
+    async fn policy_scopes_handler_materializes_per_agent_on_missing_scope() {
+        let state = tempfile::tempdir().unwrap();
+        let operator = state.path().join("policies");
+        let managed = state.path().join("policies-managed");
+        std::fs::create_dir_all(&operator).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        // Managed-only gmail-read-only tier (no calendar scopes).
+        stage_multi_policy_default(&managed, &["gmail.readonly"]);
+
+        let app = build_with_policies_dir(operator.clone(), None);
+        // Agent "angie" on gmail-read-only requests a calendar scope it lacks.
+        let resp = app
+            .oneshot(post_policy_scopes_for_agent(
+                "gmail-read-only",
+                "angie",
+                &["calendar.readonly"],
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::OK);
+        let json = body_json(resp).await;
+        // Materialized under the AGENT name, not the managed tier.
+        assert_eq!(json["policy_name"], "angie");
+        assert!(operator.join("angie.toml").exists(), "per-agent policy materialized");
+        assert!(!operator.join("gmail-read-only.toml").exists(), "no shadow under managed name");
+        // The managed bundle is untouched.
+        assert!(managed.join("default.toml").exists());
+    }
+
+    /// Story 10.6 / H2: an agent name equal to the managed policy name
+    /// is rejected (would shadow the tier) — 400, no file written.
+    #[tokio::test]
+    async fn policy_scopes_handler_rejects_agent_name_colliding_with_managed() {
+        let state = tempfile::tempdir().unwrap();
+        let operator = state.path().join("policies");
+        let managed = state.path().join("policies-managed");
+        std::fs::create_dir_all(&operator).unwrap();
+        std::fs::create_dir_all(&managed).unwrap();
+        stage_multi_policy_default(&managed, &["gmail.readonly"]);
+
+        let app = build_with_policies_dir(operator.clone(), None);
+        let resp = app
+            .oneshot(post_policy_scopes_for_agent(
+                "gmail-read-only",
+                "gmail-read-only", // collides with the managed name
+                &["calendar.readonly"],
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        let json = body_json(resp).await;
+        assert_eq!(json["code"], "policy.invalid_agent_name");
+        assert!(!operator.join("gmail-read-only.toml").exists());
     }
 
     #[tokio::test]
