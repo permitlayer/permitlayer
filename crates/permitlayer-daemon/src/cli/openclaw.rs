@@ -218,6 +218,27 @@ mod tests {
     }
 
     #[test]
+    fn snippet_always_carries_scope_header_even_with_placeholder_bearer() {
+        // Story 10.8 AC #7 regression guard: the chain that broke Angie-2
+        // started when an operator hand-built a calendar MCP entry that
+        // dropped the `x-agentsso-scope` header. The structural defense is
+        // that EVERY snippet we emit carries the header — including the
+        // existing-agent placeholder path (no real bearer in hand).
+        let addr: SocketAddr = "127.0.0.1:3820".parse().unwrap();
+        let snippet = build_snippet(
+            "calendar",
+            "<PASTE_YOUR_EXISTING_BEARER_TOKEN>",
+            addr,
+            "calendar.readonly",
+        );
+        assert_eq!(snippet["headers"]["x-agentsso-scope"], "calendar.readonly");
+        assert!(
+            !snippet["headers"]["x-agentsso-scope"].is_null(),
+            "scope header must never be absent"
+        );
+    }
+
+    #[test]
     fn snippet_uses_passed_first_policy_scope() {
         let addr: SocketAddr = "127.0.0.1:3820".parse().unwrap();
         let snippet = build_snippet("calendar", "agt_v2_alice_secret", addr, "calendar.readonly");

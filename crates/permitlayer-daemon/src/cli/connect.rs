@@ -492,10 +492,11 @@ pub struct ConnectArgs {
     /// `~/.zsh_history`) and are visible to other users on the host via
     /// `ps auxww` / `/proc/<pid>/cmdline`. The env var avoids both leaks.
     ///
-    /// In interactive mode, omitting both this flag and the env var
-    /// prompts via stdin (`dialoguer::Password`, hidden echo). In
-    /// `--non-interactive` mode without either, the snippet uses a
-    /// `<REPLACE_WITH_TOKEN>` placeholder for downstream substitution.
+    /// Omitting both this flag and the env var emits the snippet with a
+    /// placeholder for the bearer token (connect operates on a pre-existing
+    /// agent whose bearer it never holds): `<PASTE_YOUR_EXISTING_BEARER_TOKEN>`
+    /// in interactive mode, `<REPLACE_WITH_TOKEN>` in `--non-interactive`
+    /// mode. The operator substitutes their existing token by hand.
     #[arg(long)]
     pub bearer_token: Option<String>,
 
@@ -1493,11 +1494,11 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
     // ── Step 7 — OpenClaw snippet emission ─────────────────────────
     //
     // Resolve the bearer token (flag → AGENTSSO_BEARER_TOKEN env var
-    // → interactive Password prompt → placeholder). Emit the snippet
+    // → placeholder; connect never prompts — Story 10.8). Emit the snippet
     // to stdout AND optionally write to --mcp-config-out. Connect
     // does NOT auto-merge into the end user's ~/.openclaw config —
     // see cli::openclaw module docs for the admin/user-split rationale.
-    emit_openclaw_snippet(&args, &service, interactive, &theme, &default_scope).await?;
+    emit_openclaw_snippet(&args, &service, interactive, &default_scope).await?;
 
     // ── Step 8 — summary ───────────────────────────────────────────
     if interactive {
@@ -2018,27 +2019,26 @@ async fn post_rebind(home: &Path, agent: &str, policy: &str) -> anyhow::Result<(
 
 /// Resolve the bearer token + emit the OpenClaw snippet (Step 7).
 ///
-/// Resolution order (Round-1 P3 + P4 + P9 hardening):
+/// Resolution order:
 /// 1. `--bearer-token <T>` flag — value is **trimmed** (flag-passed values
 ///    from `$(< token.txt)` may carry trailing CRLF; untrimmed they would
 ///    produce a malformed `Authorization: Bearer <token>\n` header).
 /// 2. `AGENTSSO_BEARER_TOKEN` env var — preferred over flag for scripted
 ///    use, as env vars do NOT land in shell history or `/proc/<pid>/cmdline`.
-/// 3. Interactive `dialoguer::Password` prompt — hides the secret from
-///    terminal echo + scrollback. Wrapped in `spawn_blocking` (dialoguer is
-///    sync) and `tokio::time::timeout` so an AFK operator can't stall the
-///    runtime. Empty input → placeholder + warning.
+/// 3. Interactive without flag/env (Story 10.8): emit a
+///    `<PASTE_YOUR_EXISTING_BEARER_TOKEN>` placeholder + honest copy. connect
+///    always operates on a pre-existing agent (whose bearer it never holds and
+///    never persists), so prompting for a token the operator doesn't have was
+///    a dead-end — and the abandoned prompt produced hand-built configs that
+///    dropped the required `x-agentsso-scope` header.
 /// 4. `--non-interactive` without env or flag — emit `<REPLACE_WITH_TOKEN>`
 ///    placeholder + stderr warning.
 async fn emit_openclaw_snippet(
     args: &ConnectArgs,
     service: &str,
     interactive: bool,
-    theme: &Theme,
     default_scope: &str,
 ) -> anyhow::Result<()> {
-    const PROMPT_TIMEOUT_SECS: u64 = 300;
-
     let bearer_token: String = if let Some(t) = &args.bearer_token {
         // Round-1 P9: trim flag value. `$(< token.txt)` may carry CRLF.
         let trimmed = t.trim().to_owned();
@@ -2054,49 +2054,33 @@ async fn emit_openclaw_snippet(
         }
         trimmed
     } else if interactive {
-        // Round-1 P4: Password prompt (no terminal echo) + timeout.
-        let teal_theme = std::sync::Arc::new(build_teal_theme(theme));
+        // Story 10.8: connect ALWAYS operates on a pre-existing agent (the
+        // flow aborts earlier with `agent.not_found` if it doesn't exist, and
+        // never registers — that's quickstart's job). So connect never holds
+        // a freshly-minted bearer, and agentsso never persists it. The old
+        // interactive `Bearer token` prompt was therefore a dead-end: the
+        // operator has no token to paste (it lives in their MCP-client config,
+        // possibly on another machine/user). That dead-end is what led to a
+        // hand-reconstructed config entry that dropped the required
+        // `x-agentsso-scope` header. Do NOT prompt: emit a self-explanatory
+        // placeholder and tell the operator their existing bearer is unchanged
+        // and to keep it. Operators who DO want a fully-rendered snippet pass
+        // `--bearer-token` / `AGENTSSO_BEARER_TOKEN` (handled above).
         eprintln!();
         eprintln!(
-            "  agentsso never persists the bearer token — paste it from `agent register`'s output."
+            "  your agent's bearer token is UNCHANGED — connect only edited the policy behind it."
         );
-        eprintln!("  (or set AGENTSSO_BEARER_TOKEN before re-running to avoid the prompt)");
-        let theme_for_prompt = teal_theme.clone();
-        let read_handle = tokio::task::spawn_blocking(move || -> dialoguer::Result<String> {
-            dialoguer::Password::with_theme(&*theme_for_prompt)
-                .with_prompt("Bearer token")
-                .allow_empty_password(true) // empty = placeholder fallback below
-                .interact()
-        });
-        let raw = match tokio::time::timeout(
-            std::time::Duration::from_secs(PROMPT_TIMEOUT_SECS),
-            read_handle,
-        )
-        .await
-        {
-            Ok(Ok(Ok(s))) => s,
-            Ok(Ok(Err(e))) => {
-                anyhow::bail!("Password prompt failed: {e}")
-            }
-            Ok(Err(join_err)) => {
-                anyhow::bail!("stdin task panicked during token prompt: {join_err}")
-            }
-            Err(_) => {
-                anyhow::bail!(
-                    "no bearer token entered within {PROMPT_TIMEOUT_SECS}s; aborting Step 7"
-                )
-            }
-        };
-        let trimmed = raw.trim().to_owned();
-        if trimmed.is_empty() {
-            // Operator hit Enter without typing — treat as "skip the
-            // file write but still emit a placeholder snippet to stdout
-            // so they can copy the URL/transport shape later".
-            eprintln!("  (no token entered; emitting snippet with placeholder)");
-            "<REPLACE_WITH_TOKEN>".to_owned()
-        } else {
-            trimmed
-        }
+        eprintln!(
+            "  the snippet below carries an `x-agentsso-scope` header you MUST keep; copy the"
+        );
+        eprintln!(
+            "  `url`, `transport`, and BOTH headers, substituting your EXISTING bearer token"
+        );
+        eprintln!("  (the one already in your MCP-client config — agentsso never stores it).");
+        eprintln!(
+            "  (pass --bearer-token / set AGENTSSO_BEARER_TOKEN to render the token inline instead.)"
+        );
+        "<PASTE_YOUR_EXISTING_BEARER_TOKEN>".to_owned()
     } else {
         // --non-interactive without --bearer-token or AGENTSSO_BEARER_TOKEN.
         eprintln!(

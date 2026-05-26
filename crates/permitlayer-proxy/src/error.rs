@@ -436,7 +436,7 @@ impl ProxyError {
                 Some("The upstream service is experiencing issues. Try again later.".to_owned()),
                 None,
             ),
-            Self::PolicyDenied { policy_name, rule_id, .. } => {
+            Self::PolicyDenied { policy_name, rule_id, denied_scope, .. } => {
                 // Special case: the no-agent-binding rule_id has policy_name="-",
                 // so the file-edit remediation is meaningless. Point operators
                 // at the actual fix instead. Story 4.4 ships the registry, so
@@ -444,6 +444,26 @@ impl ProxyError {
                 let remediation = if rule_id == "default-deny-no-agent-binding" {
                     "Run `agentsso agent register <name> --policy=<policy>` \
                      to bind this agent's bearer token to a policy."
+                        .to_owned()
+                } else if rule_id == "default-deny-scope-out-of-allowlist"
+                    && denied_scope.as_deref() == Some("*")
+                {
+                    // Story 10.8: a `*` denied scope means the request carried no
+                    // *usable* scope. The proxy canonicalizes a missing/empty
+                    // `x-agentsso-scope` header to `*` (middleware/policy.rs), and
+                    // a client that sends the header literally as `*` reaches the
+                    // same value — either way `*` is never a valid allowlist entry
+                    // (the policy compiler rejects it), so it can only ever be
+                    // denied. The policy is NOT the problem — editing it cannot fix
+                    // this — the MCP request lacks a real scope. Name the real fix.
+                    // (Code-review 10.8 #1: don't assert "sent no header" — that's
+                    // false for the explicit-`*` case; say "missing, empty, or `*`".)
+                    "This request sent no usable `x-agentsso-scope` (the header was \
+                     missing, empty, or literally `*`, none of which any policy \
+                     grants). Add an `x-agentsso-scope` header naming a scope this \
+                     policy allows — the correct value is in the `agentsso connect` \
+                     / MCP-config snippet output for this service (e.g. \
+                     `x-agentsso-scope: calendar.readonly`)."
                         .to_owned()
                 } else {
                     let home_override = permitlayer_core::paths::home_override();
@@ -709,6 +729,86 @@ mod tests {
         let remediation = json["error"]["remediation"].as_str().unwrap();
         assert!(remediation.contains("gmail-read-only.toml"));
         assert!(!remediation.contains("~/.agentsso/policies"));
+    }
+
+    #[tokio::test]
+    async fn policy_denied_missing_scope_header_names_the_header_not_the_policy() {
+        // Story 10.8 AC #4: a `*` denied scope on the scope-allowlist rule
+        // means no `x-agentsso-scope` header was sent. The remediation must
+        // name the missing-header fix, NOT tell the operator to edit the
+        // policy file (the policy is fine; the request is malformed).
+        let err = ProxyError::PolicyDenied {
+            policy_name: "angie".to_owned(),
+            rule_id: "default-deny-scope-out-of-allowlist".to_owned(),
+            denied_scope: Some("*".to_owned()),
+            denied_resource: None,
+            message: "Blocked by policy".to_owned(),
+        };
+        let response = err.into_response_with_request_id(Some("01TESTHDR".to_owned()));
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        let bytes = Body::new(response.into_body()).collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let remediation = json["error"]["remediation"].as_str().unwrap();
+        assert!(
+            remediation.contains("x-agentsso-scope"),
+            "remediation must name the missing header: {remediation}"
+        );
+        // Must NOT point at the policy file (the policy is fine; the request
+        // is malformed). Assert on the concrete `.toml` path rather than a
+        // fragile "edit" substring (copy could legitimately use that word).
+        assert!(
+            !remediation.contains(".toml"),
+            "must NOT tell the operator to edit the policy file: {remediation}"
+        );
+    }
+
+    #[tokio::test]
+    async fn policy_denied_explicit_star_scope_uses_missing_scope_remediation() {
+        // Code-review 10.8 #1: a client that sends `x-agentsso-scope: *`
+        // literally lands in the same `denied_scope == Some("*")` state as a
+        // missing header. The remediation must NOT claim "sent no header"
+        // (false here) — it covers missing/empty/literal-`*` uniformly.
+        let err = ProxyError::PolicyDenied {
+            policy_name: "angie".to_owned(),
+            rule_id: "default-deny-scope-out-of-allowlist".to_owned(),
+            denied_scope: Some("*".to_owned()),
+            denied_resource: None,
+            message: "Blocked by policy".to_owned(),
+        };
+        let response = err.into_response_with_request_id(Some("01TESTSTAR".to_owned()));
+        let bytes = Body::new(response.into_body()).collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let remediation = json["error"]["remediation"].as_str().unwrap();
+        assert!(remediation.contains("x-agentsso-scope"));
+        // The copy must not falsely assert the header was absent.
+        assert!(
+            !remediation.contains("sent no `x-agentsso-scope` header"),
+            "must not claim the header was absent (explicit-`*` case): {remediation}"
+        );
+        assert!(!remediation.contains(".toml"));
+    }
+
+    #[tokio::test]
+    async fn policy_denied_genuine_scope_keeps_edit_policy_remediation() {
+        // Story 10.8 AC #5: a real denied scope (not `*`) on the same rule
+        // still gets the edit-the-policy remediation — that IS a policy
+        // decision, not a malformed request.
+        let err = ProxyError::PolicyDenied {
+            policy_name: "gmail-read-only".to_owned(),
+            rule_id: "default-deny-scope-out-of-allowlist".to_owned(),
+            denied_scope: Some("gmail.modify".to_owned()),
+            denied_resource: None,
+            message: "Blocked by policy".to_owned(),
+        };
+        let response = err.into_response_with_request_id(Some("01TESTSCO".to_owned()));
+        let bytes = Body::new(response.into_body()).collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let remediation = json["error"]["remediation"].as_str().unwrap();
+        assert!(
+            remediation.contains("gmail-read-only.toml"),
+            "genuine denied scope keeps edit-policy copy: {remediation}"
+        );
+        assert!(!remediation.contains("x-agentsso-scope"));
     }
 
     #[tokio::test]

@@ -31,6 +31,61 @@ pub fn luhn_check(digits_raw: &str) -> bool {
     sum.is_multiple_of(10)
 }
 
+/// Google domains whose `<local>@<domain>` strings are opaque *identifiers*,
+/// not human mailboxes. They are syntactically identical to email addresses
+/// (so the email regex matches them) but the agent must round-trip them
+/// verbatim to the Google API — redacting them corrupts calendar/resource
+/// lookups (a redacted calendar ID yields HTTP 404 upstream).
+///
+/// - `group.calendar.google.com` — secondary / family / shared calendars
+/// - `import.calendar.google.com` — imported (iCal-subscription) calendars
+/// - `resource.calendar.google.com` — resource calendars (rooms, equipment)
+///
+/// Matched on a case-insensitive exact-domain-suffix basis (not a substring
+/// `contains`, which a crafted local-part or lookalike domain could spoof).
+const GOOGLE_IDENTIFIER_DOMAINS: [&str; 3] =
+    ["group.calendar.google.com", "import.calendar.google.com", "resource.calendar.google.com"];
+
+/// Service-account identifier domain suffix. Service-account addresses
+/// (`<name>@<project>.iam.gserviceaccount.com`, and the legacy
+/// `<id>@<project>.gserviceaccount.com` form) appear in attendee /
+/// organizer / ACL payloads as identifiers, not reachable mailboxes.
+const GSERVICEACCOUNT_SUFFIX: &str = ".gserviceaccount.com";
+
+/// Post-match validator for the `email` rule: returns `true` (redact) for a
+/// genuine email address, `false` (pass through) for a Google non-mailbox
+/// identifier (calendar/resource/service-account). Mirrors the `luhn_check`
+/// post-filter on the credit-card rule.
+///
+/// Real human addresses — `@gmail.com`, `@googlemail.com`, corporate domains —
+/// are NOT in the carve-out and are still redacted: the PII guarantee holds.
+///
+/// Fail-safe note: the engine invokes this on the regex match within a bounded
+/// window (`scrub/engine.rs` `REGEX_WINDOW_BYTES`). A domain longer than that
+/// window would be truncated, so `rsplit_once('@')` could see a clipped domain
+/// — but a clipped domain can never `==`-match a carve-out domain nor end with
+/// `.gserviceaccount.com`, so it falls through to `true` (redact). Truncation
+/// therefore fails toward redaction, never toward leaking an identifier as a
+/// false email — and toward redaction is the safe direction for PII anyway.
+pub fn is_real_email_not_google_identifier(matched: &str) -> bool {
+    let Some((_local, domain)) = matched.rsplit_once('@') else {
+        // No `@` — the regex shouldn't produce this, but if it does, treat
+        // it as a real match (fail toward redaction, never toward leaking).
+        return true;
+    };
+    let domain = domain.trim().to_ascii_lowercase();
+
+    if GOOGLE_IDENTIFIER_DOMAINS.iter().any(|d| domain == *d) {
+        return false;
+    }
+    // `*.gserviceaccount.com` (any project subdomain), but not a domain that
+    // merely ends with the literal string as a non-label boundary.
+    if domain == "gserviceaccount.com" || domain.ends_with(GSERVICEACCOUNT_SUFFIX) {
+        return false;
+    }
+    true
+}
+
 /// Returns rules for detecting common PII types.
 ///
 /// # Panics
@@ -39,12 +94,15 @@ pub fn luhn_check(digits_raw: &str) -> bool {
 #[allow(clippy::expect_used)]
 pub(super) fn pii_rules() -> Vec<ScrubRule> {
     vec![
-        // Email addresses
-        ScrubRule::new(
+        // Email addresses. The validator excludes Google non-mailbox
+        // identifiers (calendar/resource/service-account) that are
+        // syntactically emails but must round-trip to the API verbatim.
+        ScrubRule::with_validator(
             "email",
             vec!["@".into()],
             r"[a-zA-Z0-9._%+\-]+@[a-zA-Z0-9.\-]+\.[a-zA-Z]{2,}",
             Placeholder::Email,
+            is_real_email_not_google_identifier,
         )
         .expect("email pattern must compile"),
         // US phone numbers
@@ -146,6 +204,83 @@ mod tests {
     fn tn_invalid_email_no_tld() {
         let r = engine().scrub("user@localhost");
         assert!(r.is_clean(), "no TLD should not match: {}", r.output);
+    }
+
+    // --- Google non-mailbox identifier carve-out (Story 10.8) ---
+    // These are calendar/resource/service-account IDs the agent must
+    // round-trip to the API; redacting them yields HTTP 404 upstream.
+
+    #[test]
+    fn tn_google_group_calendar_id_preserved() {
+        let id = "c_9c5d88d2c9f3a44ae8d6b0b88dd3e0f5@group.calendar.google.com";
+        let r = engine().scrub(&format!("calendar id: {id}"));
+        assert!(r.is_clean(), "group calendar id must pass through: {}", r.output);
+        assert!(r.output.contains(id), "id must be intact verbatim: {}", r.output);
+    }
+
+    #[test]
+    fn tn_google_import_calendar_id_preserved() {
+        let id = "abc123@import.calendar.google.com";
+        let r = engine().scrub(id);
+        assert!(r.is_clean(), "import calendar id must pass through: {}", r.output);
+    }
+
+    #[test]
+    fn tn_google_resource_calendar_id_preserved() {
+        let id = "room-42@resource.calendar.google.com";
+        let r = engine().scrub(id);
+        assert!(r.is_clean(), "resource calendar id must pass through: {}", r.output);
+    }
+
+    #[test]
+    fn tn_google_service_account_id_preserved() {
+        let id = "agent-bot@my-project-123.iam.gserviceaccount.com";
+        let r = engine().scrub(id);
+        assert!(r.is_clean(), "service-account id must pass through: {}", r.output);
+        // Legacy (non-iam) form too.
+        let legacy = "12345@my-project.gserviceaccount.com";
+        let r2 = engine().scrub(legacy);
+        assert!(r2.is_clean(), "legacy SA id must pass through: {}", r2.output);
+    }
+
+    #[test]
+    fn tp_mixed_payload_redacts_email_keeps_calendar_id() {
+        // A list_calendars-style payload: a real human email AND a calendar
+        // identifier in the same input. Only the human email is redacted.
+        let human = "alice@gmail.com";
+        let cal = "c_deadbeef@group.calendar.google.com";
+        let input = format!("{{\"summary\":\"{human}\",\"id\":\"{cal}\"}}");
+        let r = engine().scrub(&input);
+        assert!(r.output.contains("<REDACTED_EMAIL>"), "human email must redact: {}", r.output);
+        assert!(!r.output.contains(human), "human email must not survive: {}", r.output);
+        assert!(r.output.contains(cal), "calendar id must survive: {}", r.output);
+    }
+
+    #[test]
+    fn tp_googlemail_still_redacted() {
+        // A lookalike Google domain that IS a real mailbox — not carved out.
+        let r = engine().scrub("reach me at bob@googlemail.com");
+        assert!(r.output.contains("<REDACTED_EMAIL>"), "googlemail is real PII: {}", r.output);
+    }
+
+    #[test]
+    fn validator_unit_distinguishes_identifiers_from_mailboxes() {
+        // Real mailboxes → redact (true).
+        assert!(is_real_email_not_google_identifier("alice@gmail.com"));
+        assert!(is_real_email_not_google_identifier("bob@googlemail.com"));
+        assert!(is_real_email_not_google_identifier("x@example.com"));
+        // A domain that merely *contains* a carve-out string but isn't a
+        // suffix-label match must still redact (anti-spoof).
+        assert!(is_real_email_not_google_identifier("x@group.calendar.google.com.evil.com"));
+        assert!(is_real_email_not_google_identifier("x@notgserviceaccount.com"));
+        // Google identifiers → pass through (false).
+        assert!(!is_real_email_not_google_identifier("c_1@group.calendar.google.com"));
+        assert!(!is_real_email_not_google_identifier("a@import.calendar.google.com"));
+        assert!(!is_real_email_not_google_identifier("r@resource.calendar.google.com"));
+        assert!(!is_real_email_not_google_identifier("sa@p.iam.gserviceaccount.com"));
+        assert!(!is_real_email_not_google_identifier("sa@gserviceaccount.com"));
+        // Case-insensitive.
+        assert!(!is_real_email_not_google_identifier("C_1@Group.Calendar.Google.Com"));
     }
 
     // --- Phone true positives ---
