@@ -11,9 +11,11 @@ policy on every request, and writes a tamper-evident audit log.
 MCP clients connect to it over Streamable HTTP; upstream providers see a
 normal OAuth client. The tokens never touch the agent.
 
-> **Status:** alpha. The `agentsso` binary version is tracked in
-> `Cargo.toml`; the plugin host-API surface is separately versioned at
-> `1.0.0-rc.1` and is what [CHANGELOG.md](CHANGELOG.md) documents.
+> **Status:** 1.0. The `agentsso` binary version is tracked in
+> `Cargo.toml` (currently `1.0.0`); the plugin host-API surface is
+> separately versioned at `1.0.0-rc.1` and is what
+> [CHANGELOG.md](CHANGELOG.md) documents — they have independent
+> cadences by design.
 > The fully-supported install path is macOS (ARM64 + Intel) via
 > Homebrew with `sudo agentsso setup`; Linux and Windows
 > builds compile but ship a legacy per-user layout under
@@ -21,10 +23,10 @@ normal OAuth client. The tokens never touch the agent.
 
 ## Install
 
-> **Pre-release.** Binaries are signed (ed25519 / minisign) and
-> published to [GitHub Releases](https://github.com/permitlayer/permitlayer/releases),
-> but the first stable tag is still pending. The Homebrew and curl
-> paths below work once a release is cut.
+> Binaries are signed (ed25519 / minisign) and published to
+> [GitHub Releases](https://github.com/permitlayer/permitlayer/releases).
+> The first stable release is **v1.0.0** (2026-05-28). Install via
+> Homebrew or the curl script below.
 
 ### macOS — Homebrew (recommended)
 
