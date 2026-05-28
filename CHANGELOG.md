@@ -24,12 +24,103 @@ is required when a method is dropped in a major bump.
 
 ## [Unreleased]
 
-### Changed
+_No changes yet._
 
-- **agentsso MCP routing for rc.24:** Gmail MCP clients must use
-  `http://127.0.0.1:3820/mcp/gmail`; bare `/mcp` is no longer a
-  route. Calendar remains `/mcp/calendar`, and Drive remains
-  `/mcp/drive`.
+## [1.0.0] - 2026-05-28 — `agentsso` binary
+
+First stable release of the `agentsso` binary. This is a workspace /
+binary version bump only; the plugin host-API surface remains at
+`1.0.0-rc.1` (next section) with its own independent cadence.
+
+The road from `0.3.0-rc.1` (April 2026) to `1.0.0` shipped four
+overlapping epics. The highlights below summarize the user-visible
+surface at 1.0; per-rc release notes for every step along the way are
+preserved on
+[GitHub Releases](https://github.com/permitlayer/permitlayer/releases).
+
+### Highlights
+
+- **macOS as a system service.** The daemon ships as a root
+  LaunchDaemon at `/Library/LaunchDaemons/dev.permitlayer.daemon.plist`,
+  installed via `sudo agentsso setup`. The control plane (`agent
+  register`, `kill`, `resume`, `status --connections`) lives on a Unix
+  domain socket at `/var/run/permitlayer/control.sock` gated to the
+  `permitlayer-clients` group. The MCP data plane (`/mcp/*`) lives on
+  TCP loopback at `127.0.0.1:3820`. Per-service routes
+  (`/mcp/{gmail,calendar,drive}`); bare `/mcp` is not a route.
+- **`sudo agentsso setup` is the canonical install + upgrade verb.**
+  Idempotent, self-healing (re-stages the privileged binary,
+  re-bootstraps wedged LaunchDaemons), and detects/repairs the
+  daemon-crashing legacy-policy shadow from earlier rc lines. The
+  older `agentsso service install` verb still works as a loud
+  redirect. `sudo agentsso uninstall` is the matching one-step
+  teardown.
+- **`agentsso quickstart <service> --read|--read-write --oauth-client
+  <json>` is the one-command agent connect.** Registers the agent
+  under the matching shipped policy
+  (`{gmail,calendar,drive}-{read-only,read-write}`), drives the OAuth
+  flow, seals tokens into the OS keychain, and emits an MCP config
+  snippet (with `transport: streamable-http`, the bearer token, and
+  the `x-agentsso-scope` header all baked in). Idempotent —
+  re-running rebinds scope and rotates credentials cleanly. The
+  underlying `agent register` and `connect <service>` verbs still
+  exist for advanced use.
+- **`agentsso doctor [--fix] [--json] [--restart-ok]`** — diagnostic
+  command with truthful findings, legacy-seed snapshot garbage
+  collection, and an actionable `--fix` mode.
+- **Multi-service agents with per-agent policy materialization.** One
+  agent can be extended onto Gmail, Calendar, and Drive — the daemon
+  composes the per-agent policy from the matching shipped tiers.
+- **`agentsso update`** is a drift detector (it reports whether the
+  installed binary matches the latest published release); the upgrade
+  path is `brew upgrade permitlayer/tap/agentsso && sudo agentsso
+  setup`.
+- **Connector capability coverage.** Read/write tiers across
+  Gmail (26 MCP tools, including the `gmail.attachments.get` /
+  `gmail.messages.get` two-step flow), Calendar (12), and Drive (8).
+  Headless daemon — no human-in-the-loop approval; access is binary
+  per the bound policy tier.
+- **OAuth onboarding for non-local browsers.** `--headless`
+  (paste-redirect) for SSH sessions and `--device-flow` (RFC 8628
+  with TV/Limited-Input OAuth clients) for fully-headless CI / cloud
+  provisioning.
+- **Cross-user provisioning.** Daemon-runs-as-root vs.
+  end-user-account split documented and reliable. The
+  `permitlayer-clients` group + `dseditgroup` flow handles the
+  multi-operator case.
+- **Bring-your-own OAuth credentials.** Desktop-app client JSON sealed
+  into the encrypted vault on `quickstart`; the `client_id`,
+  `client_secret`, and refresh token never leave the machine.
+- **Response scrub engine.** Built-in rules for bearer tokens, JWTs,
+  OTPs, password-reset links, emails, phones, SSNs, credit cards —
+  redacted with one-way `<REDACTED_*>` placeholders before responses
+  reach the agent.
+- **Tamper-evident audit log** with `agentsso audit
+  [--limit N] [--follow] [--export=audit.csv]`.
+- **Kill switch.** `agentsso kill` flips the daemon into refuse-all
+  mode (HTTP 403 `kill_switch_active`); `agentsso resume` restores.
+- **Connector plugins** run sandboxed in an embedded QuickJS runtime.
+  Author your own with `agentsso connectors new`.
+- **OpenClaw skill.** `clawhub install agentsso-gateway` drops an
+  agent-facing skill that documents the policy/scrub/audit model and
+  the non-obvious tool flows (Gmail attachments two-step,
+  base64url decoding, `calendar.events.update` PUT semantics).
+
+### Notes for users upgrading from the rc track
+
+- `brew upgrade permitlayer/tap/agentsso && sudo agentsso setup` is
+  the upgrade path. No flag changes; no operator-policy migration
+  needed — `setup` auto-heals the legacy-seed shadow if any
+  rc.31-era operator `policies/default.toml` is still on disk.
+- The MCP config snippet emitted by `quickstart` is what your MCP
+  client (OpenClaw / Claude Desktop / Cursor) consumes. If you
+  hand-built an MCP config against pre-overhaul docs, re-run
+  `agentsso quickstart <service> --mcp-config-out <path>` to get the
+  current shape (per-service URL, `streamable-http` transport,
+  bearer + scope headers).
+- The bundled brew formula's `caveats` text was refreshed for 1.0
+  (post-install hint now leads with `setup` + `quickstart`, not the
+  old `service install` + `agent register` + `connect` three-step).
 
 ## [1.0.0-rc.1] - 2026-04-18
 

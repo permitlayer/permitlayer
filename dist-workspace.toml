@@ -37,9 +37,12 @@ include = ["LICENSE", "README.md", "install/install.sh", "install/install.ps1"]
 # omits both) and pushes to the tap repo using HOMEBREW_TAP_TOKEN.
 tap = "permitlayer/homebrew-tap"
 formula = "agentsso"
-# UX-overhaul Story 2: every shipped tag is a semver prerelease
-# (vX.Y.Z-rc.N) — this project has no stable-release cadence. The tap
-# MUST track every release; prerelease tap publication is PERMANENT.
+# UX-overhaul Story 2 + v1.0 carry-over: the tap MUST track every
+# release (stable AND prerelease). Pre-1.0, every shipped tag was a
+# semver prerelease (`vX.Y.Z-rc.N`); v1.0.0 (2026-05-28) is the first
+# non-prerelease tag. Future minor releases will likely ship through
+# rc tags again, so `publish-prereleases = true` stays — gating
+# prereleases would silently stop the tap on those.
 # (The load-bearing gate lives in release.yml's homebrew-publish job;
 # this dist setting governs dist's own generated publish path and is
 # set true for consistency so a future dist-driven path can't

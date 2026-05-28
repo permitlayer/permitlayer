@@ -83,17 +83,20 @@ fn run_update(
 /// actionable drift), NOT mis-rank rc.9 above rc.10 lexically.
 #[tokio::test]
 async fn drift_report_selects_highest_prerelease_and_flags_cli_behind() {
-    // Use a base version (0.9.0) unambiguously higher than ANY
+    // Use a base version (99.0.0) unambiguously higher than ANY
     // plausible CARGO_PKG_VERSION the test binary is built at, so the
     // "CLI behind latest" finding is genuinely exercised regardless of
-    // the current workspace version. rc.9 vs rc.10 also guards the
-    // lexical-misrank bug (semver: rc.10 > rc.9; string-sort inverts).
+    // the current workspace version. (Originally 0.9.0, which broke at
+    // the v1.0.0 binary bump on 2026-05-28 because 1.0.0 > 0.9.0-rc.36.
+    // 99.0.0 future-proofs across 1.x/2.x without further drift.)
+    // rc.9 vs rc.10 also guards the lexical-misrank bug (semver:
+    // rc.10 > rc.9; string-sort inverts).
     let mut server = mockito::Server::new_async().await;
     let body = releases_list(&[
-        release_obj("v0.9.0-rc.34", false, true, "older"),
-        release_obj("v0.9.0-rc.9", false, true, "much older"),
-        release_obj("v0.9.0-rc.36", false, true, "## What's new\n- fix #58"),
-        release_obj("v0.9.0-rc.10", false, true, "old"),
+        release_obj("v99.0.0-rc.34", false, true, "older"),
+        release_obj("v99.0.0-rc.9", false, true, "much older"),
+        release_obj("v99.0.0-rc.36", false, true, "## What's new\n- fix #58"),
+        release_obj("v99.0.0-rc.10", false, true, "old"),
     ]);
     let _mock = server
         .mock("GET", "/repos/permitlayer/permitlayer/releases")
@@ -110,15 +113,15 @@ async fn drift_report_selects_highest_prerelease_and_flags_cli_behind() {
 
     let (code, stdout, stderr) = run_update(&home, Some(&server.url()), &[]);
 
-    // 0.9.0-rc.36 is unambiguously ahead of the test binary's
+    // 99.0.0-rc.36 is unambiguously ahead of the test binary's
     // CARGO_PKG_VERSION → "CLI behind latest" drift → exit 4.
     assert_eq!(
         code, 4,
         "expected exit 4 (drift detected); got {code}.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
     assert!(
-        stdout.contains("0.9.0-rc.36"),
-        "expected the highest prerelease (0.9.0-rc.36) to be selected;\nstdout:\n{stdout}"
+        stdout.contains("99.0.0-rc.36"),
+        "expected the highest prerelease (99.0.0-rc.36) to be selected;\nstdout:\n{stdout}"
     );
     assert!(
         stdout.contains("is behind the latest release"),
