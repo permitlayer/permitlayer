@@ -15,7 +15,7 @@ normal OAuth client. The tokens never touch the agent.
 > `Cargo.toml`; the plugin host-API surface is separately versioned at
 > `1.0.0-rc.1` and is what [CHANGELOG.md](CHANGELOG.md) documents.
 > The fully-supported install path is macOS (ARM64 + Intel) via
-> Homebrew with `sudo agentsso service install`; Linux and Windows
+> Homebrew with `sudo agentsso setup`; Linux and Windows
 > builds compile but ship a legacy per-user layout under
 > `~/.agentsso/` and are not yet supported end-to-end.
 
@@ -31,30 +31,34 @@ normal OAuth client. The tokens never touch the agent.
 ```sh
 brew tap permitlayer/tap
 brew install permitlayer/tap/agentsso
-sudo agentsso service install                       # one-time, per machine
+sudo agentsso setup                                  # one-time, per machine
 # Log out + back in (or open a new login shell) — the install adds
 # you to permitlayer-clients; group membership doesn't take effect in
-# your current shell. Then, from your end-user account:
-agentsso agent register <name> --policy gmail-read-only
-agentsso connect gmail --oauth-client ./client_secret.json --agent <name>
+# your current shell. Then, from your end-user account, connect a service
+# in one command (registers the agent + drives OAuth + emits MCP config):
+agentsso quickstart gmail --read --oauth-client ./client_secret.json
+# Use --read-write instead of --read to grant write access.
 ```
 
-`sudo agentsso service install` provisions a root LaunchDaemon at
+`sudo agentsso setup` provisions a root LaunchDaemon at
 `/Library/LaunchDaemons/dev.permitlayer.daemon.plist`, creates
 `/Library/Application Support/permitlayer/`, sets up the
 `permitlayer-clients` macOS group, and starts the daemon. macOS will
 display a "Background item added" notification — if the daemon doesn't
 appear running, check **System Settings → General → Login Items →
-Allow in the Background**. If `agentsso agent register` returns a
+Allow in the Background**. If `agentsso quickstart` returns a
 permission error, your `permitlayer-clients` group membership hasn't
 taken effect yet — log out and back in.
 
-`agentsso agent register <name> --policy <policy-name>` mints a
-per-user bearer token at `~/.agentsso/agent-bearer.token` (mode 0600).
-MCP clients (OpenClaw / Claude Desktop / Cursor) read that token and
+`agentsso quickstart <service> --read|--read-write --oauth-client
+<json>` registers the agent under the matching shipped policy (e.g.
+`gmail-read-only` or `gmail-read-write`), mints a bearer token, drives
+the OAuth flow, and emits an MCP config snippet. Pass
+`--mcp-config-out <path>` to write the snippet to a file your MCP client
+can load directly. MCP clients (OpenClaw / Claude Desktop / Cursor)
 connect to the daemon with transport `streamable-http`. Gmail uses
 `http://127.0.0.1:3820/mcp/gmail`; Calendar and Drive use
-`/mcp/calendar` and `/mcp/drive`.
+`/mcp/calendar` and `/mcp/drive`. Bare `/mcp` is not a route.
 
 Running the daemon and end-user under different OS accounts? See
 [Running the daemon and the agent under different OS users](#running-the-daemon-and-the-agent-under-different-os-users)
@@ -98,53 +102,43 @@ keeps tokens scoped to your Google account, not a shared app.
 1. **Set up the daemon** (one-time per machine):
 
    ```sh
-   sudo agentsso service install
+   sudo agentsso setup
    agentsso service status        # confirm daemon is running
    ```
 
    After this completes, log out and back in (or open a new login
    shell) so your new `permitlayer-clients` group membership takes
-   effect. Steps 2-6 below run from your end-user account, NOT under
+   effect. Steps 2-4 below run from your end-user account, NOT under
    `sudo`.
 
-2. **Register an agent** (from your end-user account, once per MCP client):
-
-   ```sh
-   agentsso agent register <name> --policy gmail-read-only
-   ```
-
-   `--policy` is required and must name a policy that already exists
-   under `/Library/Application Support/permitlayer/policies/`. The
-   seeded `gmail-read-only` policy is a safe starting point. Add
-   `--json` for a `jq`-parseable envelope (scripted installs).
-
-   Mints a bearer token at `~/.agentsso/agent-bearer.token` (mode 0600,
-   owned by you). MCP clients read this file.
-
-3. **Create a Google OAuth client** (one-time):
+2. **Create a Google OAuth client** (one-time):
 
    - <https://console.cloud.google.com/apis/credentials> → **Create
      Credentials** → **OAuth client ID** → **Application type: Desktop app**.
    - Download the JSON file (Google calls it `client_secret_*.json`).
 
-4. **Connect Gmail** (or `calendar`, `drive`):
+3. **Connect Gmail** (or `calendar`, `drive`) in one command:
 
    ```sh
-   agentsso connect gmail --oauth-client ./client_secret_XXXX.json --agent <name>
+   agentsso quickstart gmail --read --oauth-client ./client_secret_XXXX.json
+   # Use --read-write instead of --read for read+write scope.
+   # Add --mcp-config-out <path> to write the MCP client snippet to a file.
    ```
 
-   A browser window opens for Google consent. Tokens get sealed into the
-   OS keychain (System.keychain on macOS; Secret Service on Linux;
-   Credential Manager on Windows). The `--agent <name>` flag is required;
-   `connect` composes credential sealing + policy update + agent rebind in
-   one idempotent command.
+   `quickstart` registers the agent under the matching shipped policy
+   (`gmail-read-only` or `gmail-read-write`), mints a bearer token,
+   drives the Google consent flow, and prints an MCP config snippet for
+   your client. A browser window opens for Google consent. Tokens get
+   sealed into the OS keychain (System.keychain on macOS; Secret Service
+   on Linux; Credential Manager on Windows). It is idempotent — re-run
+   it any time to refresh scope or rotate credentials.
 
-5. **Point your MCP client** at `http://127.0.0.1:3820/mcp/gmail` with
-   transport `streamable-http`, using the bearer token from step 2.
-   Bare `/mcp` is not a route; Calendar and Drive are available at
-   `/mcp/calendar` and `/mcp/drive`.
+4. **Point your MCP client** at `http://127.0.0.1:3820/mcp/gmail` with
+   transport `streamable-http`, using the bearer token + scope header
+   from the snippet quickstart emitted. Bare `/mcp` is not a route;
+   Calendar and Drive are available at `/mcp/calendar` and `/mcp/drive`.
 
-6. **Inspect activity**:
+5. **Inspect activity**:
 
    ```sh
    agentsso audit --follow
@@ -152,11 +146,11 @@ keeps tokens scoped to your Google account, not a shared app.
 
 ### Connect over SSH or under `su`
 
-If `agentsso connect` cannot reach a usable browser (SSH session, `su user`
-without GUI access, headless server, etc.), pass `--headless` instead:
+If `agentsso quickstart` cannot reach a usable browser (SSH session,
+`su user` without GUI access, headless server, etc.), pass `--headless`:
 
 ```sh
-agentsso connect gmail --oauth-client ./client_secret.json --agent <name> --headless
+agentsso quickstart gmail --read --oauth-client ./client_secret.json --headless
 ```
 
 For truly headless boxes (no browser available at all on the target
@@ -170,11 +164,8 @@ polling completes without operator interaction at the target machine:
 # OAuth client must be type "TV and Limited Input Device" (NOT "Desktop app").
 # See the "Fully-headless / scripted installs" section in
 # docs/user-guide/install.md for the OAuth client setup details.
-sudo agentsso service install
-# Mint a bearer token first — `connect` requires the agent to be
-# pre-registered. `--json` parses cleanly through jq for scripted use.
-AGENTSSO_BEARER_TOKEN=$(agentsso agent register ci-bot --policy gmail-read-only --json | jq -r .bearer_token)
-agentsso connect gmail --oauth-client ./client_secret_device.json --agent ci-bot \
+sudo agentsso setup
+agentsso quickstart gmail --read --oauth-client ./client_secret_device.json \
   --device-flow --device-flow-timeout 300 --non-interactive
 ```
 
@@ -217,8 +208,8 @@ authenticate to it on two separate channels:
   mode `0660`, owned `root:permitlayer-clients`. Members of the
   `permitlayer-clients` group can connect; the daemon reads the
   caller's UID via `LOCAL_PEERCRED` and audit-logs it alongside any
-  bearer-token claim. `sudo agentsso service install` adds the
-  invoking operator to that group; add additional operators with
+  bearer-token claim. `sudo agentsso setup` adds the invoking operator
+  to that group; add additional operators with
   `sudo dseditgroup -o edit -a <user> -t user permitlayer-clients`,
   then have the user log out and back in for the group membership to
   take effect.
@@ -228,18 +219,16 @@ authenticate to it on two separate channels:
   speak HTTP-over-streamable-http, which is TCP-only; we keep this
   channel on loopback specifically for compatibility. The daemon
   authenticates MCP clients via per-user bearer tokens minted by
-  `agentsso agent register <name> --policy <policy-name>` and written
-  to `~/.agentsso/agent-bearer.token` (mode `0600`, owned by the
-  invoking user). MCP clients read the token **value** from that file
-  (not the path — e.g., Claude Desktop's `env` block needs the bearer
-  string itself, not a `~/.agentsso/...` path expression).
+  `agentsso quickstart <service>` (which calls `agent register`
+  internally under a shipped policy and emits an MCP config snippet
+  carrying the token + scope header). MCP clients read the headers
+  from that snippet directly.
 
-  If the operator who ran `sudo agentsso service install` is a
-  different OS account than the end-user who'll run
-  `agentsso agent register`, that end-user must be added to the
-  `permitlayer-clients` group too — `sudo dseditgroup -o edit -a
-  <end-user> -t user permitlayer-clients` then log them out and back
-  in.
+  If the operator who ran `sudo agentsso setup` is a different OS
+  account than the end-user who'll run `agentsso quickstart`, that
+  end-user must be added to the `permitlayer-clients` group too —
+  `sudo dseditgroup -o edit -a <end-user> -t user permitlayer-clients`
+  then log them out and back in.
 
 The split is deliberate. The control plane gets kernel-attested peer
 identity from UDS; the MCP plane gets backward-compatibility with
@@ -250,8 +239,8 @@ The MCP plane's TCP bind address is configurable via the
 `Env::prefixed("AGENTSSO_").split("__")`, so `AGENTSSO_HTTP__BIND_ADDR=
 127.0.0.1:3920` overrides the default `127.0.0.1:3820`). Set it in
 the LaunchDaemon plist's `EnvironmentVariables` if you need a
-non-default port — `sudo agentsso service install` regenerates the
-plist, so this is a one-time edit per machine.
+non-default port — `sudo agentsso setup` regenerates the plist, so
+this is a one-time edit per machine.
 
 ## What's in the box
 
@@ -282,9 +271,11 @@ details.
 - [docs/agent-identity-memo.md](docs/agent-identity-memo.md) — identity
   model design
 - [docs/user-guide/agent-skill-permitlayer-mcp.md](docs/user-guide/agent-skill-permitlayer-mcp.md)
-  — drop-in skill / system prompt for LLM agents that talk to permitlayer's
-  MCP daemon (covers policy semantics, scrub placeholders, error retry rules,
-  audit expectations)
+  — paste-in skill / system prompt for non-ClawHub MCP clients (Claude
+  Desktop, Linux/Windows hosts). ClawHub/OpenClaw users get the same skill
+  via `clawhub install agentsso-gateway`. Covers policy semantics, scrub
+  placeholders, error retry rules, audit expectations, and the non-obvious
+  tool flows (Gmail two-step attachments, base64url decoding, etc.)
 - [CONTRIBUTING.md](CONTRIBUTING.md) — dev workflow, test gates,
   CODEOWNERS policy
 - [SECURITY.md](SECURITY.md) — vulnerability reporting

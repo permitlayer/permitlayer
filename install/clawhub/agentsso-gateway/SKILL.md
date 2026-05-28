@@ -1,7 +1,7 @@
 ---
 name: agentsso-gateway
 description: "Stop your OpenClaw agent from leaking credentials. Wraps Gmail/Calendar/Drive access through a local permitlayer daemon with policy enforcement, audit logging, and one-key kill switch."
-version: 1.0.0
+version: 1.1.0
 metadata:
   openclaw:
     requires:
@@ -33,52 +33,212 @@ runs locally on the user's machine, holds the credentials in the OS keychain
 (macOS Keychain Services, Linux libsecret, Windows DPAPI), and enforces a
 TOML-based policy on every request you make.
 
+> Not using ClawHub? The same skill is available as a paste-in copy at
+> [`docs/user-guide/agent-skill-permitlayer-mcp.md`](https://github.com/permitlayer/permitlayer/blob/main/docs/user-guide/agent-skill-permitlayer-mcp.md)
+> for non-ClawHub MCP clients (Claude Desktop system prompt, hosts where the
+> ClawHub package isn't yet supported, etc.).
+
 ## When to use this skill
 
-The user has installed `agentsso` and run `agentsso setup gmail` (or
-`calendar`, or `drive`). They want you to read or send mail, manage calendar
-events, or work with their Drive files — but they **don't** want to paste
-OAuth tokens into your context, and they **don't** want you to access services
-beyond what the policy allows.
+The user has installed `agentsso` and connected at least one service via
+`agentsso quickstart gmail` (or `calendar`, or `drive`). They want you to read
+or send mail, manage calendar events, or work with their Drive files — but they
+**don't** want to paste OAuth tokens into your context, and they **don't** want
+you to access services beyond what the policy allows.
 
 If the user says "use my Gmail" or "check my calendar" or anything similar,
 route through agentsso instead of asking for tokens or trying to use a generic
 HTTP client.
 
-## How to call agentsso
+## How agentsso is wired in
 
-permitlayer exposes an MCP-compatible HTTP endpoint on `127.0.0.1:3820`.
-Endpoints are namespaced by service:
+permitlayer exposes an MCP-compatible HTTP endpoint on `127.0.0.1:3820`,
+namespaced by service:
 
 - `http://127.0.0.1:3820/mcp/gmail`
 - `http://127.0.0.1:3820/mcp/calendar`
 - `http://127.0.0.1:3820/mcp/drive`
 
-Every request must include two headers:
+(Bare `/mcp` is **not** a route — every call goes to a per-service path.)
 
-- `X-Agentsso-Agent: <agent-name>` — the registered agent identity
-- `X-Agentsso-Scope: <granted-scope>` — the OAuth scope the user granted
-  (e.g. `https://www.googleapis.com/auth/gmail.readonly`)
+You do **not** set HTTP headers by hand. When the user ran
+`agentsso quickstart <service> --mcp-config-out <path>`, it emitted an MCP
+config snippet for your client that already carries:
 
-The `X-Agentsso-Scope` header is permitlayer-specific (other MCP servers
-ignore it). If you get a 403 with body containing `denied_scope`, the agent
-identity isn't allowed that scope per policy — surface the error to the user
-clearly so they can adjust their policy file rather than retrying blindly.
+- `Authorization: Bearer agt_v2_<name>_<random>` — identity (agent + bound
+  policy are encoded in the token; the daemon parses them on every call).
+- `x-agentsso-scope: <oauth-scope>` — the OAuth scope to use upstream.
+- `"transport": "streamable-http"` — required; OpenClaw defaults to SSE,
+  which won't work against this server.
 
-## Tools the user can run
+Your job is to **call the MCP tools**. The daemon's tool catalog is the live
+truth — `gmail.*`, `calendar.*`, `drive.*` (46 tools today). Use your MCP
+client's tool-listing capability to discover them; their names, parameter
+schemas, and descriptions come straight from the server. The rest of this
+document is the non-obvious stuff the schemas don't capture.
 
-If you need to debug or the user asks "what did the agent just do?", these
-shell commands are safe to suggest. They all run instantly against the local
+## Using the tools correctly
+
+These are the flows agents most commonly get wrong. None of them is in the
+tool schema; you need this guidance to use the catalog correctly.
+
+### Gmail attachments are TWO calls
+
+`gmail.messages.get` does **not** return attachment bytes. It returns the
+message envelope and parts; an attachment part has metadata + a pointer.
+
+1. **Call `gmail.messages.get`** with `format: "full"`. Walk
+   `payload.parts[]` (and nested `parts[]` for multipart messages). An
+   attachment part looks like:
+   ```json
+   {
+     "filename": "handbook.pdf",
+     "mimeType": "application/pdf",
+     "body": { "size": 718000, "attachmentId": "ANGjdJ..." }
+   }
+   ```
+   The `body` here is a **pointer**, not the file. `body.data` may be
+   absent or tiny — that is not a truncation.
+
+2. **Call `gmail.attachments.get`** with the `message_id` (the outer
+   message's `id`) and `attachment_id` (the part's `body.attachmentId`).
+   It returns:
+   ```json
+   { "size": 718000, "data": "<base64url-encoded bytes>" }
+   ```
+
+3. **Decode `data` as base64url**, not standard base64. Base64url uses `-_`
+   in place of `+/` and may omit `=` padding (RFC 4648 §5). Decoding it as
+   standard base64 corrupts the bytes and produces what looks like a
+   truncated file (missing PDF `%%EOF`, broken zip central directory, etc.).
+   Most stdlibs offer it directly: Python `base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))`,
+   Node `Buffer.from(s, "base64url")`, Go `base64.URLEncoding.DecodeString`,
+   Rust `base64::engine::general_purpose::URL_SAFE_NO_PAD`.
+
+There is **no silent truncation**. If the encoded attachment exceeds the
+proxy's 10 MiB response cap, you get a loud too-large error, not a
+half-file. So a stub-sized result means you read the wrong field (step 1's
+pointer) instead of fetching the bytes (step 2). Re-read step 2.
+
+### `format` on messages/threads/drafts
+
+`gmail.messages.get`, `gmail.threads.get`, `gmail.drafts.get` all take a
+`format` param:
+
+- `full` (default) — full payload tree, with `attachmentId` pointers in
+  parts. Use this whenever you might need to discover attachments.
+- `metadata` — headers only (combine with `metadata_headers: [...]`).
+- `minimal` — IDs + labels + snippet.
+- `raw` — entire RFC822 message base64url-encoded in `payload.body.data`.
+
+If you only need the subject and sender, `metadata` is much cheaper than
+`full`. But you cannot find attachments from `metadata`.
+
+### `calendar.events.update` replaces the WHOLE event
+
+`calendar.events.update` is a **PUT** — any field you omit gets **cleared**
+on the server. To change one field safely:
+
+1. `calendar.events.get` to fetch the current event.
+2. Mutate the returned object in place.
+3. `calendar.events.update` with the complete mutated object.
+
+Or use **`calendar.events.patch`** instead — it's PATCH semantics and only
+touches fields you include. Prefer `patch` for single-field changes.
+
+### Trash vs. delete
+
+- `gmail.messages.trash` is **reversible** — there's an `untrash`
+  counterpart. Use this for "delete this email."
+- `drive.files.delete` is **permanent** — it bypasses the trash, no undo.
+  Do not call it casually. If the user said "delete," confirm whether they
+  meant "move to trash" (no Drive equivalent — Drive's `delete` is hard)
+  before invoking it.
+
+### Sending mail and creating drafts
+
+`gmail.messages.send` expects `{ "raw": "<base64url-encoded RFC822>" }`.
+`gmail.drafts.create` and `gmail.drafts.update` wrap that as
+`{ "message": { "raw": "<base64url RFC822>" } }`. `gmail.drafts.send`
+takes `{ "id": "<draftId>" }` (no body).
+
+Compose the RFC822 envelope yourself (`From: …\r\nTo: …\r\nSubject: …\r\n\r\nBody`),
+base64url-encode the whole thing, embed.
+
+### Scope tiers gate writes
+
+Read tools use `*.readonly` scopes. Writes need the matching scope:
+`gmail.send`/`gmail.modify`/`gmail.compose`, `calendar.events`,
+`drive.file`. If a write returns **403 `policy.denied`** it's because the
+agent is bound to a read-only tier. Tell the user: they need to re-run
+`agentsso quickstart <service> --read-write` to grant write access. Don't
+retry the call.
+
+## Errors are operational, not transient
+
+Common error codes and what they mean:
+
+| Code | What it means | What you should do |
+|---|---|---|
+| `policy.denied` (HTTP 403) | The operator's policy refused this scope/resource. Response includes a `rule_id`. | **Don't retry.** Surface the rule_id. Tell the user they can re-run `agentsso quickstart <service> --read-write` for write access, or hand-edit their host-local operator-layer policy. |
+| `auth.invalid_token` | Your bearer is wrong, expired, or the agent record was removed. | **Don't retry.** The user needs to re-run `agentsso quickstart <service>` to mint a fresh token. |
+| `agent.not_found` | Same situation, different surface. | Same remediation. |
+| `kill_switch_active` (HTTP 403) | The user (or you) hit the kill switch (`agentsso kill`). All calls deny until `agentsso resume`. | **Don't retry.** Tell the user. |
+| 5xx / network | Daemon is unreachable or crashed. | Retry once after a short delay. If still failing, tell the user to run `agentsso status` and check the daemon. |
+
+**Never retry `policy.*` or `auth.*` errors.** They are deliberate refusals,
+not transients. Retrying wastes audit-log space and operator attention.
+
+## Access is binary; there's no approval flow
+
+permitlayer's daemon runs **headless** (a background system service with no
+controlling terminal). There is **no approval prompt**, no "wait for the
+operator to press y/n," and no `agentsso approve` command. Your access is
+fixed at the moment the user ran `agentsso quickstart`:
+
+- A scope your policy grants → the call works, immediately.
+- A scope it does not grant → `policy.denied` (HTTP 403), immediately.
+
+A call that's slow is slow for ordinary reasons (upstream Google latency, a
+large response) — never because a human is deciding. Don't special-case long
+calls as "waiting for approval"; use a normal generous timeout and surface
+real errors verbatim.
+
+## Scrubbed content
+
+Tool responses can contain **redaction placeholders** in place of sensitive
+content the daemon detected and removed:
+
+- `<REDACTED_BEARER>` — bearer-token-shaped string
+- `<REDACTED_JWT>` — JSON Web Token
+- `<REDACTED_OTP>` — 6-digit one-time password
+- `<REDACTED_RESET_LINK>` — password-reset URL
+- `<REDACTED_EMAIL>` — email address
+- `<REDACTED_PHONE>` — phone number
+- `<REDACTED_SSN>` — US SSN-shaped string
+- `<REDACTED_CC>` — credit-card-shaped digit run
+
+These are **one-way redactions** — there's no reverse mapping. When
+summarizing a scrubbed response, don't pretend you saw the value and don't
+try to reconstruct it from context. Say something like: "the message
+contains a one-time code (redacted by permitlayer) — the operator can read
+it directly."
+
+## CLI tools the user can run
+
+These shell commands are safe to suggest if you need to debug, or the user
+asks "what did the agent just do?" They all run instantly against the local
 daemon — no network, no auth.
 
 ### Tail recent activity
 
 ```bash
-agentsso audit --tail 20
+agentsso audit --limit 20
 ```
 
 Shows the 20 most recent permitlayer audit events (allowed/denied, scope,
-which agent, timestamp). The user can pipe this to `--follow` for live tail.
+which agent, timestamp). Add `--follow` for live tail, or
+`--export=audit.csv` to dump a CSV.
 
 ### Stop a runaway agent immediately
 
@@ -86,11 +246,11 @@ which agent, timestamp). The user can pipe this to `--follow` for live tail.
 agentsso kill
 ```
 
-Sets a global kill switch. Every subsequent request returns 503 until the
-user runs `agentsso resume`. Use this if you're about to do something the
-user clearly didn't intend (mass-delete, broad search, etc.) and want to
-give them an emergency abort. After kill, audit logs show exactly what was
-blocked.
+Sets a global kill switch. Every subsequent request returns 403 with
+`kill_switch_active` until the user runs `agentsso resume`. Use this if
+you're about to do something the user clearly didn't intend (mass-delete,
+broad search, etc.) and want to give them an emergency abort. After kill,
+audit logs show exactly what was blocked.
 
 ### Check daemon status
 
@@ -100,50 +260,51 @@ agentsso status
 
 Reports whether the daemon is running, which port it's bound to, and which
 services are connected. If the user's request fails with "connection
-refused," this is the first thing to check.
+refused," this is the first thing to check. `agentsso service status` is a
+separate command that reports the macOS LaunchDaemon state — useful when the
+daemon isn't running.
 
-### Register your agent identity
+### Re-mint or grant a new service
 
-If `agentsso status` shows you're not registered, ask the user to run:
+If `agentsso status` shows the agent isn't connected — or the user wants to
+grant additional scope — they can re-run quickstart:
 
 ```bash
-agentsso agent register <name> --policy <policy-name>
+agentsso quickstart gmail --read --oauth-client ./client_secret.json
+# or --read-write for read+write
 ```
 
-Example: `agentsso agent register openclaw --policy gmail-read-only`. The
-policy name must match a file in `~/.agentsso/policies/`. If the user is
-unsure of the policy name, suggest `agentsso agent register <name>` without
-`--policy` to get an interactive picker (introduced in Story 7.10).
-
-## Policy boundaries
-
-permitlayer enforces a TOML policy on every request. Common rejections:
-
-- **403 PolicyDenied with `denied_scope`**: the requested scope is not in
-  the agent's policy allowlist. Tell the user to either narrow the request
-  to an allowed scope OR edit `~/.agentsso/policies/<name>.toml` to add the
-  scope they want to grant.
-- **503 with `kill_switch_active`**: the user (or you) hit the kill switch.
-  Surface this; do not retry.
-- **402-style with approval-required**: the policy requires user approval
-  for this action. The daemon is waiting on `agentsso approve <id>` from
-  the user's terminal. Pause and tell the user.
-
-Always prefer suggesting policy edits over retrying. permitlayer's whole
-point is that the user controls what you can do.
+This registers the agent (if needed), drives the OAuth flow, and emits an
+updated MCP config snippet. The user can also pass
+`--mcp-config-out <path>` to write the snippet to a file your client can
+load directly.
 
 ## Anti-patterns — do not
 
 - Do **not** ask the user for their Gmail/Calendar/Drive OAuth tokens.
   permitlayer's job is to make that question unnecessary.
 - Do **not** call Google APIs directly via `https://gmail.googleapis.com/`
-  or similar; route through `127.0.0.1:3820/mcp/gmail` instead.
-- Do **not** retry on 403 PolicyDenied. The policy decided no for a reason.
-  Ask the user.
+  or similar; route through `127.0.0.1:3820/mcp/<service>` instead.
+- Do **not** retry on 403 `policy.denied`. The policy decided no for a
+  reason. Ask the user.
 - Do **not** call `agentsso kill` on the user's behalf without telling them
   what's happening. It's a panic button, not a flow-control mechanism.
 - Do **not** suggest the user disable agentsso to "make things work." If
   things don't work, the policy is wrong — fix the policy.
+- Do **not** invent an approval flow. There is none. A denied call won't
+  become allowed by waiting or retrying.
+- Do **not** decode Gmail attachment `data` as standard base64. It's
+  base64url. (Yes, this catches everyone.)
+
+## Audit is ground truth
+
+Every call you make is recorded in the daemon's audit log with your agent
+name, scope, resource, and policy decision. The operator can grep it
+(`agentsso audit --follow` or `--export=audit.csv`).
+
+Be honest about your tool calls in your replies to the user. Don't hide
+failed calls; the operator will see them anyway and you'll lose trust if
+the audit log doesn't match your story.
 
 ## Further reading
 

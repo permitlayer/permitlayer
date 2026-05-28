@@ -43,35 +43,35 @@ Run this **logged in as the operator account who will use agentsso**,
 and supply `sudo` when prompted:
 
 ```sh
-sudo agentsso service install
+sudo agentsso setup
 ```
 
 **Do this from the operator's own login session.** Do **not** run it
-from a root shell (`sudo su -`, `sudo -i`, then `agentsso service
-install`), and do not run it while logged in as a *different* user
-than the one who will later run `agentsso connect`.
+from a root shell (`sudo su -`, `sudo -i`, then `agentsso setup`), and
+do not run it while logged in as a *different* user than the one who
+will later run `agentsso quickstart`.
 
-**Why this matters.** `service install` binds the cross-user auth
-identity to the *invoking operator's* UID and username, and it adds
-*that* user (and only that user) to the `permitlayer-clients` group.
-The daemon's control socket is gated to that principal. If you run
-`service install` as the wrong user — or from a root shell where the
-invoking identity is `root` rather than the operator — you authorize
-the wrong principal. The daemon comes up fine, but the operator who
-actually needs it is locked out, and the symptom
+**Why this matters.** `setup` binds the cross-user auth identity to
+the *invoking operator's* UID and username, and it adds *that* user
+(and only that user) to the `permitlayer-clients` group. The daemon's
+control socket is gated to that principal. If you run `setup` as the
+wrong user — or from a root shell where the invoking identity is
+`root` rather than the operator — you authorize the wrong principal.
+The daemon comes up fine, but the operator who actually needs it is
+locked out, and the symptom
 ([see below](#two-false-alarms-that-look-identical)) looks exactly
 like "the daemon isn't running."
 
 If you have already made this mistake, the fix is to re-run
-`sudo agentsso service install` from the *correct* operator's login
-session. It is idempotent for the system-service bits and re-binds
-the identity to the right user.
+`sudo agentsso setup` from the *correct* operator's login session.
+It is idempotent for the system-service bits and re-binds the identity
+to the right user.
 
 ### 3. Add the operator(s) to `permitlayer-clients`
 
 Step 2 already added the *invoking* operator to the
 `permitlayer-clients` group. You do **not** need to repeat that for
-the operator who ran `service install`.
+the operator who ran `setup`.
 
 For **additional** operator accounts on the same machine, an admin
 must add each one explicitly:
@@ -107,32 +107,22 @@ session — log out fully and back in. Do **not** proceed to step 5
 until this check passes; every downstream failure traces back to
 here.
 
-### 5. Register an agent
+### 5. Connect a service
 
 From the operator account (the one that now shows
 `permitlayer-clients` in `id -Gn`):
 
 ```sh
-agentsso agent register <name> --policy <policy>
+agentsso quickstart <service> --read|--read-write --oauth-client <path>
 ```
 
-`<name>` is positional; `--policy` is required and must name a policy
-that already exists under
-`/Library/Application Support/permitlayer/policies/`. The seeded
-`gmail-read-only` policy is a safe starting point. The bearer token
-is written to `~/.agentsso/agent-bearer.token` (mode 0600, owned by
-the operator).
-
-### 6. Connect a service
-
-```sh
-agentsso connect <service> --agent <name> --oauth-client <path>
-```
-
-`<service>` is `gmail`, `calendar`, or `drive`. A browser opens for
-Google consent; tokens are sealed into the OS keychain. See the
+`<service>` is `gmail`, `calendar`, or `drive`. `quickstart` registers
+the agent under the matching shipped policy (`<svc>-read-only` or
+`<svc>-read-write`), drives the OAuth flow, and emits an MCP config
+snippet for the client. A browser opens for Google consent; tokens
+are sealed into the OS keychain. See the
 [install guide](install.md#connect-a-service) for the SSH /
-device-flow variants.
+device-flow variants and the full flag list.
 
 #### `--oauth-client` must point at a stable path
 
@@ -147,7 +137,7 @@ A good home is a per-operator config directory you control, e.g.:
 ```sh
 mkdir -p ~/.config/agentsso
 mv ~/Downloads/client_secret_*.json ~/.config/agentsso/client_secret.json
-agentsso connect gmail --agent <name> --oauth-client ~/.config/agentsso/client_secret.json
+agentsso quickstart gmail --read --oauth-client ~/.config/agentsso/client_secret.json
 ```
 
 Once connected, the client credentials are read at connect time and
@@ -155,8 +145,8 @@ sealed into the encrypted vault; the original file is no longer
 needed by the daemon at runtime (you may keep it for re-provisioning
 another service later, or delete it — either is safe). Keeping it in
 a stable location simply means you do not have to re-download it from
-Google Cloud Console the next time you `agentsso connect` another
-service for this client.
+Google Cloud Console the next time you connect another service for
+this client.
 
 ## Two false alarms that look identical
 
@@ -209,28 +199,28 @@ user was never actually added, add them
 ([step 3](#3-add-the-operators-to-permitlayer-clients)) first, then
 re-login.
 
-### Symptom (b): `service install` ran as the wrong user
+### Symptom (b): `setup` ran as the wrong user
 
 `id -Gn` shows `permitlayer-clients` for the current operator — so
-group membership is fine — but `agentsso connect` still reports the
+group membership is fine — but `agentsso quickstart` still reports the
 daemon error. This means the daemon's cross-user identity was bound
-to a *different* operator UID, because `sudo agentsso service
-install` was run as the wrong user or from a root shell
+to a *different* operator UID, because `sudo agentsso setup` was run
+as the wrong user or from a root shell
 ([see step 2](#2-install-the-system-service-as-the-operator-account)).
 The daemon is up, the socket is openable, but the daemon refuses the
 control token because it is gated to a different principal.
 
-**Fix:** re-run `sudo agentsso service install` **from the correct
-operator's login session** (not from `sudo -i` / `sudo su -`). This
-re-binds the cross-user identity to the operator who actually needs
-it. Then retry `agentsso agent register` / `agentsso connect`.
+**Fix:** re-run `sudo agentsso setup` **from the correct operator's
+login session** (not from `sudo -i` / `sudo su -`). This re-binds the
+cross-user identity to the operator who actually needs it. Then retry
+`agentsso quickstart <service>`.
 
 ### Quick disambiguation table
 
 | `agentsso service status` | `id -Gn ... grep permitlayer-clients` | Diagnosis | Fix |
 |---|---|---|---|
 | daemon running | prints nothing | Symptom (a) — stale session | Re-login; verify `id -Gn` |
-| daemon running | prints `permitlayer-clients` | Symptom (b) — wrong install principal | Re-run `service install` as the correct operator |
+| daemon running | prints `permitlayer-clients` | Symptom (b) — wrong install principal | Re-run `setup` as the correct operator |
 | daemon **not** running | (either) | Not an access problem | See [launchd troubleshooting](troubleshooting-launchd.md) |
 
 ## See also
