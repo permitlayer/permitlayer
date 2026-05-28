@@ -51,26 +51,31 @@ Each service has two ready-made policies:
 
 ## Bind an agent to a tier
 
-Agents are bound to a policy by name when you register them. The policy
-must already exist in the daemon policy directory (the six tier policies
-ship in the seeded `default.toml`).
+`agentsso quickstart` binds the agent to the matching shipped policy
+for you — pick the tier with `--read` or `--read-write` and the verb
+takes care of the policy name. The six tier policies ship in the
+seeded `default.toml`.
 
-Register a read-only Gmail agent:
-
-```sh
-agentsso agent register my-reader --policy gmail-read-only-tier
-```
-
-Give an agent read **and** prompted-write access to Calendar:
+Connect a read-only Gmail agent:
 
 ```sh
-agentsso agent register my-scheduler --policy calendar-read-write
+agentsso quickstart gmail --read --oauth-client ./client_secret.json
+# → binds the agent to gmail-read-only
 ```
 
-To move an existing agent between tiers, re-register it against the
-other policy name (e.g. `--policy gmail-read-write` instead of
-`gmail-read-only-tier`). The bearer token is printed once on stdout —
-copy it then; it is not shown again.
+Give an agent read **and** write access to Calendar:
+
+```sh
+agentsso quickstart calendar --read-write --oauth-client ./client_secret.json
+# → binds the agent to calendar-read-write
+```
+
+To move an existing agent between tiers, re-run `quickstart` for the
+service with the other flag (e.g. `--read-write` instead of `--read`).
+`quickstart` is idempotent; the second run rebinds the agent to the
+new policy and emits a fresh MCP config snippet. The bearer token is
+printed once during the run — capture it then, or pass
+`--mcp-config-out <path>` to write the full config snippet to disk.
 
 To narrow a tier further (e.g. only the primary calendar, or one Drive
 folder), copy the tier policy in `default.toml` to a new named policy

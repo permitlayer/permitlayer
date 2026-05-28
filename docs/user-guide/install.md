@@ -49,10 +49,18 @@ service.
 Run, once per machine:
 
 ```sh
-sudo agentsso service install
+sudo agentsso setup
 ```
 
-This command:
+`sudo agentsso setup` is the canonical install **and** upgrade verb. It
+is idempotent: run it on a fresh machine to install, and run it again
+after every `brew upgrade agentsso` to roll the new binary into place
+and re-bootstrap the LaunchDaemon. It detects and repairs the common
+refusal conditions itself (re-staging the privileged binary, re-pointing
+the version symlink, re-bootstrapping a wedged LaunchDaemon) rather
+than handing you a list of `launchctl` commands to run by hand.
+
+What setup does:
 
 1. Copies the binary to `/Library/PrivilegedHelperTools/agentsso`
    (root:wheel, mode 0755).
@@ -77,16 +85,12 @@ macOS may display a "Background item added" notification. If
 **System Settings → General → Login Items → Allow in the
 Background** and confirm permitlayer is enabled.
 
-### `agentsso setup` — the self-healing install/upgrade verb
+> The older `sudo agentsso service install` verb still works as a
+> redirect into `setup`. The CLI prints a loud one-time notice telling
+> you to use `setup` going forward; no scripts break, but new docs and
+> automation should use `setup`.
 
-`sudo agentsso setup` is the recommended one-command install **and**
-upgrade path. It is idempotent: run it on a fresh machine to install,
-and run it again after every `brew upgrade agentsso` to roll the new
-binary into place. Unlike a bare `service install`, `setup` detects and
-repairs the common refusal conditions itself (re-staging the privileged
-binary, re-pointing the version symlink, re-bootstrapping a wedged
-LaunchDaemon) rather than handing you a list of `launchctl` commands to
-run by hand.
+### Legacy-policy migration on upgrade
 
 The one decision `setup` cannot make for you is what to do with a
 **legacy operator policy that shadows a shipped (managed) policy** —
@@ -119,28 +123,6 @@ To add additional operators to the control-plane group:
 sudo dseditgroup -o edit -a <username> -t user permitlayer-clients
 ```
 
-## Register an agent
-
-From your **end-user** account (not from `sudo`), mint a per-user
-bearer token. The agent name is positional; `--policy` is required
-and must reference a policy that already exists under
-`/Library/Application Support/permitlayer/policies/`. The seeded
-`gmail-read-only` policy is a safe starting point:
-
-```sh
-agentsso agent register <name> --policy gmail-read-only
-```
-
-The token is written to `~/.agentsso/agent-bearer.token` (mode 0600,
-owned by you), and is also echoed once to stdout for piping into MCP
-client configs. Add `--json` to get a single-line JSON envelope
-(`{"status":"ok","name":"...","policy_name":"...","bearer_token":"..."}`)
-suitable for `jq` parsing in scripted installs.
-
-The token survives daemon restarts. If you need to rotate it, delete
-the file and re-run `agentsso agent register <name> --policy
-<policy-name>`.
-
 ## Creating an OAuth client
 
 permitlayer uses bring-your-own OAuth credentials. You create the
@@ -160,23 +142,45 @@ type: TV and Limited Input Device** instead and use the
 
 ## Connect a service
 
-From your end-user account:
+From your **end-user** account (not from `sudo`), connect a Google
+service in one command. `quickstart` registers the agent under a
+shipped policy (read-only or read+write), drives the OAuth flow, seals
+the resulting tokens into the OS keychain, and emits an MCP config
+snippet for your client:
 
 ```sh
-agentsso connect gmail   --oauth-client ./client_secret.json --agent <name>
-agentsso connect calendar --oauth-client ./client_secret.json --agent <name>
-agentsso connect drive   --oauth-client ./client_secret.json --agent <name>
+agentsso quickstart gmail    --read --oauth-client ./client_secret.json
+agentsso quickstart calendar --read-write --oauth-client ./client_secret.json
+agentsso quickstart drive    --read-write --oauth-client ./client_secret.json
 ```
 
-A browser opens for Google consent. Tokens are sealed into the OS
-keychain. The `--agent <name>` flag is required; `connect` composes
-credential sealing, policy update, and agent rebind in one
-idempotent command.
+Pick `--read` for read-only or `--read-write` for read+write — those
+bind the agent to the matching shipped policy (`<svc>-read-only` or
+`<svc>-read-write`). A browser opens for Google consent; tokens are
+sealed locally. `quickstart` is idempotent — re-run it any time to
+refresh scope, rotate credentials, or repoint a client.
+
+Useful flags:
+
+- `--mcp-config-out <path>` — write the MCP client config snippet to
+  a file (auth headers + URL + `streamable-http` transport) so your
+  client can load it directly.
+- `--agent <name>` — override the default agent name
+  (`<service>-quickstart`). Useful when one operator runs several
+  parallel agents.
+- `--non-interactive` — require all decisions on the command line; no
+  prompts. Pair with `--read` / `--read-write` (required) for
+  scripted installs.
 
 How much each agent can do with a connected service depends on the
-policy it is bound to. See [Connector access
-tiers](connector-tiers.md) for the read-only vs read/write tier model,
+policy tier you pick. See [Connector access
+tiers](connector-tiers.md) for the read-only vs read+write tier model,
 the per-service tool matrix, and the security posture.
+
+> Older docs and CI scripts may still call `agentsso agent register`
+> followed by `agentsso connect <service>`. Those verbs still work,
+> but `quickstart` collapses them into one idempotent command and is
+> the documented entry point.
 
 ### Connecting over SSH
 
@@ -184,7 +188,7 @@ If the operator account has no local browser (SSH session, `su`
 without GUI), use `--headless`:
 
 ```sh
-agentsso connect gmail --oauth-client ./client_secret.json --agent <name> --headless
+agentsso quickstart gmail --read --oauth-client ./client_secret.json --headless
 ```
 
 `agentsso` prints the authorization URL, you complete consent in any
@@ -197,8 +201,8 @@ Ansible-driven provisioning), use `--device-flow` with a TV /
 Limited Input OAuth client:
 
 ```sh
-agentsso connect gmail --oauth-client ./client_secret_device.json --agent ci-bot \
-  --device-flow --device-flow-timeout 300 --non-interactive
+agentsso quickstart gmail --read --oauth-client ./client_secret_device.json \
+  --agent ci-bot --device-flow --device-flow-timeout 300 --non-interactive
 ```
 
 `agentsso` prints a URL and a code. Complete consent on any device
@@ -220,22 +224,28 @@ see [Troubleshooting](#troubleshooting).
 
 ## Point your MCP client at agentsso
 
-MCP clients connect with transport `streamable-http` and authenticate
-via the bearer token from `~/.agentsso/agent-bearer.token`. Gmail uses
-`http://127.0.0.1:3820/mcp/gmail`; Calendar and Drive use
-`http://127.0.0.1:3820/mcp/calendar` and
-`http://127.0.0.1:3820/mcp/drive`. Bare `/mcp` is not a route.
-The exact config syntax depends on your client:
+`agentsso quickstart` emits an MCP config snippet at the end of its
+run (and writes it to `--mcp-config-out <path>` if you supplied one)
+that already carries:
 
-- **OpenClaw**: in your `~/.openclaw/config.json`, set the MCP
-  server's `transport` to `streamable-http` and `url` to
-  `http://127.0.0.1:3820/mcp/gmail`. Read the bearer token via shell
-  substitution or paste it directly.
+- `"transport": "streamable-http"` (required — OpenClaw defaults to
+  SSE, which won't work).
+- `"url": "http://127.0.0.1:3820/mcp/<service>"` (Gmail / Calendar /
+  Drive each have their own per-service path; bare `/mcp` is not a
+  route).
+- `Authorization: Bearer agt_v2_<name>_<random>` and
+  `x-agentsso-scope: <oauth-scope>` headers — auth is wired up for you;
+  you don't set headers by hand.
+
+The exact paste target depends on your client:
+
+- **OpenClaw**: paste the snippet into the MCP servers section of
+  `~/.openclaw/config.json`, or point OpenClaw at the file you wrote
+  with `--mcp-config-out`.
 - **Claude Desktop**: in the MCP servers section of the desktop
-  app's settings, add a `streamable-http` transport pointed at
-  `http://127.0.0.1:3820/mcp/gmail`.
+  app's settings, paste the same snippet (or transcribe URL + headers).
 - **Cursor**: same pattern — `streamable-http` transport at port
-  3820.
+  3820, with the headers from the snippet.
 
 ## Uninstall
 
@@ -243,6 +253,9 @@ The exact config syntax depends on your client:
 sudo agentsso service uninstall   # stop the daemon, remove all state
 brew uninstall agentsso           # remove the binary
 ```
+
+(`agentsso uninstall` is the documented one-step verb that wraps both;
+either path works.)
 
 `service uninstall` is idempotent: it tears down the LaunchDaemon,
 deletes the master key from System.keychain, removes
@@ -291,27 +304,26 @@ Other common failures:
   `sudo launchctl kickstart -k system/dev.permitlayer.daemon`.
 - **Master-key item missing or unreadable**: typically only happens
   if someone manually removed the System.keychain entry. Run
-  `sudo agentsso service uninstall && sudo agentsso service install`
-  to mint a fresh one — this discards any sealed credentials, so each
-  end-user with a registered agent will need to re-run
-  `agentsso agent register <name> --policy <policy-name>` and re-run
-  `agentsso connect <service> --agent <name>` for any services they
-  had connected.
+  `sudo agentsso uninstall && sudo agentsso setup` to mint a fresh
+  one — this discards any sealed credentials, so each end-user with a
+  connected service will need to re-run
+  `agentsso quickstart <service> --read|--read-write --oauth-client
+  <json>` to reconnect.
 - **Stale binary after `brew upgrade agentsso`**: the privileged
   helper copy at `/Library/PrivilegedHelperTools/agentsso` is what
   the LaunchDaemon executes; `brew upgrade` only refreshes
   `/opt/homebrew/bin/agentsso`. Re-run `sudo agentsso setup` after
   every `brew upgrade` to roll the new binary into place and
-  re-bootstrap the LaunchDaemon (`setup` is the self-healing
-  install/upgrade verb — see [above](#agentsso-setup--the-self-healing-installupgrade-verb)).
+  re-bootstrap the LaunchDaemon (`setup` is the canonical
+  install/upgrade verb — see [above](#set-up-the-system-service)).
   The master key in System.keychain is preserved (`-A` ACL is
   independent of the binary's codesign hash), so sealed credentials
   survive the upgrade.
 
-### `agentsso connect` returns a permission error
+### `agentsso quickstart` returns a permission error
 
-If you're not the operator who ran `sudo agentsso service install`,
-you may not be in the `permitlayer-clients` group. Add yourself:
+If you're not the operator who ran `sudo agentsso setup`, you may not
+be in the `permitlayer-clients` group. Add yourself:
 
 ```sh
 sudo dseditgroup -o edit -a "$(whoami)" -t user permitlayer-clients
@@ -326,18 +338,18 @@ Log out and back in so the new group membership takes effect.
 If you are provisioning across more than one OS user, or the error
 persists after re-login, work through the
 [cross-user setup runbook](multi-user-setup.md#two-false-alarms-that-look-identical):
-the same error has two distinct root causes (stale session vs.
-`service install` run as the wrong user) that need different fixes.
+the same error has two distinct root causes (stale session vs. `setup`
+run as the wrong user) that need different fixes.
 
-### `agentsso connect` says `connect.daemon_must_run`
+### `agentsso quickstart` says `connect.daemon_must_run`
 
-`agentsso connect` writes credentials through the daemon (the daemon
+`agentsso quickstart` writes credentials through the daemon (the daemon
 owns the master key and the vault directory). It refuses to run if
 the daemon isn't reachable. The structured remediation block branches
 on the detected failure:
 
 - **Helper binary not installed** (no `/var/run/permitlayer/control.sock`):
-  run `sudo agentsso service install`.
+  run `sudo agentsso setup`.
 - **Helper installed but the LaunchDaemon isn't running**:
   `sudo launchctl kickstart -k system/dev.permitlayer.daemon`.
 - **Helper running but the listener is wedged** (`kickstart -k`
@@ -358,7 +370,7 @@ on the detected failure:
 - **Socket connect with EACCES** (you're not in the group):
   see the permission-error troubleshooting above.
 
-### `agentsso connect` hangs on "waiting for browser consent" over SSH
+### `agentsso quickstart` hangs on "waiting for browser consent" over SSH
 
 `/usr/bin/open` can't reach a usable browser from an SSH session or
 from a process whose owning user doesn't hold the Aqua session.
@@ -366,7 +378,7 @@ The CLI detects most of these cases automatically and prints a
 copy-paste URL block with `--headless` / `--device-flow` suggestions.
 
 If detection doesn't trip (e.g. you're under `sudo -i` from SSH which
-masks `SSH_CONNECTION`) and `agentsso connect` appears to hang,
+masks `SSH_CONNECTION`) and `agentsso quickstart` appears to hang,
 press Ctrl-C and re-run with one of:
 
 - `--headless` — print the OAuth URL, accept the pasted redirect URL

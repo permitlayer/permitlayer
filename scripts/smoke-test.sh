@@ -3,7 +3,7 @@
 #
 # Prerequisites:
 #   - cargo build --release
-#   - agentsso setup gmail --oauth-client <path> (token must not be expired)
+#   - agentsso quickstart gmail --read --oauth-client <path> (token not expired)
 #   - agentsso start (daemon running on default port 3820)
 #
 # Usage:
@@ -169,7 +169,7 @@ else
       else
         # Token may have expired.
         if echo "$search_response" | grep -q 'isError.*true'; then
-          fail "MCP gmail.search" "error (token may be expired — re-run agentsso setup gmail)"
+          fail "MCP gmail.search" "error (token may be expired — re-run agentsso quickstart gmail)"
         else
           fail "MCP gmail.search" "unexpected response"
         fi

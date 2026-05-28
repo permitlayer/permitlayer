@@ -752,7 +752,7 @@ function Invoke-Main {
     Write-Host ''
     Write-Host "  installed in ${elapsed}s"
     Write-Host ''
-    Write-Host "  next:  agentsso setup gmail"
+    Write-Host "  next:  agentsso quickstart gmail --read --oauth-client client_secret.json"
     Write-Host ''
 }
 
