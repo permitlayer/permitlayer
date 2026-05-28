@@ -9,15 +9,15 @@
 #   - class-doc comment — required by rubocop's `Style/Documentation`
 #     cop that `brew style --fix` enforces but cannot autocorrect.
 #   - `caveats` — users need post-install instructions pointing at
-#     `sudo agentsso service install` (the rc.22 system-service install
-#     path) + `agentsso agent register <name> --policy <policy>` (mints
-#     token consumed by MCP clients) + `agentsso connect <service>`
-#     (Story 7.13 verb rename).
+#     `sudo agentsso setup` (the UX-overhaul system-service install
+#     path) + `agentsso quickstart <service>` (the single-command agent
+#     connect that registers the agent, mints the token, and drives
+#     OAuth — UX-overhaul Story 5).
 #
 # Historical note: a `service do` block was injected in Story 7.1 and
-# dropped in Story 7.16; with rc.22 the daemon is a root LaunchDaemon
-# installed via `sudo agentsso service install`, so `brew services start
-# agentsso` never enters the picture.
+# dropped in Story 7.16; the daemon is a root LaunchDaemon installed via
+# `sudo agentsso setup`, so `brew services start agentsso` never enters
+# the picture.
 #
 # This script performs two injections in a single awk pass:
 #

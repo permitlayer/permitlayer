@@ -117,26 +117,28 @@ if ! diff -q "$ACTUAL" "$REPATCHED" >/dev/null; then
 fi
 
 # Structural sanity: patched output must contain the caveats block AND
-# Story 7.29 (rc.22) invariants. rc.22 ships the daemon as a root
-# LaunchDaemon installed via `sudo agentsso service install`; the
-# per-user `agentsso autostart enable` flow is gone, as is the
-# `brew services start agentsso` path that Story 7.16 already dropped.
+# the UX-overhaul invariants. The daemon ships as a root LaunchDaemon
+# installed via `sudo agentsso setup`, and the single-command agent
+# connect is `agentsso quickstart <service>` (Story 5). The pre-overhaul
+# `service install` / `agent register` / `connect` verbs are gone, as is
+# the `brew services start agentsso` path that Story 7.16 already dropped.
 #
 # Positive markers (must be present):
-for marker in 'def caveats' 'agentsso connect' 'sudo agentsso service install' 'agentsso agent register'; do
+for marker in 'def caveats' 'sudo agentsso setup' 'agentsso quickstart'; do
     if ! grep -q "$marker" "$ACTUAL"; then
         echo "FAIL: patched output missing expected marker: $marker" >&2
         exit 1
     fi
 done
 
-# Negative markers (must NOT be present — Story 7.16 + 7.29 invariants):
-for negative in '^[[:space:]]+service do$' 'brew services start agentsso' '\bagentsso setup\b' 'agentsso autostart enable' 'agent register --name'; do
+# Negative markers (must NOT be present — UX-overhaul + Story 7.16 invariants):
+for negative in '^[[:space:]]+service do$' 'brew services start agentsso' 'agentsso service install' 'agentsso agent register' 'agentsso autostart enable'; do
     if grep -Eq "$negative" "$ACTUAL"; then
         echo "FAIL: patched output contains banned marker: $negative" >&2
-        echo "      rc.22 brew formula ships no service-do block, no" >&2
-        echo "      'agentsso setup' verb, and no 'agentsso autostart enable'" >&2
-        echo "      (replaced by 'sudo agentsso service install')." >&2
+        echo "      the brew formula ships no service-do block, no" >&2
+        echo "      'agentsso service install' / 'agent register' verbs, and" >&2
+        echo "      no 'agentsso autostart enable' (replaced by 'sudo agentsso" >&2
+        echo "      setup' + 'agentsso quickstart <service>')." >&2
         exit 1
     fi
 done
