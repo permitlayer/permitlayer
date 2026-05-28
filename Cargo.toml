@@ -133,6 +133,10 @@ indicatif = "0.18"
 # Terminal detection (Story 1.13)
 crossterm = "0.28"
 unicode-width = "0.2"
+# Terminal UI — `agentsso ui` (read-only TUI, slice 1). Pinned to 0.29
+# so it resolves crossterm 0.28.x, matching the pin above. Do NOT bump
+# to 0.30 without re-checking the crossterm pin.
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
 
 # Daemon lifecycle (Story 1.4)
 figment = { version = "0.10", features = ["toml", "env"] }

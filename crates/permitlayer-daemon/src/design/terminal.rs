@@ -109,7 +109,11 @@ pub fn styled(text: &str, color: &str, support: ColorSupport) -> String {
 /// Parse a `#RRGGBB` hex string into (R, G, B) bytes.
 ///
 /// Returns `(0, 0, 0)` if the string is too short or contains invalid hex digits.
-fn parse_hex(hex: &str) -> (u8, u8, u8) {
+///
+/// `pub(crate)` so the `cli/ui` theme bridge can map the same
+/// [`crate::design::tokens::ThemeTokens`] hex strings into ratatui
+/// `Color::Rgb` values without re-implementing the parser.
+pub(crate) fn parse_hex(hex: &str) -> (u8, u8, u8) {
     let hex = hex.strip_prefix('#').unwrap_or(hex);
     if hex.len() < 6 {
         return (0, 0, 0);
@@ -121,7 +125,9 @@ fn parse_hex(hex: &str) -> (u8, u8, u8) {
 }
 
 /// Map RGB to nearest ANSI-256 color index.
-fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
+///
+/// `pub(crate)` for the `cli/ui` theme bridge (256-color downgrade).
+pub(crate) fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
     // Check if it's close to a greyscale value.
     if r == g && g == b {
         if r < 8 {
@@ -140,19 +146,22 @@ fn rgb_to_ansi256(r: u8, g: u8, b: u8) -> u8 {
     16 + 36 * ri + 6 * gi + bi
 }
 
-/// Map RGB to the nearest ANSI-16 color code (30–37, 90–97).
-fn rgb_to_ansi16(r: u8, g: u8, b: u8) -> u8 {
-    // Simple luminance-based mapping to the 16-color palette.
+/// Classify an RGB triple into the four bits the 16-color palette needs:
+/// which of the R/G/B channels are "on" (above half the dominant channel)
+/// plus a brightness bit (luminance > 128). Shared by [`rgb_to_ansi16`]
+/// (escape-code output) and the `cli/ui` theme bridge (ratatui `Color`
+/// output) so the luminance/hue-bucket logic lives in exactly one place.
+pub(crate) fn rgb_channel_bits(r: u8, g: u8, b: u8) -> (bool, bool, bool, bool) {
     let lum = 0.299 * r as f64 + 0.587 * g as f64 + 0.114 * b as f64;
     let bright = lum > 128.0;
-
-    // Determine dominant channel for hue bucket.
     let max = r.max(g).max(b);
     let threshold = max / 2;
+    (r > threshold, g > threshold, b > threshold, bright)
+}
 
-    let r_on = r > threshold;
-    let g_on = g > threshold;
-    let b_on = b > threshold;
+/// Map RGB to the nearest ANSI-16 color code (30–37, 90–97).
+fn rgb_to_ansi16(r: u8, g: u8, b: u8) -> u8 {
+    let (r_on, g_on, b_on, bright) = rgb_channel_bits(r, g, b);
 
     let base: u8 = match (r_on, g_on, b_on) {
         (false, false, false) => 30, // black

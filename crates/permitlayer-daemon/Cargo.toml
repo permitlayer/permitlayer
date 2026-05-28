@@ -108,6 +108,7 @@ dialoguer.workspace = true
 console.workspace = true
 indicatif.workspace = true
 crossterm.workspace = true
+ratatui.workspace = true
 unicode-width.workspace = true
 async-trait.workspace = true
 hkdf.workspace = true

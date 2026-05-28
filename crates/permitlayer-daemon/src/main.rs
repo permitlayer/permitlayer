@@ -44,6 +44,10 @@ enum Commands {
     Stop,
     /// Show daemon status
     Status(cli::status::StatusArgs),
+    /// Read-only terminal UI: navigable status / agents / policies
+    /// console over the loopback control plane (slice 1). Runs as the
+    /// operator's UID; no mutations. `q` / Ctrl-C to quit.
+    Ui(cli::ui::UiArgs),
     /// Reload configuration (sends SIGHUP)
     Reload,
     /// Connect a Google service to an agent end-to-end (Story 7.13).
@@ -285,6 +289,7 @@ async fn main() -> ExitCode {
         },
         Some(Commands::Stop) => anyhow_to_exit_code(cli::stop::run()),
         Some(Commands::Status(args)) => anyhow_to_exit_code(cli::status::run(args).await),
+        Some(Commands::Ui(args)) => anyhow_to_exit_code(cli::ui::run(args).await),
         Some(Commands::Reload) => anyhow_to_exit_code(cli::reload::run().await),
         Some(Commands::Connect(args)) => connect_to_exit_code(cli::connect::run(args).await),
         // Quickstart reuses connect::run (which emits ConnectExitCode2/3

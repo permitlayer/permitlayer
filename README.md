@@ -328,14 +328,29 @@ and toggle **your terminal app** on. Fully quit and relaunch it after.
 > tmux, try running it directly in your terminal first to confirm.
 >
 > If `cargo nextest run` appears completely hung even with Developer
-> Tools enabled, `syspolicyd` may have a scan backlog from a prior
-> session. Kill it to clear the queue:
+> Tools enabled, `syspolicyd` may have a scan backlog — or have wedged
+> into a runaway loop (pegging a full core steadily, independent of any
+> build). Kill it to clear either:
 >
 > ```sh
 > sudo killall syspolicyd
 > ```
 >
-> launchd restarts it automatically within seconds.
+> launchd restarts it automatically within seconds. After restarting it,
+> also re-run your build — processes that were already blocked on the old
+> daemon do not recover.
+>
+> **Diagnose hung-vs-slow quickly** (so you don't wait it out): sample
+> CPU ~20s after launch. A healthy `rustc`/`nextest` shows state `R`
+> with >0% CPU; if it sits at state `S` / 0.0% CPU for minutes while
+> `syspolicyd` pegs a core, it's wedged — restart the daemon, don't wait.
+>
+> ```sh
+> ps -o pid,%cpu,state,comm -ax | grep -iE 'rustc|nextest|syspolicyd' | grep -v grep
+> ```
+>
+> Also run only **one** cargo invocation at a time — overlapping
+> `cargo`/`nextest` runs are a known trigger for the `syspolicyd` backlog.
 
 See the [nextest antivirus guide](https://nexte.st/book/antivirus-gatekeeper.html)
 for background.

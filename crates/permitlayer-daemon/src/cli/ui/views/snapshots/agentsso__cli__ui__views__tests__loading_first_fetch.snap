@@ -1,0 +1,20 @@
+---
+source: crates/permitlayer-daemon/src/cli/ui/views/mod.rs
+expression: draw(&app)
+---
+"┌ agentsso ────────────────────────────────────────────────────────────────────┐"
+"│daemon: connecting…                                                           │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"┌ Agents ──────────────────────────────────────────────────────────────────────┐"
+"│No agents registered. Run `agentsso quickstart` to create one.                │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"loading… ↑/↓ move · Enter detail · Tab view · r refresh · ? help · q quit       "

@@ -18,15 +18,20 @@
 //! | `--watch` alone                    | rejected — `invalid_flag_combination` |
 //! | `--connections --watch --json`     | rejected — `invalid_flag_combination` |
 //!
-//! # Why clear-screen, not ratatui
+//! # Why clear-screen, not ratatui (for THIS command)
 //!
-//! `ratatui` is not in the workspace and adding it for one screen
-//! would be ~40 transitive crates and a new ownership model
-//! (alternate-screen + raw-mode + draw frames). UX-DR13 says
-//! "auto-updating, keyboard-interruptible" — raw ANSI clear-screen
-//! (`\x1b[2J\x1b[H`) + reprint satisfies both, matching the
-//! simplicity of Story 5.2's `audit --follow` (which also avoids
-//! ratatui).
+//! `status --watch` deliberately uses a raw ANSI clear-screen
+//! (`\x1b[2J\x1b[H`) + reprint loop, not ratatui. UX-DR13 asks only
+//! for "auto-updating, keyboard-interruptible", which the reprint loop
+//! satisfies, matching the simplicity of `audit --follow` (also
+//! ratatui-free). A single auto-refreshing table does not justify an
+//! alternate-screen + raw-mode + draw-frame ownership model.
+//!
+//! Note: ratatui *is* now a workspace dependency, but only for the
+//! `agentsso ui` command (`cli/ui/`), where a navigable multi-view
+//! console (status header + agents + policies + Tab/list/detail)
+//! genuinely needs the frame model and amortizes its cost. Keeping
+//! `status --watch` on the reprint loop is intentional, not stale.
 
 use std::net::SocketAddr;
 use std::time::Duration;
