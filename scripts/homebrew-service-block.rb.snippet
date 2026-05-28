@@ -4,28 +4,24 @@
 
       1. Set up the system service (one-time, per machine):
 
-             sudo agentsso service install
+             sudo agentsso setup
 
          macOS will display a "Background item added" notification. If
          the daemon doesn't appear running, check
          System Settings → General → Login Items → Allow in the Background.
 
-      2. From your end-user account, register an agent and mint a
-         bearer token:
-
-             agentsso agent register <name> --policy <policy-name>
-
-         The token is written to ~/.agentsso/agent-bearer.token and is
-         the credential your MCP client (OpenClaw / Claude Desktop /
-         Cursor) authenticates with.
-
-      3. Connect a service. Create a Desktop OAuth client at
+      2. From your end-user account, connect ONE agent to ONE Google
+         service in a single command. Create a Desktop OAuth client at
          https://console.cloud.google.com/apis/credentials, download
-         the JSON, and run:
+         the JSON, then run (gmail | calendar | drive):
 
-             agentsso connect gmail --oauth-client ./client_secret.json --agent <name>
+             agentsso quickstart gmail --read --oauth-client ./client_secret.json
 
-         For SSH-from-another-machine, add --headless.
+         Use --read for read-only or --read-write for read+write. The
+         bearer token is written to ~/.agentsso/agent-bearer.token and
+         is the credential your MCP client (OpenClaw / Claude Desktop /
+         Cursor) authenticates with. Add --mcp-config-out <path> to emit
+         the client's MCP config snippet.
 
       Verify the daemon is up:
 
