@@ -4600,7 +4600,8 @@ mod tests {
         std::fs::write(&gone, b"stale").unwrap();
 
         // Sweep with `now` = the real now: nothing is older than the TTL yet.
-        let removed_none = sweep_media_ttl_at(root, Duration::from_secs(3600), std::time::SystemTime::now());
+        let removed_none =
+            sweep_media_ttl_at(root, Duration::from_secs(3600), std::time::SystemTime::now());
         assert_eq!(removed_none, 0, "fresh files are not swept");
         assert!(keep.exists() && gone.exists());
 
