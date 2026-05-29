@@ -130,13 +130,15 @@ dialoguer = "0.11"
 console = "0.15"
 indicatif = "0.18"
 
-# Terminal detection (Story 1.13)
-crossterm = "0.28"
+# Terminal detection (Story 1.13). Bumped 0.28→0.29 alongside ratatui
+# 0.30 (ratatui 0.30 depends on crossterm 0.29); keeping them on the same
+# crossterm major avoids a duplicate-crossterm tree.
+crossterm = "0.29"
 unicode-width = "0.2"
-# Terminal UI — `agentsso ui` (read-only TUI, slice 1). Pinned to 0.29
-# so it resolves crossterm 0.28.x, matching the pin above. Do NOT bump
-# to 0.30 without re-checking the crossterm pin.
-ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+# Terminal UI — `agentsso ui` (read-only TUI). Bumped 0.29→0.30 to pull a
+# patched `lru` (>=0.16.3, RUSTSEC-2026-0002) transitively; 0.30 pins
+# crossterm 0.29, so the workspace crossterm pin moves in lockstep above.
+ratatui = { version = "0.30", default-features = false, features = ["crossterm"] }
 
 # Daemon lifecycle (Story 1.4)
 figment = { version = "0.10", features = ["toml", "env"] }

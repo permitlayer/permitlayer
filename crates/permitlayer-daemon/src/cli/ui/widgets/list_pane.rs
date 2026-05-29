@@ -57,7 +57,9 @@ pub fn render(
     let highlight = format!("{} ", g.selected);
     let list = List::new(list_items)
         .block(block)
-        .highlight_symbol(&highlight)
+        // ratatui 0.30: `highlight_symbol` takes `Into<Line>`; `&String`
+        // no longer coerces, so pass `&str`.
+        .highlight_symbol(highlight.as_str())
         .highlight_style(theme_bridge::fg(ctx.tokens.accent, ctx.support));
 
     let mut state = ListState::default();
