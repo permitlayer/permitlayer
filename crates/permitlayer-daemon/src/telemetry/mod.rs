@@ -76,7 +76,6 @@ pub enum TelemetryInitError {
         #[source]
         source: io::Error,
     },
-
 }
 
 /// Initialize the `tracing` subscriber with the given log level
@@ -184,18 +183,14 @@ pub fn init_tracing(
             // added (acceptable: both install the same stdout layer, and
             // the file layer only matters for the daemon's `start` path,
             // which initializes first).
-            if let Err(e) = tracing_subscriber::registry()
-                .with(stdout_layer)
-                .with(file_layer)
-                .try_init()
+            if let Err(e) =
+                tracing_subscriber::registry().with(stdout_layer).with(file_layer).try_init()
             {
                 tracing::debug!(error = %e, "tracing subscriber already initialized; reusing it");
             }
         }
         None => {
-            if let Err(e) =
-                tracing_subscriber::registry().with(stdout_layer).try_init()
-            {
+            if let Err(e) = tracing_subscriber::registry().with(stdout_layer).try_init() {
                 tracing::debug!(error = %e, "tracing subscriber already initialized; reusing it");
             }
         }
