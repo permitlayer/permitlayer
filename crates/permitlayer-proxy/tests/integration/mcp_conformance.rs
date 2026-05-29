@@ -126,6 +126,7 @@ async fn start_mcp_server_with_agent(
         Arc::clone(&audit_store) as Arc<dyn AuditStore>,
         Arc::new(ScrubEngine::new(builtin_rules().to_vec()).unwrap()),
         std::env::temp_dir(),
+        std::env::temp_dir().join("permitlayer-test-media"),
     ));
 
     let mcp = mcp_service(proxy);
@@ -609,6 +610,23 @@ async fn call_tool(
     resp.text().await.unwrap()
 }
 
+/// Extract a string field's value from an SSE-framed MCP tool result
+/// where the descriptor JSON is escaped inside the `text` content (so
+/// `"path":"..."` appears as `\"path\":\"...\"`). Returns the unescaped
+/// value. Test-only convenience — not a general JSON parser.
+fn extract_json_string_field(body: &str, field: &str) -> Option<String> {
+    // Try escaped form first (inside MCP text content), then plain.
+    for needle in [format!("\\\"{field}\\\":\\\""), format!("\"{field}\":\"")] {
+        if let Some(start) = body.find(&needle) {
+            let rest = &body[start + needle.len()..];
+            // Terminator is the matching closing quote (escaped or plain).
+            let end = rest.find("\\\"").or_else(|| rest.find('"'))?;
+            return Some(rest[..end].to_owned());
+        }
+    }
+    None
+}
+
 #[tokio::test]
 async fn mcp_tools_list_returns_twenty_six_gmail_tools() {
     let mut upstream = mockito::Server::new_async().await;
@@ -689,15 +707,31 @@ async fn mcp_tools_list_returns_twenty_six_gmail_tools() {
 }
 
 #[tokio::test]
-async fn mcp_attachments_get_returns_upstream_body_unmodified() {
+async fn mcp_attachments_get_writes_file_and_returns_path() {
     let mut upstream = mockito::Server::new_async().await;
-    // Gmail's attachments.get returns { size, data } with data being
-    // base64url. Assert the proxy passes it through byte-for-byte.
-    let upstream_body = r#"{"size":42,"data":"aGVsbG8td29ybGQtcmVjZWlwdC1wZGY="}"#;
-    let _mock = upstream
+    // attachments.get returns { size, data } (base64url). The proxy
+    // decodes it, writes the bytes to a local file, and returns a path
+    // descriptor — NOT the base64.
+    // "hello-world-receipt-pdf" → base64url below.
+    let decoded = b"hello-world-receipt-pdf";
+    let upstream_body = r#"{"size":23,"data":"aGVsbG8td29ybGQtcmVjZWlwdC1wZGY"}"#;
+    let _att_mock = upstream
         .mock("GET", "/users/me/messages/MSG1/attachments/ATT1")
         .with_status(200)
         .with_body(upstream_body)
+        .create_async()
+        .await;
+    // The metadata lookup that resolves mimeType + filename. The proxy
+    // requests `messages.get?format=full`; match the path with a query.
+    let _meta_mock = upstream
+        .mock("GET", "/users/me/messages/MSG1")
+        .match_query(mockito::Matcher::Any)
+        .with_status(200)
+        .with_body(
+            r#"{"id":"MSG1","payload":{"parts":[
+                {"mimeType":"application/pdf","filename":"receipt.pdf",
+                 "body":{"attachmentId":"ATT1","size":23}}]}}"#,
+        )
         .create_async()
         .await;
     let (base_url, handle) = start_mcp_server(&format!("{}/", upstream.url())).await;
@@ -712,16 +746,25 @@ async fn mcp_attachments_get_returns_upstream_body_unmodified() {
     )
     .await;
 
-    // The upstream JSON (incl. the exact base64url data) must appear
-    // verbatim in the tool result — no scrub mutation, no re-encoding.
+    // The tool result must NOT contain the base64 (no bytes in context).
     assert!(
-        body.contains("aGVsbG8td29ybGQtcmVjZWlwdC1wZGY="),
-        "attachment data must pass through unmodified, got: {body}"
+        !body.contains("aGVsbG8td29ybGQtcmVjZWlwdC1wZGY"),
+        "attachment base64 must NOT appear in the tool result, got: {body}"
     );
-    assert!(
-        body.contains("\\\"size\\\":42") || body.contains("\"size\":42"),
-        "attachment size field must pass through, got: {body}"
-    );
+    // It returns a descriptor with the resolved mime/filename + a path.
+    assert!(body.contains("application/pdf"), "mimeType resolved from metadata: {body}");
+    assert!(body.contains("receipt.pdf"), "filename resolved from metadata: {body}");
+
+    // Extract the `path` from the tool result (SSE-framed JSON-in-text;
+    // the descriptor is escaped inside the MCP text content). Pull the
+    // value of the `path` field directly and verify the file exists with
+    // the decoded bytes.
+    let path = extract_json_string_field(&body, "path")
+        .unwrap_or_else(|| panic!("descriptor has a path field; got: {body}"));
+    let written = std::fs::read(&path).expect("attachment file exists at returned path");
+    assert_eq!(written, decoded, "written file holds the decoded attachment bytes");
+    let _ = std::fs::remove_file(&path);
+
     handle.abort();
 }
 

@@ -1077,6 +1077,9 @@ pub(crate) async fn try_build_proxy_service(
         Arc::clone(audit_store),
         Arc::clone(scrub_engine),
         config.paths.home.join("vault"),
+        // Decoded inbound attachments (Gmail `attachments.get`) are
+        // materialized here for the MCP agent to read by local path.
+        config.paths.home.join("media"),
     )))
 }
 
@@ -3410,6 +3413,45 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         });
     }
 
+    // Media dir + TTL sweep (Gmail attachment materialization).
+    //
+    // The proxy writes decoded attachment bytes under `<state>/media` for
+    // the MCP agent to read by local path. On macOS the install step
+    // (`create_state_dirs`) created it group-traversable; on single-user
+    // tiers (Linux/Windows, `~/.agentsso`) create it here at startup, 0700
+    // under the operator's own home (the agent IS the operator). A 1h TTL
+    // sweep prevents unbounded growth — these files are transient.
+    {
+        let media_dir = config.paths.home.join("media");
+        if let Err(e) = std::fs::create_dir_all(&media_dir) {
+            tracing::warn!(error = %e, path = %media_dir.display(),
+                "failed to create media dir; attachment fetch will error until it exists");
+        }
+        #[cfg(all(unix, not(target_os = "macos")))]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&media_dir, std::fs::Permissions::from_mode(0o700));
+        }
+        let shutdown = Arc::clone(&sweep_shutdown);
+        tokio::spawn(async move {
+            const MEDIA_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            tick.tick().await; // skip immediate first tick
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => {
+                        let removed = sweep_media_ttl(&media_dir, MEDIA_TTL);
+                        if removed > 0 {
+                            tracing::debug!(removed, "media TTL sweep");
+                        }
+                    }
+                    _ = shutdown.notified() => break,
+                }
+            }
+        });
+    }
+
     // 8. Assemble tower middleware chain via the canonical helper.
     //
     // The chain order (outermost → innermost) is:
@@ -3968,6 +4010,45 @@ pub(crate) fn clamp_approval_timeout_seconds(raw: u64) -> u64 {
     raw.clamp(1, 300)
 }
 
+/// Delete files under `media_dir` (recursively) whose mtime is older than
+/// `ttl`, returning the count removed. Best-effort: I/O errors are skipped
+/// (logged at trace), and a file modified within `ttl` is left alone —
+/// this `stat`-and-skip avoids deleting a file the daemon just wrote or an
+/// agent is mid-read on. Empty per-agent/nonce subdirs are pruned after
+/// their files age out.
+fn sweep_media_ttl(media_dir: &std::path::Path, ttl: std::time::Duration) -> usize {
+    sweep_media_ttl_at(media_dir, ttl, std::time::SystemTime::now())
+}
+
+/// `sweep_media_ttl` with an injectable `now` (so tests can age files
+/// without backdating mtimes — this crate is `forbid(unsafe_code)`, ruling
+/// out a direct `utimensat`).
+fn sweep_media_ttl_at(
+    dir: &std::path::Path,
+    ttl: std::time::Duration,
+    now: std::time::SystemTime,
+) -> usize {
+    let mut removed = 0;
+    let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.is_dir() {
+            removed += sweep_media_ttl_at(&path, ttl, now);
+            // Prune the dir if it's now empty.
+            if std::fs::read_dir(&path).map(|mut d| d.next().is_none()).unwrap_or(false) {
+                let _ = std::fs::remove_dir(&path);
+            }
+        } else if let Ok(modified) = meta.modified()
+            && now.duration_since(modified).map(|age| age > ttl).unwrap_or(false)
+            && std::fs::remove_file(&path).is_ok()
+        {
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// UX-overhaul Story 1: ensure the **operator** policy directory
 /// exists, created empty at mode 0700.
 ///
@@ -4499,6 +4580,40 @@ mod tests {
         assert_eq!(clamp_approval_timeout_seconds(300), 300);
         assert_eq!(clamp_approval_timeout_seconds(500), 300);
         assert_eq!(clamp_approval_timeout_seconds(u64::MAX), 300);
+    }
+
+    #[test]
+    fn sweep_media_ttl_removes_old_keeps_fresh_and_prunes_dirs() {
+        use std::time::Duration;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+
+        // Two files written "now"; in nested per-agent/nonce subdirs.
+        let keep_dir = root.join("agenthash").join("nonce-keep");
+        std::fs::create_dir_all(&keep_dir).unwrap();
+        let keep = keep_dir.join("keep.pdf");
+        std::fs::write(&keep, b"recent").unwrap();
+
+        let gone_dir = root.join("agenthash").join("nonce-gone");
+        std::fs::create_dir_all(&gone_dir).unwrap();
+        let gone = gone_dir.join("gone.pdf");
+        std::fs::write(&gone, b"stale").unwrap();
+
+        // Sweep with `now` = the real now: nothing is older than the TTL yet.
+        let removed_none =
+            sweep_media_ttl_at(root, Duration::from_secs(3600), std::time::SystemTime::now());
+        assert_eq!(removed_none, 0, "fresh files are not swept");
+        assert!(keep.exists() && gone.exists());
+
+        // Now sweep with `now` pushed 2h into the future and a 1h TTL — both
+        // files are now "old". (Inject `now` instead of backdating mtimes:
+        // the crate forbids unsafe, so no utimensat.)
+        let future = std::time::SystemTime::now() + Duration::from_secs(2 * 3600);
+        let removed = sweep_media_ttl_at(root, Duration::from_secs(3600), future);
+        assert_eq!(removed, 2, "both aged-out files removed");
+        assert!(!keep.exists() && !gone.exists());
+        // Emptied nonce dirs are pruned.
+        assert!(!keep_dir.exists() && !gone_dir.exists(), "emptied dirs pruned");
     }
 
     /// Test-only `KeyStore` that counts calls and can simulate

@@ -51,6 +51,15 @@ zeroize.workspace = true
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+# `files::write_client_readable_file` reconciles media-file ownership to
+# the `permitlayer-clients` group on macOS (chgrp + chmod 0o640) so the
+# operator-user MCP agent can read daemon-written attachment files — the
+# same cross-user pattern `control.token` uses. macOS-only production dep
+# (the reconcile is `cfg(target_os = "macos")`); gated tight to keep the
+# link surface minimal, matching the dirs/libc gating above.
+[target.'cfg(target_os = "macos")'.dependencies]
+nix = { workspace = true }
+
 # Story 7.26: paths::legacy_dot_agentsso() resolves $HOME for Linux +
 # Windows defaults. macOS callers go through the new system paths
 # under /Library/Application Support/permitlayer/ (no home-dir lookup),

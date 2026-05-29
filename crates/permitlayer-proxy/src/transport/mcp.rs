@@ -24,6 +24,7 @@ use tracing::debug;
 use crate::error::{AgentId, ProxyError};
 use crate::request::ProxyRequest;
 use crate::service::ProxyService;
+use crate::transport::gmail_shape;
 
 // ─────────────────────────────────────────────────────────────────────
 // Per-tool-call agent identity propagation.
@@ -306,6 +307,13 @@ impl GmailMcpServer {
         }
     }
 
+    /// Dispatch a request and return the raw upstream JSON `Value` (still
+    /// scrubbed — it goes through `handle`). Used by the shaping helpers.
+    async fn dispatch_json(&self, req: ProxyRequest) -> Result<serde_json::Value, String> {
+        let body = self.dispatch(req).await?;
+        serde_json::from_str(&body).map_err(|e| format!("upstream JSON parse error: {e}"))
+    }
+
     /// Build a `ProxyRequest` for a Gmail endpoint.
     ///
     /// `Content-Type: application/json` is set automatically when `body`
@@ -371,6 +379,56 @@ fn validate_resource_id(id: &str) -> Result<(), String> {
         return Err(format!("id contains unsafe characters: {id}"));
     }
     Ok(())
+}
+
+/// Sanitize an attachment filename for safe use as a path component.
+///
+/// Strips directory separators (incl. Unicode), control chars, NTFS
+/// alternate-data-stream `:`, leading dots, and bounds the length. Falls
+/// back to `att-<short attachment-id>.bin` when the result is empty or no
+/// filename was provided. The agent + message-id path components are
+/// `validate_resource_id`-checked by the caller; this guards the one
+/// attacker-influenced component (the MIME filename header).
+fn sanitize_filename(filename: Option<&str>, attachment_id: &str) -> String {
+    const MAX_LEN: usize = 128;
+    let fallback = || {
+        let short: String = attachment_id.chars().take(16).collect();
+        format!("att-{short}.bin")
+    };
+    let Some(raw) = filename else { return fallback() };
+
+    let cleaned: String = raw
+        .chars()
+        .map(|c| {
+            if c == '/' || c == '\\' || c == ':' || c.is_control() || c == std::path::MAIN_SEPARATOR
+            {
+                '_'
+            } else {
+                c
+            }
+        })
+        .collect();
+    // Strip leading dots (no `.`/`..`/hidden-file traversal) and surrounding
+    // whitespace.
+    let trimmed = cleaned.trim().trim_start_matches('.').trim();
+    if trimmed.is_empty() {
+        return fallback();
+    }
+    // Bound length at a char boundary.
+    if trimmed.len() <= MAX_LEN {
+        trimmed.to_owned()
+    } else {
+        let end = (0..=MAX_LEN).rev().find(|&i| trimmed.is_char_boundary(i)).unwrap_or(0);
+        trimmed[..end].to_owned()
+    }
+}
+
+/// Short hex digest (first 16 bytes of SHA-256) for filesystem-safe,
+/// non-reversible path components (per-agent dir + per-fetch nonce).
+fn short_hex_hash(input: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(input);
+    digest[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// Validate a Calendar ID (calendar or event ID).
@@ -490,7 +548,10 @@ impl GmailMcpServer {
 
     #[tool(
         name = "gmail.messages.get",
-        description = "Get a specific Gmail message by ID. Returns full message content."
+        description = "Get a Gmail message by ID. By default returns a compact shaped object \
+            (headers, prioritized text body, and an attachment manifest) with attachment bytes \
+            stripped — fetch attachment bytes via `gmail.attachments.get`, which returns a local \
+            file path. Pass format=metadata/minimal/raw for the unshaped upstream Gmail JSON."
     )]
     async fn messages_get(
         &self,
@@ -500,13 +561,31 @@ impl GmailMcpServer {
         debug!(tool = "gmail.messages.get", id = %params.id, "MCP tool call");
         let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         validate_resource_id(&params.id)?;
+
+        // Shape only the default/`full` path. metadata/minimal/raw are
+        // passed through unshaped (a `raw` body is base64 RFC822, not a
+        // MIME tree — the shaper would mangle it).
+        let format = params.format.as_deref().unwrap_or("full");
+        let shape = format == "full";
+
         let qs = build_query_string(&[
-            ("format", params.format),
+            // Genuine attachments already come back as attachmentId+empty
+            // data under `format=full`, so no special fields mask is needed
+            // to keep the big bytes out; the shaper strips residual inline
+            // part data.
+            ("format", Some(format.to_owned())),
             ("metadataHeaders", params.metadata_headers.map(|h| h.join(","))),
         ]);
         let path = format!("users/me/messages/{}{qs}", params.id);
         let req = Self::gmail_request(path, "gmail.readonly", Method::GET, Bytes::new(), agent_id);
-        self.dispatch(req).await
+
+        if !shape {
+            return self.dispatch(req).await;
+        }
+        let msg = self.dispatch_json(req).await?;
+        let shaped = gmail_shape::shape_message(&msg)
+            .ok_or_else(|| "upstream message JSON missing `id`".to_owned())?;
+        serde_json::to_string(&shaped).map_err(|e| format!("shape serialization error: {e}"))
     }
 
     #[tool(
@@ -533,7 +612,9 @@ impl GmailMcpServer {
 
     #[tool(
         name = "gmail.threads.get",
-        description = "Get a specific Gmail thread by ID. Returns all messages in the thread."
+        description = "Get a Gmail thread by ID. By default returns a compact shaped array (one \
+            object per message: headers, prioritized text body, attachment manifest) with \
+            attachment bytes stripped. Pass format=metadata/minimal for the unshaped upstream JSON."
     )]
     async fn threads_get(
         &self,
@@ -543,10 +624,20 @@ impl GmailMcpServer {
         debug!(tool = "gmail.threads.get", id = %params.id, "MCP tool call");
         let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         validate_resource_id(&params.id)?;
-        let qs = build_query_string(&[("format", params.format)]);
+
+        let format = params.format.as_deref().unwrap_or("full");
+        let shape = format == "full";
+
+        let qs = build_query_string(&[("format", Some(format.to_owned()))]);
         let path = format!("users/me/threads/{}{qs}", params.id);
         let req = Self::gmail_request(path, "gmail.readonly", Method::GET, Bytes::new(), agent_id);
-        self.dispatch(req).await
+
+        if !shape {
+            return self.dispatch(req).await;
+        }
+        let thread = self.dispatch_json(req).await?;
+        let shaped = gmail_shape::shape_thread(&thread);
+        serde_json::to_string(&shaped).map_err(|e| format!("shape serialization error: {e}"))
     }
 
     #[tool(
@@ -574,10 +665,10 @@ impl GmailMcpServer {
 
     #[tool(
         name = "gmail.attachments.get",
-        description = "Get a Gmail message attachment by message ID and attachment ID. \
-            Returns the upstream JSON { size, data } with the attachment bytes \
-            base64url-encoded in `data`. Attachments whose encoded body exceeds the \
-            proxy's 10 MiB response limit surface a too-large error (no streaming)."
+        description = "Fetch a Gmail attachment's bytes and write them to a local file, returning \
+            JSON { messageId, attachmentId, size, mimeType, filename, path }. The `path` is a \
+            local file the agent's file/pdf tools can read directly — NO base64 is returned. \
+            Files are transient (cleaned up automatically)."
     )]
     async fn attachments_get(
         &self,
@@ -593,10 +684,92 @@ impl GmailMcpServer {
         let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         validate_resource_id(&params.message_id)?;
         validate_resource_id(&params.attachment_id)?;
-        let path =
+
+        // 1. Fetch the attachment bytes via the un-scrubbed raw path
+        //    (scrubbing base64 would corrupt the decoded file).
+        let att_path =
             format!("users/me/messages/{}/attachments/{}", params.message_id, params.attachment_id);
-        let req = Self::gmail_request(path, "gmail.readonly", Method::GET, Bytes::new(), agent_id);
-        self.dispatch(req).await
+        let att_req = Self::gmail_request(
+            att_path,
+            "gmail.readonly",
+            Method::GET,
+            Bytes::new(),
+            agent_id.clone(),
+        );
+        let att_resp = self.proxy_service.fetch_raw(att_req).await.map_err(|e| e.to_string())?;
+        let att_json: serde_json::Value = serde_json::from_slice(&att_resp.body)
+            .map_err(|e| format!("attachment JSON parse error: {e}"))?;
+        let data = att_json
+            .get("data")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| "attachment response missing `data`".to_owned())?;
+        let bytes = permitlayer_core::files::decode_base64url_maybe_padded(data)
+            .ok_or_else(|| "attachment data is not valid base64url".to_owned())?;
+        let size = att_json.get("size").and_then(serde_json::Value::as_u64);
+
+        // 2. Resolve mimeType + filename via a metadata message lookup
+        //    (attachments.get returns neither).
+        let meta_req = Self::gmail_request(
+            format!("users/me/messages/{}?format=full", params.message_id),
+            "gmail.readonly",
+            Method::GET,
+            Bytes::new(),
+            agent_id.clone(),
+        );
+        let (filename, mime_type) = match self.dispatch_json(meta_req).await {
+            Ok(msg) => {
+                gmail_shape::part_lookup(&msg, &params.attachment_id).unwrap_or((None, None))
+            }
+            // Metadata lookup is best-effort; fall back to defaults so the
+            // bytes are still delivered.
+            Err(_) => (None, None),
+        };
+        let filename = sanitize_filename(filename.as_deref(), &params.attachment_id);
+        let mime_type = mime_type.unwrap_or_else(|| "application/octet-stream".to_owned());
+
+        // 3. Write the bytes to a per-agent, unguessable media path.
+        let path = self
+            .write_attachment(&agent_id, &params.message_id, &filename, &bytes)
+            .map_err(|e| format!("failed to write attachment: {e}"))?;
+
+        let descriptor = serde_json::json!({
+            "messageId": params.message_id,
+            "attachmentId": params.attachment_id,
+            "size": size.unwrap_or(bytes.len() as u64),
+            "mimeType": mime_type,
+            "filename": filename,
+            "path": path.to_string_lossy(),
+        });
+        Ok(descriptor.to_string())
+    }
+
+    /// Write decoded attachment bytes to a per-agent, unguessable path
+    /// under the media dir, returning the absolute path. The unguessable
+    /// component bounds cross-agent disclosure within the
+    /// `permitlayer-clients` group (the file is group-readable on macOS so
+    /// the operator-user agent can read it — see the media-trust-boundary
+    /// ADR). The agent-name and message-id components are
+    /// `validate_resource_id`-checked by the caller; the filename is
+    /// sanitized. Returns the path for the descriptor.
+    fn write_attachment(
+        &self,
+        agent_id: &str,
+        message_id: &str,
+        filename: &str,
+        bytes: &[u8],
+    ) -> Result<std::path::PathBuf, String> {
+        // Hash the agent name so the directory component is filesystem-safe
+        // and doesn't leak the raw agent id; add an unguessable random
+        // segment per fetch.
+        let agent_hash = short_hex_hash(agent_id.as_bytes());
+        let nonce = short_hex_hash(
+            format!("{agent_id}:{message_id}:{filename}:{}", bytes.len()).as_bytes(),
+        );
+        let dir = self.proxy_service.media_dir().join(agent_hash).join(nonce);
+        let path = dir.join(filename);
+        permitlayer_core::files::write_client_readable_file(&path, bytes)
+            .map_err(|e| e.to_string())?;
+        Ok(path)
     }
 
     #[tool(
@@ -2075,6 +2248,57 @@ mod tests {
             ("orderBy", Some(String::new())),
         ]);
         assert_eq!(qs, "");
+    }
+
+    #[test]
+    fn sanitize_filename_strips_path_traversal() {
+        // Separators, traversal, control chars, NTFS stream, leading dots
+        // must all be neutralized so the result is a safe single component.
+        for evil in [
+            "../../etc/passwd",
+            "..\\..\\windows\\system32",
+            "a/b/c.pdf",
+            "name:stream",
+            "....//....//x",
+            "\u{0000}\u{0007}bad",
+        ] {
+            let out = sanitize_filename(Some(evil), "ATTID123");
+            assert!(!out.contains('/'), "no fwd slash in {out:?}");
+            assert!(!out.contains('\\'), "no backslash in {out:?}");
+            assert!(!out.contains(':'), "no colon in {out:?}");
+            assert!(!out.starts_with('.'), "no leading dot in {out:?}");
+            assert!(!out.is_empty());
+        }
+    }
+
+    #[test]
+    fn sanitize_filename_keeps_normal_name() {
+        assert_eq!(sanitize_filename(Some("invoice.pdf"), "X"), "invoice.pdf");
+    }
+
+    #[test]
+    fn sanitize_filename_falls_back_when_absent_or_empty() {
+        assert_eq!(sanitize_filename(None, "ABCDEF0123456789XYZ"), "att-ABCDEF0123456789.bin");
+        // Becomes empty after stripping → fallback.
+        assert_eq!(sanitize_filename(Some("..."), "ZZ"), "att-ZZ.bin");
+    }
+
+    #[test]
+    fn sanitize_filename_bounds_length() {
+        let long = "a".repeat(500);
+        let out = sanitize_filename(Some(&long), "X");
+        assert!(out.len() <= 128);
+    }
+
+    #[test]
+    fn short_hex_hash_is_stable_and_hex() {
+        let a = short_hex_hash(b"agent-one");
+        let b = short_hex_hash(b"agent-one");
+        let c = short_hex_hash(b"agent-two");
+        assert_eq!(a, b, "deterministic");
+        assert_ne!(a, c, "distinct inputs differ");
+        assert_eq!(a.len(), 32, "16 bytes → 32 hex chars");
+        assert!(a.chars().all(|ch| ch.is_ascii_hexdigit()));
     }
 
     #[test]

@@ -82,43 +82,44 @@ document is the non-obvious stuff the schemas don't capture.
 These are the flows agents most commonly get wrong. None of them is in the
 tool schema; you need this guidance to use the catalog correctly.
 
-### Gmail attachments are TWO calls
+### Gmail attachments: read the manifest, then fetch the file path
 
-`gmail.messages.get` does **not** return attachment bytes. It returns the
-message envelope and parts; an attachment part has metadata + a pointer.
+You do **not** decode base64. The proxy shapes the message read and writes
+attachment bytes to a local file for you.
 
-1. **Call `gmail.messages.get`** with `format: "full"`. Walk
-   `payload.parts[]` (and nested `parts[]` for multipart messages). An
-   attachment part looks like:
+1. **Call `gmail.messages.get`** (default `format`). You get a compact
+   shaped object — headers, the prioritized text body, and an
+   `attachments` manifest with the bytes stripped:
    ```json
    {
-     "filename": "handbook.pdf",
-     "mimeType": "application/pdf",
-     "body": { "size": 718000, "attachmentId": "ANGjdJ..." }
+     "id": "18f...", "subject": "...", "from": "...",
+     "body": { "text": "<message text>", "htmlAvailable": true, "truncated": false },
+     "attachments": [
+       { "id": "att-0", "filename": "handbook.pdf",
+         "mimeType": "application/pdf", "size": 718000,
+         "attachmentId": "ANGjdJ..." }
+     ]
    }
    ```
-   The `body` here is a **pointer**, not the file. `body.data` may be
-   absent or tiny — that is not a truncation.
+   No attachment bytes are in this response — by design, not truncation.
+   (Pass `format: "metadata"`/`"minimal"`/`"raw"` for the raw upstream
+   Gmail JSON instead of the shaped object.)
 
-2. **Call `gmail.attachments.get`** with the `message_id` (the outer
-   message's `id`) and `attachment_id` (the part's `body.attachmentId`).
-   It returns:
+2. **Call `gmail.attachments.get`** with the `message_id` and the
+   `attachmentId` from the manifest. It writes the decoded bytes to a
+   local file and returns a **path** (no base64):
    ```json
-   { "size": 718000, "data": "<base64url-encoded bytes>" }
+   {
+     "messageId": "18f...", "attachmentId": "ANGjdJ...",
+     "size": 718000, "mimeType": "application/pdf",
+     "filename": "handbook.pdf",
+     "path": "/Library/Application Support/permitlayer/media/<...>/handbook.pdf"
+   }
    ```
 
-3. **Decode `data` as base64url**, not standard base64. Base64url uses `-_`
-   in place of `+/` and may omit `=` padding (RFC 4648 §5). Decoding it as
-   standard base64 corrupts the bytes and produces what looks like a
-   truncated file (missing PDF `%%EOF`, broken zip central directory, etc.).
-   Most stdlibs offer it directly: Python `base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))`,
-   Node `Buffer.from(s, "base64url")`, Go `base64.URLEncoding.DecodeString`,
-   Rust `base64::engine::general_purpose::URL_SAFE_NO_PAD`.
-
-There is **no silent truncation**. If the encoded attachment exceeds the
-proxy's 10 MiB response cap, you get a loud too-large error, not a
-half-file. So a stub-sized result means you read the wrong field (step 1's
-pointer) instead of fetching the bytes (step 2). Re-read step 2.
+3. **Hand `path` to your file/PDF tool** and read the local file. Don't
+   fetch it over HTTP; don't expect base64. The file is transient (swept
+   after ~1 hour), so use it within the session.
 
 ### `format` on messages/threads/drafts
 

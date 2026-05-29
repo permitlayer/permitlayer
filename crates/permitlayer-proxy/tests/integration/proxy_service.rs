@@ -135,6 +135,7 @@ async fn build_service_multi(
         Arc::clone(&audit_store) as Arc<dyn AuditStore>,
         test_scrub_engine(),
         std::env::temp_dir(),
+        std::env::temp_dir().join("permitlayer-test-media"),
     ));
 
     (service, audit_store)
@@ -188,6 +189,33 @@ async fn full_happy_path() {
 }
 
 #[tokio::test]
+async fn fetch_raw_does_not_scrub_response_body() {
+    // The attachment-fetch path must NOT run the scrub engine over the
+    // body — scrubbing base64 corrupts the decoded file. Embed an
+    // OTP-looking 6-digit run (a scrub trigger) and assert it survives
+    // verbatim through `fetch_raw` (whereas `handle` would redact it).
+    let body = r#"{"size":9,"data":"VGhlIGNvZGUgaXMgODQ3MjkxIQ"}"#; // contains 847291
+    let mut server = mockito::Server::new_async().await;
+    let mock = server
+        .mock("GET", "/users/me/messages/m1/attachments/a1")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(body)
+        .create_async()
+        .await;
+
+    let (service, _) = build_service(&format!("{}/", server.url())).await;
+    let req = make_request("gmail", "users/me/messages/m1/attachments/a1");
+    let resp = service.fetch_raw(req).await.unwrap();
+
+    assert_eq!(resp.status, StatusCode::OK);
+    // Verbatim — no redaction of the embedded 6-digit run.
+    assert_eq!(resp.body, body.as_bytes(), "fetch_raw must return the body un-scrubbed");
+
+    mock.assert_async().await;
+}
+
+#[tokio::test]
 async fn missing_credentials_returns_503() {
     let server = mockito::Server::new_async().await;
 
@@ -210,6 +238,7 @@ async fn missing_credentials_returns_503() {
         audit_store,
         test_scrub_engine(),
         std::env::temp_dir(),
+        std::env::temp_dir().join("permitlayer-test-media"),
     );
 
     let req = make_request("gmail", "users/me/messages");
@@ -247,6 +276,7 @@ async fn upstream_unreachable_returns_503_with_audit() {
         Arc::clone(&audit_store) as Arc<dyn AuditStore>,
         test_scrub_engine(),
         std::env::temp_dir(),
+        std::env::temp_dir().join("permitlayer-test-media"),
     );
 
     let req = make_request("gmail", "users/me/messages");
@@ -422,6 +452,7 @@ async fn scrub_before_log_otp_never_in_audit_file() {
         audit_store as Arc<dyn AuditStore>,
         scrub_engine,
         tmp.path().to_path_buf(),
+        tmp.path().join("media"),
     ));
 
     let req = make_request("gmail", "users/me/messages");

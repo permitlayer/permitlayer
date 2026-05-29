@@ -9,6 +9,17 @@ use url::Url;
 
 use crate::error::ProxyError;
 
+/// Default maximum upstream response body size for the JSON/MCP path
+/// (10 MiB). Caps memory on the fully-buffered response read.
+pub const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024;
+
+/// Maximum upstream response body for the attachment-fetch path (50 MiB).
+/// Gmail attachment `data` is base64 (~33% inflation), so this bounds a
+/// raw attachment of roughly ~37 MiB. The bytes are decoded and written
+/// to disk server-side (never streamed through an MCP text result), so
+/// the larger cap does not enlarge any model-visible payload.
+pub const MAX_ATTACHMENT_BODY: usize = 50 * 1024 * 1024;
+
 /// Response from an upstream API call.
 #[derive(Debug)]
 pub struct UpstreamResponse {
@@ -74,6 +85,7 @@ impl UpstreamClient {
     ///
     /// Builds the full upstream URL from the service's base URL and the path,
     /// sets the `Authorization: Bearer` header, and forwards the request.
+    #[allow(clippy::too_many_arguments)] // HTTP dispatch: full request shape + body cap.
     pub async fn dispatch(
         &self,
         service: &str,
@@ -82,6 +94,7 @@ impl UpstreamClient {
         headers: HeaderMap,
         body: Bytes,
         access_token: &str,
+        max_body: usize,
     ) -> Result<UpstreamResponse, ProxyError> {
         let base_url = self.base_urls.get(service).ok_or_else(|| ProxyError::Internal {
             message: format!("no upstream URL configured for service '{service}'"),
@@ -137,9 +150,6 @@ impl UpstreamClient {
             });
         }
 
-        /// Maximum upstream response body size (10 MB, matching request limit).
-        const MAX_RESPONSE_BODY: usize = 10 * 1024 * 1024;
-
         // Handle 5xx server errors.
         if status >= 500 {
             // F11: Truncate 5xx body to avoid leaking internal API details.
@@ -158,21 +168,23 @@ impl UpstreamClient {
 
         let resp_headers = convert_headers(response.headers());
         // F7: Cap response body size to prevent OOM on large upstream responses.
+        // `max_body` is the caller-supplied ceiling (MAX_RESPONSE_BODY for the
+        // JSON/MCP path; MAX_ATTACHMENT_BODY for the attachment-fetch path).
         let content_length = response.content_length().unwrap_or(0);
-        if content_length > MAX_RESPONSE_BODY as u64 {
+        if content_length > max_body as u64 {
             return Err(ProxyError::Internal {
                 message: format!(
-                    "upstream response body too large: {content_length} bytes (max {MAX_RESPONSE_BODY})"
+                    "upstream response body too large: {content_length} bytes (max {max_body})"
                 ),
             });
         }
         let resp_body = response.bytes().await.map_err(|e| ProxyError::Internal {
             message: format!("failed to read upstream response body: {e}"),
         })?;
-        if resp_body.len() > MAX_RESPONSE_BODY {
+        if resp_body.len() > max_body {
             return Err(ProxyError::Internal {
                 message: format!(
-                    "upstream response body too large: {} bytes (max {MAX_RESPONSE_BODY})",
+                    "upstream response body too large: {} bytes (max {max_body})",
                     resp_body.len()
                 ),
             });
@@ -244,6 +256,7 @@ mod tests {
                 HeaderMap::new(),
                 Bytes::new(),
                 "test-token",
+                MAX_RESPONSE_BODY,
             )
             .await;
 
@@ -272,6 +285,7 @@ mod tests {
                 HeaderMap::new(),
                 Bytes::new(),
                 "test-token",
+                MAX_RESPONSE_BODY,
             )
             .await;
 
@@ -304,6 +318,7 @@ mod tests {
                 HeaderMap::new(),
                 Bytes::new(),
                 "test-token",
+                MAX_RESPONSE_BODY,
             )
             .await;
 
@@ -339,6 +354,7 @@ mod tests {
                 HeaderMap::new(),
                 Bytes::new(),
                 "test-token",
+                MAX_RESPONSE_BODY,
             )
             .await;
 
@@ -355,7 +371,15 @@ mod tests {
     async fn unknown_service_returns_error() {
         let client = test_client("http://localhost:1234/");
         let result = client
-            .dispatch("unknown", "path", Method::GET, HeaderMap::new(), Bytes::new(), "token")
+            .dispatch(
+                "unknown",
+                "path",
+                Method::GET,
+                HeaderMap::new(),
+                Bytes::new(),
+                "token",
+                MAX_RESPONSE_BODY,
+            )
             .await;
 
         assert!(matches!(result, Err(ProxyError::Internal { .. })));
@@ -428,6 +452,7 @@ mod tests {
                 HeaderMap::new(),
                 Bytes::new(),
                 "test-token",
+                MAX_RESPONSE_BODY,
             )
             .await;
 
@@ -460,7 +485,15 @@ mod tests {
         let upstream = UpstreamClient::with_client_and_urls(client, base_urls);
 
         let result = upstream
-            .dispatch("drive", "files", Method::GET, HeaderMap::new(), Bytes::new(), "test-token")
+            .dispatch(
+                "drive",
+                "files",
+                Method::GET,
+                HeaderMap::new(),
+                Bytes::new(),
+                "test-token",
+                MAX_RESPONSE_BODY,
+            )
             .await;
 
         let resp = result.unwrap();
