@@ -61,8 +61,9 @@
 //!
 //! There is no `StepSummary` API; rendering uses
 //! `design::render::{Outcome, styled_outcome, outcome_icon,
-//! error_block}` plus the `cli::setup` `Glyphs`/`glyphs()` color
-//! pattern.
+//! error_block}` plus `design::terminal::styled` for the structural
+//! glyphs (→, ✓, ⚠), all routed through the shared `Theme`/`ColorSupport`
+//! palette.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -74,6 +75,7 @@ use serde::Serialize;
 use crate::cli::kill::{self, ControlEndpoint};
 use crate::cli::silent_cli_error;
 use crate::design::render::{self, Outcome};
+use crate::design::terminal::styled;
 use permitlayer_core::store::AuditStore;
 
 // ── Embedded managed bundle (Decision C1) ───────────────────────────
@@ -108,27 +110,19 @@ pub struct DoctorArgs {
     /// attempted when BOTH `--fix` and `--restart-ok` are set.
     #[arg(long)]
     pub restart_ok: bool,
+
+    /// Show the full per-check report. By default a healthy system
+    /// prints only a one-line summary (Rule of Silence); checks that
+    /// pass are hidden and only warnings/failures are shown with their
+    /// remediation. `-v` always renders every check and its detail.
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
 }
 
-// ── Glyphs (mirror cli::setup / cli::update) ────────────────────────
-
-struct Glyphs {
-    arrow: &'static str,
-    check: &'static str,
-    warn: &'static str,
-}
-
-fn glyphs() -> Glyphs {
-    use crate::design::terminal::ColorSupport;
-    match ColorSupport::detect() {
-        ColorSupport::NoColor => Glyphs { arrow: "->", check: "[ok]", warn: "[!]" },
-        _ => Glyphs {
-            arrow: "\u{2192}", // →
-            check: "\u{2713}", // ✓
-            warn: "\u{26A0}",  // ⚠
-        },
-    }
-}
+// The bespoke `Glyphs`/`glyphs()` helper was removed in the CLI output
+// consistency pass — `render_human` now styles its structural glyphs
+// (→, ✓, ⚠) directly through the shared `Theme`/`ColorSupport` palette
+// via `design::terminal::styled`, the one idiom every command shares.
 
 // ── Core report types ───────────────────────────────────────────────
 
@@ -1819,7 +1813,7 @@ pub async fn run(args: DoctorArgs) -> Result<()> {
         };
         println!("{}", serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_owned()));
     } else {
-        render_human(&reports, &ctx, pass, warn, fail);
+        render_human(&reports, &ctx, pass, warn, fail, args.verbose);
     }
 
     // Exit code: any Fail severity OR any Refused/Failed fix_outcome
@@ -1963,57 +1957,91 @@ fn compute_integrity_gate(daemon_version: Option<&str>) -> (bool, String) {
 }
 
 /// Human-rendered report (Decision D — `render::Outcome` + Glyphs).
-fn render_human(reports: &[CheckReport], ctx: &DoctorCtx, pass: usize, warn: usize, fail: usize) {
+/// Whether a check appears in the default (non-verbose) human report.
+/// Rule of Silence: passing checks are hidden unless `-v`; warnings and
+/// failures always show (they carry actionable remediation). Pure so the
+/// silent-on-healthy rule is unit-testable without capturing stdout.
+fn check_is_visible(report: &CheckReport, verbose: bool) -> bool {
+    verbose || report.severity != Severity::Pass
+}
+
+fn render_human(
+    reports: &[CheckReport],
+    ctx: &DoctorCtx,
+    pass: usize,
+    warn: usize,
+    fail: usize,
+    verbose: bool,
+) {
     use crate::design::terminal::ColorSupport;
     use crate::design::theme::Theme;
 
-    let g = glyphs();
     let support = ColorSupport::detect();
     let theme = Theme::default();
+    // Shared palette (replaces the bespoke `Glyphs` helper — every glyph
+    // now routes through `Theme`/`ColorSupport`, the one CLI idiom).
+    // `arrow` is a neutral structural marker (heading/summary); `check`
+    // and `warn` carry semantic color via the accent / warn tokens. All
+    // three always render a glyph (UX-DR7); NoColor drops only the ANSI.
+    let arrow = styled("\u{2192}", theme.tokens().text_2, support); // →
+    let check = styled("\u{2713}", theme.tokens().accent, support); // ✓
+    let warn_glyph = styled("\u{26A0}", theme.tokens().warn, support); // ⚠
 
-    println!();
-    println!("{} agentsso doctor", g.arrow);
-    println!("    CLI:            {}", ctx.cli_version);
-    match &ctx.daemon_version {
-        Some(v) => println!("    running daemon: {v}"),
-        None => println!("    running daemon: {} unreachable", g.warn),
-    }
-    if ctx.fix {
-        println!("    fix mode:       ON{}", if ctx.restart_ok { " (restart-ok)" } else { "" });
-        if !ctx.fix_integrity_gate_passed {
-            println!(
-                "    {} integrity gate FAILED — all --fix mutations refused: {}",
-                g.warn, ctx.fix_integrity_gate_reason
-            );
+    // Rule of Silence: a healthy `doctor` is near-silent. By default we
+    // print ONLY the version/fix header in verbose mode, and ONLY the
+    // checks that aren't passing (those carry actionable remediation).
+    // `-v` restores the full per-check grid.
+    let visible: Vec<&CheckReport> =
+        reports.iter().filter(|r| check_is_visible(r, verbose)).collect();
+    let hidden_passing = reports.len() - visible.len();
+
+    // Header + per-check grid (verbose, or whenever there's something to
+    // show — a warn/fail run still wants the version context).
+    if verbose || !visible.is_empty() {
+        println!();
+        println!("{arrow} agentsso doctor");
+        println!("    CLI:            {}", ctx.cli_version);
+        match &ctx.daemon_version {
+            Some(v) => println!("    running daemon: {v}"),
+            None => println!("    running daemon: {warn_glyph} unreachable"),
         }
-    }
-    println!();
-
-    for r in reports {
-        let styled = render::styled_outcome(r.severity.to_outcome(), &theme, support);
-        println!("  {styled}  {}  ({})", r.title, r.id);
-        println!("       {}", r.detail);
-        if let Some(fo) = &r.fix_outcome {
-            match fo {
-                FixOutcome::Repaired { old, new } => {
-                    println!("       {} fixed: {old} -> {new}", g.check);
-                }
-                FixOutcome::Skipped { why } => {
-                    println!("       {} fix skipped: {why}", g.arrow);
-                }
-                FixOutcome::Refused { why } => {
-                    println!("       {} fix refused: {why}", g.warn);
-                }
-                FixOutcome::Failed { err } => {
-                    println!("       {} fix failed: {err}", g.warn);
-                }
+        if ctx.fix {
+            println!("    fix mode:       ON{}", if ctx.restart_ok { " (restart-ok)" } else { "" });
+            if !ctx.fix_integrity_gate_passed {
+                println!(
+                    "    {warn_glyph} integrity gate FAILED — all --fix mutations refused: {}",
+                    ctx.fix_integrity_gate_reason
+                );
             }
-        } else if let Some(rem) = &r.remediation {
-            println!("       run:  {rem}");
         }
+        println!();
+
+        for r in &visible {
+            let styled_o = render::styled_outcome(r.severity.to_outcome(), &theme, support);
+            println!("  {styled_o}  {}  ({})", r.title, r.id);
+            println!("       {}", r.detail);
+            if let Some(fo) = &r.fix_outcome {
+                match fo {
+                    FixOutcome::Repaired { old, new } => {
+                        println!("       {check} fixed: {old} -> {new}");
+                    }
+                    FixOutcome::Skipped { why } => {
+                        println!("       {arrow} fix skipped: {why}");
+                    }
+                    FixOutcome::Refused { why } => {
+                        println!("       {warn_glyph} fix refused: {why}");
+                    }
+                    FixOutcome::Failed { err } => {
+                        println!("       {warn_glyph} fix failed: {err}");
+                    }
+                }
+            } else if let Some(rem) = &r.remediation {
+                println!("       run:  {rem}");
+            }
+        }
+        println!();
     }
 
-    println!();
     // Bug 4 (Story 10.3): a positive-affordance line on an all-green
     // system — doctor's "nothing to do" signal. A present legacy-seed
     // snapshot is a Warn (so `warn >= 1`), which correctly suppresses
@@ -2021,11 +2049,16 @@ fn render_human(reports: &[CheckReport], ctx: &DoctorCtx, pass: usize, warn: usi
     // unreachable `daemon_version` is None and `daemon_not_running`
     // Fails, so this branch is never reached without a `Some(v)`.
     if let Some(line) =
-        healthy_summary_line(warn, fail, ctx.daemon_version.as_deref(), &ctx.endpoint, g.check)
+        healthy_summary_line(warn, fail, ctx.daemon_version.as_deref(), &ctx.endpoint, &check)
     {
         println!("{line}");
     }
-    println!("{} summary: {} pass · {} warn · {} fail", g.arrow, pass, warn, fail);
+    println!("{arrow} summary: {pass} pass · {warn} warn · {fail} fail");
+    // When passing checks were hidden (default mode on a system with
+    // some passes), tell the operator how to see the full report.
+    if hidden_passing > 0 {
+        println!("  (agentsso doctor -v \u{2192} full per-check report)");
+    }
 }
 
 /// Bug 4: build the all-green positive line, or `None` when it should
@@ -2336,6 +2369,31 @@ mod tests {
         assert_eq!(Severity::Pass.to_outcome(), Outcome::Ok);
         assert_eq!(Severity::Warn.to_outcome(), Outcome::Blocked);
         assert_eq!(Severity::Fail.to_outcome(), Outcome::Error);
+    }
+
+    // ── Rule of Silence: silent-on-healthy check visibility ──────────
+
+    fn report_with_severity(severity: Severity) -> CheckReport {
+        let mut r = CheckReport::pass("test_id", "test title", "detail", FixClass::NeverAutomatic);
+        r.severity = severity;
+        r
+    }
+
+    #[test]
+    fn check_visibility_default_hides_pass_shows_warn_and_fail() {
+        // Default (non-verbose): a passing check is hidden; warn/fail
+        // always render (they carry actionable remediation).
+        assert!(!check_is_visible(&report_with_severity(Severity::Pass), false));
+        assert!(check_is_visible(&report_with_severity(Severity::Warn), false));
+        assert!(check_is_visible(&report_with_severity(Severity::Fail), false));
+    }
+
+    #[test]
+    fn check_visibility_verbose_shows_everything() {
+        // `-v`: every check renders, including passes (the full grid).
+        assert!(check_is_visible(&report_with_severity(Severity::Pass), true));
+        assert!(check_is_visible(&report_with_severity(Severity::Warn), true));
+        assert!(check_is_visible(&report_with_severity(Severity::Fail), true));
     }
 
     // ── Story 10.3 snapshot GC: pure helpers (fixed `now`) ───────────

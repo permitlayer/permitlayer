@@ -80,6 +80,12 @@ pub async fn run() -> Result<()> {
     Ok(())
 }
 
+/// The reload success headline. Pure so the "one outcome, not six facts"
+/// shape is unit-testable without capturing stdout.
+fn reload_headline(policies_loaded: usize, agents_loaded: usize) -> String {
+    format!("reload OK ({policies_loaded} policies, {agents_loaded} agents)")
+}
+
 /// Parse and display the JSON response from `/v1/control/reload`.
 ///
 /// Returns `Ok(())` on success, or an `Err` with a non-zero exit code
@@ -88,18 +94,39 @@ pub async fn run() -> Result<()> {
 fn handle_reload_response(body: &str) -> Result<()> {
     // Try the success shape first.
     if let Ok(resp) = serde_json::from_str::<ReloadResponseView>(body) {
-        println!(
-            "\u{2713} {} policies, {} agents loaded \u{00b7} {} added, {} modified, {} unchanged, {} removed",
-            resp.policies_loaded,
-            resp.agents_loaded,
-            resp.added,
-            resp.modified,
-            resp.unchanged,
-            resp.removed
+        // Rule of Silence + hierarchy: one outcome headline, then at most
+        // one secondary diff line — not six facts crammed into the
+        // headline with `·` separators.
+        let support = crate::design::terminal::ColorSupport::detect();
+        let theme = crate::design::theme::Theme::default();
+        print!(
+            "{}",
+            crate::design::render::success_headline(
+                &reload_headline(resp.policies_loaded, resp.agents_loaded),
+                &theme,
+                support,
+            )
         );
-        if !resp.policy_scan_path.is_empty() {
-            println!("  scanned: {}", resp.policy_scan_path);
+        // Secondary detail (dim): the diff, only when something actually
+        // changed (a pure no-op reload doesn't need the zeros), plus the
+        // scanned path when present.
+        let changed = resp.added + resp.modified + resp.removed > 0;
+        let mut detail: Vec<String> = Vec::new();
+        if changed {
+            detail.push(format!(
+                "changes: {} added, {} modified, {} unchanged, {} removed",
+                resp.added, resp.modified, resp.unchanged, resp.removed
+            ));
         }
+        if !resp.policy_scan_path.is_empty() {
+            detail.push(format!("scanned: {}", resp.policy_scan_path));
+        }
+        if !detail.is_empty() {
+            let refs: Vec<&str> = detail.iter().map(String::as_str).collect();
+            print!("{}", crate::design::render::detail_block(&refs, &theme, support));
+        }
+        // Real warnings stay on stderr as their own warning lines (not
+        // appended to the success headline).
         if let Some(warn) = resp.policy_scan_empty_warning {
             eprintln!("  warning: {warn}");
         }
@@ -154,5 +181,24 @@ fn send_sighup_fallback(home: &std::path::Path) -> Result<()> {
             "reload command is not supported on this platform (no SIGHUP) and the control endpoint is unavailable"
         );
         std::process::exit(1);
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reload_headline_is_one_outcome_not_six_facts() {
+        // Rule of Silence: the headline names the outcome + the two
+        // top-line counts, NOT the full added/modified/unchanged/removed
+        // diff (that moved to a secondary detail line).
+        let h = reload_headline(3, 5);
+        assert_eq!(h, "reload OK (3 policies, 5 agents)");
+        // The diff stats must NOT be in the headline.
+        assert!(!h.contains("added"));
+        assert!(!h.contains("modified"));
+        assert!(!h.contains("removed"));
     }
 }

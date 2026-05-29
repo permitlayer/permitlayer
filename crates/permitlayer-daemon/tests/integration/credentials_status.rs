@@ -55,20 +55,29 @@ fn credentials_status_with_valid_meta_shows_service_info() {
         stdout.contains("gmail.readonly"),
         "expected 'gmail.readonly' in output, got: {stdout}"
     );
-    // Story 1.14b Task 5a renamed the misleading `refreshed:` label
-    // to `connected:` because the field was always `connected_at`,
-    // not `last_refreshed_at`. Both the label and its value should
-    // appear in the output.
-    assert!(stdout.contains("connected:"), "expected 'connected:' in output, got: {stdout}");
-    // Story 1.14b Task 5b: when `last_refreshed_at` is None (as in
-    // this fixture), the `last refresh:` line must be absent.
+    // CLI output consistency pass: `status` now renders through the
+    // shared `render::table()` pipeline (matching `credentials list`),
+    // so the per-line `connected:` label became a `CONNECTED` column
+    // header. Story 1.14b Task 5a's semantics still hold — the column
+    // value is `connected_at`, the setup timestamp.
     assert!(
-        !stdout.contains("last refresh:"),
-        "pre-refresh credentials must not show a 'last refresh:' line, got: {stdout}"
+        stdout.contains("CONNECTED"),
+        "expected 'CONNECTED' column header in output, got: {stdout}"
+    );
+    // Story 1.14b Task 5b: when `last_refreshed_at` is None (as in this
+    // fixture), the LAST REFRESH column renders an em-dash placeholder
+    // (the table keeps every column aligned), not a stale timestamp.
+    assert!(
+        stdout.contains("LAST REFRESH"),
+        "expected 'LAST REFRESH' column header in output, got: {stdout}"
+    );
+    assert!(
+        stdout.contains('\u{2014}'),
+        "pre-refresh credentials must show an em-dash placeholder in LAST REFRESH, got: {stdout}"
     );
     // Token will be expired (connected_at is in the past relative to now + expires_in_secs).
     assert!(
-        stdout.contains("token:") || stdout.contains("expired") || stdout.contains("valid"),
+        stdout.contains("TOKEN") || stdout.contains("expired") || stdout.contains("valid"),
         "expected token status in output, got: {stdout}"
     );
 }
@@ -113,10 +122,19 @@ fn credentials_status_shows_last_refresh_line_when_refreshed() {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
 
-    assert!(stdout.contains("connected:"), "expected 'connected:' line, got: {stdout}");
+    // CLI output consistency pass: `status` renders through
+    // `render::table()`, so the per-line labels became column headers.
+    assert!(stdout.contains("CONNECTED"), "expected 'CONNECTED' column header, got: {stdout}");
     assert!(
-        stdout.contains("last refresh:"),
-        "expected 'last refresh:' line when last_refreshed_at is Some, got: {stdout}"
+        stdout.contains("LAST REFRESH"),
+        "expected 'LAST REFRESH' column header when last_refreshed_at is Some, got: {stdout}"
+    );
+    // The LAST REFRESH column must carry an actual timestamp (not the
+    // em-dash placeholder) when last_refreshed_at is Some. "just now"
+    // is `format_timestamp`'s rendering of a 30-seconds-ago instant.
+    assert!(
+        stdout.contains("just now") || stdout.contains("ago"),
+        "expected a recent timestamp in LAST REFRESH when refreshed 30s ago, got: {stdout}"
     );
     assert!(
         stdout.contains("valid"),

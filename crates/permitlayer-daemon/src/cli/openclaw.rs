@@ -110,25 +110,36 @@ pub(crate) fn emit_snippet(
     let stdout_body =
         if redact_stdout { redact_bearer(&body_with_bearer) } else { body_with_bearer.clone() };
 
-    // Always write to stdout in a delimited block.
-    let mut stdout = io::stdout().lock();
-    writeln!(stdout)?;
+    // Stream split (clig.dev): the JSON snippet is machine payload → it
+    // goes to STDOUT as bare, fence-free JSON so `agentsso connect … |
+    // jq` and `… > config.json` Just Work. The human-facing labels
+    // ("copy this into …", entry-name hint, redaction note) are chrome →
+    // STDERR. Pre-fix this was a single `### … ###`-fenced block on
+    // stdout, which (a) was unreadable and (b) made the stdout copy
+    // un-parseable as JSON.
+    //
+    // The labels are only useful to a human at a terminal; when stdout is
+    // piped the consumer wants pure JSON and the labels would be noise,
+    // but stderr is the right channel either way (it never pollutes the
+    // piped stdout), so we always emit them to stderr.
+    let mut stderr = io::stderr().lock();
+    writeln!(stderr)?;
     writeln!(
-        stdout,
-        "### copy this into your MCP client config (e.g. ~/.openclaw/openclaw.json) ###"
+        stderr,
+        "  Paste into your MCP client (e.g. ~/.openclaw/openclaw.json) as \"permitlayer-{service}\":"
     )?;
-    writeln!(stdout, "### entry name suggestion: \"permitlayer-{service}\" ###")?;
     if redact_stdout {
         writeln!(
-            stdout,
-            "### NOTE: bearer redacted because stdout is piped — real token in --mcp-config-out ###"
+            stderr,
+            "  (bearer redacted on piped stdout \u{2014} the real token is in --mcp-config-out)"
         )?;
     }
-    writeln!(stdout)?;
+    writeln!(stderr)?;
+    drop(stderr);
+
+    // The payload: bare JSON on stdout, nothing else.
+    let mut stdout = io::stdout().lock();
     writeln!(stdout, "{stdout_body}")?;
-    writeln!(stdout)?;
-    writeln!(stdout, "### end ###")?;
-    writeln!(stdout)?;
     drop(stdout);
 
     // Optional file write — always uses the un-redacted body (the file
@@ -154,9 +165,21 @@ fn redact_bearer(body: &str) -> String {
     if let Some(start) = body.find("\"Authorization\":")
         && let Some(open) = body[start..].find("\"Bearer ")
     {
-        let abs_open = start + open + 1; // position of opening quote
-        // Find the next unescaped closing quote.
-        let after_open = abs_open + 1; // skip the opening quote
+        // `open` is the offset of the opening quote of the value
+        // (`"Bearer …"`) relative to `start`. `abs_open` is its absolute
+        // index — the opening quote itself, NOT one past it.
+        //
+        // Bug fix (CLI output consistency pass): the previous code set
+        // `abs_open = start + open + 1` and then copied `body[..abs_open]`
+        // (which INCLUDED the opening `"`) before pushing a fresh
+        // `"Bearer …"`, producing a doubled quote (`""Bearer …`) that
+        // made the redacted stdout body INVALID JSON. The old unit test
+        // only substring-checked the placeholder, so it never caught it.
+        // Now `abs_open` points AT the opening quote so the prefix copy
+        // stops just before it and the replacement re-emits exactly one.
+        let abs_open = start + open; // position of the opening quote
+        // Find the value's closing quote (skip the opening quote).
+        let after_open = abs_open + 1;
         if let Some(close_rel) = body[after_open..].find('"') {
             let abs_close = after_open + close_rel;
             let mut out = String::with_capacity(body.len());
@@ -269,6 +292,28 @@ mod tests {
         // Other fields preserved.
         assert!(redacted.contains("streamable-http"));
         assert!(redacted.contains("http://127.0.0.1:3820/mcp/gmail"));
+    }
+
+    #[test]
+    fn redacted_snippet_body_is_still_valid_json() {
+        // Stream-split contract (CLI output consistency pass): the
+        // snippet body emitted on stdout — redacted or not — must remain
+        // bare, parseable JSON now that the `### … ###` fences and the
+        // human labels moved to stderr. A consumer doing
+        // `agentsso connect … | jq` or `… > config.json` relies on this.
+        let addr: SocketAddr = "127.0.0.1:3820".parse().unwrap();
+        let snippet = build_snippet("gmail", "agt_v2_alice_supersecret", addr, "gmail.readonly");
+        let pretty = serde_json::to_string_pretty(&snippet).unwrap();
+        let redacted = redact_bearer(&pretty);
+        // Both the un-redacted and the redacted stdout copies parse.
+        let parsed_plain: serde_json::Value = serde_json::from_str(&pretty).unwrap();
+        let parsed_redacted: serde_json::Value = serde_json::from_str(&redacted).unwrap();
+        assert_eq!(parsed_plain["transport"], "streamable-http");
+        assert_eq!(parsed_redacted["transport"], "streamable-http");
+        assert_eq!(
+            parsed_redacted["headers"]["Authorization"],
+            "Bearer <REDACTED_FOR_PIPED_STDOUT>"
+        );
     }
 
     #[test]

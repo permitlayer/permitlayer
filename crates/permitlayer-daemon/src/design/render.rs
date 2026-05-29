@@ -222,6 +222,85 @@ pub fn empty_state(description: &str, command: &str) -> String {
     buf
 }
 
+/// Render a success headline — the single bright/accent line that states
+/// what a command accomplished. The visual top of a command's success
+/// output (clig.dev: "lead with the outcome"; Rule of Silence: one line,
+/// not a per-step wall).
+///
+/// Format (UX-DR23):
+/// ```text
+///   ✓ Connected gmail to agent gmail-quickstart (read-only)
+/// ```
+/// The `✓` glyph always appears (UX-DR7); the whole line is accent-colored
+/// when color is supported, plain otherwise. `text` is control-char
+/// sanitized (it routinely interpolates agent/service names).
+pub fn success_headline(text: &str, theme: &Theme, support: ColorSupport) -> String {
+    let text = sanitize_control_chars(text);
+    let line = format!("  \u{2713} {text}");
+    format!("{}\n", styled(&line, theme.tokens().accent, support))
+}
+
+/// Render an indented, dim block of secondary detail lines — the
+/// "confirmations" demoted below the headline (collapsed step summary,
+/// key/value facts, the bearer-chain note). Dim (secondary) so they don't
+/// compete with the headline or the next action (Heroku: use `.dim` for
+/// secondary text).
+///
+/// Format:
+/// ```text
+///      scopes: gmail.readonly
+///      client: byo:client_secret.json
+///      5 steps completed — run with -v for detail
+/// ```
+/// Each line is indented to the 5-space content column and dim-styled
+/// (via the `text_2` secondary token); plain when color is unavailable,
+/// but the indentation structure is preserved either way (NO_COLOR rule:
+/// strip color, keep structure). Lines are control-char sanitized.
+pub fn detail_block(lines: &[&str], theme: &Theme, support: ColorSupport) -> String {
+    let dim = theme.tokens().text_2;
+    let mut buf = String::with_capacity(128);
+    for line in lines {
+        let line = sanitize_control_chars(line);
+        if line.is_empty() {
+            writeln!(buf).ok();
+        } else {
+            let styled_line = styled(&format!("     {line}"), dim, support);
+            writeln!(buf, "{styled_line}").ok();
+        }
+    }
+    buf
+}
+
+/// Render a "Next:" section — the ONE action the user must take, set apart
+/// by a blank line with a bright/accent label and an indented body
+/// (clig.dev: "suggest the next command"; the body may be a command, a
+/// path, or a multi-line config block). The body is printed VERBATIM
+/// (callers pass already-formatted JSON/commands); only the label is
+/// styled. Each body line is indented to the content column.
+///
+/// Format:
+/// ```text
+///
+/// Next — add this to your MCP client config:
+///      { ...json... }
+/// ```
+/// The caller is responsible for stream routing: the label is human chrome
+/// (stderr), but a machine-payload body (e.g. JSON) may go to stdout —
+/// callers that need the split should render label and body separately.
+/// This helper renders the human/TTY form (label + indented body together).
+pub fn next_steps(label: &str, body: &str, theme: &Theme, support: ColorSupport) -> String {
+    let label = sanitize_control_chars(label);
+    let mut buf = String::with_capacity(256);
+    writeln!(buf).ok();
+    writeln!(buf, "{}", styled(&label, theme.tokens().accent, support)).ok();
+    for line in body.lines() {
+        // Body is caller-formatted (commands/JSON) — do NOT sanitize or
+        // restyle; just indent to the content column.
+        writeln!(buf, "     {line}").ok();
+    }
+    buf
+}
+
 /// Truncate a field to `max_width` characters, appending `\u{2026}` (…) if truncated.
 pub fn truncate_field(text: &str, max_width: usize) -> String {
     if max_width == 0 {
@@ -1425,5 +1504,88 @@ mod tests {
     #[test]
     fn snapshot_policy_reloaded_ok() {
         insta::assert_snapshot!(snapshot_event("policy-reloaded", "ok"));
+    }
+
+    // --- hierarchy helpers (success_headline / detail_block / next_steps) ---
+
+    #[test]
+    fn success_headline_nocolor_is_plain_with_glyph() {
+        let out = success_headline(
+            "Connected gmail to agent gmail-quickstart (read-only)",
+            &Theme::Carapace,
+            ColorSupport::NoColor,
+        );
+        // Glyph always present (UX-DR7); no ANSI under NoColor.
+        assert_eq!(out, "  \u{2713} Connected gmail to agent gmail-quickstart (read-only)\n");
+        assert!(!out.contains('\u{1b}'), "NoColor must not emit ANSI");
+    }
+
+    #[test]
+    fn success_headline_truecolor_wraps_in_ansi_but_keeps_text() {
+        let out = success_headline("done", &Theme::Carapace, ColorSupport::TrueColor);
+        assert!(out.contains('\u{1b}'), "TrueColor should style the line");
+        assert!(out.contains("\u{2713} done"), "text + glyph preserved");
+        assert!(out.ends_with('\n'));
+    }
+
+    #[test]
+    fn success_headline_sanitizes_control_chars() {
+        // A hostile agent/service name carrying a CR or RLO must not reach
+        // the terminal unsanitized.
+        let out = success_headline("evil\r\u{202e}name", &Theme::Carapace, ColorSupport::NoColor);
+        assert!(!out.contains('\r'));
+        assert!(!out.contains('\u{202e}'));
+        assert!(out.contains("evilname"));
+    }
+
+    #[test]
+    fn detail_block_nocolor_indents_each_line_no_ansi() {
+        let out = detail_block(
+            &["scopes: gmail.readonly", "client: byo:client_secret.json"],
+            &Theme::Carapace,
+            ColorSupport::NoColor,
+        );
+        assert_eq!(out, "     scopes: gmail.readonly\n     client: byo:client_secret.json\n");
+        assert!(!out.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn detail_block_preserves_blank_separators() {
+        let out = detail_block(&["a", "", "b"], &Theme::Carapace, ColorSupport::NoColor);
+        // Empty entries become bare blank lines (no trailing indent
+        // whitespace), keeping structure under NO_COLOR.
+        assert_eq!(out, "     a\n\n     b\n");
+    }
+
+    #[test]
+    fn detail_block_truecolor_keeps_indent_and_styles() {
+        let out = detail_block(&["row"], &Theme::Carapace, ColorSupport::TrueColor);
+        assert!(out.contains('\u{1b}'), "should dim-style detail lines");
+        assert!(out.contains("     row"), "content column preserved");
+    }
+
+    #[test]
+    fn next_steps_separates_with_blank_line_and_indents_body() {
+        let out = next_steps(
+            "Next \u{2014} add this to your MCP client config:",
+            "{\n  \"transport\": \"streamable-http\"\n}",
+            &Theme::Carapace,
+            ColorSupport::NoColor,
+        );
+        // Leading blank line sets the section apart; body indented to the
+        // 5-space content column verbatim (NoColor → no ANSI).
+        assert_eq!(
+            out,
+            "\nNext \u{2014} add this to your MCP client config:\n     {\n       \"transport\": \"streamable-http\"\n     }\n"
+        );
+        assert!(!out.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn next_steps_styles_only_label_under_color() {
+        let out = next_steps("Next:", "agentsso doctor", &Theme::Carapace, ColorSupport::TrueColor);
+        assert!(out.contains('\u{1b}'), "label is styled");
+        // Body is emitted verbatim (no per-line restyle), just indented.
+        assert!(out.contains("     agentsso doctor"));
     }
 }

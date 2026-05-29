@@ -13,7 +13,9 @@ use crate::cli::kill::{
     error_block_daemon_unreachable_endpoint, error_block_protocol_error,
     load_daemon_config_or_default_with_warn, resolve_control_endpoint,
 };
-use crate::design::render::error_block;
+use crate::design::render::{self, TableCell, error_block, table};
+use crate::design::terminal::{ColorSupport, TableLayout};
+use crate::design::theme::Theme;
 
 /// Top-level `policy` subcommand wrapper.
 #[derive(Args)]
@@ -179,7 +181,20 @@ fn validate_policy(args: ValidateArgs) -> Result<()> {
 
     match permitlayer_core::policy::PolicySet::compile_from_str(&text, path) {
         Ok(set) => {
-            println!("\u{2713} valid policy file ({} {})", set.len(), policy_count_noun(set.len()));
+            // Route the success glyph through the shared palette via
+            // `success_headline` (TTY/NO_COLOR-aware accent ✓) instead of
+            // a bare Unicode literal, matching the one CLI output idiom.
+            let support = ColorSupport::detect();
+            let theme =
+                Theme::load(&super::agentsso_home().unwrap_or_else(|_| PathBuf::from(".agentsso")));
+            print!(
+                "{}",
+                render::success_headline(
+                    &format!("valid policy file ({} {})", set.len(), policy_count_noun(set.len())),
+                    &theme,
+                    support,
+                )
+            );
             Ok(())
         }
         Err(e) => {
@@ -281,14 +296,51 @@ async fn list_policies() -> Result<()> {
         }
     };
 
+    let support = ColorSupport::detect();
+    let theme = Theme::load(&super::agentsso_home().unwrap_or_else(|_| PathBuf::from(".agentsso")));
+
     if entries.is_empty() {
-        println!("no policies loaded");
+        print!(
+            "{}",
+            render::empty_state(
+                "no policies loaded",
+                "register with:  agentsso policy register <name>"
+            )
+        );
         return Ok(());
     }
 
-    for entry in entries {
-        let scopes = entry.scopes.join(", ");
-        println!("{}  {}  {}", entry.name, entry.origin, scopes);
+    // Render through the shared `render::table()` pipeline (matching
+    // `agent list` / `credentials list`) instead of hand-rolled
+    // space-padded `println!` columns — TTY/NO_COLOR-aware, adaptive.
+    let layout = TableLayout::detect();
+    let headers = &["POLICY", "ORIGIN", "SCOPES"];
+    let rows: Vec<Vec<TableCell>> = entries
+        .into_iter()
+        .map(|entry| {
+            vec![
+                TableCell::Plain(entry.name),
+                TableCell::Plain(entry.origin),
+                TableCell::Plain(entry.scopes.join(", ")),
+            ]
+        })
+        .collect();
+
+    match table(headers, &rows, layout, &theme, support) {
+        Ok(rendered) => print!("{rendered}"),
+        Err(e) => {
+            tracing::warn!(error = %e, "table render failed — falling back to plain output");
+            for row in &rows {
+                let cells: Vec<&str> = row
+                    .iter()
+                    .map(|c| match c {
+                        TableCell::Plain(s) => s.as_str(),
+                        _ => "",
+                    })
+                    .collect();
+                println!("{}", cells.join("  "));
+            }
+        }
     }
 
     Ok(())

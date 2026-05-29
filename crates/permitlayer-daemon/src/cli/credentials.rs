@@ -281,44 +281,76 @@ fn status_credentials() -> anyhow::Result<()> {
 
     entries.sort_by(|a, b| a.0.cmp(&b.0));
 
-    for (service, meta) in &entries {
-        let (validity, time_remaining) = compute_token_validity(meta);
-        // Story 1.14b Task 5a: the label was previously "refreshed:"
-        // (misleading — the value has always been `connected_at`, the
-        // setup timestamp). Renamed to "connected:" so the display
-        // matches the field semantics. See `deferred-work.md:58` for
-        // the original bug report.
-        let connected = if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&meta.connected_at) {
-            format_timestamp(ts.with_timezone(&chrono::Utc))
-        } else {
-            meta.connected_at.clone()
-        };
-        // Story 1.14b Task 5b: new "last refresh:" line, only printed
-        // when the refresh flow has actually updated the meta file.
-        // When `None` the line is omitted entirely (not "never" or
-        // "unknown") — keeps the display clean for pre-refresh
-        // credentials.
-        let last_refresh: Option<String> = meta.last_refreshed_at.as_ref().map(|raw| {
-            if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(raw) {
+    // Render through the shared `render::table()` pipeline (the same one
+    // `credentials list` uses) so `status` shares the one CLI table
+    // idiom — TTY/NO_COLOR-aware, width-adaptive — instead of the old
+    // hand-rolled per-credential `println!` column block.
+    let home = super::agentsso_home().unwrap_or_else(|_| PathBuf::from(".agentsso"));
+    let theme = Theme::load(&home);
+    let support = ColorSupport::detect();
+    let layout = TableLayout::detect();
+
+    let headers = &["SERVICE", "TOKEN", "CONNECTED", "LAST REFRESH", "SCOPES"];
+    let rows: Vec<Vec<TableCell>> = entries
+        .iter()
+        .map(|(service, meta)| {
+            let (validity, time_remaining) = compute_token_validity(meta);
+            // Story 1.14b Task 5a: the value has always been
+            // `connected_at` (the setup timestamp) — the column header
+            // matches the field semantics.
+            let connected = if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(&meta.connected_at)
+            {
                 format_timestamp(ts.with_timezone(&chrono::Utc))
             } else {
-                raw.clone()
-            }
-        });
-        let scopes_display = meta
-            .scopes
-            .iter()
-            .map(|s| s.strip_prefix("https://www.googleapis.com/auth/").unwrap_or(s))
-            .collect::<Vec<_>>()
-            .join(", ");
+                meta.connected_at.clone()
+            };
+            // Story 1.14b Task 5b: "last refresh" is `None` until the
+            // refresh flow has updated the meta file. In the old layout
+            // the line was omitted entirely; as a table column we render
+            // an em-dash placeholder so the column stays aligned.
+            let last_refresh: String = meta
+                .last_refreshed_at
+                .as_ref()
+                .map(|raw| {
+                    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(raw) {
+                        format_timestamp(ts.with_timezone(&chrono::Utc))
+                    } else {
+                        raw.clone()
+                    }
+                })
+                .unwrap_or_else(|| "\u{2014}".to_owned());
+            let scopes_display = meta
+                .scopes
+                .iter()
+                .map(|s| s.strip_prefix("https://www.googleapis.com/auth/").unwrap_or(s))
+                .collect::<Vec<_>>()
+                .join(", ");
 
-        println!("{service}");
-        println!("  token:        {validity}{time_remaining}");
-        println!("  connected:    {connected}");
-        if let Some(last) = last_refresh {
-            println!("  last refresh: {last}");
+            vec![
+                TableCell::Plain(service.clone()),
+                TableCell::Plain(format!("{validity}{time_remaining}")),
+                TableCell::Plain(connected),
+                TableCell::Plain(last_refresh),
+                TableCell::Plain(scopes_display),
+            ]
+        })
+        .collect();
+
+    match table(headers, &rows, layout, &theme, support) {
+        Ok(rendered) => print!("{rendered}"),
+        Err(e) => {
+            tracing::warn!(error = %e, "table render failed — falling back to plain output");
+            for row in &rows {
+                let cells: Vec<String> = row
+                    .iter()
+                    .map(|c| match c {
+                        TableCell::Plain(s) => s.clone(),
+                        other => format!("{other:?}"),
+                    })
+                    .collect();
+                println!("{}", cells.join("  "));
+            }
         }
-        println!("  scopes:       {scopes_display}");
     }
 
     Ok(())
@@ -812,7 +844,11 @@ async fn refresh_credentials(args: RefreshArgs) -> anyhow::Result<()> {
 /// integration-test harness that needs to inject mock OAuth clients
 /// yet). Returns `Err(String)` with a human-readable detail so the
 /// caller can wrap it in `RefreshFlowError::MetaInvalid`.
-fn build_oauth_client_for_cli(
+///
+/// `pub(crate)` so the control-plane verify handler's 401 self-heal
+/// (`server::control::try_self_heal_refresh`) can build the same
+/// production resolver the CLI `credentials refresh` path uses.
+pub(crate) fn build_oauth_client_for_cli(
     vault: &permitlayer_vault::Vault,
     vault_dir: &std::path::Path,
     service: &str,
