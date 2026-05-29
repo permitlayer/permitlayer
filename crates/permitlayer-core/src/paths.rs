@@ -266,6 +266,20 @@ pub fn plugins_dir(home_override: Option<&Path>) -> PathBuf {
     daemon_state_dir(home_override).join("plugins")
 }
 
+/// Media directory — transient store for decoded inbound attachments
+/// (e.g. Gmail attachment bytes the proxy materializes so the MCP agent
+/// can read them by local path). Per-agent subdirs live below this.
+///
+/// On macOS this is created group-traversable (`0o710 root:permitlayer-clients`)
+/// so the operator-user agent can reach its files; files inside are written
+/// `0o640 root:permitlayer-clients` via
+/// [`crate::files::write_client_readable_file`]. On single-user tiers it is
+/// `0o700` under the operator's own home. Files are swept on a TTL by the
+/// daemon (NOT a durable store). See the ADR on the media trust boundary.
+pub fn media_dir(home_override: Option<&Path>) -> PathBuf {
+    daemon_state_dir(home_override).join("media")
+}
+
 /// Audit log path.
 pub fn audit_log_path(home_override: Option<&Path>) -> PathBuf {
     daemon_log_dir(home_override).join("audit.log")

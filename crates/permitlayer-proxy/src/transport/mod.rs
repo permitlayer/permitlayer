@@ -4,5 +4,6 @@
 //! adapter builds `ProxyRequest` from MCP tool calls, the REST adapter
 //! builds `ProxyRequest` from axum HTTP requests.
 
+pub mod gmail_shape;
 pub mod mcp;
 pub mod rest;

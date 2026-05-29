@@ -90,6 +90,11 @@ pub struct ProxyService {
     /// to reconstruct the correct `OAuthClient` on demand (Story 1.14).
     /// Typically `~/.agentsso/vault`.
     vault_dir: PathBuf,
+    /// Directory where decoded inbound attachments are materialized for
+    /// the MCP agent to read by local path (Gmail `attachments.get`). Per
+    /// `permitlayer_core::paths::media_dir`. Files are written
+    /// client-readable + TTL-swept by the daemon.
+    media_dir: PathBuf,
     /// Test-only OAuth client override map.
     ///
     /// `None` in production. When `Some(map)`,
@@ -122,6 +127,7 @@ impl ProxyService {
     /// The refresh path reads these meta files on demand to reconstruct
     /// the correct `OAuthClient` for each service being refreshed.
     #[must_use]
+    #[allow(clippy::too_many_arguments)] // wiring constructor: all deps + vault_dir + media_dir.
     pub fn new(
         credential_store: Arc<dyn CredentialStore>,
         vault: Arc<Vault>,
@@ -130,6 +136,7 @@ impl ProxyService {
         audit_store: Arc<dyn AuditStore>,
         scrub_engine: Arc<ScrubEngine>,
         vault_dir: PathBuf,
+        media_dir: PathBuf,
     ) -> Self {
         Self {
             credential_store,
@@ -139,8 +146,15 @@ impl ProxyService {
             audit_store,
             scrub_engine,
             vault_dir,
+            media_dir,
             oauth_client_overrides: None,
         }
+    }
+
+    /// The directory where attachment bytes are materialized for the agent.
+    #[must_use]
+    pub fn media_dir(&self) -> &std::path::Path {
+        &self.media_dir
     }
 
     /// Construct a `ProxyService` with a pre-populated OAuth client
@@ -183,6 +197,7 @@ impl ProxyService {
         audit_store: Arc<dyn AuditStore>,
         scrub_engine: Arc<ScrubEngine>,
         vault_dir: PathBuf,
+        media_dir: PathBuf,
         oauth_client_overrides: HashMap<String, Arc<OAuthClient>>,
     ) -> Self {
         Self {
@@ -193,6 +208,7 @@ impl ProxyService {
             audit_store,
             scrub_engine,
             vault_dir,
+            media_dir,
             oauth_client_overrides: Some(oauth_client_overrides),
         }
     }
@@ -422,6 +438,7 @@ impl ProxyService {
         scope: &str,
         resource: &str,
         replay: &ProxyRequestReplayParts,
+        max_body: usize,
     ) -> Result<Option<crate::upstream::UpstreamResponse>, ProxyError> {
         use crate::refresh_flow::{RefreshFlowError, RefreshOutcome, refresh_service};
 
@@ -578,6 +595,7 @@ impl ProxyService {
                 replay.headers.clone(),
                 replay.body.clone(),
                 access_token_str,
+                max_body,
             )
             .await;
 
@@ -612,6 +630,32 @@ impl ProxyService {
     /// solely for the upstream `Authorization: Bearer` header and is NEVER
     /// returned to the agent.
     pub async fn handle(&self, req: ProxyRequest) -> Result<ProxyResponse, ProxyError> {
+        self.handle_inner(req, true).await
+    }
+
+    /// Like [`Self::handle`] but returns the upstream body **un-scrubbed**.
+    ///
+    /// For binary upstream payloads where running the text scrub engine
+    /// over the bytes would be both wrong (it corrupts non-text data —
+    /// e.g. a base64 attachment blob whose characters incidentally match
+    /// a scrub rule) and pointless (binary carries no scrub-targeted
+    /// secrets). Still performs credential unseal, scoped-token issue,
+    /// the 401 refresh-retry, and audit logging — only the scrub step is
+    /// skipped. Used by the Gmail attachment-fetch path (`attachments.get`),
+    /// which decodes the returned base64 itself.
+    pub async fn fetch_raw(&self, req: ProxyRequest) -> Result<ProxyResponse, ProxyError> {
+        self.handle_inner(req, false).await
+    }
+
+    /// Shared request pipeline for [`Self::handle`] (scrubbed) and
+    /// [`Self::fetch_raw`] (un-scrubbed). `scrub_response` gates ONLY the
+    /// response-body scrub step; credential/token/refresh/audit are
+    /// identical on both paths.
+    async fn handle_inner(
+        &self,
+        req: ProxyRequest,
+        scrub_response: bool,
+    ) -> Result<ProxyResponse, ProxyError> {
         // 1. Fetch sealed credential.
         let sealed = match self.credential_store.get(&req.service).await {
             Ok(Some(sealed)) => sealed,
@@ -726,10 +770,25 @@ impl ProxyService {
             body: req.body.clone(),
         };
 
-        // 4. Dispatch upstream.
+        // 4. Dispatch upstream. The attachment-fetch path (`!scrub_response`)
+        // uses a larger body cap since a single attachment's base64 can
+        // exceed the 10 MiB JSON ceiling.
+        let max_body = if scrub_response {
+            crate::upstream::MAX_RESPONSE_BODY
+        } else {
+            crate::upstream::MAX_ATTACHMENT_BODY
+        };
         let upstream_result = self
             .upstream_client
-            .dispatch(&req.service, &req.path, req.method, req.headers, req.body, access_token_str)
+            .dispatch(
+                &req.service,
+                &req.path,
+                req.method,
+                req.headers,
+                req.body,
+                access_token_str,
+                max_body,
+            )
             .await;
 
         // 5. Write error-case audit events immediately (no response body to scrub).
@@ -788,6 +847,7 @@ impl ProxyService {
                     &req.scope,
                     &req.resource,
                     &replay_parts,
+                    max_body,
                 )
                 .await
             {
@@ -803,7 +863,12 @@ impl ProxyService {
             }
         }
 
-        let (scrubbed_body, scrub_summary, scrub_samples, was_scrubbed) =
+        let (scrubbed_body, scrub_summary, scrub_samples, was_scrubbed) = if !scrub_response {
+            // fetch_raw path: never scrub. The caller (attachment fetch)
+            // owns binary bytes that must travel verbatim — scrubbing the
+            // base64 would corrupt the decoded file.
+            (upstream_resp.body.clone(), Default::default(), Vec::new(), false)
+        } else {
             match std::str::from_utf8(&upstream_resp.body) {
                 Ok(text) => {
                     let result = self.scrub_engine.scrub(text);
@@ -831,7 +896,8 @@ impl ProxyService {
                     // Binary/non-UTF-8 response — pass through without scrubbing.
                     (upstream_resp.body.clone(), Default::default(), Vec::new(), false)
                 }
-            };
+            }
+        };
 
         // 7. Write success-case audit event AFTER scrubbing (scrub-before-log invariant).
         // Enrich with scrub payload (summary + samples) when content was scrubbed.
@@ -1212,6 +1278,7 @@ mod tests {
             Arc::clone(&audit_store) as Arc<dyn AuditStore>,
             test_scrub_engine(),
             tempdir.path().to_path_buf(),
+            tempdir.path().join("media"),
         ));
 
         (service, audit_store, tempdir)
@@ -1281,6 +1348,7 @@ mod tests {
             audit_store,
             test_scrub_engine(),
             _tempdir.path().to_path_buf(),
+            _tempdir.path().join("media"),
         );
 
         let req = test_request("gmail", "users/me/messages");
@@ -1306,6 +1374,7 @@ mod tests {
             Arc::new(MockAuditStore::new()) as Arc<dyn AuditStore>,
             test_scrub_engine(),
             dir.to_path_buf(),
+            dir.join("media"),
         )
     }
 
@@ -1435,6 +1504,7 @@ mod tests {
             audit_store,
             test_scrub_engine(),
             _tempdir.path().to_path_buf(),
+            _tempdir.path().join("media"),
         );
 
         let req = test_request("gmail", "users/me/messages");
@@ -1471,6 +1541,7 @@ mod tests {
             Arc::clone(&audit_store) as Arc<dyn AuditStore>,
             test_scrub_engine(),
             _tempdir.path().to_path_buf(),
+            _tempdir.path().join("media"),
         );
 
         let req = test_request("gmail", "users/me/messages");
@@ -1769,6 +1840,7 @@ mod tests {
             audit_store,
             test_scrub_engine(),
             _tempdir.path().to_path_buf(),
+            _tempdir.path().join("media"),
         );
 
         assert!(
@@ -1819,6 +1891,7 @@ mod tests {
             audit_store,
             test_scrub_engine(),
             tempdir.path().to_path_buf(),
+            tempdir.path().join("media"),
             overrides,
         );
 

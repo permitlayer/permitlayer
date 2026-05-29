@@ -38,6 +38,7 @@ compile_error!(
 pub mod agent;
 pub mod audit;
 pub mod error;
+pub mod files;
 pub mod killswitch;
 pub mod paths;
 pub mod policy;

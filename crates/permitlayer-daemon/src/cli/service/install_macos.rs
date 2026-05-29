@@ -1094,6 +1094,26 @@ pub(crate) fn create_state_dirs() -> Result<()> {
         std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700))
             .with_context(|| format!("chmod 0700 {}", p.display()))?;
     }
+    // Media dir: 0710 root:permitlayer-clients (group-traversable, NOT
+    // group-readable/listable), so the operator-user agent can reach the
+    // 0640 attachment files the proxy writes inside (per the media
+    // trust-boundary ADR). Unlike vault/agents (0700 root-private), media
+    // intentionally permits group traversal — but per-agent + unguessable
+    // subdirs mean a group member can't enumerate or guess another agent's
+    // attachments. Distinct from the 0700 loop above precisely because of
+    // this cross-user-read requirement.
+    {
+        let media = permitlayer_core::paths::media_dir(None);
+        std::fs::create_dir_all(&media).with_context(|| format!("mkdir -p {}", media.display()))?;
+        nix::unistd::chown(
+            &media,
+            Some(nix::unistd::Uid::from_raw(0)),
+            Some(nix::unistd::Gid::from_raw(clients_gid)),
+        )
+        .with_context(|| format!("chown root:{CLIENTS_GROUP} {}", media.display()))?;
+        std::fs::set_permissions(&media, std::fs::Permissions::from_mode(0o710))
+            .with_context(|| format!("chmod 0710 {}", media.display()))?;
+    }
     // Log dir 0750 root:wheel.
     std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o750))
         .with_context(|| format!("chmod 0750 {}", log.display()))?;
