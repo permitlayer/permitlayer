@@ -30,6 +30,7 @@ pub mod setup;
 pub mod start;
 pub mod status;
 pub mod stop;
+pub mod ui;
 pub mod uninstall;
 pub mod update;
 

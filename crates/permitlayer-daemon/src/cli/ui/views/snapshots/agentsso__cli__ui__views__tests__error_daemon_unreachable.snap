@@ -1,0 +1,20 @@
+---
+source: crates/permitlayer-daemon/src/cli/ui/views/mod.rs
+expression: draw(&app)
+---
+"┌ agentsso ────────────────────────────────────────────────────────────────────┐"
+"│daemon: unreachable — run: agentsso start                                     │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"┌ Agents ──────────────────────────────────────────────────────────────────────┐"
+"│No agents registered. Run `agentsso quickstart` to create one.                │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"│                                                                              │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"daemon not running — run: agentsso start                                        "

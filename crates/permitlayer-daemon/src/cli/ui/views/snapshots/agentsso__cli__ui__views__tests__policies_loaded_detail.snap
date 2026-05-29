@@ -1,0 +1,20 @@
+---
+source: crates/permitlayer-daemon/src/cli/ui/views/mod.rs
+expression: draw(&app)
+---
+"┌ agentsso ────────────────────────────────────────────────────────────────────┐"
+"│daemon: * running v1.0.0  /  kill: o inactive  /  tokens 2  /  127.0.0.1:3820 │"
+"└──────────────────────────────────────────────────────────────────────────────┘"
+"┌ Policies ────────────────────┐┌ Detail ──────────────────────────────────────┐"
+"│> - calendar-ro  calendar-ro.t││name       calendar-ro                        │"
+"│  - drive-ro  drive-ro.toml   ││scopes                                        │"
+"│                              ││https://www.googleapis.com/auth/calendar.reado│"
+"│                              ││nly                                           │"
+"│                              ││resources  *                                  │"
+"│                              ││approval   auto                               │"
+"│                              ││rules      (none)                             │"
+"│                              ││                                              │"
+"│                              ││                                              │"
+"│                              ││                                              │"
+"└──────────────────────────────┘└──────────────────────────────────────────────┘"
+"↑/↓ move · Enter detail · Tab view · r refresh · ? help · q quit                "
