@@ -76,12 +76,6 @@ pub enum TelemetryInitError {
         #[source]
         source: io::Error,
     },
-
-    /// The global tracing subscriber was already initialized. Happens
-    /// when a test harness pre-installs a subscriber. Not expected on
-    /// the production boot path.
-    #[error("tracing subscriber already initialized: {0}")]
-    SubscriberInit(String),
 }
 
 /// Initialize the `tracing` subscriber with the given log level
@@ -94,12 +88,13 @@ pub enum TelemetryInitError {
 /// the non-blocking writer's queue and shuts down the worker thread
 /// so trailing log lines reach disk before exit.
 ///
-/// Must be called exactly once per process, as early as possible in
-/// daemon startup (after config load, before any other operations).
-/// M1 fix: integration tests that need a subscriber installed should
-/// install their own (via `tracing_subscriber::fmt()` directly) rather
-/// than calling this function — calling twice returns
-/// [`TelemetryInitError::SubscriberInit`] on the second call.
+/// Idempotent: if a global subscriber is already installed (e.g. a
+/// single-shot CLI command like `quickstart` initialized tracing and then
+/// delegated to `connect::run`, which initializes again), the second call
+/// is a benign no-op that returns empty guards — the first installer's
+/// subscriber stays authoritative. The daemon's `start` path should still
+/// call this first, as early as possible after config load, so its file
+/// appender is the one that gets installed.
 ///
 /// # Parameters
 ///
@@ -178,17 +173,26 @@ pub fn init_tracing(
                 .json()
                 .with_filter(LevelFilter::TRACE);
 
-            tracing_subscriber::registry()
-                .with(stdout_layer)
-                .with(file_layer)
-                .try_init()
-                .map_err(|e| TelemetryInitError::SubscriberInit(e.to_string()))?;
+            // `try_init` fails only when a global subscriber is already
+            // installed. That is benign for composing single-shot CLI
+            // commands (e.g. `quickstart` initializes tracing, then calls
+            // `connect::run`, which initializes again) — treat
+            // already-initialized as success rather than aborting the
+            // whole command. The first installer's subscriber stays
+            // authoritative; the second caller's layers are simply not
+            // added (acceptable: both install the same stdout layer, and
+            // the file layer only matters for the daemon's `start` path,
+            // which initializes first).
+            if let Err(e) =
+                tracing_subscriber::registry().with(stdout_layer).with(file_layer).try_init()
+            {
+                tracing::debug!(error = %e, "tracing subscriber already initialized; reusing it");
+            }
         }
         None => {
-            tracing_subscriber::registry()
-                .with(stdout_layer)
-                .try_init()
-                .map_err(|e| TelemetryInitError::SubscriberInit(e.to_string()))?;
+            if let Err(e) = tracing_subscriber::registry().with(stdout_layer).try_init() {
+                tracing::debug!(error = %e, "tracing subscriber already initialized; reusing it");
+            }
         }
     }
 
