@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use crate::config::{CliOverrides, DaemonConfig};
-use crate::design::render::{self, error_block};
+use crate::design::render::error_block;
 use crate::design::terminal::ColorSupport;
 use crate::design::theme::Theme;
 use crate::lifecycle::pid::PidFile;
@@ -95,7 +95,10 @@ pub fn run() -> anyhow::Result<()> {
             if !pid_path.exists() {
                 // Success chrome → stderr (matches the connect/quickstart
                 // idiom; stop has no machine payload for stdout).
-                eprint!("{}", render::success_headline("daemon stopped", &theme, support));
+                eprint!(
+                    "{}",
+                    crate::design::render::success_headline("daemon stopped", &theme, support)
+                );
                 return Ok(());
             }
             if std::time::Instant::now() > deadline {
