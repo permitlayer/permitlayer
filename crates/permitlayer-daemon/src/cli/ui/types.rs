@@ -27,7 +27,21 @@ pub struct StateBody {
     pub daemon_version: String,
 }
 
-/// One element of `GET /v1/control/agent/list`.
+/// Envelope of `GET /v1/control/agent/list`.
+///
+/// The daemon returns `{"status":"ok","agents":[...]}` (see
+/// `server::control::ListAgentsResponse`), NOT a bare array. Slice 1
+/// (#78) deserialized the whole body into `Vec<AgentSummary>` and its
+/// unit test used a bare-array fixture that did not match the wire shape,
+/// so the mismatch (`invalid type: map, expected a sequence`) only
+/// surfaced against a live daemon. This envelope mirrors the working
+/// `ListPoliciesBody` pattern.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ListAgentsBody {
+    pub agents: Vec<AgentSummary>,
+}
+
+/// One element of the `agents` array in `GET /v1/control/agent/list`.
 ///
 /// Mirrors `server::control::AgentSummary`. `policy_name` is already
 /// here — the TUI does NOT make a per-agent `policy_name` fetch.
@@ -120,11 +134,23 @@ mod tests {
 
     #[test]
     fn agent_list_parses() {
-        let body = r#"[{"name":"calendar-bot","policy_name":"calendar-ro","created_at":"2026-05-01T00:00:00Z","last_seen_at":null}]"#;
-        let agents: Vec<AgentSummary> = serde_json::from_str(body).unwrap();
-        assert_eq!(agents.len(), 1);
-        assert_eq!(agents[0].policy_name, "calendar-ro");
-        assert!(agents[0].last_seen_at.is_none());
+        // The daemon returns the `{"status":"ok","agents":[...]}` envelope
+        // (server::control::ListAgentsResponse) — NOT a bare array. The
+        // slice-1 fixture used a bare array and so missed the real shape;
+        // this fixture matches the wire format.
+        let body = r#"{"status":"ok","agents":[{"name":"calendar-bot","policy_name":"calendar-ro","created_at":"2026-05-01T00:00:00Z","last_seen_at":null}]}"#;
+        let parsed: ListAgentsBody = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed.agents.len(), 1);
+        assert_eq!(parsed.agents[0].policy_name, "calendar-ro");
+        assert!(parsed.agents[0].last_seen_at.is_none());
+    }
+
+    #[test]
+    fn agent_list_rejects_bare_array() {
+        // Regression guard for the Angie v1.1.0 bug: a bare array is NOT
+        // the daemon's shape and must not parse as the envelope.
+        let bare = r#"[{"name":"x","policy_name":"p","created_at":"t","last_seen_at":null}]"#;
+        assert!(serde_json::from_str::<ListAgentsBody>(bare).is_err());
     }
 
     #[test]
