@@ -1218,10 +1218,18 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
                     // than being collapsed behind -v; collect it here and
                     // emit it in the Step 8 summary.
                     original_client_path = Some(oauth_config.source_path().display().to_string());
-                    trace.step(&format!(
-                        "client credentials sealed \u{2014} original {} no longer needed by the daemon",
-                        oauth_config.source_path().display()
-                    ));
+                    // NOTE: the step line is deliberately STATIC — it does
+                    // NOT interpolate `oauth_config.source_path()`. The
+                    // original-file path is still surfaced to the operator
+                    // (Story 7.35 AC#2) via `original_client_path` in the
+                    // `-v` summary detail block. Keeping any
+                    // `oauth_config`-derived value out of the `StepTrace`
+                    // sink avoids CodeQL `rust/cleartext-logging` flagging
+                    // the whole format string (the rule is not
+                    // field-sensitive: it taints anything derived from
+                    // `oauth_config`, which also holds `client_secret`,
+                    // even though only the non-secret path is ever shown).
+                    trace.step("client credentials sealed");
                 } else {
                     tracing::info!(
                         service = %service,
