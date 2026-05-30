@@ -28,7 +28,10 @@ use super::views::{self, Ctx};
 
 const STATE_JSON: &str =
     r#"{"active":false,"activated_at":null,"token_count":1,"daemon_version":"9.9.9"}"#;
-const AGENTS_JSON: &str = r#"[{"name":"smoke-agent","policy_name":"smoke-ro","created_at":"2026-05-28T00:00:00Z","last_seen_at":"2026-05-28T01:00:00Z"}]"#;
+// Real daemon shape: the `{"status":"ok","agents":[...]}` envelope
+// (server::control::ListAgentsResponse), NOT a bare array. The prior
+// bare-array fixture is exactly what masked the Angie v1.1.0 parse bug.
+const AGENTS_JSON: &str = r#"{"status":"ok","agents":[{"name":"smoke-agent","policy_name":"smoke-ro","created_at":"2026-05-28T00:00:00Z","last_seen_at":"2026-05-28T01:00:00Z"}]}"#;
 const POLICIES_JSON: &str = r#"{"status":"ok","policies":[{"name":"smoke-ro","origin":"/etc/agentsso/policies/managed/smoke-ro.toml","scopes":["https://example.com/auth/readonly"]}]}"#;
 
 /// Serve exactly one HTTP/1.1 request on `stream`, replying with a 200

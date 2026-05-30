@@ -17,7 +17,7 @@
 
 use crate::cli::kill::{self, ControlEndpoint};
 
-use super::types::{AgentSummary, ListPoliciesBody, PolicyDetailBody, StateBody};
+use super::types::{AgentSummary, ListAgentsBody, ListPoliciesBody, PolicyDetailBody, StateBody};
 
 /// The home + endpoint a fetch needs. Cheap to clone; carries no token
 /// (the token is re-read per fetch from `home`).
@@ -48,6 +48,23 @@ pub enum FetchOutcome<T> {
     Parse { summary: String },
 }
 
+impl<T> FetchOutcome<T> {
+    /// Re-tag a non-`Ok` outcome to a different success type. Used when a
+    /// fetch parses into an envelope but hands the caller the inner value
+    /// (e.g. `fetch_agents` → `ListAgentsBody.agents`). Panics on `Ok`,
+    /// which callers must map themselves.
+    fn map_non_ok<U>(self) -> FetchOutcome<U> {
+        match self {
+            FetchOutcome::Ok(_) => unreachable!("map_non_ok called on Ok"),
+            FetchOutcome::Unreachable => FetchOutcome::Unreachable,
+            FetchOutcome::BadResponse { summary } => FetchOutcome::BadResponse { summary },
+            FetchOutcome::Forbidden { code } => FetchOutcome::Forbidden { code },
+            FetchOutcome::HttpError { status, code } => FetchOutcome::HttpError { status, code },
+            FetchOutcome::Parse { summary } => FetchOutcome::Parse { summary },
+        }
+    }
+}
+
 impl RawOutcome {
     /// Map a non-`Ok` raw outcome into the matching `FetchOutcome`. Panics
     /// if called on `RawOutcome::Ok` (callers handle the success body
@@ -72,8 +89,16 @@ impl ControlClient {
     }
 
     /// Read the agent list.
+    ///
+    /// The daemon returns the `{"status":"ok","agents":[...]}` envelope,
+    /// so we parse `ListAgentsBody` and hand back the inner `Vec` —
+    /// callers (and the `Fetched::Agents` message) keep working with a
+    /// plain `Vec<AgentSummary>`.
     pub async fn fetch_agents(&self) -> FetchOutcome<Vec<AgentSummary>> {
-        self.get_json("/v1/control/agent/list").await
+        match self.get_json::<ListAgentsBody>("/v1/control/agent/list").await {
+            FetchOutcome::Ok(body) => FetchOutcome::Ok(body.agents),
+            other => other.map_non_ok(),
+        }
     }
 
     /// Read the policy list (names + origin + inlined scopes).
