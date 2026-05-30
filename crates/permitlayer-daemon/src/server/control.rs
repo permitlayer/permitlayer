@@ -3591,12 +3591,48 @@ pub(crate) async fn credentials_verify_handler(
         }
     };
 
-    let verify_result = permitlayer_oauth::google::verify::verify_connection(
+    let mut verify_result = permitlayer_oauth::google::verify::verify_connection(
         &service,
         access_token.reveal(),
         payload.project_id.as_deref(),
     )
     .await;
+
+    // ── Self-heal: auto-refresh on an expired access token ─────────
+    //
+    // The sealed *access* token is short-lived (~1h). When `connect`'s
+    // verify runs against a credential whose access token has aged out,
+    // Google returns 401 and the probe fails. Before this self-heal the
+    // CLI surfaced a "Press Enter to retry" loop that re-probed the SAME
+    // dead token up to 5 times — pointless busy-waiting, since a 401
+    // here is almost always a stale access token, not a revoked grant.
+    //
+    // The proxy's runtime path already self-heals 401s via the shared
+    // `refresh_flow::refresh_service` core (refresh-token → new access
+    // token → retry). Wire the same core into verify: on a 401, refresh
+    // once, re-unseal the now-rotated access token, and re-probe. A
+    // success here makes a stale-token `connect` Just Work with zero
+    // operator interaction. If refresh is impossible (no refresh token)
+    // or the re-probe still fails (genuinely revoked grant / scope
+    // problem), we fall through to the original `ok:false` path and the
+    // CLI's retry prompt remains as the fallback.
+    if is_verify_401(&verify_result)
+        && let Some(new_access_bytes) = try_self_heal_refresh(
+            &state,
+            &service,
+            &request_id,
+            &payload.agent,
+            peer_creds_for_audit,
+        )
+        .await
+    {
+        verify_result = permitlayer_oauth::google::verify::verify_connection(
+            &service,
+            &new_access_bytes,
+            payload.project_id.as_deref(),
+        )
+        .await;
+    }
 
     // Audit-emit helper used by both ok and error paths.
     let emit_audit = |outcome: &'static str, extra: serde_json::Value| {
@@ -3734,6 +3770,139 @@ pub(crate) async fn credentials_verify_handler(
                 Some(request_id),
             )
         }
+    }
+}
+
+/// Predicate: does this verify probe result represent an expired-access-
+/// token 401 (the case the self-heal targets)? Only a
+/// `VerificationFailed` with `status_code == 401` qualifies — every other
+/// failure (403 scope/billing, 5xx, transport, non-VerificationFailed
+/// errors) is NOT a stale-token situation and must skip the refresh so we
+/// don't burn a refresh attempt on a problem refresh can't fix.
+///
+/// Extracted as a pure fn so the gate is unit-testable without a live
+/// Google probe.
+fn is_verify_401(
+    result: &Result<permitlayer_oauth::google::verify::VerifyResult, permitlayer_oauth::OAuthError>,
+) -> bool {
+    matches!(
+        result,
+        Err(permitlayer_oauth::OAuthError::VerificationFailed { status_code: Some(401), .. })
+    )
+}
+
+/// Attempt a single token refresh as a self-heal for a verify 401.
+///
+/// Called by `credentials_verify_handler` when the first verify probe
+/// returns 401 (expired access token). Drives the shared
+/// `refresh_flow::refresh_service` core — the same one the proxy's
+/// runtime 401-retry path and the `credentials refresh` CLI command use
+/// — to mint a fresh access token from the stored refresh token.
+///
+/// Returns `Some(new_access_bytes)` when the refresh succeeded (the
+/// caller re-probes with these bytes); `None` when refresh is impossible
+/// (no refresh token stored → `Skipped`) or failed (network, revoked
+/// grant, persistence error), in which case the caller falls through to
+/// the original `ok:false` path.
+///
+/// Emits a best-effort `credentials-verify`/`token-auto-refresh` audit
+/// event so the self-heal is observable (it's an invisible action from
+/// the operator's point of view otherwise).
+async fn try_self_heal_refresh(
+    state: &ControlState,
+    service: &str,
+    request_id: &str,
+    agent: &str,
+    peer_creds: Option<crate::server::PeerCredentials>,
+) -> Option<zeroize::Zeroizing<Vec<u8>>> {
+    use permitlayer_proxy::refresh_flow::{self, RefreshFlowError, RefreshOutcome};
+
+    let home = state.vault_dir.parent().map(std::path::Path::to_path_buf)?;
+    let store: Arc<dyn CredentialStore> = match permitlayer_core::store::fs::CredentialFsStore::new(
+        home,
+    ) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            tracing::warn!(error = %e, service, "verify self-heal: credential store init failed");
+            return None;
+        }
+    };
+
+    // Production resolver — same builder the CLI `credentials refresh`
+    // path uses (no integration-test seam needed daemon-side here).
+    let vault_for_resolver = Arc::clone(&state.vault);
+    let vault_dir_for_resolver = state.vault_dir.clone();
+    let resolver = move |svc: &str| {
+        crate::cli::credentials::build_oauth_client_for_cli(
+            &vault_for_resolver,
+            &vault_dir_for_resolver,
+            svc,
+        )
+        .map_err(|detail| RefreshFlowError::MetaInvalid { service: svc.to_owned(), detail })
+    };
+
+    let outcome =
+        refresh_flow::refresh_service(&state.vault, &store, &state.vault_dir, service, &resolver)
+            .await;
+
+    // Audit the self-heal attempt (best-effort).
+    let (audit_outcome, audit_label, result): (&'static str, &'static str, _) = match &outcome {
+        Ok(RefreshOutcome::Refreshed { rotated, .. }) => {
+            tracing::info!(
+                target: "control",
+                request_id = %request_id,
+                service,
+                agent,
+                refresh_token_rotated = rotated,
+                "verify self-heal: access token auto-refreshed after 401",
+            );
+            ("ok", "token-auto-refresh-succeeded", true)
+        }
+        Ok(RefreshOutcome::Skipped) => {
+            tracing::info!(
+                target: "control",
+                request_id = %request_id,
+                service,
+                agent,
+                "verify self-heal: no refresh token stored — cannot auto-refresh",
+            );
+            ("error", "token-auto-refresh-skipped-no-refresh-token", false)
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "control",
+                request_id = %request_id,
+                service,
+                agent,
+                error = %e,
+                "verify self-heal: auto-refresh failed",
+            );
+            ("error", "token-auto-refresh-failed", false)
+        }
+    };
+
+    if let Some(audit) = state.audit_store.clone() {
+        let mut event = AuditEvent::with_request_id(
+            request_id.to_owned(),
+            agent.to_owned(),
+            "permitlayer".to_owned(),
+            service.to_owned(),
+            "credentials-verify".to_owned(),
+            audit_outcome.to_owned(),
+            audit_label.to_owned(),
+        );
+        enrich_audit_extra_with_peer_creds(&mut event.extra, peer_creds);
+        if let Err(e) = audit.append(event).await {
+            tracing::warn!(error = %e, "verify self-heal audit write failed (best-effort)");
+        }
+    }
+
+    if !result {
+        return None;
+    }
+    match outcome {
+        Ok(RefreshOutcome::Refreshed { new_access_bytes, .. }) => Some(new_access_bytes),
+        _ => None,
     }
 }
 
@@ -8628,5 +8797,47 @@ auto-approve-reads = true
             .unwrap();
         // Parse error → 400, not 200 with a false empty-dir warning.
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    // ── verify 401 self-heal gate (`is_verify_401`) ────────────────
+
+    fn verification_failed(status_code: Option<u16>) -> permitlayer_oauth::OAuthError {
+        permitlayer_oauth::OAuthError::VerificationFailed {
+            service: "gmail".to_owned(),
+            reason: "test".to_owned(),
+            status_code,
+            verify_reason: None,
+            source: None,
+        }
+    }
+
+    #[test]
+    fn is_verify_401_true_only_for_401_verification_failed() {
+        // The self-heal fires: an expired access token presents as a
+        // 401 VerificationFailed.
+        assert!(is_verify_401(&Err(verification_failed(Some(401)))));
+    }
+
+    #[test]
+    fn is_verify_401_false_for_other_status_codes() {
+        // 403 (scope/billing) and 5xx are NOT stale-token cases — a
+        // refresh can't fix them, so the gate must NOT fire and waste a
+        // refresh attempt.
+        assert!(!is_verify_401(&Err(verification_failed(Some(403)))));
+        assert!(!is_verify_401(&Err(verification_failed(Some(500)))));
+        assert!(!is_verify_401(&Err(verification_failed(None))));
+    }
+
+    #[test]
+    fn is_verify_401_false_for_success_and_non_verification_errors() {
+        // A successful probe never self-heals.
+        let ok = Ok(permitlayer_oauth::google::verify::VerifyResult {
+            summary: "ok".to_owned(),
+            email: None,
+        });
+        assert!(!is_verify_401(&ok));
+        // A non-VerificationFailed error (e.g. transport) is handled by
+        // the generic error arm, not the 401 self-heal.
+        assert!(!is_verify_401(&Err(permitlayer_oauth::OAuthError::DeviceCodeExpired)));
     }
 }

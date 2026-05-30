@@ -46,8 +46,9 @@
 //!   read_control_token, http_get_via, http_post_json_via}`.
 //! - PRIVATE to a sibling, reimplemented locally here with the same
 //!   discipline `doctor` used for `sha256_file`: the kill-state probe
-//!   (private to `connect.rs`), the register POST (private to
-//!   `agent.rs`), and the `Glyphs` helper (private to `doctor`).
+//!   (private to `connect.rs`) and the register POST (private to
+//!   `agent.rs`). The post-connect summary renders through the shared
+//!   `design::render` hierarchy helpers (matching `connect`'s idiom).
 
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
@@ -57,28 +58,6 @@ use clap::Args;
 
 use crate::cli::silent_cli_error;
 use crate::design::render;
-
-// ── Glyphs (mirror cli::doctor / cli::setup / cli::update) ──────────
-//
-// Private to each of those modules by design; reimplemented here per
-// the "local reimpl of a private sibling" discipline (same as
-// doctor's `sha256_file` copy of setup's).
-
-struct Glyphs {
-    arrow: &'static str,
-    check: &'static str,
-}
-
-fn glyphs() -> Glyphs {
-    use crate::design::terminal::ColorSupport;
-    match ColorSupport::detect() {
-        ColorSupport::NoColor => Glyphs { arrow: "->", check: "[ok]" },
-        _ => Glyphs {
-            arrow: "\u{2192}", // →
-            check: "\u{2713}", // ✓
-        },
-    }
-}
 
 // ── Service allowlist ───────────────────────────────────────────────
 //
@@ -180,6 +159,12 @@ pub struct QuickstartArgs {
     /// this is a hard error (we cannot prompt with no human present).
     #[arg(long)]
     pub non_interactive: bool,
+
+    /// Show the full per-step progress trace from the underlying
+    /// `connect` flow. Forwarded to `connect`; default output collapses
+    /// the steps into a one-line summary.
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
 }
 
 // ── Run ─────────────────────────────────────────────────────────────
@@ -189,9 +174,11 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
     use anyhow::Context as _;
 
     // Single-shot CLI command — install only the stdout subscriber
-    // (mirror connect::run).
+    // (mirror connect::run). Default to `warn` so a clean run shows no
+    // timestamped `INFO` flow chrome; `-v` restores `info`.
+    let log_level = if args.verbose { "info" } else { "warn" };
     let _guards =
-        crate::telemetry::init_tracing("info", None, 30).context("tracing init failed")?;
+        crate::telemetry::init_tracing(log_level, None, 30).context("tracing init failed")?;
 
     let service = args.service.trim().to_lowercase();
 
@@ -314,11 +301,12 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
         bearer_token: bearer,
         mcp_config_out: args.mcp_config_out.clone(),
         allow_root: args.allow_root,
+        verbose: args.verbose,
     })
     .await?;
 
     // ── Step 7 — plain-language summary ─────────────────────────────
-    print_summary(&service, &agent_name, access);
+    print_summary(&service, &agent_name, access, args.verbose);
 
     Ok(())
 }
@@ -360,28 +348,47 @@ fn prompt_access(service: &str) -> Access {
     Access::Read
 }
 
-/// Plain-language post-connect summary. Uses the design `render`
-/// primitives + the local `Glyphs` helper (mirror doctor's
-/// human-render style).
-fn print_summary(service: &str, agent: &str, access: Access) {
-    let g = glyphs();
-    println!();
-    println!("{} quickstart complete", g.arrow);
-    println!("    agent:   {agent}");
-    println!("    service: {service}");
-    match access {
-        Access::Read => {
-            println!("    {} can READ {service}; writes are denied", g.check);
-        }
+/// Plain-language post-connect summary, rendered through the shared
+/// `design::render` hierarchy helpers so it matches `connect`'s output
+/// idiom (one accent headline + a dim detail block). All chrome goes to
+/// **stderr** — `connect` already emitted the snippet payload on stdout
+/// (Step 7), and quickstart adds no payload of its own.
+///
+/// Default = headline + the single capability line. The "runs headless …
+/// capability is fixed by the access level chosen" sentence restates the
+/// capability line, so it only renders under `-v` (Rule of Silence).
+fn print_summary(service: &str, agent: &str, access: Access, verbose: bool) {
+    use crate::design::terminal::ColorSupport;
+    use crate::design::theme::Theme;
+
+    let support = ColorSupport::detect();
+    let theme = Theme::default();
+
+    let capability = match access {
+        Access::Read => format!("can READ {service}; writes are denied"),
         Access::ReadWrite => {
-            println!("    {} can READ and WRITE {service} (send/modify/delete), no gate", g.check);
+            format!("can READ and WRITE {service} (send/modify/delete), no gate")
         }
-    }
-    println!(
-        "    runs headless — no approval, no prompt; capability is fixed by the \
-         access level chosen"
+    };
+
+    eprint!(
+        "{}",
+        render::success_headline(
+            &format!("quickstart complete \u{00b7} agent {agent} \u{2192} {service}"),
+            &theme,
+            support,
+        )
     );
-    println!();
+    if verbose {
+        let detail = [
+            capability.as_str(),
+            "runs headless \u{2014} no approval, no prompt; capability is fixed by the access level chosen",
+        ];
+        eprint!("{}", render::detail_block(&detail, &theme, support));
+    } else {
+        eprint!("{}", render::detail_block(&[capability.as_str()], &theme, support));
+    }
+    eprintln!();
 }
 
 // ── Locally-reimplemented private siblings ──────────────────────────

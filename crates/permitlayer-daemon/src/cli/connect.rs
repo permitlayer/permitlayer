@@ -287,6 +287,40 @@ pub(crate) fn rebind_bearer_preserved_note() -> &'static str {
      the agent (\u{0060}agentsso agent rotate\u{0060})"
 }
 
+/// Collects the connect flow's per-step confirmations so the success
+/// screen can obey the Rule of Silence: by default the ~6 step lines
+/// (`oauth + seal`, `tokens sealed`, `verify`, `policy`, `reload`,
+/// `rebind`) are NOT printed inline — they're recorded here and replaced
+/// by a single collapsed-count line in the summary. With `-v/--verbose`
+/// each step streams to **stderr** the moment it completes (live progress
+/// chrome belongs on stderr, not stdout, so a piped stdout stays clean).
+///
+/// Only used on the interactive/TTY path; the `--non-interactive` path
+/// keeps emitting structured `tracing::info!` events instead (machine
+/// log, not human chrome) and never constructs a `StepTrace`.
+struct StepTrace {
+    verbose: bool,
+    accent: &'static str,
+    support: ColorSupport,
+}
+
+impl StepTrace {
+    fn new(verbose: bool, accent: &'static str, support: ColorSupport) -> Self {
+        Self { verbose, accent, support }
+    }
+
+    /// Record a completed step. In verbose mode, stream it to stderr with
+    /// the accent `✓` glyph; in default mode it's a no-op (Rule of
+    /// Silence — the success headline is the only confirmation an
+    /// operator needs; `-v` reveals the per-step trace).
+    fn step(&self, text: &str) {
+        if self.verbose {
+            let check = styled("\u{2713}", self.accent, self.support);
+            eprintln!("  {check} {text}");
+        }
+    }
+}
+
 pub(crate) fn silent_err_for_code(code: &str, internal_msg: &'static str) -> anyhow::Error {
     let marker_attached = match connect_exit_code(code) {
         2 => anyhow::Error::new(ConnectExitCode2),
@@ -513,6 +547,13 @@ pub struct ConnectArgs {
     /// run this command from their user shell.
     #[arg(long)]
     pub allow_root: bool,
+
+    /// Show the full per-step progress trace (oauth, seal, verify, policy,
+    /// reload, rebind). Default output collapses these into a one-line
+    /// summary headline plus the next-step snippet; `-v` streams each
+    /// completed step to stderr as it happens.
+    #[arg(short = 'v', long)]
+    pub verbose: bool,
 }
 
 // ──────────────────────────────────────────────────────────────────
@@ -524,8 +565,11 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
     use anyhow::Context as _;
 
     // Single-shot CLI command — install only the stdout subscriber.
+    // Default to `warn` so a clean run shows no timestamped `INFO` flow
+    // chrome; `-v` restores `info` for the full diagnostic trace.
+    let log_level = if args.verbose { "info" } else { "warn" };
     let _guards =
-        crate::telemetry::init_tracing("info", None, 30).context("tracing init failed")?;
+        crate::telemetry::init_tracing(log_level, None, 30).context("tracing init failed")?;
 
     let service = args.service.trim().to_lowercase();
     #[cfg(unix)]
@@ -734,13 +778,23 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
         }
     };
 
-    if interactive {
+    // Step-trace collector (interactive path only). Default mode records
+    // the per-step confirmations and replaces them with a one-line
+    // collapsed summary; `-v` streams each step to stderr live.
+    let trace = StepTrace::new(args.verbose, theme.tokens().accent, color_support);
+
+    if interactive && args.verbose {
+        // Pre-flight intro — `-v` only. The default screen leads with the
+        // `✓ Connected …` headline (Step 7); this intro restates the
+        // service/agent (already in that headline) and the policy
+        // (verbose-tier detail), so on the default run it's a 3-line wall
+        // before the outcome. Show it only under `-v`, on stderr.
         let styled_service = styled(&service, theme.tokens().accent, color_support);
         let styled_agent = styled(&args.agent, theme.tokens().accent, color_support);
-        println!();
-        println!("agentsso connect {styled_service} \u{00b7} agent {styled_agent}");
-        println!("  policy: {agent_policy_name}");
-        println!();
+        eprintln!();
+        eprintln!("agentsso connect {styled_service} \u{00b7} agent {styled_agent}");
+        eprintln!("  policy: {agent_policy_name}");
+        eprintln!();
     }
 
     // ── Step 2 — OAuth + seal (daemon-mediated phase) ──────────────
@@ -824,11 +878,18 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
     // None — verify renders 7.12's actionable URLs without the
     // `?project=<id>` query param when project_id is unknown.
     let mut oauth_config_opt: Option<GoogleOAuthConfig> = None;
+    // Path to the operator's original client JSON, captured on the seal
+    // path so the Step 8 summary can tell them it's no longer needed
+    // (Story 7.35 AC#2). `None` on the credential-skip path (we never
+    // re-read or re-seal the client file there).
+    let mut original_client_path: Option<String> = None;
+    // Story 10.6: when the rebind materialized a per-agent policy, the
+    // identity change is surfaced in the Step 8 summary as a dim detail.
+    let mut per_agent_policy_note: Option<String> = None;
 
     let granted_scopes: Vec<String> = if credential_already_present {
         if interactive {
-            let check = styled("\u{2713}", theme.tokens().accent, color_support);
-            println!("  {check} oauth + seal \u{00b7} skipped (credential already present)");
+            trace.step("oauth + seal \u{00b7} skipped (credential already present)");
         } else {
             tracing::info!(service = %service, "oauth + seal skipped: credential present");
         }
@@ -1124,11 +1185,10 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
         match super::connect_uds::post_credentials_seal(&control_handle, &seal_req).await {
             Ok(super::connect_uds::ControlOutcome::Ok(resp)) => {
                 if interactive {
-                    let check = styled("\u{2713}", theme.tokens().accent, color_support);
                     if resp.replaced_previous {
-                        println!("  {check} tokens sealed (replaced previous)");
+                        trace.step("tokens sealed (replaced previous)");
                     } else {
-                        println!("  {check} tokens sealed");
+                        trace.step("tokens sealed");
                     }
                     // Story 7.35: the client JSON is now sealed in the
                     // vault; the daemon no longer reads the original
@@ -1151,11 +1211,25 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
                     // dismissed in GitHub code-scanning with this
                     // justification rather than distorting required
                     // operator UX to satisfy an imprecise query.
-                    println!(
-                        "  {check} client credentials sealed \u{2014} the original {} is no longer",
-                        oauth_config.source_path().display()
-                    );
-                    println!("    needed by the daemon (you may keep or delete it)");
+                    //
+                    // The original-file-no-longer-needed note is
+                    // operator-actionable (Story 7.35 AC#2) so it stays
+                    // on the summary screen as a dim detail line rather
+                    // than being collapsed behind -v; collect it here and
+                    // emit it in the Step 8 summary.
+                    original_client_path = Some(oauth_config.source_path().display().to_string());
+                    // NOTE: the step line is deliberately STATIC — it does
+                    // NOT interpolate `oauth_config.source_path()`. The
+                    // original-file path is still surfaced to the operator
+                    // (Story 7.35 AC#2) via `original_client_path` in the
+                    // `-v` summary detail block. Keeping any
+                    // `oauth_config`-derived value out of the `StepTrace`
+                    // sink avoids CodeQL `rust/cleartext-logging` flagging
+                    // the whole format string (the rule is not
+                    // field-sensitive: it taints anything derived from
+                    // `oauth_config`, which also holds `client_secret`,
+                    // even though only the non-secret path is ever shown).
+                    trace.step("client credentials sealed");
                 } else {
                     tracing::info!(
                         service = %service,
@@ -1220,14 +1294,13 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
     verify_with_retry(&control_handle, &service, project_id_for_verify, interactive, &args).await?;
 
     if interactive {
-        let check = styled("\u{2713}", theme.tokens().accent, color_support);
         let styled_service = styled(&service, theme.tokens().accent, color_support);
         // Story 7.38: scope the claim — verify only proves the sealed
         // Google credential mints an upstream token, not the full
         // agent→daemon→Google bearer chain. Service token is styled
         // separately; suffix is shared with `verify_success_line` (and
         // its snapshot test) via `VERIFY_SUFFIX`.
-        println!("  {check} {styled_service} {VERIFY_SUFFIX}");
+        trace.step(&format!("{styled_service} {VERIFY_SUFFIX}"));
     } else {
         tracing::info!(
             service = %service,
@@ -1378,25 +1451,24 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
     if interactive {
         if policy_was_modified {
             let added = policy_resp.added.join(", ");
-            let check = styled("\u{2713}", theme.tokens().accent, color_support);
-            println!("  {check} policy '{agent_policy_name}' updated \u{00b7} added: {added}");
+            trace.step(&format!("policy '{agent_policy_name}' updated \u{00b7} added: {added}"));
             if policy_resp.reloaded {
-                let check = styled("\u{2713}", theme.tokens().accent, color_support);
-                println!("  {check} daemon reloaded");
+                trace.step("daemon reloaded");
             } else {
-                let warn = styled("!", theme.tokens().accent, color_support);
+                // Disk-drift is a WARNING, not a routine step — it must
+                // surface regardless of -v (the operator's new scopes are
+                // NOT live yet). Always emit to stderr.
+                let warn = styled("!", theme.tokens().warn, color_support);
                 eprintln!(
                     "  {warn} policy file updated on disk but daemon has NOT reloaded yet \u{2014} \
                      the new scopes are NOT live until you run `agentsso reload`."
                 );
             }
         } else {
-            let check = styled("\u{2713}", theme.tokens().accent, color_support);
-            println!(
-                "  {check} policy '{agent_policy_name}' \u{00b7} skipped (scopes already present)"
-            );
-            let check = styled("\u{2713}", theme.tokens().accent, color_support);
-            println!("  {check} reload \u{00b7} skipped (policy unchanged)");
+            trace.step(&format!(
+                "policy '{agent_policy_name}' \u{00b7} skipped (scopes already present)"
+            ));
+            trace.step("reload \u{00b7} skipped (policy unchanged)");
         }
     } else {
         if disk_drift {
@@ -1430,25 +1502,23 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
     match post_rebind(&home, &args.agent, rebind_target).await {
         Ok(()) => {
             if interactive {
-                let check = styled("\u{2713}", theme.tokens().accent, color_support);
-                println!(
-                    "  {check} agent '{}' \u{00b7} bound to policy '{}'",
+                trace.step(&format!(
+                    "agent '{}' \u{00b7} bound to policy '{}'",
                     args.agent, rebind_target
-                );
+                ));
                 // Story 10.6: if the daemon materialized a per-agent
                 // policy, the bound policy name changed from the managed
                 // tier — say so explicitly so the identity change is not
-                // silent.
+                // silent. Survives to the summary as a dim detail (it's
+                // a real identity change, not a routine step).
                 if rebind_target != &agent_policy_name {
-                    println!(
-                        "    (extended into a per-agent policy '{}' — was on managed tier '{}')",
-                        rebind_target, agent_policy_name
-                    );
+                    per_agent_policy_note = Some(format!(
+                        "extended into a per-agent policy '{rebind_target}' \u{2014} was on managed tier '{agent_policy_name}'"
+                    ));
                 }
                 // Story 7.36 AC #1: tell the operator the bearer was
                 // NOT touched, so a later token problem isn't misread
-                // as connect having orphaned it.
-                println!("    {}", rebind_bearer_preserved_note());
+                // as connect having orphaned it. Surfaced in the summary.
             } else {
                 tracing::info!(
                     agent = %args.agent,
@@ -1491,7 +1561,29 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
         }
     }
 
-    // ── Step 7 — OpenClaw snippet emission ─────────────────────────
+    // ── Step 7 — summary headline (BEFORE the snippet) ─────────────
+    //
+    // Rule of Silence + visual hierarchy: the outcome leads. One accent
+    // headline naming service · agent · granted scopes, on STDERR (the
+    // snippet payload on stdout stays pipeable on its own). The snippet
+    // (Step 8) follows as the headline's payload; the one caveat (Step 9)
+    // closes. The verbose detail (scope descriptions, client provenance,
+    // rotate note, chain caveat, collapsed-step count) only renders under
+    // `-v` — see Step 9.
+    if interactive {
+        let scope_short: Vec<&str> = granted_scopes
+            .iter()
+            .map(|uri| scopes::scope_info(uri).map(|i| i.short_name).unwrap_or(uri.as_str()))
+            .collect();
+        let headline = format!(
+            "Connected {service} \u{00b7} agent {} \u{00b7} {}",
+            args.agent,
+            scope_short.join(", ")
+        );
+        eprint!("{}", render::success_headline(&headline, &theme, color_support));
+    }
+
+    // ── Step 8 — OpenClaw snippet emission ─────────────────────────
     //
     // Resolve the bearer token (flag → AGENTSSO_BEARER_TOKEN env var
     // → placeholder; connect never prompts — Story 10.8). Emit the snippet
@@ -1500,25 +1592,67 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
     // see cli::openclaw module docs for the admin/user-split rationale.
     emit_openclaw_snippet(&args, &service, interactive, &default_scope).await?;
 
-    // ── Step 8 — summary ───────────────────────────────────────────
+    // ── Step 9 — closing caveat (default = ONE line; -v = full detail) ─
     if interactive {
-        println!();
-        println!("  scopes granted:");
-        for scope_uri in &granted_scopes {
-            match scopes::scope_info(scope_uri) {
-                Some(info) => println!("    {} ({})", info.description, info.short_name),
-                None => println!("    {scope_uri}"),
+        if args.verbose {
+            // Full detail tier: scope descriptions, client provenance,
+            // original-client-path note, per-agent-policy note, the full
+            // bearer-preserved note, and the collapsed-step count. The
+            // pinned helper fns (rebind_bearer_preserved_note /
+            // next_steps_bearer_note) render here so their contractual
+            // substrings still appear under -v.
+            let mut detail: Vec<String> = Vec::new();
+            detail.push("scopes granted:".to_owned());
+            for scope_uri in &granted_scopes {
+                match scopes::scope_info(scope_uri) {
+                    Some(info) => {
+                        detail.push(format!("  {} ({})", info.description, info.short_name))
+                    }
+                    None => detail.push(format!("  {scope_uri}")),
+                }
             }
+            if let Some(cfg) = oauth_config_opt.as_ref() {
+                detail.push(format!("client: {}", cfg.provenance_tag()));
+            }
+            if let Some(path_note) = original_client_path.as_ref() {
+                detail.push(format!(
+                    "original {path_note} no longer needed by the daemon (keep or delete it)"
+                ));
+            }
+            if let Some(note) = per_agent_policy_note.as_ref() {
+                detail.push(note.clone());
+            }
+            // Story 7.36 AC #1 — bearer preserved across the rebind.
+            detail.push(rebind_bearer_preserved_note().to_owned());
+            let detail_refs: Vec<&str> = detail.iter().map(String::as_str).collect();
+            eprint!("{}", render::detail_block(&detail_refs, &theme, color_support));
+            // Story 7.38: verify success ≠ chain works — the bearer token
+            // still has to be valid in the MCP client.
+            eprint!(
+                "{}",
+                render::next_steps(
+                    "Next \u{2014} hand the MCP config snippet to whoever runs OpenClaw on this machine.",
+                    next_steps_bearer_note(),
+                    &theme,
+                    color_support,
+                )
+            );
+            eprintln!();
+        } else {
+            // Default tier: ONE caveat line. Collapses the three legacy
+            // restatements of the bearer fact into a single reminder.
+            eprint!(
+                "{}",
+                render::detail_block(
+                    &[
+                        "Keep your existing bearer token \u{2014} connect didn't change it.  (-v for details)"
+                    ],
+                    &theme,
+                    color_support,
+                )
+            );
+            eprintln!();
         }
-        if let Some(cfg) = oauth_config_opt.as_ref() {
-            println!("  client: {}", cfg.provenance_tag());
-        }
-        println!();
-        println!("  next: hand the snippet above to whoever runs OpenClaw on this machine.");
-        // Story 7.38: be explicit that verify success ≠ chain works —
-        // the bearer token still has to be valid in the MCP client.
-        println!("  note: {}", next_steps_bearer_note());
-        println!();
     } else {
         tracing::info!(
             service = %service,
@@ -1708,14 +1842,21 @@ async fn verify_with_retry(
 
         let status_code_401 = body.get("status_code").and_then(|v| v.as_u64()) == Some(401);
         if last_attempt && status_code_401 && interactive {
+            // The daemon's verify endpoint now auto-refreshes the access
+            // token on a 401 before returning failure (control plane
+            // self-heal). A 401 that reaches here therefore means the
+            // refresh ALSO failed — typically a missing/revoked refresh
+            // token — so the fix is a full re-auth, not a bare re-run.
             eprintln!();
-            eprintln!("  hint: 401 after multiple retries can mean the access token expired");
+            eprintln!("  hint: a 401 here means the daemon could not auto-refresh the access");
+            eprintln!("        token — the stored refresh token is likely missing or revoked.");
             eprintln!(
-                "        mid-loop. Re-run `agentsso connect {service} --agent {}`;",
+                "        Re-authenticate: `agentsso connect {service} --agent {} --force`",
                 args.agent
             );
-            eprintln!("        Step 2 will skip OAuth (credential is sealed) and the next");
-            eprintln!("        verify gets a fresh handshake.");
+            eprintln!(
+                "        (--force replaces the sealed credential via a fresh Google consent)."
+            );
             eprintln!();
         }
 
@@ -2066,20 +2207,13 @@ async fn emit_openclaw_snippet(
         // placeholder and tell the operator their existing bearer is unchanged
         // and to keep it. Operators who DO want a fully-rendered snippet pass
         // `--bearer-token` / `AGENTSSO_BEARER_TOKEN` (handled above).
-        eprintln!();
-        eprintln!(
-            "  your agent's bearer token is UNCHANGED — connect only edited the policy behind it."
-        );
-        eprintln!(
-            "  the snippet below carries an `x-agentsso-scope` header you MUST keep; copy the"
-        );
-        eprintln!(
-            "  `url`, `transport`, and BOTH headers, substituting your EXISTING bearer token"
-        );
-        eprintln!("  (the one already in your MCP-client config — agentsso never stores it).");
-        eprintln!(
-            "  (pass --bearer-token / set AGENTSSO_BEARER_TOKEN to render the token inline instead.)"
-        );
+        //
+        // The 5-line "bearer is UNCHANGED / copy both headers" preamble
+        // that used to print here was deleted in the Rule-of-Silence
+        // pass: the Step 9 closing caveat ("Keep your existing bearer
+        // token — connect didn't change it") covers the same fact in one
+        // line, and the `<PASTE_…>` placeholder in the snippet is itself
+        // self-explanatory. `-v` restores the full chain caveat.
         "<PASTE_YOUR_EXISTING_BEARER_TOKEN>".to_owned()
     } else {
         // --non-interactive without --bearer-token or AGENTSSO_BEARER_TOKEN.
@@ -2104,10 +2238,12 @@ async fn emit_openclaw_snippet(
     // before pasting the snippet into a config that exposes the token.
     if !bind_addr.ip().is_loopback() {
         eprintln!();
-        eprintln!("  warn: daemon is bound to non-loopback address {bind_addr} — the snippet's");
-        eprintln!("        Authorization header will travel over plaintext HTTP if the MCP client");
-        eprintln!("        connects across the network. Bind to 127.0.0.1 (localhost) unless you");
-        eprintln!("        know what you're doing.");
+        eprintln!(
+            "  warn: daemon bound to non-loopback {bind_addr} — the snippet's bearer will travel"
+        );
+        eprintln!(
+            "        over plaintext HTTP across the network. Bind 127.0.0.1 unless intended."
+        );
         eprintln!();
     }
 

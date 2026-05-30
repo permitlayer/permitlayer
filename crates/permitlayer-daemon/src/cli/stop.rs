@@ -1,23 +1,48 @@
 use std::path::PathBuf;
 
 use crate::config::{CliOverrides, DaemonConfig};
+use crate::design::render::error_block;
+use crate::design::terminal::ColorSupport;
+use crate::design::theme::Theme;
 use crate::lifecycle::pid::PidFile;
 
 pub fn run() -> anyhow::Result<()> {
     let home = resolve_home();
+    // Route output through the shared CLI palette (errors → stderr via
+    // `error_block`, success → `success_headline`), matching the one
+    // idiom every other command uses instead of bare `eprintln!`/
+    // `println!`.
+    let support = ColorSupport::detect();
+    let theme = Theme::load(&home);
 
     // Read PID from file.
     let pid = match PidFile::read(&home)? {
         Some(pid) => pid,
         None => {
-            eprintln!("daemon not running (no PID file)");
+            eprint!(
+                "{}",
+                error_block(
+                    "stop.daemon_not_running",
+                    "daemon not running (no PID file)",
+                    "start it with:  agentsso start",
+                    None,
+                )
+            );
             std::process::exit(3);
         }
     };
 
     // Check if the process is actually alive.
     if !PidFile::is_daemon_running(&home)? {
-        eprintln!("daemon not running (stale PID file for PID {pid})");
+        eprint!(
+            "{}",
+            error_block(
+                "stop.daemon_not_running",
+                &format!("daemon not running (stale PID file for PID {pid})"),
+                "start it with:  agentsso start",
+                None,
+            )
+        );
         // Clean up the stale PID file.
         let pid_path = home.join("agentsso.pid");
         let _ = std::fs::remove_file(pid_path);
@@ -28,7 +53,15 @@ pub fn run() -> anyhow::Result<()> {
     let raw_pid = match i32::try_from(pid) {
         Ok(p) if p > 0 => p,
         _ => {
-            eprintln!("invalid PID {pid} in PID file (out of range)");
+            eprint!(
+                "{}",
+                error_block(
+                    "stop.invalid_pid",
+                    &format!("invalid PID {pid} in PID file (out of range)"),
+                    "remove the corrupt PID file, then:  agentsso start",
+                    None,
+                )
+            );
             std::process::exit(3);
         }
     };
@@ -36,8 +69,16 @@ pub fn run() -> anyhow::Result<()> {
     // Send SIGTERM.
     #[cfg(not(unix))]
     {
-        let _ = raw_pid;
-        eprintln!("stop command is not supported on this platform");
+        let _ = (raw_pid, &theme, support);
+        eprint!(
+            "{}",
+            error_block(
+                "stop.unsupported_platform",
+                "stop command is not supported on this platform",
+                "stop the daemon process manually",
+                None,
+            )
+        );
         std::process::exit(1);
     }
 
@@ -52,11 +93,24 @@ pub fn run() -> anyhow::Result<()> {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             if !pid_path.exists() {
-                println!("daemon stopped");
+                // Success chrome → stderr (matches the connect/quickstart
+                // idiom; stop has no machine payload for stdout).
+                eprint!(
+                    "{}",
+                    crate::design::render::success_headline("daemon stopped", &theme, support)
+                );
                 return Ok(());
             }
             if std::time::Instant::now() > deadline {
-                eprintln!("warning: daemon did not shut down cleanly within 10 seconds");
+                eprint!(
+                    "{}",
+                    error_block(
+                        "stop.unclean_shutdown",
+                        "daemon did not shut down cleanly within 10 seconds",
+                        "check the daemon's tracing log; it may still be flushing",
+                        None,
+                    )
+                );
                 std::process::exit(3);
             }
             std::thread::sleep(std::time::Duration::from_millis(100));
