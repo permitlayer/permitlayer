@@ -17,4 +17,4 @@ expression: draw(&app)
 "│                                                                              │"
 "│                                                                              │"
 "└──────────────────────────────────────────────────────────────────────────────┘"
-"loading… ↑/↓ move · Enter detail · Tab view · r refresh · ? help · q quit       "
+"loading… ↑/↓ move · Enter detail · Tab view · r refresh · Ctrl-K kill · ? help ·"

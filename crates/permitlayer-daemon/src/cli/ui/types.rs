@@ -27,6 +27,41 @@ pub struct StateBody {
     pub daemon_version: String,
 }
 
+/// `POST /v1/control/kill` success body.
+///
+/// Mirrors `server::control::KillResponse` → its nested
+/// `SerializableActivationSummary`. The daemon returns
+/// `{"activation":{"tokens_invalidated":N,"activated_at":"…",
+/// "was_already_active":bool,"reason":"…"},"daemon_version":"…"}` — a
+/// nested object, NOT a flat one. We deserialize only the two fields the
+/// TUI footer line needs; loose (no `deny_unknown_fields`).
+#[derive(Debug, Clone, Deserialize)]
+pub struct KillBody {
+    pub activation: KillActivation,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct KillActivation {
+    pub tokens_invalidated: usize,
+    pub was_already_active: bool,
+}
+
+/// `POST /v1/control/resume` success body.
+///
+/// Mirrors `server::control::ResumeResponse` → its nested
+/// `SerializableDeactivationSummary`:
+/// `{"deactivation":{"resumed_at":"…","was_already_inactive":bool},
+/// "daemon_version":"…"}`.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResumeBody {
+    pub deactivation: ResumeDeactivation,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct ResumeDeactivation {
+    pub was_already_inactive: bool,
+}
+
 /// Envelope of `GET /v1/control/agent/list`.
 ///
 /// The daemon returns `{"status":"ok","agents":[...]}` (see
@@ -130,6 +165,32 @@ mod tests {
         let s: StateBody = serde_json::from_str(body).unwrap();
         assert!(s.active);
         assert_eq!(s.activated_at.as_deref(), Some("2026-05-28T00:00:00Z"));
+    }
+
+    #[test]
+    fn kill_body_parses_nested_activation_envelope() {
+        // Real wire shape: KillResponse → nested `activation` object, NOT
+        // a flat one. Mirror-the-wire + test-the-real-shape (the slice-1
+        // agent-list bug came from a fixture that didn't match the wire).
+        let body = r#"{"activation":{"tokens_invalidated":3,"activated_at":"2026-05-30T00:00:00.000Z","was_already_active":false,"reason":"user-initiated"},"daemon_version":"1.1.0"}"#;
+        let parsed: KillBody = serde_json::from_str(body).unwrap();
+        assert_eq!(parsed.activation.tokens_invalidated, 3);
+        assert!(!parsed.activation.was_already_active);
+    }
+
+    #[test]
+    fn kill_body_rejects_flat_shape() {
+        // A flat `{"tokens_invalidated":...}` is NOT the daemon's nested
+        // envelope and must not parse — regression guard.
+        let flat = r#"{"tokens_invalidated":3,"was_already_active":false}"#;
+        assert!(serde_json::from_str::<KillBody>(flat).is_err());
+    }
+
+    #[test]
+    fn resume_body_parses_nested_deactivation_envelope() {
+        let body = r#"{"deactivation":{"resumed_at":"2026-05-30T00:01:00.000Z","was_already_inactive":true},"daemon_version":"1.1.0"}"#;
+        let parsed: ResumeBody = serde_json::from_str(body).unwrap();
+        assert!(parsed.deactivation.was_already_inactive);
     }
 
     #[test]

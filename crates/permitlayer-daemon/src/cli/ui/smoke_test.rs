@@ -13,7 +13,7 @@
 //! end-to-end without a live daemon.
 
 #![cfg(test)]
-#![allow(clippy::unwrap_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -33,6 +33,10 @@ const STATE_JSON: &str =
 // bare-array fixture is exactly what masked the Angie v1.1.0 parse bug.
 const AGENTS_JSON: &str = r#"{"status":"ok","agents":[{"name":"smoke-agent","policy_name":"smoke-ro","created_at":"2026-05-28T00:00:00Z","last_seen_at":"2026-05-28T01:00:00Z"}]}"#;
 const POLICIES_JSON: &str = r#"{"status":"ok","policies":[{"name":"smoke-ro","origin":"/etc/agentsso/policies/managed/smoke-ro.toml","scopes":["https://example.com/auth/readonly"]}]}"#;
+// Real daemon shapes for the slice-2 mutation endpoints (nested
+// activation/deactivation envelopes).
+const KILL_JSON: &str = r#"{"activation":{"tokens_invalidated":2,"activated_at":"2026-05-30T00:00:00.000Z","was_already_active":false,"reason":"user-initiated"},"daemon_version":"9.9.9"}"#;
+const RESUME_JSON: &str = r#"{"deactivation":{"resumed_at":"2026-05-30T00:01:00.000Z","was_already_inactive":false},"daemon_version":"9.9.9"}"#;
 
 /// Serve exactly one HTTP/1.1 request on `stream`, replying with a 200
 /// whose body is chosen by the request path. Closes the connection
@@ -52,6 +56,10 @@ where
         AGENTS_JSON
     } else if path.contains("/policies") {
         POLICIES_JSON
+    } else if path.contains("/kill") {
+        KILL_JSON
+    } else if path.contains("/resume") {
+        RESUME_JSON
     } else {
         "{}"
     };
@@ -156,6 +164,37 @@ async fn policy_detail_target_is_reachable() {
         "detail fetch should reach the server and classify"
     );
     let _ = Target::PolicyDetail("smoke-ro".into());
+}
+
+#[tokio::test]
+async fn kill_post_reaches_server_and_drives_reducer() {
+    // Slice 2: the full mutation round-trip against the canned server —
+    // post_kill parses the real {"activation":{...}} envelope, and
+    // feeding the outcome through the reducer sets the notice + emits the
+    // /state auto-refresh.
+    let (endpoint, home) = canned_endpoint().await;
+    let client = ControlClient { home: home.path().to_path_buf(), endpoint };
+
+    let outcome = client.post_kill().await;
+    let body = match outcome {
+        FetchOutcome::Ok(b) => b,
+        other => panic!("post_kill should reach the canned server and parse: {other:?}"),
+    };
+    assert_eq!(body.activation.tokens_invalidated, 2);
+    assert!(!body.activation.was_already_active);
+
+    // Reducer: confirm pending → Mutated(Ok) clears it, sets the notice,
+    // and asks for a /state refresh.
+    let mut app = App { pending_confirm: Some(app::ConfirmAction::Kill), ..App::default() };
+    let mutation = app::MutationOutcome::Killed {
+        tokens_invalidated: body.activation.tokens_invalidated,
+        was_already_active: body.activation.was_already_active,
+    };
+    let (next, effects) = app::step(&app, Event::Fetched(Fetched::Mutated(Ok(mutation))));
+    app = next;
+    assert!(app.pending_confirm.is_none());
+    assert!(app.footer_notice.unwrap().contains("kill active"));
+    assert_eq!(effects, vec![app::Effect::Fetch(app::Target::State)]);
 }
 
 fn feed(app: &mut App, fetched: Fetched) {

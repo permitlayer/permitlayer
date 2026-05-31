@@ -1,9 +1,16 @@
-//! `agentsso ui` — read-only terminal UI (slice 1).
+//! `agentsso ui` — navigable terminal UI (slice 2).
 //!
 //! A navigable status / agents / policies console. It is "just another
 //! control-plane client": it runs as the operator's UID, reads
-//! `<home>/control.token` per fetch, and calls the existing
-//! `/v1/control/*` loopback API. No mutations in slice 1.
+//! `<home>/control.token` per request, and calls the existing
+//! `/v1/control/*` loopback API.
+//!
+//! Slice 2 adds the UI's first **mutation**: a kill-switch toggle
+//! (`Ctrl-K` → y/n confirm → `POST /v1/control/kill` or `/resume`). The
+//! POST follows the same per-request token discipline as the reads (read
+//! fresh, never retained/rendered/logged); on success the header's kill
+//! ●/○ flips via an auto-refresh of `/state` and the footer shows a
+//! one-line confirmation. All other actions remain read-only.
 //!
 //! # Shape
 //!
@@ -195,27 +202,53 @@ fn run_effects(
     fetch_tx: &mpsc::UnboundedSender<Fetched>,
 ) {
     for effect in effects {
-        let Effect::Fetch(target) = effect;
         let client = client.clone();
         let tx = fetch_tx.clone();
-        tokio::spawn(async move {
-            let target_for_fallback = target.clone();
-            let inner = tokio::spawn(async move { perform_fetch(&client, target).await });
-            let fetched = match inner.await {
-                Ok(fetched) => fetched,
-                // The fetch task panicked: still emit a result so the
-                // pending-fetches counter settles and loading clears.
-                Err(join_err) => {
-                    let summary = if join_err.is_panic() {
-                        "internal error (fetch task panicked)".to_owned()
-                    } else {
-                        "fetch cancelled".to_owned()
+        match effect {
+            Effect::Fetch(target) => {
+                tokio::spawn(async move {
+                    let target_for_fallback = target.clone();
+                    let inner = tokio::spawn(async move { perform_fetch(&client, target).await });
+                    let fetched = match inner.await {
+                        Ok(fetched) => fetched,
+                        // The fetch task panicked: still emit a result so the
+                        // pending-fetches counter settles and loading clears.
+                        Err(join_err) => {
+                            let summary = if join_err.is_panic() {
+                                "internal error (fetch task panicked)".to_owned()
+                            } else {
+                                "fetch cancelled".to_owned()
+                            };
+                            fetched_failure(target_for_fallback, summary)
+                        }
                     };
-                    fetched_failure(target_for_fallback, summary)
-                }
-            };
-            let _ = tx.send(fetched);
-        });
+                    let _ = tx.send(fetched);
+                });
+            }
+            Effect::Mutate(mutation) => {
+                tokio::spawn(async move {
+                    let inner =
+                        tokio::spawn(async move { perform_mutation(&client, mutation).await });
+                    let fetched = match inner.await {
+                        Ok(fetched) => fetched,
+                        // Same panic-safety as fetches: if the POST task
+                        // panics, synthesize a `Mutated(Err)` so the
+                        // confirm modal still clears (it was already
+                        // cleared on confirm, but the footer surfaces the
+                        // failure).
+                        Err(join_err) => {
+                            let summary = if join_err.is_panic() {
+                                "internal error (mutation task panicked)".to_owned()
+                            } else {
+                                "mutation cancelled".to_owned()
+                            };
+                            Fetched::Mutated(Err(app::FetchError::BadResponse { summary }))
+                        }
+                    };
+                    let _ = tx.send(fetched);
+                });
+            }
+        }
     }
 }
 
@@ -257,6 +290,28 @@ async fn perform_fetch(client: &ControlClient, target: Target) -> Fetched {
             Fetched::PolicyDetail { name, result }
         }
     }
+}
+
+/// Run one mutation (kill/resume) and convert the `client` outcome into a
+/// `Fetched::Mutated` event. The result carries the bits the footer
+/// confirmation line renders.
+async fn perform_mutation(client: &ControlClient, mutation: app::Mutation) -> Fetched {
+    let result = match mutation {
+        app::Mutation::Kill => {
+            let outcome = client.post_kill().await;
+            into_result(outcome, |b| app::MutationOutcome::Killed {
+                tokens_invalidated: b.activation.tokens_invalidated,
+                was_already_active: b.activation.was_already_active,
+            })
+        }
+        app::Mutation::Resume => {
+            let outcome = client.post_resume().await;
+            into_result(outcome, |b| app::MutationOutcome::Resumed {
+                was_already_inactive: b.deactivation.was_already_inactive,
+            })
+        }
+    };
+    Fetched::Mutated(result)
 }
 
 /// Convert a `FetchOutcome<T>` into a `Result<U, FetchError>` via `map`,
@@ -312,6 +367,13 @@ fn translate_key(ev: KeyEvent) -> Option<Key> {
     {
         return Some(Key::CtrlC);
     }
+    // Ctrl-K — kill-switch toggle. Checked in the modifier block so it
+    // doesn't collide with plain `k` (vim-style "up").
+    if ev.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(ev.code, KeyCode::Char('k') | KeyCode::Char('K'))
+    {
+        return Some(Key::Kill);
+    }
     match ev.code {
         KeyCode::Up | KeyCode::Char('k') => Some(Key::Up),
         KeyCode::Down | KeyCode::Char('j') => Some(Key::Down),
@@ -321,6 +383,11 @@ fn translate_key(ev: KeyEvent) -> Option<Key> {
         KeyCode::Char('r') | KeyCode::Char('R') => Some(Key::Refresh),
         KeyCode::Char('?') => Some(Key::ToggleHelp),
         KeyCode::Char('q') | KeyCode::Char('Q') => Some(Key::Quit),
+        // Confirm-modal keys. Harmless outside a modal — the reducer
+        // treats `ConfirmYes`/`ConfirmNo` as no-ops when nothing is
+        // pending (so `y`/`n` do nothing on the normal screen).
+        KeyCode::Char('y') | KeyCode::Char('Y') => Some(Key::ConfirmYes),
+        KeyCode::Char('n') | KeyCode::Char('N') => Some(Key::ConfirmNo),
         _ => None,
     }
 }

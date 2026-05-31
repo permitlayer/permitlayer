@@ -17,7 +17,10 @@
 
 use crate::cli::kill::{self, ControlEndpoint};
 
-use super::types::{AgentSummary, ListAgentsBody, ListPoliciesBody, PolicyDetailBody, StateBody};
+use super::types::{
+    AgentSummary, KillBody, ListAgentsBody, ListPoliciesBody, PolicyDetailBody, ResumeBody,
+    StateBody,
+};
 
 /// The home + endpoint a fetch needs. Cheap to clone; carries no token
 /// (the token is re-read per fetch from `home`).
@@ -118,6 +121,60 @@ impl ControlClient {
                 Err(e) => FetchOutcome::Parse { summary: parse_summary(&e.to_string()) },
             },
             other => other.into_non_ok(),
+        }
+    }
+
+    /// Activate the kill switch (`POST /v1/control/kill`). The daemon
+    /// handler is idempotent — a repeat POST returns `was_already_active:
+    /// true`. Slice-2's first mutation.
+    pub async fn post_kill(&self) -> FetchOutcome<KillBody> {
+        self.post_json("/v1/control/kill").await
+    }
+
+    /// Deactivate the kill switch (`POST /v1/control/resume`). Idempotent
+    /// — returns `was_already_inactive: true` when not killed.
+    pub async fn post_resume(&self) -> FetchOutcome<ResumeBody> {
+        self.post_json("/v1/control/resume").await
+    }
+
+    /// Generic empty-body JSON POST → parse `T`. Mirrors `get_json`.
+    async fn post_json<T: serde::de::DeserializeOwned>(&self, path: &str) -> FetchOutcome<T> {
+        match self.post_raw(path).await {
+            RawOutcome::Ok(body) => match serde_json::from_str::<T>(&body) {
+                Ok(parsed) => FetchOutcome::Ok(parsed),
+                Err(e) => FetchOutcome::Parse { summary: parse_summary(&e.to_string()) },
+            },
+            other => other.into_non_ok(),
+        }
+    }
+
+    /// One empty-body POST, classified into the same transport/status
+    /// buckets as `get_raw`. Same per-request token discipline: the
+    /// control token is read fresh and dropped when this returns — never
+    /// retained in the long-lived TUI, never rendered, never logged.
+    async fn post_raw(&self, path: &str) -> RawOutcome {
+        let token = kill::read_control_token(&self.home);
+        let result =
+            kill::http_post_json_with_status_via(&self.endpoint, path, "{}", token.as_deref())
+                .await;
+
+        match result {
+            Err(e) => {
+                if is_connect_failure(&e) {
+                    RawOutcome::Unreachable
+                } else {
+                    RawOutcome::BadResponse { summary: parse_summary(&format!("{e:#}")) }
+                }
+            }
+            Ok((status, body)) if (200..300).contains(&status) => RawOutcome::Ok(body),
+            Ok((403, body)) => {
+                let code = parse_error_code(&body).unwrap_or_else(|| "forbidden".to_owned());
+                RawOutcome::Forbidden { code }
+            }
+            Ok((status, body)) => {
+                let code = parse_error_code(&body).unwrap_or_else(|| format!("http_{status}"));
+                RawOutcome::HttpError { status, code }
+            }
         }
     }
 
