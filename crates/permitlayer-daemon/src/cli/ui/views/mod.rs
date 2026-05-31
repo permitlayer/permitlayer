@@ -7,13 +7,16 @@ pub mod policies;
 pub mod status;
 
 use ratatui::Frame;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 use crate::design::terminal::ColorSupport;
 use crate::design::tokens::ThemeTokens;
 
-use super::app::{App, View};
+use super::app::{App, ConfirmAction, View};
 use super::glyphs::Glyphs;
+use super::theme_bridge;
 use super::widgets::footer;
 
 /// Everything the pure render functions need that is *not* `App`: the
@@ -42,6 +45,59 @@ pub fn render(frame: &mut Frame, app: &App, ctx: &Ctx) {
     }
 
     footer::render(frame, chunks[2], app, ctx);
+
+    // First overlay in the UI: a centered confirm dialog for the
+    // kill-switch toggle. Drawn last so it sits on top of everything; the
+    // reducer's modal guard means only y/n/Esc are honoured while it's up.
+    if let Some(action) = app.pending_confirm {
+        render_confirm_overlay(frame, app, ctx, action);
+    }
+}
+
+/// Centered modal for the kill/resume confirmation. `Clear`s the area
+/// first so the box is opaque over the main pane.
+fn render_confirm_overlay(frame: &mut Frame, _app: &App, ctx: &Ctx, action: ConfirmAction) {
+    let (title, body) = match action {
+        ConfirmAction::Kill => (
+            " kill switch ",
+            "Invalidate ALL agent tokens?\nThe daemon stops issuing until you resume.",
+        ),
+        ConfirmAction::Resume => {
+            (" resume ", "Re-enable token issuance?\nAgents can authenticate again.")
+        }
+    };
+    let area = centered_modal_area(frame.area(), 52, 7);
+    frame.render_widget(Clear, area);
+
+    let border = match action {
+        // Kill is the consequential one — warn (amber) border; resume is
+        // a restorative action — accent.
+        ConfirmAction::Kill => theme_bridge::fg(ctx.tokens.warn, ctx.support),
+        ConfirmAction::Resume => theme_bridge::fg(ctx.tokens.accent, ctx.support),
+    };
+    let block = Block::default().borders(Borders::ALL).border_style(border).title(title);
+
+    let mut lines: Vec<Line> = body
+        .lines()
+        .map(|l| Line::from(Span::styled(l, theme_bridge::fg(ctx.tokens.text_1, ctx.support))))
+        .collect();
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        "[y] yes      [n] cancel",
+        theme_bridge::fg(ctx.tokens.accent, ctx.support),
+    )));
+
+    frame.render_widget(Paragraph::new(lines).block(block).alignment(Alignment::Center), area);
+}
+
+/// A `Rect` of `w`×`h` centered in `area` (clamped to fit). Pure Rect
+/// math — no allocation, snapshot-stable.
+fn centered_modal_area(area: Rect, w: u16, h: u16) -> Rect {
+    let w = w.min(area.width);
+    let h = h.min(area.height);
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    Rect { x, y, width: w, height: h }
 }
 
 #[cfg(test)]
@@ -52,7 +108,8 @@ mod tests {
 
     use super::*;
     use crate::cli::ui::app::{
-        AgentSummary, Focus, HeaderStatus, PolicyDetail, PolicyDetailState, PolicyListEntry,
+        AgentSummary, ConfirmAction, Focus, HeaderStatus, PolicyDetail, PolicyDetailState,
+        PolicyListEntry,
     };
     use crate::cli::ui::glyphs::Glyphs;
     use crate::design::theme::Theme;
@@ -165,6 +222,24 @@ mod tests {
             ..App::default()
         };
         insta::assert_snapshot!("empty", draw(&app));
+    }
+
+    #[test]
+    fn snapshot_kill_confirm_overlay() {
+        // The kill confirm modal drawn over the loaded screen.
+        let mut app = loaded_app();
+        app.pending_confirm = Some(ConfirmAction::Kill);
+        insta::assert_snapshot!("kill_confirm_overlay", draw(&app));
+    }
+
+    #[test]
+    fn snapshot_kill_active_with_notice() {
+        // Post-kill: header shows active, footer shows the success notice.
+        let mut app = loaded_app();
+        app.header =
+            HeaderStatus::Running { version: "1.0.0".into(), kill_active: true, token_count: 0 };
+        app.footer_notice = Some("kill active · 2 tokens invalidated".into());
+        insta::assert_snapshot!("kill_active_with_notice", draw(&app));
     }
 
     #[test]

@@ -46,6 +46,17 @@ pub enum Target {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Effect {
     Fetch(Target),
+    /// Slice 2: a mutating control-plane POST (kill / resume). The loop
+    /// performs it and feeds the result back as `Fetched::Mutated`.
+    Mutate(Mutation),
+}
+
+/// A mutating control-plane action. Slice 2 has exactly two (the
+/// kill-switch toggle); later slices add reload / rotate / rebind here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mutation {
+    Kill,
+    Resume,
 }
 
 /// A parsed fetch result handed back to the reducer as an event. Mirrors
@@ -56,7 +67,23 @@ pub enum Fetched {
     State(Result<StateBody, FetchError>),
     Agents(Result<Vec<AgentSummary>, FetchError>),
     Policies(Result<Vec<PolicyListEntry>, FetchError>),
-    PolicyDetail { name: String, result: Result<PolicyDetail, FetchError> },
+    PolicyDetail {
+        name: String,
+        result: Result<PolicyDetail, FetchError>,
+    },
+    /// Slice 2: result of a kill/resume mutation.
+    Mutated(Result<MutationOutcome, FetchError>),
+}
+
+/// The successful outcome of a mutation, carrying the bits the footer
+/// confirmation line renders.
+#[derive(Debug, Clone)]
+pub enum MutationOutcome {
+    /// Kill activated. `tokens_invalidated` + whether it was already
+    /// active (idempotent repeat).
+    Killed { tokens_invalidated: usize, was_already_active: bool },
+    /// Resume completed. `was_already_inactive` = nothing to resume.
+    Resumed { was_already_inactive: bool },
 }
 
 /// View-facing classification of a failed fetch.
@@ -122,6 +149,20 @@ pub enum Key {
     Quit,
     /// Ctrl-C — always quits.
     CtrlC,
+    /// Ctrl-K — toggle the kill switch (opens the confirm modal).
+    Kill,
+    /// `y` — confirm the pending action.
+    ConfirmYes,
+    /// `n` — cancel the pending action (Esc also cancels).
+    ConfirmNo,
+}
+
+/// A mutation awaiting operator confirmation. While `Some`, the confirm
+/// modal is open and the reducer blocks all keys except confirm/cancel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ConfirmAction {
+    Kill,
+    Resume,
 }
 
 /// Connection/auth status derived from the most recent `/state` fetch,
@@ -182,8 +223,17 @@ pub struct App {
     /// Transient footer banner (last error). Cleared on a successful
     /// refresh.
     pub footer_error: Option<String>,
+    /// Transient footer banner for a NON-error notice (e.g. the
+    /// kill/resume success confirmation). Rendered in accent, not danger
+    /// red — a successful mutation must not look like an error. Cleared
+    /// on the next refresh, same as `footer_error`.
+    pub footer_notice: Option<String>,
     /// Whether the `?` key-hint line is expanded.
     pub show_help: bool,
+    /// A mutation awaiting `y`/`n` confirmation. `Some` ⇒ the confirm
+    /// modal is open and the reducer blocks every key except confirm and
+    /// cancel.
+    pub pending_confirm: Option<ConfirmAction>,
     /// Set once the reducer has seen a quit key — the loop checks this.
     pub should_quit: bool,
 }
@@ -202,7 +252,9 @@ impl Default for App {
             policy_detail: PolicyDetailState::None,
             pending_fetches: 0,
             footer_error: None,
+            footer_notice: None,
             show_help: false,
+            pending_confirm: None,
             should_quit: false,
         }
     }
@@ -247,15 +299,41 @@ pub fn step(app: &App, event: Event) -> (App, Vec<Effect>) {
     let mut next = app.clone();
     let effects = match event {
         Event::Key(key) => reduce_key(&mut next, key),
-        Event::Fetched(fetched) => {
-            reduce_fetched(&mut next, fetched);
-            Vec::new()
-        }
+        // `reduce_fetched` can itself emit effects now — a successful
+        // mutation triggers a `/state` re-fetch so the header flips
+        // without the operator pressing `r`.
+        Event::Fetched(fetched) => reduce_fetched(&mut next, fetched),
     };
     (next, effects)
 }
 
 fn reduce_key(app: &mut App, key: Key) -> Vec<Effect> {
+    // Modal guard: while a confirmation is pending, the dialog is
+    // *blocking* — only confirm (`y`), cancel (`n`/Esc), and Ctrl-C
+    // (always quits) are honoured; every other key is swallowed so the
+    // operator can't navigate away mid-confirm.
+    if let Some(action) = app.pending_confirm {
+        return match key {
+            Key::ConfirmYes => {
+                app.pending_confirm = None;
+                let mutation = match action {
+                    ConfirmAction::Kill => Mutation::Kill,
+                    ConfirmAction::Resume => Mutation::Resume,
+                };
+                vec![Effect::Mutate(mutation)]
+            }
+            Key::ConfirmNo | Key::Esc => {
+                app.pending_confirm = None;
+                Vec::new()
+            }
+            Key::CtrlC => {
+                app.should_quit = true;
+                Vec::new()
+            }
+            _ => Vec::new(),
+        };
+    }
+
     match key {
         Key::Quit | Key::CtrlC => {
             // Quit is driven by the `should_quit` flag, which the event
@@ -263,6 +341,26 @@ fn reduce_key(app: &mut App, key: Key) -> Vec<Effect> {
             app.should_quit = true;
             Vec::new()
         }
+        Key::Kill => {
+            // Toggle: derive the action from the current kill state. Only
+            // possible when we have a live `/state` reading — otherwise
+            // there's nothing meaningful to toggle.
+            match app.header {
+                HeaderStatus::Running { kill_active: true, .. } => {
+                    app.pending_confirm = Some(ConfirmAction::Resume);
+                }
+                HeaderStatus::Running { kill_active: false, .. } => {
+                    app.pending_confirm = Some(ConfirmAction::Kill);
+                }
+                _ => {
+                    app.footer_error =
+                        Some("cannot toggle kill switch: daemon state unknown".to_owned());
+                }
+            }
+            Vec::new()
+        }
+        // Confirm keys outside a pending modal are no-ops.
+        Key::ConfirmYes | Key::ConfirmNo => Vec::new(),
         Key::ToggleHelp => {
             app.show_help = !app.show_help;
             Vec::new()
@@ -292,6 +390,7 @@ fn reduce_key(app: &mut App, key: Key) -> Vec<Effect> {
             let effects = App::refresh_effects();
             app.pending_fetches = effects.len();
             app.footer_error = None;
+            app.footer_notice = None;
             effects
         }
     }
@@ -339,11 +438,12 @@ fn enter_detail(app: &mut App) -> Vec<Effect> {
     }
 }
 
-fn reduce_fetched(app: &mut App, fetched: Fetched) {
+fn reduce_fetched(app: &mut App, fetched: Fetched) -> Vec<Effect> {
     // Any non-detail fetch landing decrements the in-flight counter set
-    // by the last refresh. Detail fetches are out-of-band (Enter) and do
-    // not participate in the refresh-loading indicator.
+    // by the last refresh. Detail fetches and mutations are out-of-band
+    // and do not participate in the refresh-loading indicator.
     let mut count_down = true;
+    let mut effects = Vec::new();
     match fetched {
         Fetched::State(Ok(state)) => {
             app.header = HeaderStatus::Running {
@@ -380,10 +480,51 @@ fn reduce_fetched(app: &mut App, fetched: Fetched) {
                 };
             }
         }
+        Fetched::Mutated(result) => {
+            // Mutations are out-of-band (Ctrl-K, not a refresh), so they
+            // never touch `pending_fetches`. The modal was already
+            // cleared when the operator confirmed; this is belt-and-
+            // suspenders (and clears it if a mutation ever lands without
+            // a prior confirm).
+            count_down = false;
+            app.pending_confirm = None;
+            match result {
+                Ok(outcome) => {
+                    app.footer_notice = Some(mutation_confirmation_line(&outcome));
+                    app.footer_error = None;
+                    // Re-fetch `/state` so the header's kill ●/○ flips
+                    // without the operator pressing `r`. Counts as an
+                    // in-flight fetch for the loading indicator.
+                    app.pending_fetches += 1;
+                    effects.push(Effect::Fetch(Target::State));
+                }
+                Err(err) => set_footer(app, &err),
+            }
+        }
     }
 
     if count_down && app.pending_fetches > 0 {
         app.pending_fetches -= 1;
+    }
+    effects
+}
+
+/// The one-line footer confirmation after a successful kill/resume. Uses
+/// the same `footer_error` channel as other transient banners (it is the
+/// UI's single transient-message slot, not exclusively for errors).
+fn mutation_confirmation_line(outcome: &MutationOutcome) -> String {
+    match outcome {
+        MutationOutcome::Killed { was_already_active: true, .. } => {
+            "kill switch already active".to_owned()
+        }
+        MutationOutcome::Killed { tokens_invalidated, .. } => {
+            let plural = if *tokens_invalidated == 1 { "token" } else { "tokens" };
+            format!("kill active \u{00b7} {tokens_invalidated} {plural} invalidated")
+        }
+        MutationOutcome::Resumed { was_already_inactive: true } => {
+            "kill switch was not active \u{2014} nothing to resume".to_owned()
+        }
+        MutationOutcome::Resumed { .. } => "resumed \u{2014} tokens re-enabled".to_owned(),
     }
 }
 
@@ -537,6 +678,144 @@ mod tests {
         let (next, effects) = key(&app, Key::Enter);
         assert_eq!(next.focus, Focus::Detail);
         assert!(effects.is_empty(), "agent detail is in-memory, no fetch");
+    }
+
+    // ── Slice 2: kill-switch toggle (first mutation) ─────────────────
+
+    fn running(kill_active: bool) -> HeaderStatus {
+        HeaderStatus::Running { version: "1.1.0".into(), kill_active, token_count: 3 }
+    }
+
+    #[test]
+    fn ctrl_k_when_inactive_opens_kill_confirm_no_effect() {
+        let app = App { header: running(false), ..App::default() };
+        let (next, effects) = key(&app, Key::Kill);
+        assert_eq!(next.pending_confirm, Some(ConfirmAction::Kill));
+        assert!(effects.is_empty(), "opening the confirm modal posts nothing");
+    }
+
+    #[test]
+    fn ctrl_k_when_active_opens_resume_confirm() {
+        let app = App { header: running(true), ..App::default() };
+        let (next, _) = key(&app, Key::Kill);
+        assert_eq!(next.pending_confirm, Some(ConfirmAction::Resume));
+    }
+
+    #[test]
+    fn ctrl_k_with_unknown_header_errors_no_modal() {
+        // No live /state reading → nothing meaningful to toggle.
+        let app = App { header: HeaderStatus::Unreachable, ..App::default() };
+        let (next, effects) = key(&app, Key::Kill);
+        assert_eq!(next.pending_confirm, None);
+        assert!(next.footer_error.is_some());
+        assert!(effects.is_empty());
+    }
+
+    #[test]
+    fn confirm_yes_fires_mutation_and_clears_modal() {
+        let app = App { pending_confirm: Some(ConfirmAction::Kill), ..App::default() };
+        let (next, effects) = key(&app, Key::ConfirmYes);
+        assert_eq!(next.pending_confirm, None);
+        assert_eq!(effects, vec![Effect::Mutate(Mutation::Kill)]);
+    }
+
+    #[test]
+    fn confirm_yes_resume_fires_resume_mutation() {
+        let app = App { pending_confirm: Some(ConfirmAction::Resume), ..App::default() };
+        let (next, effects) = key(&app, Key::ConfirmYes);
+        assert_eq!(next.pending_confirm, None);
+        assert_eq!(effects, vec![Effect::Mutate(Mutation::Resume)]);
+    }
+
+    #[test]
+    fn confirm_no_and_esc_cancel_modal_no_effect() {
+        let app = App { pending_confirm: Some(ConfirmAction::Kill), ..App::default() };
+        let (n1, e1) = key(&app, Key::ConfirmNo);
+        assert_eq!(n1.pending_confirm, None);
+        assert!(e1.is_empty());
+        let (n2, e2) = key(&app, Key::Esc);
+        assert_eq!(n2.pending_confirm, None);
+        assert!(e2.is_empty());
+    }
+
+    #[test]
+    fn modal_is_blocking_other_keys_swallowed() {
+        // While a confirm is pending, navigation/refresh/tab do nothing.
+        let app = App {
+            pending_confirm: Some(ConfirmAction::Kill),
+            view: View::Agents,
+            ..app_with_lists()
+        };
+        for k in [Key::Down, Key::Tab, Key::Refresh, Key::Enter] {
+            let (next, effects) = key(&app, k);
+            assert_eq!(next.pending_confirm, Some(ConfirmAction::Kill), "{k:?} broke the modal");
+            assert_eq!(next.view, View::Agents, "{k:?} switched view through the modal");
+            assert!(effects.is_empty(), "{k:?} emitted an effect through the modal");
+        }
+    }
+
+    #[test]
+    fn ctrl_c_quits_even_through_modal() {
+        let app = App { pending_confirm: Some(ConfirmAction::Kill), ..App::default() };
+        let (next, _) = key(&app, Key::CtrlC);
+        assert!(next.should_quit);
+    }
+
+    #[test]
+    fn confirm_keys_are_noops_outside_a_modal() {
+        let app = App { header: running(false), ..App::default() };
+        let (ny, ey) = key(&app, Key::ConfirmYes);
+        assert!(ny.pending_confirm.is_none() && ey.is_empty());
+        let (nn, en) = key(&app, Key::ConfirmNo);
+        assert!(nn.pending_confirm.is_none() && en.is_empty());
+    }
+
+    #[test]
+    fn mutated_ok_sets_notice_and_refetches_state() {
+        let app = App { pending_confirm: Some(ConfirmAction::Kill), ..App::default() };
+        let (next, effects) = step(
+            &app,
+            Event::Fetched(Fetched::Mutated(Ok(MutationOutcome::Killed {
+                tokens_invalidated: 3,
+                was_already_active: false,
+            }))),
+        );
+        assert_eq!(next.pending_confirm, None);
+        assert!(next.footer_error.is_none());
+        let notice = next.footer_notice.unwrap();
+        assert!(notice.contains("kill active"));
+        assert!(notice.contains('3'));
+        // Auto-refresh of /state so the header flips without `r`.
+        assert_eq!(effects, vec![Effect::Fetch(Target::State)]);
+        assert_eq!(next.pending_fetches, 1);
+    }
+
+    #[test]
+    fn mutated_idempotent_kill_says_already_active() {
+        let app = App::default();
+        let (next, _) = step(
+            &app,
+            Event::Fetched(Fetched::Mutated(Ok(MutationOutcome::Killed {
+                tokens_invalidated: 0,
+                was_already_active: true,
+            }))),
+        );
+        assert!(next.footer_notice.unwrap().contains("already active"));
+    }
+
+    #[test]
+    fn mutated_err_surfaces_in_footer_clears_modal() {
+        let app = App { pending_confirm: Some(ConfirmAction::Kill), ..App::default() };
+        let (next, effects) = step(
+            &app,
+            Event::Fetched(Fetched::Mutated(Err(FetchError::Forbidden {
+                code: "forbidden_missing_control_token".into(),
+            }))),
+        );
+        assert_eq!(next.pending_confirm, None);
+        assert!(next.footer_error.is_some());
+        assert!(next.footer_notice.is_none());
+        assert!(effects.is_empty(), "a failed mutation does not refetch");
     }
 
     #[test]
