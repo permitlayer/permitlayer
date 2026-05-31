@@ -36,7 +36,42 @@ use std::net::TcpStream;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::common::{DaemonTestConfig, agentsso_bin, start_daemon, wait_for_health};
+use crate::common::{
+    DaemonTestConfig, agentsso_bin, http_request_control, read_test_control_token, start_daemon,
+    wait_for_health,
+};
+
+/// Poll `/v1/control/whoami` until the control plane actually ANSWERS
+/// (200), not merely until its socket file exists.
+///
+/// `start_daemon` waits for the control socket *file* to appear and
+/// `wait_for_health` waits for HTTP `/health` — but neither guarantees
+/// the daemon is yet accepting+serving `/v1/control/*` requests. The
+/// `quickstart` child's first action is a control-plane register POST;
+/// if it lands in that startup window it fails fast with
+/// `quickstart.register_failed` (transport error). On loaded macOS
+/// runners that window is wide enough to lose deterministically (the
+/// real cause behind the old `observed binding: None` flake). Probing
+/// `whoami` to a 200 before spawning the child closes the window.
+fn wait_for_control_ready(home: &std::path::Path, port: u16) -> bool {
+    let token = read_test_control_token(home);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        let (status, _) = http_request_control(
+            home,
+            port,
+            "GET",
+            "/v1/control/whoami",
+            None,
+            &[("X-Agentsso-Control", token.as_str())],
+        );
+        if status == 200 {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
 
 /// Run `agentsso <args>` against `home` (no running daemon expected),
 /// capturing exit code + stdout + stderr.
@@ -413,6 +448,13 @@ fn assert_quickstart_registers_then_oauth(service: &str, write: bool) {
     });
     let port = daemon.port;
     assert!(wait_for_health(port), "daemon did not become healthy");
+    // Health (HTTP) up is NOT enough: the quickstart child's first act is
+    // a control-plane register POST, which races daemon startup if the
+    // control plane isn't serving yet. Wait until it actually answers.
+    assert!(
+        wait_for_control_ready(home.path(), port),
+        "daemon control plane did not become ready (whoami never returned 200)"
+    );
 
     let oauth_client = write_fake_oauth_client(home.path());
     let agent = format!("{service}-quickstart");
