@@ -515,27 +515,52 @@ async fn register_agent_capture_bearer(
     })
     .to_string();
 
-    let response = match crate::cli::kill::http_post_json_via(
-        &handle.endpoint,
-        "/v1/control/agent/register",
-        &body,
-        handle.control_token.as_deref(),
-    )
-    .await
-    {
-        Ok(b) => b,
-        Err(e) => {
-            tracing::debug!(error = %e, "quickstart agent register request failed");
-            eprint!(
-                "{}",
-                render::error_block(
-                    "quickstart.register_failed",
-                    "could not reach the daemon control plane to register the agent",
-                    "agentsso doctor",
-                    None,
-                )
-            );
-            return Err(silent_cli_error("quickstart: agent register transport failed"));
+    // Retry the register POST on transient TRANSPORT errors. The control
+    // plane was just proven live by `require_daemon_running`'s whoami
+    // probe, so a failed connect here is a momentary UDS blip (accept-
+    // backlog pressure on a busy/just-started daemon), not "daemon down".
+    // A one-shot POST would fail-fast and leave the operator with a
+    // spurious `register_failed`; a few short-backoff retries close the
+    // window. A non-transport error (the daemon answered) is returned as
+    // a normal response and handled below — we only retry the connect.
+    let response = {
+        let mut attempt = crate::cli::kill::http_post_json_via(
+            &handle.endpoint,
+            "/v1/control/agent/register",
+            &body,
+            handle.control_token.as_deref(),
+        )
+        .await;
+        let mut backoff_ms = 100u64;
+        for _ in 0..4 {
+            if attempt.is_ok() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            backoff_ms = (backoff_ms * 2).min(500);
+            attempt = crate::cli::kill::http_post_json_via(
+                &handle.endpoint,
+                "/v1/control/agent/register",
+                &body,
+                handle.control_token.as_deref(),
+            )
+            .await;
+        }
+        match attempt {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::debug!(error = %e, "quickstart agent register request failed after retries");
+                eprint!(
+                    "{}",
+                    render::error_block(
+                        "quickstart.register_failed",
+                        "could not reach the daemon control plane to register the agent",
+                        "agentsso doctor",
+                        None,
+                    )
+                );
+                return Err(silent_cli_error("quickstart: agent register transport failed"));
+            }
         }
     };
 

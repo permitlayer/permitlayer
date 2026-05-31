@@ -176,14 +176,30 @@ impl ScrubEngine {
         let resolved = resolve_overlaps(confirmed);
 
         // Build output string.
+        //
+        // Each match span's edges are clamped off the interior of any
+        // JSON backslash escape they bisect (`clamp_off_escape`): the
+        // start moves back to an escape's opening `\`, the end moves
+        // forward past it. Without this, a PII match that clips a
+        // `\uXXXX` (e.g. Gmail's `<` for HTML `<`) would leave a
+        // partial escape in the spliced output and produce invalid JSON
+        // — the deterministic `format=full` parse failure. Clamping
+        // redacts at most one extra adjacent escape, which is safe.
         let mut output = String::with_capacity(input.len());
         let mut cursor = 0;
         for m in &resolved {
-            if m.span.start > cursor {
-                output.push_str(&input[cursor..m.span.start]);
+            let start = clamp_off_escape(input, m.span.start, Direction::Back);
+            let end = clamp_off_escape(input, m.span.end, Direction::Forward);
+            // A prior match may have already consumed past this one's
+            // (clamped) start; skip if so to keep `cursor` monotonic.
+            if end <= cursor {
+                continue;
+            }
+            if start > cursor {
+                output.push_str(&input[cursor..start]);
             }
             output.push_str(&m.placeholder.to_string());
-            cursor = m.span.end;
+            cursor = end;
         }
         if cursor < input.len() {
             output.push_str(&input[cursor..]);
@@ -223,6 +239,84 @@ fn resolve_overlaps(sorted: Vec<ScrubMatch>) -> Vec<ScrubMatch> {
 enum Direction {
     Back,
     Forward,
+}
+
+/// Move a cut index off the *interior* of a JSON-style backslash escape.
+///
+/// The scrubber rebuilds output by slicing `input` at match-span
+/// boundaries and splicing in placeholders. When the scrubbed text is
+/// serialized JSON (e.g. a Gmail `messages.get` response), string values
+/// contain backslash escapes — `\"`, `\\`, `\n`, … (2 chars) and
+/// `\uXXXX` (6 chars). Gmail JSON-escapes HTML `<`/`>`/`&` as
+/// `<`/`>`/`&`, which are dense in HTML email bodies. If a
+/// match span's start or end lands *inside* one of those escapes, the
+/// rebuild emits a partial/orphaned escape and the result is invalid
+/// JSON (the deterministic "invalid escape at line N column M" the proxy
+/// hit on `format=full`).
+///
+/// This clamps `index` to a safe edge of any escape it bisects:
+/// - `Direction::Back` (used for the kept-prefix cut = `span.start`):
+///   move to the escape's opening `\`, so the whole escape falls into the
+///   redacted span rather than being half-kept.
+/// - `Direction::Forward` (used for the resume point = `span.end`): move
+///   past the escape's end, so the suffix resumes on a clean boundary.
+///
+/// Redacting slightly more is always safe; emitting invalid JSON is not.
+/// On text with no backslash escapes the function is a no-op, so non-JSON
+/// scrub inputs are unaffected.
+///
+/// `index` is assumed to already be on a UTF-8 char boundary (callers run
+/// [`clamp_to_char_boundary`] first); escapes are pure ASCII so the two
+/// clamps compose.
+fn clamp_off_escape(s: &str, index: usize, dir: Direction) -> usize {
+    if index == 0 || index >= s.len() {
+        return index;
+    }
+    let bytes = s.as_bytes();
+
+    // Find the escape sequence (if any) whose interior contains `index`.
+    // An escape begins at an *unescaped* backslash: one preceded by an
+    // even number of consecutive backslashes (0, 2, …). Scan backwards a
+    // bounded distance — an escape is at most 6 bytes (`\uXXXX`), so the
+    // governing `\` is within 5 bytes before `index`.
+    let lo = index.saturating_sub(5);
+    for bs in (lo..index).rev() {
+        if bytes[bs] != b'\\' {
+            continue;
+        }
+        // Parity: count consecutive backslashes immediately before `bs`.
+        // Odd total run length ending at `bs` ⇒ this `\` is unescaped and
+        // opens an escape; even ⇒ it is itself the second half of a `\\`
+        // pair (e.g. the literal-backslash case `\\u003c`) and opens
+        // nothing.
+        let mut run = 1usize;
+        let mut j = bs;
+        while j > 0 && bytes[j - 1] == b'\\' {
+            run += 1;
+            j -= 1;
+        }
+        if run.is_multiple_of(2) {
+            // `bs` is an escaped backslash, not an escape opener. The
+            // index is not inside an escape governed by this `\`.
+            continue;
+        }
+        // `bs` opens an escape. Determine its length: `\uXXXX` is 6,
+        // everything else (`\"`, `\\`, `\n`, …) is 2.
+        let esc_len = if bytes.get(bs + 1) == Some(&b'u') { 6 } else { 2 };
+        let esc_end = bs + esc_len;
+        // Interior iff strictly between the opening `\` and the end. At
+        // `index == bs` or `index == esc_end` the cut is already safe.
+        if index > bs && index < esc_end {
+            return match dir {
+                Direction::Back => bs,
+                Direction::Forward => esc_end.min(s.len()),
+            };
+        }
+        // The nearest preceding unescaped `\` doesn't cover `index`; no
+        // closer opener can either (we scanned the whole 5-byte window).
+        break;
+    }
+    index
 }
 
 /// Clamp a byte index to a valid UTF-8 character boundary.
@@ -741,5 +835,113 @@ mod tests {
         let json = serde_json::to_string(&sample).unwrap();
         let back: ScrubSample = serde_json::from_str(&json).unwrap();
         assert_eq!(back, sample);
+    }
+
+    // ── JSON-escape-safety (the Gmail format=full corruption fix) ────
+    // (reuses the `email_rule()` helper defined earlier in this module)
+
+    /// Assert the scrub output is valid JSON when used as a string value.
+    /// (The real corruption manifested as `serde_json::from_str` rejecting
+    /// the proxy's whole-response JSON; wrapping the scrubbed fragment as a
+    /// JSON string value reproduces the same parser at the same layer.)
+    fn assert_valid_as_json_string(scrubbed: &str) {
+        let doc = format!("{{\"v\":\"{scrubbed}\"}}");
+        serde_json::from_str::<serde_json::Value>(&doc)
+            .unwrap_or_else(|e| panic!("scrubbed output is not valid JSON: {e}\n  doc: {doc}"));
+    }
+
+    #[test]
+    fn escape_then_email_start_side_clamp_stays_valid_json() {
+        // THE reproducing case. A `<` escape (Gmail's JSON for HTML
+        // `<`) immediately followed by an email: the email local-part
+        // class matches `u003cuser@…`, so the match STARTS at the `u`
+        // right after the `\`. Pre-fix, the prefix cut ended on a lone
+        // `\` → `\<REDACTED_EMAIL>` → invalid JSON escape. The clamp
+        // moves the start back to the `\`, redacting the leading escape
+        // with the email (safe over-redaction).
+        let engine = ScrubEngine::new(vec![email_rule()]).unwrap();
+        // bytes: \ u 0 0 3 c u s e r @ e x a m p l e . c o m
+        let input = "\\u003cuser@example.com x";
+        let result = engine.scrub(input);
+        assert!(!result.output.contains("user@example.com"), "email leaked: {}", result.output);
+        assert!(result.output.contains("<REDACTED_EMAIL>"), "not redacted: {}", result.output);
+        assert_valid_as_json_string(&result.output);
+        // No orphaned/partial escape remains (the leading `<` was
+        // consumed into the redaction, not left dangling).
+        assert!(!result.output.contains("\\<"), "dangling escape: {}", result.output);
+    }
+
+    #[test]
+    fn escape_after_email_end_side_stays_valid_json() {
+        // Control + end-side: an email FOLLOWED by a `>` escape. The
+        // email match ends at the `\` (a safe boundary), so this was
+        // already valid pre-fix; assert the fix doesn't break it and the
+        // trailing escape survives.
+        let engine = ScrubEngine::new(vec![email_rule()]).unwrap();
+        let input = "a@example.com\\u003eTAIL";
+        let result = engine.scrub(input);
+        assert!(!result.output.contains("a@example.com"));
+        assert!(result.output.contains("<REDACTED_EMAIL>"));
+        assert_valid_as_json_string(&result.output);
+        assert!(
+            result.output.contains("\\u003eTAIL"),
+            "trailing escape corrupted: {}",
+            result.output
+        );
+    }
+
+    #[test]
+    fn escaped_backslash_then_text_not_treated_as_escape() {
+        // `\\u003c` is a LITERAL backslash followed by "u003c" — not a
+        // `<` escape. Parity must not over-redact or mis-clamp here.
+        let engine = ScrubEngine::new(vec![email_rule()]).unwrap();
+        let input = r"a@b.com\\u003cTAIL";
+        let result = engine.scrub(input);
+        assert_valid_as_json_string(&result.output);
+        assert!(result.output.contains("<REDACTED_EMAIL>"));
+        // The literal `\\` + `u003cTAIL` after the email is preserved
+        // verbatim (the clamp must not swallow it).
+        assert!(result.output.contains(r"\\u003cTAIL"), "tail corrupted: {}", result.output);
+    }
+
+    #[test]
+    fn two_char_escape_adjacent_to_match_not_split() {
+        // `\"` / `\n` adjacent to a match must stay paired.
+        let engine = ScrubEngine::new(vec![email_rule()]).unwrap();
+        let input = r"a@b.com\nNext line\twith tab";
+        let result = engine.scrub(input);
+        assert_valid_as_json_string(&result.output);
+        assert!(result.output.contains(r"\n"), "newline escape split: {}", result.output);
+    }
+
+    #[test]
+    fn clamp_off_escape_is_noop_on_plaintext() {
+        // No backslashes ⇒ the clamp changes nothing; scrub output is
+        // byte-identical to the pre-fix behavior (prefix + placeholder +
+        // suffix at the raw match boundaries).
+        let engine = ScrubEngine::new(vec![email_rule()]).unwrap();
+        let input = "from alice@example.org to bob, see attached";
+        let result = engine.scrub(input);
+        assert_eq!(result.output, "from <REDACTED_EMAIL> to bob, see attached");
+    }
+
+    #[test]
+    fn clamp_off_escape_unit() {
+        // `<` = 6 bytes (backslash,u,0,0,3,c). An index in its
+        // interior (1..6) clamps: Back→0 (the `\`), Forward→6 (past it).
+        let s = "\\u003c"; // bytes: \ u 0 0 3 c
+        assert_eq!(s.len(), 6);
+        assert_eq!(clamp_off_escape(s, 3, Direction::Back), 0);
+        assert_eq!(clamp_off_escape(s, 3, Direction::Forward), 6);
+        // At the boundary index 1 (right after the `\`, still interior)
+        // → Back 0. Index 0 (the `\` itself) is not interior → unchanged.
+        assert_eq!(clamp_off_escape(s, 1, Direction::Back), 0);
+        // A 2-char escape `\n` at the start of "a\nb": index 2 is inside.
+        let t = "a\\nb";
+        assert_eq!(clamp_off_escape(t, 2, Direction::Back), 1);
+        assert_eq!(clamp_off_escape(t, 2, Direction::Forward), 3);
+        // Escaped backslash `\\` (run length 2 = even) opens nothing.
+        let u = "a\\\\b";
+        assert_eq!(clamp_off_escape(u, 3, Direction::Back), 3);
     }
 }

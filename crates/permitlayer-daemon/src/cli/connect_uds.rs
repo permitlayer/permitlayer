@@ -126,8 +126,29 @@ pub(crate) async fn require_daemon_running(
     // process is up but the control plane isn't usable from this
     // caller — same operator action as daemon-down (regenerate/install
     // the control token).
-    let probe =
+    // Retry the probe on *transport* errors (not on a reachable-but-4xx
+    // response — that's an auth problem, surfaced immediately). A freshly
+    // started or momentarily-busy daemon can transiently refuse/reset a
+    // single UDS connection (accept-backlog pressure under load); a
+    // one-shot probe would fail-fast and abort the whole flow. A handful
+    // of short-backoff retries closes that window for both CI (contended
+    // runners) and operators (just-ran `agentsso start`). ~5 attempts
+    // over ~1.5s; cheap on the common path (first attempt succeeds).
+    let mut probe =
         http_get_with_status_via(&endpoint, "/v1/control/whoami", control_token.as_deref()).await;
+    {
+        let mut backoff_ms = 100u64;
+        for _ in 0..4 {
+            if probe.is_ok() {
+                break; // reachable (2xx or 4xx) — stop retrying transport
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
+            backoff_ms = (backoff_ms * 2).min(500);
+            probe =
+                http_get_with_status_via(&endpoint, "/v1/control/whoami", control_token.as_deref())
+                    .await;
+        }
+    }
     match probe {
         Ok((status, _body)) if (200..300).contains(&status) => {
             Ok(ConnectControlHandle { endpoint, control_token })

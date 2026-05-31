@@ -216,6 +216,60 @@ async fn fetch_raw_does_not_scrub_response_body() {
 }
 
 #[tokio::test]
+async fn scrub_preserves_json_validity_around_escapes() {
+    // Regression: the response scrubber rebuilds output by slicing the
+    // raw JSON at PII-match boundaries. Gmail JSON-escapes HTML `<`/`>`
+    // as `<`/`>` (dense in HTML email bodies). Before the
+    // escape-safe clamp, an email match ending right at a `<` left a
+    // partial escape → invalid JSON → the deterministic
+    // `gmail.messages.get format=full` "invalid escape" failure on
+    // Austin's OpenClaw box.
+    //
+    // The upstream JSON below has a `snippet` whose value is the HTML
+    //   <b>user@example.com</b>
+    // which Gmail JSON-escapes as  <b>user@example.com</b>.
+    // The email regex match begins at the `u` of the leading `<`
+    // escape (local-part chars include `u003c…`), so the PRE-FIX prefix
+    // cut ended on a lone `\` → `\<REDACTED_EMAIL>` → invalid escape, the
+    // exact `format=full` corruption. (Verified: this fixture fails to
+    // parse without the escape-safe clamp.) The fix clamps the cut back
+    // to the `\`, redacting the leading escape along with the email.
+    let upstream = r#"{"id":"m1","snippet":"<b>user@example.com</b>","payload":{"headers":[]}}"#;
+    let mut server = mockito::Server::new_async().await;
+    let mock = server
+        .mock("GET", "/users/me/messages/m1")
+        .with_status(200)
+        .with_header("content-type", "application/json")
+        .with_body(upstream)
+        .create_async()
+        .await;
+
+    let (service, _) = build_service(&format!("{}/", server.url())).await;
+    let req = make_request("gmail", "users/me/messages/m1");
+    let resp = service.handle(req).await.unwrap();
+
+    let body = String::from_utf8(resp.body.to_vec()).expect("utf8");
+    // (1) The scrubbed body is still valid JSON — this is the bug fix.
+    //     Pre-fix, `serde_json::from_str` here failed with "invalid
+    //     escape" exactly as the proxy's `dispatch_json` did on
+    //     `format=full`.
+    let parsed: serde_json::Value = serde_json::from_str(&body)
+        .unwrap_or_else(|e| panic!("scrubbed body is invalid JSON: {e}\n  body: {body}"));
+    // (2) The PII is gone (no-leak: snippet is scrubbed since the engine
+    //     still runs over the WHOLE response).
+    assert!(!body.contains("bob@example.com"), "email leaked: {body}");
+    assert!(body.contains("<REDACTED_EMAIL>"), "email not redacted: {body}");
+    // (3) Surviving escapes decode cleanly — the trailing `</b>`
+    //     (JSON `</b>`) is intact in the decoded snippet. (The
+    //     leading `<b>` is redacted along with the email, since the
+    //     match clamped back to that escape's `\` — safe over-redaction.)
+    let snippet = parsed["snippet"].as_str().expect("snippet string");
+    assert!(snippet.contains("</b>"), "trailing escape corrupted; snippet={snippet}");
+
+    mock.assert_async().await;
+}
+
+#[tokio::test]
 async fn missing_credentials_returns_503() {
     let server = mockito::Server::new_async().await;
 

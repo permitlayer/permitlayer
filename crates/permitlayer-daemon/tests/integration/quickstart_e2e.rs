@@ -36,7 +36,42 @@ use std::net::TcpStream;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::common::{DaemonTestConfig, agentsso_bin, start_daemon, wait_for_health};
+use crate::common::{
+    DaemonTestConfig, agentsso_bin, http_request_control, read_test_control_token, start_daemon,
+    wait_for_health,
+};
+
+/// Poll `/v1/control/whoami` until the control plane actually ANSWERS
+/// (200), not merely until its socket file exists.
+///
+/// `start_daemon` waits for the control socket *file* to appear and
+/// `wait_for_health` waits for HTTP `/health` — but neither guarantees
+/// the daemon is yet accepting+serving `/v1/control/*` requests. The
+/// `quickstart` child's first action is a control-plane register POST;
+/// if it lands in that startup window it fails fast with
+/// `quickstart.register_failed` (transport error). On loaded macOS
+/// runners that window is wide enough to lose deterministically (the
+/// real cause behind the old `observed binding: None` flake). Probing
+/// `whoami` to a 200 before spawning the child closes the window.
+fn wait_for_control_ready(home: &std::path::Path, port: u16) -> bool {
+    let token = read_test_control_token(home);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while Instant::now() < deadline {
+        let (status, _) = http_request_control(
+            home,
+            port,
+            "GET",
+            "/v1/control/whoami",
+            None,
+            &[("X-Agentsso-Control", token.as_str())],
+        );
+        if status == 200 {
+            return true;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    false
+}
 
 /// Run `agentsso <args>` against `home` (no running daemon expected),
 /// capturing exit code + stdout + stderr.
@@ -269,39 +304,97 @@ fn agent_list(home: &std::path::Path, port: u16) -> Option<serde_json::Value> {
 /// Poll the agent list until `agent` appears, or the deadline elapses.
 /// Returns the observed binding's `policy_name` (the caller asserts it
 /// equals the expected policy — see `assert_quickstart_registers_then_oauth`).
-fn wait_for_agent_bound(home: &std::path::Path, port: u16, agent: &str) -> Option<String> {
-    // 90s, not 20s: this races a freshly-spawned daemon on
-    // heavily-parallel CI. `macos-15-intel` is documented-slow under
-    // full nextest load (syspolicyd queue depth + 56 fragmented test
-    // binaries) — daemon spawn + health + the quickstart child's own
-    // cold start + kill-switch probe + require_daemon_running + the
-    // register round-trip legitimately exceeded the old 20s window
-    // there (the post-merge CI failure on the rc.37 tag-target). The
-    // child is SIGTERM'd by the caller the instant this returns, so a
-    // generous ceiling costs nothing on the common (fast) path and
-    // only buys headroom on the slow runner. `agent_list` returning
-    // None (token/UDS/boot race) is a transient — keep polling.
-    let deadline = Instant::now() + Duration::from_secs(90);
+/// Outcome of waiting for the spawned `quickstart` child to register +
+/// bind its agent (the side effect under test, a synchronous control-
+/// plane POST that completes BEFORE connect's OAuth stage).
+enum BoundOutcome {
+    /// The agent appeared in `agent/list` bound to this policy.
+    Bound(String),
+    /// The child process exited before the agent was ever observed —
+    /// a genuine failure (quickstart died before/at register), carrying
+    /// the exit status + captured stderr for a diagnosable assertion
+    /// message rather than a bare timeout.
+    ChildExited { status: std::process::ExitStatus, stderr: String },
+    /// The safety-net deadline elapsed without either signal (should
+    /// only happen if the runner is pathologically wedged).
+    TimedOut,
+}
+
+/// Wait on the CAUSAL signal — the agent binding appearing, or the child
+/// exiting — rather than racing a wall-clock against the child's cold
+/// start.
+///
+/// Why this shape (research-backed, mirrors the repo's other subprocess
+/// e2e tests): the register+bind is a synchronous POST in quickstart
+/// Step 5 that finishes before `connect::run` is even called, so the
+/// binding is observable the instant the child reaches OAuth. The old
+/// 90s *wall-clock* poll wasn't waiting on OAuth — it was absorbing
+/// daemon-spawn + child cold-start, and on loaded macOS runners that
+/// guessed ceiling collided with cold start (`observed binding: None`).
+///
+/// In `--non-interactive` the child does NOT fail fast: connect's OAuth
+/// falls into the loopback-callback path which blocks ~120s before
+/// erroring (callback `DEFAULT_TIMEOUT_SECS`). So on the happy path the
+/// binding appears (fast) and we return long before the child exits; the
+/// caller SIGTERMs it immediately. The `child.try_wait()` branch only
+/// fires if quickstart genuinely dies before registering — which we now
+/// surface as an actionable error instead of a silent timeout. The
+/// deadline is therefore a pure backstop; keep it generous.
+fn wait_for_agent_bound(
+    child: &mut std::process::Child,
+    home: &std::path::Path,
+    port: u16,
+    agent: &str,
+) -> BoundOutcome {
+    let deadline = Instant::now() + Duration::from_secs(180);
     while Instant::now() < deadline {
+        // 1. Causal success signal: the binding landed.
         if let Some(list) = agent_list(home, port)
             && let Some(agents) = list.get("agents").and_then(|a| a.as_array())
         {
             for a in agents {
                 if a.get("name").and_then(|n| n.as_str()) == Some(agent) {
-                    // Binding is atomic at register time; return the
-                    // observed policy and let the caller assert once
-                    // (asserting inside the poll is needlessly fragile).
-                    return a
-                        .get("policy_name")
-                        .and_then(|p| p.as_str())
-                        .map(str::to_owned)
-                        .or_else(|| Some(String::new()));
+                    return BoundOutcome::Bound(
+                        a.get("policy_name")
+                            .and_then(|p| p.as_str())
+                            .map(str::to_owned)
+                            .unwrap_or_default(),
+                    );
                 }
             }
         }
+        // 2. Causal failure signal: the child exited before we ever saw
+        //    the binding. Drain its output for a diagnosable message.
+        if let Ok(Some(status)) = child.try_wait() {
+            // One more list check to avoid a race where the binding
+            // landed in the same tick the child exited.
+            if let Some(list) = agent_list(home, port)
+                && let Some(agents) = list.get("agents").and_then(|a| a.as_array())
+                && let Some(a) =
+                    agents.iter().find(|a| a.get("name").and_then(|n| n.as_str()) == Some(agent))
+            {
+                return BoundOutcome::Bound(
+                    a.get("policy_name")
+                        .and_then(|p| p.as_str())
+                        .map(str::to_owned)
+                        .unwrap_or_default(),
+                );
+            }
+            let stderr = child
+                .stderr
+                .take()
+                .map(|mut s| {
+                    use std::io::Read as _;
+                    let mut buf = String::new();
+                    let _ = s.read_to_string(&mut buf);
+                    buf
+                })
+                .unwrap_or_default();
+            return BoundOutcome::ChildExited { status, stderr };
+        }
         std::thread::sleep(Duration::from_millis(150));
     }
-    None
+    BoundOutcome::TimedOut
 }
 
 fn write_fake_oauth_client(home: &std::path::Path) -> std::path::PathBuf {
@@ -355,6 +448,13 @@ fn assert_quickstart_registers_then_oauth(service: &str, write: bool) {
     });
     let port = daemon.port;
     assert!(wait_for_health(port), "daemon did not become healthy");
+    // Health (HTTP) up is NOT enough: the quickstart child's first act is
+    // a control-plane register POST, which races daemon startup if the
+    // control plane isn't serving yet. Wait until it actually answers.
+    assert!(
+        wait_for_control_ready(home.path(), port),
+        "daemon control plane did not become ready (whoami never returned 200)"
+    );
 
     let oauth_client = write_fake_oauth_client(home.path());
     let agent = format!("{service}-quickstart");
@@ -380,18 +480,29 @@ fn assert_quickstart_registers_then_oauth(service: &str, write: bool) {
         .expect("spawn quickstart");
 
     // Register+bind must complete (and the flow must advance into
-    // connect's OAuth stage, which is where the child now blocks).
-    let bound = wait_for_agent_bound(home.path(), port, &agent);
+    // connect's OAuth stage, which is where the child blocks). We wait on
+    // the causal signal — the binding appearing or the child exiting —
+    // not a wall-clock, so a slow runner can't time us out spuriously.
+    let outcome = wait_for_agent_bound(&mut child, home.path(), port, &agent);
 
     terminate(&mut child);
     drop(daemon);
 
-    assert_eq!(
-        bound.as_deref(),
-        Some(expected_policy.as_str()),
-        "quickstart must register `{agent}` bound to `{expected_policy}` BEFORE \
-         connect's OAuth stage (observed binding: {bound:?})"
-    );
+    match outcome {
+        BoundOutcome::Bound(policy) => assert_eq!(
+            policy, expected_policy,
+            "quickstart must register `{agent}` bound to `{expected_policy}` BEFORE \
+             connect's OAuth stage (observed binding: {policy:?})"
+        ),
+        BoundOutcome::ChildExited { status, stderr } => panic!(
+            "quickstart child exited (status {status:?}) before registering `{agent}` — \
+             expected it to register+bind then block at OAuth.\nstderr:\n{stderr}"
+        ),
+        BoundOutcome::TimedOut => panic!(
+            "timed out (180s backstop) waiting for `{agent}` to bind — the runner is \
+             likely wedged; the register POST never landed and the child never exited"
+        ),
+    }
 }
 
 #[test]
