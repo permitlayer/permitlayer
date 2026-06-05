@@ -136,9 +136,10 @@ keeps tokens scoped to your Google account, not a shared app.
    it any time to refresh scope or rotate credentials.
 
 4. **Point your MCP client** at `http://127.0.0.1:3820/mcp/gmail` with
-   transport `streamable-http`, using the bearer token + scope header
-   from the snippet quickstart emitted. Bare `/mcp` is not a route;
-   Calendar and Drive are available at `/mcp/calendar` and `/mcp/drive`.
+   transport `streamable-http`, using the bearer token from the snippet
+   quickstart emitted. The `/mcp` path needs no client scope header — the
+   daemon derives each tool's scope server-side. Bare `/mcp` is not a
+   route; Calendar and Drive are at `/mcp/calendar` and `/mcp/drive`.
 
 5. **Inspect activity**:
 
@@ -223,8 +224,11 @@ authenticate to it on two separate channels:
   authenticates MCP clients via per-user bearer tokens minted by
   `agentsso quickstart <service>` (which calls `agent register`
   internally under a shipped policy and emits an MCP config snippet
-  carrying the token + scope header). MCP clients read the headers
-  from that snippet directly.
+  carrying the bearer token). MCP clients read the `Authorization`
+  header from that snippet directly; the `/mcp` path needs no client
+  scope header (the daemon derives each tool's scope server-side). The
+  REST data plane (`/v1/tools/*`) is different — it *does* require an
+  `x-agentsso-scope` header per request.
 
   If the operator who ran `sudo agentsso setup` is a different OS
   account than the end-user who'll run `agentsso quickstart`, that

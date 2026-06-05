@@ -38,10 +38,11 @@ Bare `/mcp` is not a route — every call goes to a per-service path.
 ## Identity
 
 You hold a single bearer token bound to one policy, minted when an operator
-ran `agentsso quickstart <service>`. The auth headers
-(`Authorization: Bearer agt_v2_<name>_<random>` and
-`x-agentsso-scope: <oauth-scope>`) are baked into the MCP config snippet
-your client loaded; you do **not** set them by hand. The token cannot be
+ran `agentsso quickstart <service>`. The `Authorization: Bearer
+agt_v2_<name>_<random>` header is baked into the MCP config snippet your
+client loaded; you do **not** set it by hand. There is no client scope
+header on the `/mcp` path — the daemon derives each tool's required scope
+server-side and evaluates it against your policy. The token cannot be
 refreshed or escalated by you. If a call returns `auth.invalid_token` or
 `auth.unauthorized`, do not retry — the operator must re-run
 `agentsso quickstart <service>` to mint a fresh token.
@@ -136,12 +137,20 @@ thing, embed.
 
 ### Scope tiers gate writes
 
-Read tools use `*.readonly` scopes. Writes need the matching scope:
-`gmail.send`/`gmail.modify`/`gmail.compose`, `calendar.events`,
-`drive.file`. If a write returns **403 `policy.denied`**, the agent is
-bound to a read-only tier. Tell the operator they need to re-run
-`agentsso quickstart <service> --read-write` to grant write access.
-Don't retry.
+Each tool maps to a Google scope server-side: read tools to `*.readonly`,
+writes to `gmail.send`/`gmail.modify`/`gmail.compose`, `calendar.events`,
+`drive.file`. You don't choose or send the scope — the daemon picks it per
+tool and checks it against your policy *and* the sealed credential's granted
+scopes. A write fails if either is read-only:
+
+- **403 `policy.denied`** — your policy is a read-only tier.
+- **`scope-insufficient`** — the sealed Google credential lacks the write
+  scope (the operator connected read-only).
+
+Either way, tell the operator to re-run
+`agentsso quickstart <service> --read-write`. That now both binds the
+read-write policy *and* requests the write scopes from Google, so the
+credential can actually write. Don't retry.
 
 ## Errors are operational, not transient
 

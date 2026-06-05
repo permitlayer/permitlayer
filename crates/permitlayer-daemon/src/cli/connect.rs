@@ -177,16 +177,66 @@ pub(crate) fn connect_exit_code(code: &str) -> i32 {
     }
 }
 
-fn default_scope_for_snippet(
+/// Readiness check: does the bound policy allowlist at least one of the
+/// scopes we just requested for `service`?
+///
+/// This used to also pick a "default scope" to bake into the MCP snippet's
+/// `x-agentsso-scope` header. RC2 dropped that header (the `/mcp` path
+/// derives scopes server-side and ignored it), so this is now purely a
+/// guard: if the policy grants NO scope for the service, the agent can do
+/// nothing and we error out (`connect.policy_scope_missing`) rather than
+/// emit a snippet for a dead binding. Checks the post-merge `after` set
+/// first, falling back to the pre-merge `before` set.
+fn policy_has_usable_scope(
     policy_resp: &super::connect_uds::PolicyScopesResponse,
     requested_short_names: &[&str],
-) -> Option<String> {
-    fn first_matching_policy_scope(policy_scopes: &[String], requested: &[&str]) -> Option<String> {
-        policy_scopes.iter().find(|scope| requested.contains(&scope.as_str())).cloned()
+) -> bool {
+    fn any_matching_policy_scope(policy_scopes: &[String], requested: &[&str]) -> bool {
+        policy_scopes.iter().any(|scope| requested.contains(&scope.as_str()))
     }
 
-    first_matching_policy_scope(&policy_resp.after, requested_short_names)
-        .or_else(|| first_matching_policy_scope(&policy_resp.before, requested_short_names))
+    any_matching_policy_scope(&policy_resp.after, requested_short_names)
+        || any_matching_policy_scope(&policy_resp.before, requested_short_names)
+}
+
+/// Detect an access-tier mismatch between the `--read-write` flag and the
+/// agent's bound policy, returning the warning lines to print (or `None`
+/// when consistent / when the policy name carries no tier signal).
+///
+/// Only the shipped `-read-write` / `-read-only` suffix convention is a
+/// signal; a custom policy name (neither suffix) returns `None` so we don't
+/// nag operators running their own policies. This is a soft warning, not a
+/// hard error: a custom or hand-edited policy might legitimately allow more
+/// (or less) than the flag implies, and the proxy enforces the real
+/// policy+credential intersection at request time regardless.
+fn tier_mismatch_warning(policy_name: &str, read_write: bool) -> Option<Vec<String>> {
+    let policy_is_write = policy_name.ends_with("-read-write");
+    let policy_is_read_only = policy_name.ends_with("-read-only");
+
+    match (policy_is_write, policy_is_read_only, read_write) {
+        // Write policy, but the flag asked for read-only scopes → the
+        // credential won't be able to satisfy the policy's writes.
+        (true, _, false) => Some(vec![
+            format!(
+                "  warn: agent is bound to '{policy_name}' (read-write) but you did not pass --read-write."
+            ),
+            "        The sealed credential will be READ-ONLY, so writes will 403 at request time."
+                .to_owned(),
+            "        Re-run with --read-write to request the write scopes from Google.".to_owned(),
+        ]),
+        // Read-only policy, but the flag asked for write scopes → the extra
+        // grant is inert (policy denies the writes anyway).
+        (_, true, true) => Some(vec![
+            format!(
+                "  warn: agent is bound to '{policy_name}' (read-only) but you passed --read-write."
+            ),
+            "        The policy denies writes, so the extra OAuth scopes won't be usable."
+                .to_owned(),
+            "        Bind a -read-write policy (e.g. `agentsso agent rebind`) if you want writes."
+                .to_owned(),
+        ]),
+        _ => None,
+    }
 }
 
 #[cfg(unix)]
@@ -518,6 +568,20 @@ pub struct ConnectArgs {
     #[arg(long)]
     pub force: bool,
 
+    /// Request **write** scopes in the OAuth grant (gmail.send / compose /
+    /// modify, …), not just read. `quickstart` sets this from its
+    /// `--read-write` flag; standalone-connect operators set it when the
+    /// agent is bound to a `-read-write` policy tier.
+    ///
+    /// This controls what the **Google consent screen** asks for and what
+    /// lands in the sealed credential — it must match the bound policy
+    /// tier. Without it, connect requests read-only scopes (historical
+    /// behavior). Binding a `-read-write` policy but omitting this flag
+    /// yields an agent that *may* write per policy but holds a read-only
+    /// credential, so every write 403s with `scope-insufficient`.
+    #[arg(long = "read-write")]
+    pub read_write: bool,
+
     /// Bearer token captured from `agentsso agent register` (used to
     /// build the OpenClaw snippet in Step 7).
     ///
@@ -778,6 +842,24 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
         }
     };
 
+    // Guard against an access-tier mismatch between the `--read-write` flag
+    // and the agent's bound policy. The flag governs which OAuth scopes the
+    // consent screen requests (and thus what the sealed credential can do);
+    // the policy governs what the agent is *allowed* to use. If they
+    // disagree, the operator gets a credential that can't satisfy the policy
+    // (or a policy that can't use the credential), and the failure only
+    // surfaces later as a runtime 403. quickstart always keeps these in sync;
+    // this only bites standalone-connect operators. We only warn on the
+    // shipped `-read-write` / `-read-only` suffix convention — a custom policy
+    // name carries no tier signal, so we stay silent rather than nag.
+    if let Some(mismatch) = tier_mismatch_warning(&agent_policy_name, args.read_write) {
+        eprintln!();
+        for line in mismatch {
+            eprintln!("{line}");
+        }
+        eprintln!();
+    }
+
     // Step-trace collector (interactive path only). Default mode records
     // the per-step confirmations and replaces them with a one-line
     // collapsed summary; `-v` streams each step to stderr live.
@@ -863,8 +945,15 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
             .meta
             .as_ref()
             .map(|m| {
+                // Key the "already sealed?" check off the ACCESS LEVEL, not
+                // a fixed read-only set. A read-write re-run over a sealed
+                // *read-only* credential must NOT take the skip branch —
+                // the write scopes are missing, so `needed.is_subset(have)`
+                // is false and we re-run OAuth to request them. (This is
+                // also what stops a read-write agent from silently riding a
+                // pre-existing read-only service credential.)
                 let needed: std::collections::HashSet<&str> =
-                    scopes::default_scopes_for_service(&service).into_iter().collect();
+                    scopes::scopes_for_access(&service, args.read_write).into_iter().collect();
                 let have: std::collections::HashSet<&str> =
                     m.scopes.iter().map(String::as_str).collect();
                 needed.is_subset(&have)
@@ -890,12 +979,31 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
     let granted_scopes: Vec<String> = if credential_already_present {
         if interactive {
             trace.step("oauth + seal \u{00b7} skipped (credential already present)");
+            // RC4: credentials are keyed PER-SERVICE, not per-agent — every
+            // agent bound to `<service>` reads/writes the SAME Google account
+            // through this one sealed credential. The credential meta does not
+            // record which principal sealed it, so we can't name them; warn
+            // generically so an operator wiring a second agent doesn't assume
+            // it has its own mailbox. (`--force` re-runs OAuth and REPLACES the
+            // shared credential for every agent on this service.)
+            eprintln!(
+                "  note: all agents share ONE {service} credential \u{2014} they read/write the"
+            );
+            eprintln!(
+                "        same Google account. To bind this agent to a DIFFERENT account, re-run"
+            );
+            eprintln!(
+                "        with --force (this REPLACES the shared {service} credential for every agent)."
+            );
         } else {
             tracing::info!(service = %service, "oauth + seal skipped: credential present");
         }
         // Capture scopes from existing meta for downstream policy merge.
         existing_meta.meta.as_ref().map(|m| m.scopes.clone()).unwrap_or_else(|| {
-            scopes::default_scopes_for_service(&service).into_iter().map(str::to_owned).collect()
+            scopes::scopes_for_access(&service, args.read_write)
+                .into_iter()
+                .map(str::to_owned)
+                .collect()
         })
     } else {
         // Resolve the OAuth client now that the daemon-running gate
@@ -923,6 +1031,12 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
                 println!(
                     "  {styled_service} is already connected \u{00b7} re-running will replace existing credentials"
                 );
+                // RC4: the credential is shared per-service, so replacing it
+                // re-points EVERY agent bound to this service at the newly
+                // consented Google account — not just this agent.
+                println!(
+                    "  this credential is shared by every agent on {styled_service} \u{2014} replacing it affects them all"
+                );
                 let theme_clone = teal_theme.clone();
                 let confirm = tokio::task::spawn_blocking(move || {
                     dialoguer::Confirm::with_theme(&*theme_clone)
@@ -938,7 +1052,7 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
                 }
                 println!();
             }
-            let scope_infos = scopes::default_scope_infos_for_service(&service);
+            let scope_infos = scopes::scope_infos_for_access(&service, args.read_write);
             let styled_service = styled(&service, theme.tokens().accent, color_support);
             println!("  {styled_service} \u{00b7} scopes to request:");
             for info in &scope_infos {
@@ -976,8 +1090,12 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
             oauth_config.client_secret().map(str::to_owned),
         )?;
 
-        let default_scopes = scopes::default_scopes_for_service(&service);
-        let scopes_owned: Vec<String> = default_scopes.iter().map(|s| (*s).to_owned()).collect();
+        // The scope set the Google consent screen actually requests. Keyed
+        // off the access level so `--read-write` widens the grant to include
+        // the write scopes (the whole point of RC1 — without this the sealed
+        // credential is read-only no matter the policy binding).
+        let requested_scopes = scopes::scopes_for_access(&service, args.read_write);
+        let scopes_owned: Vec<String> = requested_scopes.iter().map(|s| (*s).to_owned()).collect();
 
         let result = if args.device_flow {
             // Story 7.17 Task 3: Google OAuth 2.0 device flow.
@@ -1424,24 +1542,21 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
             ));
         }
     };
-    let default_scope = match default_scope_for_snippet(&policy_resp, &short_names) {
-        Some(scope) => scope,
-        None => {
-            eprint!(
-                "{}",
-                render::error_block(
-                    "connect.policy_scope_missing",
-                    &format!("policy '{agent_policy_name}' has no allowlisted scope for {service}"),
-                    "edit the daemon policy file to include at least one scope, then run `agentsso reload` and retry",
-                    None,
-                )
-            );
-            return Err(silent_err_for_code(
+    if !policy_has_usable_scope(&policy_resp, &short_names) {
+        eprint!(
+            "{}",
+            render::error_block(
                 "connect.policy_scope_missing",
-                "policy has no usable default scope",
-            ));
-        }
-    };
+                &format!("policy '{agent_policy_name}' has no allowlisted scope for {service}"),
+                "edit the daemon policy file to include at least one scope, then run `agentsso reload` and retry",
+                None,
+            )
+        );
+        return Err(silent_err_for_code(
+            "connect.policy_scope_missing",
+            "policy has no usable scope for the service",
+        ));
+    }
     let policy_was_modified = !policy_resp.added.is_empty();
     // Round-1 review P30: detect the disk-edited-but-not-reloaded
     // case explicitly. Daemon emits `policy-scopes-add-partial-failure`
@@ -1590,7 +1705,7 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
     // to stdout AND optionally write to --mcp-config-out. Connect
     // does NOT auto-merge into the end user's ~/.openclaw config —
     // see cli::openclaw module docs for the admin/user-split rationale.
-    emit_openclaw_snippet(&args, &service, interactive, &default_scope).await?;
+    emit_openclaw_snippet(&args, &service, interactive).await?;
 
     // ── Step 9 — closing caveat (default = ONE line; -v = full detail) ─
     if interactive {
@@ -2170,15 +2285,14 @@ async fn post_rebind(home: &Path, agent: &str, policy: &str) -> anyhow::Result<(
 ///    `<PASTE_YOUR_EXISTING_BEARER_TOKEN>` placeholder + honest copy. connect
 ///    always operates on a pre-existing agent (whose bearer it never holds and
 ///    never persists), so prompting for a token the operator doesn't have was
-///    a dead-end — and the abandoned prompt produced hand-built configs that
-///    dropped the required `x-agentsso-scope` header.
+///    a dead-end. RC5: we point the operator at `agentsso agent rotate <agent>`
+///    so they have a concrete way to obtain a usable token.
 /// 4. `--non-interactive` without env or flag — emit `<REPLACE_WITH_TOKEN>`
 ///    placeholder + stderr warning.
 async fn emit_openclaw_snippet(
     args: &ConnectArgs,
     service: &str,
     interactive: bool,
-    default_scope: &str,
 ) -> anyhow::Result<()> {
     let bearer_token: String = if let Some(t) = &args.bearer_token {
         // Round-1 P9: trim flag value. `$(< token.txt)` may carry CRLF.
@@ -2201,19 +2315,26 @@ async fn emit_openclaw_snippet(
         // a freshly-minted bearer, and agentsso never persists it. The old
         // interactive `Bearer token` prompt was therefore a dead-end: the
         // operator has no token to paste (it lives in their MCP-client config,
-        // possibly on another machine/user). That dead-end is what led to a
-        // hand-reconstructed config entry that dropped the required
-        // `x-agentsso-scope` header. Do NOT prompt: emit a self-explanatory
-        // placeholder and tell the operator their existing bearer is unchanged
-        // and to keep it. Operators who DO want a fully-rendered snippet pass
-        // `--bearer-token` / `AGENTSSO_BEARER_TOKEN` (handled above).
+        // possibly on another machine/user). Do NOT prompt: emit a self-
+        // explanatory placeholder. Operators who DO want a fully-rendered
+        // snippet pass `--bearer-token` / `AGENTSSO_BEARER_TOKEN` (above).
         //
-        // The 5-line "bearer is UNCHANGED / copy both headers" preamble
-        // that used to print here was deleted in the Rule-of-Silence
-        // pass: the Step 9 closing caveat ("Keep your existing bearer
-        // token — connect didn't change it") covers the same fact in one
-        // line, and the `<PASTE_…>` placeholder in the snippet is itself
-        // self-explanatory. `-v` restores the full chain caveat.
+        // RC5: the bearer is minted once at `agent register` and never shown
+        // again. An operator extending an existing agent who no longer has it
+        // is otherwise stuck — point them at `agent rotate`, the one command
+        // that mints a fresh, usable token. (Matches the verb in
+        // `rebind_bearer_preserved_note`.)
+        eprintln!(
+            "  note: '{agent}' already exists \u{2014} connect didn't change its bearer.",
+            agent = args.agent
+        );
+        eprintln!(
+            "        if you no longer have it, run `agentsso agent rotate {agent}` to mint a",
+            agent = args.agent
+        );
+        eprintln!(
+            "        fresh one (this invalidates the old token), then paste it where the placeholder is."
+        );
         "<PASTE_YOUR_EXISTING_BEARER_TOKEN>".to_owned()
     } else {
         // --non-interactive without --bearer-token or AGENTSSO_BEARER_TOKEN.
@@ -2247,7 +2368,7 @@ async fn emit_openclaw_snippet(
         eprintln!();
     }
 
-    let snippet = super::openclaw::build_snippet(service, &bearer_token, bind_addr, default_scope);
+    let snippet = super::openclaw::build_snippet(service, &bearer_token, bind_addr);
 
     if let Err(e) = super::openclaw::emit_snippet(&snippet, args.mcp_config_out.as_deref(), service)
     {
@@ -2437,7 +2558,7 @@ mod tests {
     }
 
     #[test]
-    fn default_scope_for_snippet_picks_first_requested_scope_in_policy_order() {
+    fn policy_has_usable_scope_true_when_requested_scope_in_policy() {
         let resp = connect_uds::PolicyScopesResponse {
             policy_name: "calendar-read".to_owned(),
             before: vec!["calendar.readonly".to_owned(), "calendar.events".to_owned()],
@@ -2446,14 +2567,15 @@ mod tests {
             reloaded: false,
         };
 
-        assert_eq!(
-            default_scope_for_snippet(&resp, &["calendar.events", "calendar.readonly"]),
-            Some("calendar.readonly".to_owned())
-        );
+        assert!(policy_has_usable_scope(&resp, &["calendar.events", "calendar.readonly"]));
+        // Matches via the post-merge `after` set even when nothing requested
+        // intersects `before` (here they're identical, but the predicate must
+        // be true regardless of which list carries the match).
+        assert!(policy_has_usable_scope(&resp, &["calendar.events"]));
     }
 
     #[test]
-    fn default_scope_for_snippet_ignores_unrelated_policy_scopes_and_empty_policy() {
+    fn policy_has_usable_scope_false_for_unrelated_or_empty_policy() {
         let resp = connect_uds::PolicyScopesResponse {
             policy_name: "calendar-read".to_owned(),
             before: Vec::new(),
@@ -2462,11 +2584,10 @@ mod tests {
             reloaded: true,
         };
 
-        assert_eq!(
-            default_scope_for_snippet(&resp, &["calendar.events", "calendar.readonly"]),
-            Some("calendar.readonly".to_owned())
-        );
-        assert_eq!(default_scope_for_snippet(&resp, &["drive.readonly"]), None);
+        // Requested scopes intersect the policy → usable.
+        assert!(policy_has_usable_scope(&resp, &["calendar.events", "calendar.readonly"]));
+        // Requested a scope the policy doesn't grant → NOT usable.
+        assert!(!policy_has_usable_scope(&resp, &["drive.readonly"]));
 
         let empty_resp = connect_uds::PolicyScopesResponse {
             policy_name: "gmail-read".to_owned(),
@@ -2476,8 +2597,42 @@ mod tests {
             reloaded: true,
         };
 
-        assert_eq!(default_scope_for_snippet(&empty_resp, &["gmail.readonly"]), None);
-        assert_eq!(default_scope_for_snippet(&empty_resp, &[]), None);
+        // Empty policy grants nothing → never usable (the
+        // `connect.policy_scope_missing` guard fires).
+        assert!(!policy_has_usable_scope(&empty_resp, &["gmail.readonly"]));
+        assert!(!policy_has_usable_scope(&empty_resp, &[]));
+    }
+
+    #[test]
+    fn tier_mismatch_warns_on_write_policy_without_flag() {
+        // The footgun the review caught: write policy, read-only flag → the
+        // credential can't write and the operator only learns at request time.
+        let warn = tier_mismatch_warning("gmail-read-write", false);
+        assert!(warn.is_some());
+        let lines = warn.unwrap();
+        assert!(lines[0].contains("gmail-read-write"));
+        assert!(lines[0].contains("--read-write"));
+    }
+
+    #[test]
+    fn tier_mismatch_warns_on_read_only_policy_with_flag() {
+        let warn = tier_mismatch_warning("gmail-read-only", true);
+        assert!(warn.is_some());
+        assert!(warn.unwrap()[0].contains("read-only"));
+    }
+
+    #[test]
+    fn tier_mismatch_silent_when_consistent() {
+        assert!(tier_mismatch_warning("gmail-read-write", true).is_none());
+        assert!(tier_mismatch_warning("gmail-read-only", false).is_none());
+    }
+
+    #[test]
+    fn tier_mismatch_silent_for_custom_policy_name() {
+        // A custom policy carries no tier signal — never nag, in EITHER flag
+        // state (the proxy enforces the real policy+credential intersection).
+        assert!(tier_mismatch_warning("my-bespoke-gmail-policy", true).is_none());
+        assert!(tier_mismatch_warning("my-bespoke-gmail-policy", false).is_none());
     }
 
     // ── Story 7.38: verify-success wording is scoped, not absolute ──

@@ -123,6 +123,62 @@ pub fn default_scopes_for_service(service: &str) -> Vec<&'static str> {
     }
 }
 
+/// OAuth scopes to request for a read-**WRITE** connect of `service`.
+///
+/// Superset of the read-only grant ([`default_scopes_for_service`]): the
+/// write tier needs the upstream write scopes present in the **sealed
+/// credential**, not just in the policy allowlist. The policy allowlist
+/// gates which scopes an agent may *use*; it cannot authorize an upstream
+/// Google call for a scope the credential never obtained at consent time.
+/// Before this helper existed, `agentsso quickstart <svc> --read-write`
+/// bound the agent to the `-read-write` policy but still requested only
+/// the read-only OAuth scopes — so every write 403'd with
+/// `scope-insufficient`. This is the scope set the OAuth consent must
+/// request so writes actually work.
+///
+/// The gmail set deliberately omits [`GMAIL_METADATA`]: `gmail.readonly`
+/// already satisfies metadata reads upstream, and requesting both adds
+/// consent friction without granting anything new. (The `gmail-read-write`
+/// policy still *lists* `gmail.metadata` — that's an allowlist entry, not
+/// an OAuth request.)
+///
+/// `calendar` and `drive` write sets equal their read-only defaults today
+/// (their `*.events` / `*.file` scopes already cover writes), so those
+/// services are unaffected by the read/write split — kept explicit here so
+/// a future write-only scope is a one-line change.
+#[must_use]
+pub fn read_write_scopes_for_service(service: &str) -> Vec<&'static str> {
+    match service {
+        "gmail" => vec![GMAIL_READONLY, GMAIL_SEND, GMAIL_COMPOSE, GMAIL_MODIFY],
+        "calendar" => vec![CALENDAR_READONLY, CALENDAR_EVENTS],
+        "drive" => vec![DRIVE_READONLY, DRIVE_FILE],
+        _ => vec![],
+    }
+}
+
+/// Resolve the OAuth scope set to request for `service`, keyed by whether
+/// the connect is read-**write** (`write = true`) or read-only.
+///
+/// Single entry point so callers (`agentsso connect`, `quickstart`) don't
+/// branch on the access level inline. `write = false` is byte-identical to
+/// [`default_scopes_for_service`] (back-compat for read-only flows).
+#[must_use]
+pub fn scopes_for_access(service: &str, write: bool) -> Vec<&'static str> {
+    if write { read_write_scopes_for_service(service) } else { default_scopes_for_service(service) }
+}
+
+/// `ScopeInfo` entries for the scope set [`scopes_for_access`] resolves —
+/// the access-level-aware sibling of [`default_scope_infos_for_service`].
+///
+/// Used by the `connect` consent preview and the `quickstart` summary so
+/// neither hand-rolls the `scopes_for_access(..).filter_map(scope_info)`
+/// mapping. Unknown scope URIs are dropped (same contract as
+/// `default_scope_infos_for_service`).
+#[must_use]
+pub fn scope_infos_for_access(service: &str, write: bool) -> Vec<ScopeInfo> {
+    scopes_for_access(service, write).into_iter().filter_map(scope_info).collect()
+}
+
 /// Story 7.13: convert a granted OAuth scope URI to its policy-file
 /// short name.
 ///
@@ -288,5 +344,65 @@ mod tests {
     fn requested_short_names_for_unknown_is_empty() {
         let names = requested_short_names_for_service("unknown");
         assert!(names.is_empty());
+    }
+
+    /// The core fix: a read-write gmail connect must request the write
+    /// scopes (send/compose/modify) at consent time, not just readonly.
+    /// Before this, the OAuth grant was readonly-only and every write 403'd.
+    #[test]
+    fn read_write_scopes_for_gmail_includes_write_scopes() {
+        let scopes = read_write_scopes_for_service("gmail");
+        assert!(scopes.contains(&GMAIL_READONLY), "must keep read access");
+        assert!(scopes.contains(&GMAIL_SEND), "must request send");
+        assert!(scopes.contains(&GMAIL_COMPOSE), "must request compose (drafts)");
+        assert!(scopes.contains(&GMAIL_MODIFY), "must request modify");
+        // Deliberately NOT requesting gmail.metadata (gmail.readonly covers it).
+        assert!(!scopes.contains(&GMAIL_METADATA), "metadata is redundant with readonly");
+    }
+
+    /// Back-compat: calendar's write set equals its read-only default
+    /// (calendar.events already covers writes), so read/write splitting
+    /// leaves calendar flows byte-identical.
+    #[test]
+    fn read_write_scopes_for_calendar_equals_default() {
+        assert_eq!(
+            read_write_scopes_for_service("calendar"),
+            default_scopes_for_service("calendar")
+        );
+    }
+
+    /// Back-compat: drive's write set equals its read-only default.
+    #[test]
+    fn read_write_scopes_for_drive_equals_default() {
+        assert_eq!(read_write_scopes_for_service("drive"), default_scopes_for_service("drive"));
+    }
+
+    #[test]
+    fn read_write_scopes_for_unknown_is_empty() {
+        assert!(read_write_scopes_for_service("unknown").is_empty());
+    }
+
+    /// `scopes_for_access(svc, false)` must be byte-identical to the
+    /// historical default-grant (the read-only flow is unchanged).
+    #[test]
+    fn scopes_for_access_read_matches_default() {
+        for svc in ["gmail", "calendar", "drive", "unknown"] {
+            assert_eq!(
+                scopes_for_access(svc, false),
+                default_scopes_for_service(svc),
+                "read access for {svc} must match the default grant"
+            );
+        }
+    }
+
+    #[test]
+    fn scopes_for_access_write_matches_read_write_set() {
+        for svc in ["gmail", "calendar", "drive", "unknown"] {
+            assert_eq!(
+                scopes_for_access(svc, true),
+                read_write_scopes_for_service(svc),
+                "write access for {svc} must match the read-write set"
+            );
+        }
     }
 }

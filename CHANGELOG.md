@@ -24,7 +24,30 @@ is required when a method is dropped in a major bump.
 
 ## [Unreleased]
 
-_No changes yet._
+### Fixed
+
+- **`agentsso quickstart <service> --read-write` / `agentsso connect
+  --read-write` now request the write OAuth scopes from Google.**
+  Previously `--read-write` bound the agent to the `<svc>-read-write`
+  policy but the OAuth consent still requested only read-only scopes, so
+  the sealed credential could not write — every send/modify returned
+  `scope-insufficient`. The access level now flows into the OAuth grant
+  (`gmail.send`/`compose`/`modify` for Gmail), and re-running over an
+  existing read-only credential re-prompts to add the write scopes.
+
+### Changed
+
+- **The MCP config snippet emitted by `quickstart`/`connect` no longer
+  carries an `x-agentsso-scope` header.** On the `/mcp` path the daemon
+  derives each tool's required scope server-side and never read the
+  client header, so it was inert and — by implying one scope governs
+  every call — misleading. The snippet now carries only the bearer. (The
+  REST `/v1/tools/*` path still requires the `x-agentsso-scope` header
+  per request; that path is unaffected.)
+- The `connect`/`quickstart` success summary now shows the full granted
+  scope set, and the extend-existing-agent flow points operators at
+  `agentsso agent rotate <agent>` to obtain a usable bearer. A note now
+  warns that credentials are shared per-service across all agents.
 
 ## [1.0.0] - 2026-05-28 — `agentsso` binary
 
