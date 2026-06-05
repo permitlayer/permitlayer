@@ -24,6 +24,15 @@ is required when a method is dropped in a major bump.
 
 ## [Unreleased]
 
+_No changes yet._
+
+## [1.2.1] - 2026-06-05 — `agentsso` binary
+
+Patch release. Fixes the read-write onboarding path (`quickstart` /
+`connect --read-write` now actually grant write access) and removes the
+inert MCP scope header. Workspace / binary version bump 1.2.0 → 1.2.1;
+the plugin host-API surface keeps its independent cadence (unchanged).
+
 ### Fixed
 
 - **`agentsso quickstart <service> --read-write` / `agentsso connect
@@ -34,6 +43,10 @@ is required when a method is dropped in a major bump.
   `scope-insufficient`. The access level now flows into the OAuth grant
   (`gmail.send`/`compose`/`modify` for Gmail), and re-running over an
   existing read-only credential re-prompts to add the write scopes.
+- `agentsso connect --read-write` against a `-read-only` policy (or a
+  `-read-write` policy without the flag) now warns before OAuth instead
+  of failing silently at request time. Custom (non-suffixed) policy
+  names carry no tier signal and are left unwarned.
 
 ### Changed
 
