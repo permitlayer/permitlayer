@@ -154,11 +154,16 @@ agentsso quickstart calendar --read-write --oauth-client ./client_secret.json
 agentsso quickstart drive    --read-write --oauth-client ./client_secret.json
 ```
 
-Pick `--read` for read-only or `--read-write` for read+write — those
-bind the agent to the matching shipped policy (`<svc>-read-only` or
-`<svc>-read-write`). A browser opens for Google consent; tokens are
-sealed locally. `quickstart` is idempotent — re-run it any time to
-refresh scope, rotate credentials, or repoint a client.
+Pick `--read` for read-only or `--read-write` for read+write. The flag
+both binds the agent to the matching shipped policy (`<svc>-read-only`
+or `<svc>-read-write`) **and** decides which OAuth scopes the Google
+consent screen requests — `--read-write` pulls in the write scopes
+(e.g. `gmail.send`/`compose`/`modify`) so the sealed credential can
+actually write, not just the policy. A browser opens for Google
+consent; tokens are sealed locally. `quickstart` is idempotent — re-run
+it any time to refresh scope, rotate credentials, or repoint a client.
+(Re-running `--read-write` over an existing read-only credential
+re-prompts for consent to add the write scopes.)
 
 Useful flags:
 
@@ -233,9 +238,10 @@ that already carries:
 - `"url": "http://127.0.0.1:3820/mcp/<service>"` (Gmail / Calendar /
   Drive each have their own per-service path; bare `/mcp` is not a
   route).
-- `Authorization: Bearer agt_v2_<name>_<random>` and
-  `x-agentsso-scope: <oauth-scope>` headers — auth is wired up for you;
-  you don't set headers by hand.
+- `Authorization: Bearer agt_v2_<name>_<random>` — auth is wired up for
+  you; you don't set headers by hand. There is no client scope header:
+  on the `/mcp` path the daemon derives each tool's required scope
+  server-side, so the snippet carries only the bearer.
 
 The exact paste target depends on your client:
 

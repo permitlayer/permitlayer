@@ -99,6 +99,28 @@ fn unknown_service_returns_empty_scopes() {
     assert!(scopes.is_empty());
 }
 
+/// RC1 contract at the consent boundary: a read-WRITE gmail connect must
+/// ask Google for the write scopes, not just readonly. Before the fix,
+/// `--read-write` requested only `gmail.readonly`, so the sealed credential
+/// could never send/modify and every write 403'd `scope-insufficient`.
+#[test]
+fn gmail_read_write_consent_requests_write_scopes() {
+    let scopes = scopes::scopes_for_access("gmail", true);
+    assert!(scopes.contains(&scopes::GMAIL_READONLY));
+    assert!(scopes.contains(&scopes::GMAIL_SEND), "read-write consent must request gmail.send");
+    assert!(scopes.contains(&scopes::GMAIL_COMPOSE), "must request gmail.compose for drafts");
+    assert!(scopes.contains(&scopes::GMAIL_MODIFY), "must request gmail.modify");
+}
+
+/// And the read path is unchanged: `scopes_for_access(_, false)` equals the
+/// historical default grant for every service (back-compat).
+#[test]
+fn read_access_consent_matches_default_grant() {
+    for svc in ["gmail", "calendar", "drive", "slack"] {
+        assert_eq!(scopes::scopes_for_access(svc, false), scopes::default_scopes_for_service(svc),);
+    }
+}
+
 // ── CredentialMeta tests ─────────────────────────────────────────────
 
 #[test]

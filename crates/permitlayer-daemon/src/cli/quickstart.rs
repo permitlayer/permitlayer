@@ -125,14 +125,17 @@ pub struct QuickstartArgs {
     /// Service to connect: `gmail`, `calendar`, or `drive`.
     pub service: String,
 
-    /// Bind the agent to the shipped read-only policy for the service
-    /// (the agent can READ; writes are denied).
+    /// Bind the agent to the shipped read-only policy and request only
+    /// read-only OAuth scopes (the agent can READ; writes are denied).
     #[arg(long, conflicts_with = "read_write")]
     pub read: bool,
 
-    /// Bind the agent to the shipped read-write policy for the service
-    /// (the agent can READ and WRITE — send/modify/delete — with no
-    /// gate; the daemon is headless).
+    /// Bind the agent to the shipped read-write policy AND request the
+    /// write OAuth scopes from Google (gmail.send/compose/modify, …), so
+    /// the sealed credential can actually send/modify — not just the
+    /// policy binding. The agent can READ and WRITE (send/modify/delete)
+    /// with no gate; the daemon is headless. The Google consent screen
+    /// will list the write scopes.
     #[arg(long = "read-write", conflicts_with = "read")]
     pub read_write: bool,
 
@@ -295,6 +298,11 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
         device_flow: false,
         device_flow_timeout: 120,
         force: false,
+        // RC1: carry the read-write intent into the OAuth grant so connect
+        // requests the write scopes from Google — not just the read-write
+        // *policy* binding (which alone leaves a read-only credential that
+        // 403s on every write). `write` is the access level resolved above.
+        read_write: write,
         // Story 10.7: pass the fresh bearer for a new agent, or `None`
         // for an existing one — connect resolves the existing token and
         // emits the snippet either way.
@@ -380,8 +388,19 @@ fn print_summary(service: &str, agent: &str, access: Access, verbose: bool) {
         )
     );
     if verbose {
+        // RC6: list the OAuth scopes this access level actually requested, so
+        // the operator can confirm a `--read-write` connect really pulled in
+        // send/compose/modify (the RC1 fix). Short names, policy-file shape.
+        let write = matches!(access, Access::ReadWrite);
+        let scope_names = permitlayer_oauth::google::scopes::scopes_for_access(service, write)
+            .into_iter()
+            .filter_map(permitlayer_oauth::google::scopes::uri_to_short_name)
+            .collect::<Vec<_>>()
+            .join(", ");
+        let scopes_line = format!("scopes granted: {scope_names}");
         let detail = [
             capability.as_str(),
+            scopes_line.as_str(),
             "runs headless \u{2014} no approval, no prompt; capability is fixed by the access level chosen",
         ];
         eprint!("{}", render::detail_block(&detail, &theme, support));

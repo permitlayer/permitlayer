@@ -32,8 +32,7 @@
 //!   "transport": "streamable-http",
 //!   "url": "http://127.0.0.1:3820/mcp/<service>",
 //!   "headers": {
-//!     "Authorization": "Bearer <token>",
-//!     "x-agentsso-scope": "<default-scope>"
+//!     "Authorization": "Bearer <token>"
 //!   }
 //! }
 //! ```
@@ -41,6 +40,22 @@
 //! The wrapping `mcpServers` key + the entry's name (e.g.,
 //! `permitlayer-gmail`) are the operator's responsibility — the
 //! emitted JSON is just the value at that nested entry.
+//!
+//! ## No client scope header on the `/mcp` path
+//!
+//! The snippet carries NO `x-agentsso-scope` header. On the MCP tool-
+//! dispatch path (`/mcp/<service>`) the daemon derives each tool's
+//! required scope server-side (e.g. `messages.send` → `gmail.send`) and
+//! evaluates that against the agent's policy; it never reads a client
+//! scope header. A single static header could only ever name one scope,
+//! so it cannot express a read-write agent (which spans
+//! readonly/send/compose/modify) and was silently ignored anyway.
+//! Emitting it implied — falsely — that one scope governs every call,
+//! which led operators to hand-build multiple per-scope MCP entries.
+//!
+//! (The REST `/v1/tools/<service>` path is different: it DOES require an
+//! `x-agentsso-scope` header per request. That path is not what this
+//! snippet targets.)
 
 use std::io::{self, Write as _};
 use std::net::SocketAddr;
@@ -52,18 +67,19 @@ use std::path::Path;
 /// Pure function — no I/O. The returned `serde_json::Value` is
 /// shaped to drop directly into an MCP-client config under
 /// `mcpServers.permitlayer-<service>`.
+///
+/// The snippet carries no `x-agentsso-scope` header — MCP tool dispatch
+/// derives the required scope per-tool server-side (see module docs).
 pub(crate) fn build_snippet(
     service: &str,
     bearer_token: &str,
     addr: SocketAddr,
-    default_scope: &str,
 ) -> serde_json::Value {
     serde_json::json!({
         "transport": "streamable-http",
         "url": format!("http://{}/mcp/{}", addr, service),
         "headers": {
             "Authorization": format!("Bearer {}", bearer_token),
-            "x-agentsso-scope": default_scope,
         },
     })
 }
@@ -215,63 +231,51 @@ mod tests {
     #[test]
     fn snippet_has_streamable_http_transport() {
         let addr: SocketAddr = "127.0.0.1:3820".parse().unwrap();
-        let snippet = build_snippet("gmail", "agt_v2_test_xxx", addr, "gmail.readonly");
+        let snippet = build_snippet("gmail", "agt_v2_test_xxx", addr);
         assert_eq!(snippet["transport"], "streamable-http");
     }
 
     #[test]
     fn snippet_url_includes_service_path() {
         let addr: SocketAddr = "127.0.0.1:3820".parse().unwrap();
-        let snippet = build_snippet("calendar", "agt_v2_test_xxx", addr, "calendar.readonly");
+        let snippet = build_snippet("calendar", "agt_v2_test_xxx", addr);
         assert_eq!(snippet["url"], "http://127.0.0.1:3820/mcp/calendar");
     }
 
     #[test]
     fn snippet_authorization_header_uses_bearer_prefix() {
         let addr: SocketAddr = "127.0.0.1:3820".parse().unwrap();
-        let snippet = build_snippet("drive", "agt_v2_alice_secret", addr, "drive.file");
+        let snippet = build_snippet("drive", "agt_v2_alice_secret", addr);
         assert_eq!(snippet["headers"]["Authorization"], "Bearer agt_v2_alice_secret");
     }
 
     #[test]
-    fn snippet_includes_scope_header() {
+    fn snippet_omits_scope_header_on_mcp_path() {
+        // RC2: the `/mcp` path derives each tool's scope server-side and
+        // NEVER reads a client scope header. A single static
+        // `x-agentsso-scope` header can't express a read-write agent
+        // (readonly/send/compose/modify) and was silently ignored — emitting
+        // it falsely implied one scope governs every call, which pushed
+        // operators into hand-building per-scope MCP entries.
+        //
+        // This INVERTS the old Story 10.8 "header must never be absent"
+        // guard: the correct structural defense is that we never hand-build
+        // the MCP entry and never imply a client scope. Do NOT re-add the
+        // header here.
         let addr: SocketAddr = "127.0.0.1:3820".parse().unwrap();
-        let snippet = build_snippet("gmail", "agt_v2_alice_secret", addr, "gmail.readonly");
-        assert_eq!(snippet["headers"]["x-agentsso-scope"], "gmail.readonly");
-    }
-
-    #[test]
-    fn snippet_always_carries_scope_header_even_with_placeholder_bearer() {
-        // Story 10.8 AC #7 regression guard: the chain that broke Angie-2
-        // started when an operator hand-built a calendar MCP entry that
-        // dropped the `x-agentsso-scope` header. The structural defense is
-        // that EVERY snippet we emit carries the header — including the
-        // existing-agent placeholder path (no real bearer in hand).
-        let addr: SocketAddr = "127.0.0.1:3820".parse().unwrap();
-        let snippet = build_snippet(
-            "calendar",
-            "<PASTE_YOUR_EXISTING_BEARER_TOKEN>",
-            addr,
-            "calendar.readonly",
-        );
-        assert_eq!(snippet["headers"]["x-agentsso-scope"], "calendar.readonly");
-        assert!(
-            !snippet["headers"]["x-agentsso-scope"].is_null(),
-            "scope header must never be absent"
-        );
-    }
-
-    #[test]
-    fn snippet_uses_passed_first_policy_scope() {
-        let addr: SocketAddr = "127.0.0.1:3820".parse().unwrap();
-        let snippet = build_snippet("calendar", "agt_v2_alice_secret", addr, "calendar.readonly");
-        assert_eq!(snippet["headers"]["x-agentsso-scope"], "calendar.readonly");
+        for bearer in ["agt_v2_alice_secret", "<PASTE_YOUR_EXISTING_BEARER_TOKEN>"] {
+            let snippet = build_snippet("gmail", bearer, addr);
+            assert!(
+                snippet["headers"].get("x-agentsso-scope").is_none(),
+                "the MCP snippet must NOT carry a client scope header (bearer={bearer})"
+            );
+        }
     }
 
     #[test]
     fn snippet_round_trips_through_serde_json() {
         let addr: SocketAddr = "127.0.0.1:3820".parse().unwrap();
-        let snippet = build_snippet("gmail", "tok", addr, "gmail.readonly");
+        let snippet = build_snippet("gmail", "tok", addr);
         let s = serde_json::to_string(&snippet).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&s).unwrap();
         assert_eq!(parsed["transport"], "streamable-http");
@@ -302,7 +306,7 @@ mod tests {
         // human labels moved to stderr. A consumer doing
         // `agentsso connect … | jq` or `… > config.json` relies on this.
         let addr: SocketAddr = "127.0.0.1:3820".parse().unwrap();
-        let snippet = build_snippet("gmail", "agt_v2_alice_supersecret", addr, "gmail.readonly");
+        let snippet = build_snippet("gmail", "agt_v2_alice_supersecret", addr);
         let pretty = serde_json::to_string_pretty(&snippet).unwrap();
         let redacted = redact_bearer(&pretty);
         // Both the un-redacted and the redacted stdout copies parse.
