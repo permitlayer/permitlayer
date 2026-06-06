@@ -673,7 +673,13 @@ async fn run_macos(args: SetupArgs) -> Result<()> {
     };
     println!("  {} LaunchDaemon plist {}", g.check, if wrote { "written" } else { "unchanged" });
 
-    // (11) Bootstrap.
+    // (11) Bootstrap. Gate first: wait for step 7's bootout to fully
+    // release the service label before re-registering it. On a long-uptime
+    // daemon launchd's domain release lags the bootout exit, and an
+    // immediate bootstrap returns `Bootstrap failed: 5: Input/output error`
+    // — which previously exhausted the retry budget AND the rollback's, and
+    // left the daemon down.
+    im::wait_for_label_released();
     if let Err(e) = im::launchctl_bootstrap_system() {
         if let Some(bak) = &legacy_bak {
             return restore_legacy_and_rebootstrap(
@@ -1347,8 +1353,12 @@ async fn restore_legacy_and_rebootstrap(
     let restored = std::fs::rename(bak, helper_path).is_ok();
     if restored {
         // bootout-then-bootstrap to bring the restored binary's daemon
-        // back (step 7 already booted the old one out).
+        // back (step 7 already booted the old one out). Gate the bootstrap
+        // on the label fully releasing — without it, the rollback's own
+        // bootstrap hits the same post-bootout EIO race and leaves the
+        // daemon down.
         let _ = im::bootout_daemon();
+        im::wait_for_label_released();
         let rebootstrapped = im::launchctl_bootstrap_system().is_ok();
         if rebootstrapped {
             match poll_recovered_version(Duration::from_secs(15)).await {
@@ -1452,6 +1462,11 @@ async fn rollback(
             eprintln!("{} rolling back to prior binary {}", g.arrow, prior.display());
             let swap_ok = atomic_symlink_swap(prior, helper_path, helper_dir).is_ok();
             let _ = im::bootout_daemon();
+            // Gate on the label releasing before re-bootstrapping the prior
+            // binary — this is the leg that, ungated, left the daemon DOWN
+            // (`setup.rollback_incomplete`, `rebootstrapped=false`) when the
+            // post-bootout EIO race outlasted the bootstrap retry budget.
+            im::wait_for_label_released();
             let boot_ok = im::launchctl_bootstrap_system().is_ok();
             if swap_ok && boot_ok {
                 // Re-verify the old daemon actually came back reachable
