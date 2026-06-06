@@ -11,11 +11,13 @@
 //! blow-up risk is many small *inline* parts that DO carry `body.data`
 //! (e.g. embedded images) or an oversized HTML body. This shaper:
 //!
-//! - extracts the message body, prioritizing `text/plain` then
-//!   `text/html`, capped at [`MAX_BODY_BYTES`];
+//! - extracts the message body, prioritizing `text/plain` (capped at
+//!   [`MAX_BODY_BYTES`]) then `text/html` (capped harder at
+//!   [`MAX_HTML_BODY_BYTES`]);
 //! - emits one manifest entry per attachment part, stripping inline
-//!   `data` UNLESS the part has no `attachmentId` (then there is no way
-//!   to re-fetch it, so its small bytes are kept);
+//!   `data` UNLESS the part has no `attachmentId` AND its base64 is small
+//!   (≤ [`MAX_INLINE_DATA_BYTES`]); a large inline blob is dropped (it's
+//!   unfetchable, so the entry is flagged `inline_dropped`);
 //! - never reconstructs a field from a pre-scrub source — it operates on
 //!   the already-scrubbed body JSON the proxy hands it (so the scrub
 //!   engine's redactions survive into the shaped output).
@@ -26,9 +28,24 @@
 use serde::Serialize;
 use serde_json::Value;
 
-/// Maximum decoded body-text size embedded in a shaped response (64 KiB).
-/// Larger bodies are truncated with `truncated = true`.
-pub const MAX_BODY_BYTES: usize = 64 * 1024;
+/// Maximum decoded text/plain body size embedded in a shaped response
+/// (32 KiB, ≈8K tokens). Larger bodies are truncated with `truncated =
+/// true`; an agent that needs the full body can request `format=raw`.
+/// Lowered from 64 KiB after a Gmail-summary cron fed multiple ~60 KB
+/// bodies into one turn and drove model context to ~51K tokens.
+pub const MAX_BODY_BYTES: usize = 32 * 1024;
+
+/// Maximum size for an HTML-derived body (16 KiB). HTML is token-dense and
+/// low-signal (markup/CSS/tracking), so it's capped harder than plain text;
+/// `html_available = true` already tells the agent richer content exists.
+pub const MAX_HTML_BODY_BYTES: usize = 16 * 1024;
+
+/// Maximum base64 length of an inline part's `data` to retain inline
+/// (8 KiB of base64 ≈ 6 KB decoded). Inline parts have no `attachmentId`,
+/// so their bytes can't be re-fetched — but a newsletter's inline base64
+/// image can be tens of KB and is the dominant payload-bloat source. Larger
+/// inline blobs are dropped (manifest entry kept, `inline_dropped = true`).
+pub const MAX_INLINE_DATA_BYTES: usize = 8 * 1024;
 
 /// A shaped, agent-friendly message.
 #[derive(Debug, Serialize, PartialEq)]
@@ -82,10 +99,18 @@ pub struct ShapedAttachment {
     /// bytes. Absent for small inline parts that carried their data inline.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub attachment_id: Option<String>,
-    /// Kept ONLY for inline parts that had `data` but no `attachmentId`
-    /// (otherwise unfetchable). base64url, bounded by the part's small size.
+    /// Kept ONLY for inline parts that had `data`, no `attachmentId`, AND
+    /// base64 length ≤ [`MAX_INLINE_DATA_BYTES`] (otherwise unfetchable but
+    /// small enough to inline). base64url.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub inline_data: Option<String>,
+    /// True when a large inline part's bytes were dropped: it had `data` but
+    /// no `attachmentId` (so it's unfetchable) and exceeded
+    /// [`MAX_INLINE_DATA_BYTES`]. Distinguishes "no bytes because
+    /// re-fetchable" from "no bytes because too large and lost". Omitted
+    /// (false) in the common case.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub inline_dropped: bool,
 }
 
 /// Shape one Gmail message JSON (the body of `messages.get?format=full`,
@@ -116,7 +141,7 @@ pub fn shape_message(msg: &Value) -> Option<ShapedMessage> {
     if body.text.is_empty()
         && let Some(html) = html_text
     {
-        body.text = cap_body(&html, &mut body.truncated);
+        body.text = cap_body(&html, MAX_HTML_BODY_BYTES, &mut body.truncated);
     }
 
     Some(ShapedMessage {
@@ -194,9 +219,15 @@ fn walk_part(
     if is_attachment {
         *counter += 1;
         let id = format!("att-{}", *counter - 1);
-        // Strip bytes when re-fetchable (has attachmentId). Keep inline
-        // bytes only when there's no attachmentId (otherwise unfetchable).
-        let inline_data = if attachment_id.is_none() { data.map(str::to_owned) } else { None };
+        // Strip bytes when re-fetchable (has attachmentId). For inline parts
+        // (no attachmentId, otherwise unfetchable) keep the bytes only when
+        // small — a large inline base64 blob (e.g. a newsletter image) is
+        // the dominant payload-bloat source, so drop it and flag it.
+        let (inline_data, inline_dropped) = match (attachment_id, data) {
+            (None, Some(d)) if d.len() <= MAX_INLINE_DATA_BYTES => (Some(d.to_owned()), false),
+            (None, Some(_)) => (None, true),
+            _ => (None, false),
+        };
         attachments.push(ShapedAttachment {
             id,
             filename: (!filename.is_empty()).then(|| filename.to_owned()),
@@ -204,6 +235,7 @@ fn walk_part(
             size,
             attachment_id: attachment_id.map(str::to_owned),
             inline_data,
+            inline_dropped,
         });
         return;
     }
@@ -214,7 +246,7 @@ fn walk_part(
             && body.text.is_empty()
             && let Some(decoded) = decode_body(d)
         {
-            body.text = cap_body(&decoded, &mut body.truncated);
+            body.text = cap_body(&decoded, MAX_BODY_BYTES, &mut body.truncated);
         }
     } else if mime == "text/html" {
         body.html_available = true;
@@ -258,14 +290,15 @@ fn decode_body(data: &str) -> Option<String> {
     String::from_utf8(bytes).ok()
 }
 
-/// Truncate text to [`MAX_BODY_BYTES`] at a char boundary, setting
-/// `truncated` if it had to cut.
-fn cap_body(text: &str, truncated: &mut bool) -> String {
-    if text.len() <= MAX_BODY_BYTES {
+/// Truncate text to `limit` bytes at a char boundary, setting `truncated`
+/// if it had to cut. Callers pass [`MAX_BODY_BYTES`] for plain text and the
+/// smaller [`MAX_HTML_BODY_BYTES`] for HTML-derived bodies.
+fn cap_body(text: &str, limit: usize, truncated: &mut bool) -> String {
+    if text.len() <= limit {
         return text.to_owned();
     }
     *truncated = true;
-    let end = (0..=MAX_BODY_BYTES).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
+    let end = (0..=limit).rev().find(|&i| text.is_char_boundary(i)).unwrap_or(0);
     text[..end].to_owned()
 }
 
@@ -391,6 +424,51 @@ mod tests {
         let att = &shaped.attachments[0];
         assert!(att.attachment_id.is_none());
         assert_eq!(att.inline_data.as_deref(), Some(b64("PNGDATA").as_str()));
+        assert!(!att.inline_dropped, "small inline part is kept, not dropped");
+    }
+
+    #[test]
+    fn large_inline_data_is_dropped() {
+        // Inline part, no attachmentId, base64 length > MAX_INLINE_DATA_BYTES
+        // (a newsletter's inline image) — bytes dropped, flagged.
+        let big = b64(&"P".repeat(MAX_INLINE_DATA_BYTES + 1024));
+        assert!(big.len() > MAX_INLINE_DATA_BYTES);
+        let msg = json!({
+            "id": "m5",
+            "payload": {
+                "mimeType": "multipart/mixed",
+                "parts": [
+                    {"mimeType": "text/plain", "body": {"data": b64("body")}},
+                    {"mimeType": "image/png", "filename": "huge.png",
+                     "body": {"data": big, "size": 99999}}
+                ]
+            }
+        });
+        let shaped = shape_message(&msg).unwrap();
+        let att = &shaped.attachments[0];
+        assert!(att.attachment_id.is_none());
+        assert!(att.inline_data.is_none(), "large inline bytes must be dropped");
+        assert!(att.inline_dropped, "drop must be flagged");
+    }
+
+    #[test]
+    fn inline_data_at_threshold_is_kept() {
+        // base64 length right at the limit is kept (boundary is `<=`).
+        let payload = "Q".repeat(MAX_INLINE_DATA_BYTES);
+        let msg = json!({
+            "id": "m6",
+            "payload": {
+                "mimeType": "multipart/mixed",
+                "parts": [
+                    {"mimeType": "image/png", "filename": "ok.png",
+                     "body": {"data": payload, "size": 10}}
+                ]
+            }
+        });
+        let shaped = shape_message(&msg).unwrap();
+        let att = &shaped.attachments[0];
+        assert!(att.inline_data.is_some(), "at-threshold inline bytes are kept");
+        assert!(!att.inline_dropped);
     }
 
     #[test]
@@ -403,6 +481,42 @@ mod tests {
         let shaped = shape_message(&msg).unwrap();
         assert!(shaped.body.truncated);
         assert!(shaped.body.text.len() <= MAX_BODY_BYTES);
+    }
+
+    #[test]
+    fn html_fallback_capped_at_smaller_limit() {
+        // An HTML-only body between the HTML cap and the (larger) plain cap
+        // must be truncated at the HTML limit, not the plain one.
+        let big_html = "h".repeat(MAX_BODY_BYTES);
+        assert!(big_html.len() > MAX_HTML_BODY_BYTES);
+        let msg = json!({
+            "id": "m7",
+            "payload": {"mimeType": "text/html", "body": {"data": b64(&big_html)}}
+        });
+        let shaped = shape_message(&msg).unwrap();
+        assert!(shaped.body.truncated);
+        assert!(
+            shaped.body.text.len() <= MAX_HTML_BODY_BYTES,
+            "HTML body must be capped at the smaller HTML limit"
+        );
+    }
+
+    #[test]
+    fn inline_dropped_omitted_from_json_when_false() {
+        // skip_serializing_if keeps the common case byte-free.
+        let msg = json!({
+            "id": "m8",
+            "payload": {
+                "mimeType": "multipart/mixed",
+                "parts": [
+                    {"mimeType": "application/pdf", "filename": "doc.pdf",
+                     "body": {"attachmentId": "att-xyz", "size": 1000}}
+                ]
+            }
+        });
+        let shaped = shape_message(&msg).unwrap();
+        let s = serde_json::to_string(&shaped).unwrap();
+        assert!(!s.contains("inline_dropped"), "inline_dropped omitted when false: {s}");
     }
 
     #[test]
