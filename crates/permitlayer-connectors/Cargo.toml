@@ -10,6 +10,15 @@ description = "Built-in JS connectors (Gmail, Calendar, Drive) embedded as asset
 
 [dependencies]
 thiserror.workspace = true
+# Story 11.1: connector-definition typed model. `serde` (derive) for the
+# TOML schema, `toml` for deserialization, `serde_json` for the per-tool
+# MCP `input_schema` (arbitrary JSON held as a `Value`), `url` for the
+# upstream `base_url`. The workspace pins `serde`/`url` without the
+# `derive`/`serde` features, so they are enabled here at the call site.
+serde = { workspace = true, features = ["derive"] }
+toml.workspace = true
+serde_json.workspace = true
+url = { workspace = true, features = ["serde"] }
 
 [lints]
 workspace = true

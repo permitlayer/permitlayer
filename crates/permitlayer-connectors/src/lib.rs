@@ -26,11 +26,25 @@
 //! under `~/.agentsso/plugins/<name>/` with the same `metadata`
 //! shape used here. Validate with `agentsso connectors test <name>`
 //! before restarting the daemon.
+//!
+//! ## Connector-definition model ([`def`])
+//!
+//! Epic 11 introduces a declarative [`ConnectorDef`] (`connector.toml`)
+//! that collapses a connector's identity, auth, upstream, scope vocab,
+//! access tiers, and tool catalog into one artifact. Story 11.1 ships
+//! the typed model + serde deserialization only; the registry +
+//! load-time validator (11.3) and the built-in defs (11.2) follow, with
+//! the proxy reading from it in Phase 2. The JS-embed surface below is
+//! orthogonal and unchanged.
 
 #![forbid(unsafe_code)]
 
+pub mod def;
 pub mod error;
 
+pub use def::{
+    AuthSpec, ConnectorDef, ConnectorMeta, TierBundle, ToolDef, TrustTier, UpstreamSpec,
+};
 pub use error::ConnectorError;
 
 /// A built-in connector — one of Gmail/Calendar/Drive — shipped
