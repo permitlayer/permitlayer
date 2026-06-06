@@ -41,11 +41,15 @@
 
 pub mod def;
 pub mod error;
+pub mod registry;
+pub mod validate;
 
 pub use def::{
     AuthSpec, ConnectorDef, ConnectorMeta, TierBundle, ToolDef, TrustTier, UpstreamSpec,
 };
 pub use error::ConnectorError;
+pub use registry::{ConnectorRegistry, ResolvedConnector};
+pub use validate::{ValidationError, validate_def};
 
 /// A built-in connector — one of Gmail/Calendar/Drive — shipped
 /// as an embedded JS asset in the daemon binary.

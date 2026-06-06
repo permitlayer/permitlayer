@@ -266,6 +266,17 @@ pub fn plugins_dir(home_override: Option<&Path>) -> PathBuf {
     daemon_state_dir(home_override).join("plugins")
 }
 
+/// Connectors directory — host-installed connector definitions
+/// (Epic 11). Each host-installed connector lives under
+/// `connectors/<id>/connector.toml` and is discovered + validated by
+/// `permitlayer_connectors::ConnectorRegistry` at boot (and on
+/// `ArcSwap` reload) with no recompile (FR89). Built-in connectors
+/// are embedded in the binary and do NOT live here. The directory's
+/// absence is normal (a system with no host-installed connectors).
+pub fn connectors_dir(home_override: Option<&Path>) -> PathBuf {
+    daemon_state_dir(home_override).join("connectors")
+}
+
 /// Media directory — transient store for decoded inbound attachments
 /// (e.g. Gmail attachment bytes the proxy materializes so the MCP agent
 /// can read them by local path). Per-agent subdirs live below this.

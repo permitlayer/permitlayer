@@ -19,6 +19,16 @@ serde = { workspace = true, features = ["derive"] }
 toml.workspace = true
 serde_json.workspace = true
 url = { workspace = true, features = ["serde"] }
+# Story 11.3: connector registry. `arc-swap` for the hot-swappable
+# registry (same pattern as permitlayer-plugins::PluginRegistry);
+# `tracing` for skip-and-warn diagnostics on bad host-installed defs.
+# The registry takes the connectors dir as a parameter so this crate
+# stays free of permitlayer-core's path layout.
+arc-swap.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
 
 [lints]
 workspace = true

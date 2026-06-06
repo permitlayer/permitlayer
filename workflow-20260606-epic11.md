@@ -19,7 +19,7 @@ For each story N: create-story (spec file) → dev-story (implement) → code-re
 ### Phase 1 — Connector-def format + registry + validator
 - [x] 11.1 — Connector-definition format (`connector.toml` schema + typed model) ✅ committed
 - [x] 11.2 — Express built-in Gmail/Calendar/Drive as connector defs (embedded) ✅ committed (hybrid: metadata only)
-- [ ] 11.3 — Connector registry + load-time validator + host-installed discovery
+- [x] 11.3 — Connector registry + load-time validator + host-installed discovery ✅ committed
 
 ### Phase 2 — Proxy reads from registry
 - [ ] 11.4 — Generic `ConnectorMcpServer` + dynamic `/mcp/{selector}` route
