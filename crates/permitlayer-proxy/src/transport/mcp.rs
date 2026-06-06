@@ -473,13 +473,33 @@ fn validate_calendar_id(id: &str, field: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// Validate that a JSON write body is a non-empty object.
+/// Coerce a stringified-JSON-object arg into the object it encodes, then
+/// validate that the write body is a non-empty object.
 ///
-/// Rejects `null`, primitives, arrays, and empty objects (`{}`). Google
-/// Calendar/Drive write endpoints expect a JSON object resource; sending
-/// `null` or `{}` produces an opaque Google 400. This pre-rejects at the
-/// MCP boundary with a clear error message.
-fn validate_json_object_body(value: &serde_json::Value, field: &str) -> Result<(), String> {
+/// LLMs frequently pass an object-valued arg as a JSON *string* (e.g.
+/// `event` as `"{\"summary\":...}"`). Left as-is, validation rejects it,
+/// the model retries the same shape, and ~3 consecutive failures trip the
+/// MCP client's circuit breaker — taking the whole service "unreachable"
+/// for ~a minute (observed live taking calendar offline). We first coerce a
+/// `String` whose trimmed content parses to a JSON **object**, replacing it
+/// in place so the caller's subsequent `serde_json::to_vec` serializes the
+/// object. A string that parses to a non-object (array/number/…) or doesn't
+/// parse at all is left untouched and falls through to the same clear error.
+///
+/// Then the original strict checks: rejects `null`, primitives, arrays, and
+/// empty objects (`{}`) — Google write endpoints expect a JSON object
+/// resource and `null`/`{}` produce an opaque Google 400.
+fn coerce_and_validate_json_object_body(
+    value: &mut serde_json::Value,
+    field: &str,
+) -> Result<(), String> {
+    if let serde_json::Value::String(s) = value
+        && let Ok(parsed @ serde_json::Value::Object(_)) =
+            serde_json::from_str::<serde_json::Value>(s.trim())
+    {
+        debug!(field, "coerced stringified JSON object arg");
+        *value = parsed;
+    }
     if value.is_null() {
         return Err(format!("{field} must not be null — pass a JSON object resource"));
     }
@@ -898,12 +918,12 @@ impl GmailMcpServer {
     )]
     async fn messages_send(
         &self,
-        Parameters(params): Parameters<MessagesSendParams>,
+        Parameters(mut params): Parameters<MessagesSendParams>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         debug!(tool = "gmail.messages.send", "MCP tool call");
         let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
-        validate_json_object_body(&params.message, "message")?;
+        coerce_and_validate_json_object_body(&mut params.message, "message")?;
         let body = serde_json::to_vec(&params.message)
             .map_err(|e| format!("invalid message JSON: {e}"))?;
         let req = Self::gmail_request(
@@ -923,13 +943,13 @@ impl GmailMcpServer {
     )]
     async fn messages_modify(
         &self,
-        Parameters(params): Parameters<MessagesModifyParams>,
+        Parameters(mut params): Parameters<MessagesModifyParams>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         debug!(tool = "gmail.messages.modify", id = %params.id, "MCP tool call");
         let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         validate_resource_id(&params.id)?;
-        validate_json_object_body(&params.body, "body")?;
+        coerce_and_validate_json_object_body(&mut params.body, "body")?;
         let body =
             serde_json::to_vec(&params.body).map_err(|e| format!("invalid modify JSON: {e}"))?;
         let path = format!("users/me/messages/{}/modify", params.id);
@@ -980,12 +1000,12 @@ impl GmailMcpServer {
     )]
     async fn drafts_create(
         &self,
-        Parameters(params): Parameters<DraftWriteParams>,
+        Parameters(mut params): Parameters<DraftWriteParams>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         debug!(tool = "gmail.drafts.create", "MCP tool call");
         let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
-        validate_json_object_body(&params.draft, "draft")?;
+        coerce_and_validate_json_object_body(&mut params.draft, "draft")?;
         let body =
             serde_json::to_vec(&params.draft).map_err(|e| format!("invalid draft JSON: {e}"))?;
         let req = Self::gmail_request(
@@ -1005,7 +1025,7 @@ impl GmailMcpServer {
     )]
     async fn drafts_update(
         &self,
-        Parameters(params): Parameters<DraftWriteParams>,
+        Parameters(mut params): Parameters<DraftWriteParams>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         debug!(tool = "gmail.drafts.update", "MCP tool call");
@@ -1016,7 +1036,7 @@ impl GmailMcpServer {
             .filter(|s| !s.trim().is_empty())
             .ok_or_else(|| "draft_id is required for gmail.drafts.update".to_owned())?;
         validate_resource_id(draft_id)?;
-        validate_json_object_body(&params.draft, "draft")?;
+        coerce_and_validate_json_object_body(&mut params.draft, "draft")?;
         let body =
             serde_json::to_vec(&params.draft).map_err(|e| format!("invalid draft JSON: {e}"))?;
         let path = format!("users/me/drafts/{draft_id}");
@@ -1033,12 +1053,12 @@ impl GmailMcpServer {
     )]
     async fn drafts_send(
         &self,
-        Parameters(params): Parameters<DraftSendParams>,
+        Parameters(mut params): Parameters<DraftSendParams>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         debug!(tool = "gmail.drafts.send", "MCP tool call");
         let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
-        validate_json_object_body(&params.draft, "draft")?;
+        coerce_and_validate_json_object_body(&mut params.draft, "draft")?;
         let body =
             serde_json::to_vec(&params.draft).map_err(|e| format!("invalid draft JSON: {e}"))?;
         let req = Self::gmail_request(
@@ -1514,14 +1534,14 @@ impl CalendarMcpServer {
     )]
     async fn events_create(
         &self,
-        Parameters(params): Parameters<EventCreateParams>,
+        Parameters(mut params): Parameters<EventCreateParams>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         let cal_id = params.calendar_id.as_deref().unwrap_or("primary");
         debug!(tool = "calendar.events.create", calendar_id = %cal_id, "MCP tool call");
         let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         validate_calendar_id(cal_id, "calendar_id")?;
-        validate_json_object_body(&params.event, "event")?;
+        coerce_and_validate_json_object_body(&mut params.event, "event")?;
         let body =
             serde_json::to_vec(&params.event).map_err(|e| format!("invalid event JSON: {e}"))?;
         let encoded_cal_id = urlencoding::encode(cal_id);
@@ -1542,7 +1562,7 @@ impl CalendarMcpServer {
     )]
     async fn events_update(
         &self,
-        Parameters(params): Parameters<EventUpdateParams>,
+        Parameters(mut params): Parameters<EventUpdateParams>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         let cal_id = params.calendar_id.as_deref().unwrap_or("primary");
@@ -1550,7 +1570,7 @@ impl CalendarMcpServer {
         let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         validate_calendar_id(cal_id, "calendar_id")?;
         validate_resource_id(&params.event_id)?;
-        validate_json_object_body(&params.event, "event")?;
+        coerce_and_validate_json_object_body(&mut params.event, "event")?;
         let body =
             serde_json::to_vec(&params.event).map_err(|e| format!("invalid event JSON: {e}"))?;
         let encoded_cal_id = urlencoding::encode(cal_id);
@@ -1596,7 +1616,7 @@ impl CalendarMcpServer {
     )]
     async fn events_patch(
         &self,
-        Parameters(params): Parameters<EventPatchParams>,
+        Parameters(mut params): Parameters<EventPatchParams>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         let cal_id = params.calendar_id.as_deref().unwrap_or("primary");
@@ -1604,7 +1624,7 @@ impl CalendarMcpServer {
         let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         validate_calendar_id(cal_id, "calendar_id")?;
         validate_resource_id(&params.event_id)?;
-        validate_json_object_body(&params.event, "event")?;
+        coerce_and_validate_json_object_body(&mut params.event, "event")?;
         let body =
             serde_json::to_vec(&params.event).map_err(|e| format!("invalid event JSON: {e}"))?;
         let encoded_cal_id = urlencoding::encode(cal_id);
@@ -1678,12 +1698,12 @@ impl CalendarMcpServer {
     )]
     async fn freebusy_query(
         &self,
-        Parameters(params): Parameters<FreeBusyQueryParams>,
+        Parameters(mut params): Parameters<FreeBusyQueryParams>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         debug!(tool = "calendar.freebusy.query", "MCP tool call");
         let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
-        validate_json_object_body(&params.query, "query")?;
+        coerce_and_validate_json_object_body(&mut params.query, "query")?;
         let body =
             serde_json::to_vec(&params.query).map_err(|e| format!("invalid query JSON: {e}"))?;
         let req = Self::calendar_request(
@@ -2009,12 +2029,12 @@ impl DriveMcpServer {
     )]
     async fn files_create(
         &self,
-        Parameters(params): Parameters<FileCreateParams>,
+        Parameters(mut params): Parameters<FileCreateParams>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         debug!(tool = "drive.files.create", "MCP tool call");
         let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
-        validate_json_object_body(&params.file, "file")?;
+        coerce_and_validate_json_object_body(&mut params.file, "file")?;
         let body =
             serde_json::to_vec(&params.file).map_err(|e| format!("invalid file JSON: {e}"))?;
         let qs = build_query_string(&[("fields", params.fields)]);
@@ -2030,13 +2050,13 @@ impl DriveMcpServer {
     )]
     async fn files_update(
         &self,
-        Parameters(params): Parameters<FileUpdateParams>,
+        Parameters(mut params): Parameters<FileUpdateParams>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         debug!(tool = "drive.files.update", file_id = %params.file_id, "MCP tool call");
         let agent_id = agent_id_from_parts(&parts).map_err(|e| e.to_string())?;
         validate_resource_id(&params.file_id)?;
-        validate_json_object_body(&params.file, "file")?;
+        coerce_and_validate_json_object_body(&mut params.file, "file")?;
         let body =
             serde_json::to_vec(&params.file).map_err(|e| format!("invalid file JSON: {e}"))?;
         let qs = build_query_string(&[("fields", params.fields)]);
@@ -2073,7 +2093,7 @@ impl DriveMcpServer {
     )]
     async fn files_copy(
         &self,
-        Parameters(params): Parameters<FileCopyParams>,
+        Parameters(mut params): Parameters<FileCopyParams>,
         Extension(parts): Extension<axum::http::request::Parts>,
     ) -> Result<String, String> {
         debug!(tool = "drive.files.copy", file_id = %params.file_id, "MCP tool call");
@@ -2083,8 +2103,8 @@ impl DriveMcpServer {
         // object was supplied (mirrors the events_create body guard, but
         // here the body is genuinely optional per the Drive API).
         let body = match params.file {
-            Some(ref v) => {
-                validate_json_object_body(v, "file")?;
+            Some(ref mut v) => {
+                coerce_and_validate_json_object_body(v, "file")?;
                 Bytes::from(serde_json::to_vec(v).map_err(|e| format!("invalid file JSON: {e}"))?)
             }
             None => Bytes::new(),
@@ -2333,38 +2353,89 @@ mod tests {
 
     #[test]
     fn validate_json_object_body_accepts_non_empty_object() {
-        let v = serde_json::json!({"name": "test"});
-        assert!(validate_json_object_body(&v, "field").is_ok());
+        let mut v = serde_json::json!({"name": "test"});
+        assert!(coerce_and_validate_json_object_body(&mut v, "field").is_ok());
     }
 
     #[test]
     fn validate_json_object_body_rejects_null() {
-        let v = serde_json::Value::Null;
-        let err = validate_json_object_body(&v, "event").unwrap_err();
+        let mut v = serde_json::Value::Null;
+        let err = coerce_and_validate_json_object_body(&mut v, "event").unwrap_err();
         assert!(err.contains("event"), "error mentions field name: {err}");
         assert!(err.contains("null"), "error mentions null: {err}");
     }
 
     #[test]
     fn validate_json_object_body_rejects_empty_object() {
-        let v = serde_json::json!({});
-        let err = validate_json_object_body(&v, "file").unwrap_err();
+        let mut v = serde_json::json!({});
+        let err = coerce_and_validate_json_object_body(&mut v, "file").unwrap_err();
         assert!(err.contains("empty"), "error mentions empty: {err}");
     }
 
     #[test]
     fn validate_json_object_body_rejects_array() {
-        let v = serde_json::json!([1, 2, 3]);
-        let err = validate_json_object_body(&v, "file").unwrap_err();
+        let mut v = serde_json::json!([1, 2, 3]);
+        let err = coerce_and_validate_json_object_body(&mut v, "file").unwrap_err();
         assert!(err.contains("object"), "error mentions object expectation: {err}");
         assert!(err.contains("array"), "error mentions actual type: {err}");
     }
 
     #[test]
     fn validate_json_object_body_rejects_primitives() {
-        assert!(validate_json_object_body(&serde_json::json!("string"), "f").is_err());
-        assert!(validate_json_object_body(&serde_json::json!(42), "f").is_err());
-        assert!(validate_json_object_body(&serde_json::json!(true), "f").is_err());
+        let mut s = serde_json::json!("string");
+        assert!(coerce_and_validate_json_object_body(&mut s, "f").is_err());
+        let mut n = serde_json::json!(42);
+        assert!(coerce_and_validate_json_object_body(&mut n, "f").is_err());
+        let mut b = serde_json::json!(true);
+        assert!(coerce_and_validate_json_object_body(&mut b, "f").is_err());
+    }
+
+    // ── Arg coercion: stringified-JSON-object args (Fix A) ─────────
+
+    #[test]
+    fn coerce_stringified_object_is_accepted_and_replaced_in_place() {
+        let mut v = serde_json::json!("{\"summary\":\"x\"}");
+        assert!(coerce_and_validate_json_object_body(&mut v, "event").is_ok());
+        // In-place replacement matters: the caller serializes `v` afterward.
+        assert_eq!(v, serde_json::json!({"summary": "x"}));
+    }
+
+    #[test]
+    fn coerce_stringified_object_tolerates_surrounding_whitespace() {
+        let mut v = serde_json::json!("  {\"a\":1}  ");
+        assert!(coerce_and_validate_json_object_body(&mut v, "event").is_ok());
+        assert_eq!(v, serde_json::json!({"a": 1}));
+    }
+
+    #[test]
+    fn coerce_does_not_accept_stringified_array() {
+        // A string that parses to a non-object must NOT be coerced — it
+        // falls through to the same clear error as before.
+        let mut v = serde_json::json!("[1,2,3]");
+        let err = coerce_and_validate_json_object_body(&mut v, "event").unwrap_err();
+        assert!(err.contains("got string"), "keeps the original string error: {err}");
+    }
+
+    #[test]
+    fn coerce_keeps_original_error_for_non_json_string() {
+        let mut v = serde_json::json!("just some text");
+        let err = coerce_and_validate_json_object_body(&mut v, "event").unwrap_err();
+        assert!(err.contains("got string"), "keeps the original string error: {err}");
+    }
+
+    #[test]
+    fn coerce_stringified_empty_object_still_rejected() {
+        let mut v = serde_json::json!("{}");
+        let err = coerce_and_validate_json_object_body(&mut v, "event").unwrap_err();
+        assert!(err.contains("empty"), "coerced then empty-check fires: {err}");
+    }
+
+    #[test]
+    fn coerce_leaves_real_object_unchanged() {
+        let mut v = serde_json::json!({"a": 1});
+        let before = v.clone();
+        assert!(coerce_and_validate_json_object_body(&mut v, "event").is_ok());
+        assert_eq!(v, before);
     }
 
     // ── Story 4.4 Patch #29: AgentIdScopedMcpService tests ─────────
@@ -2651,12 +2722,14 @@ mod tests {
             serde_json::json!([1, 2, 3]),
             serde_json::json!("a string"),
         ] {
+            let mut bad = bad;
             assert!(
-                validate_json_object_body(&bad, "message").is_err(),
+                coerce_and_validate_json_object_body(&mut bad, "message").is_err(),
                 "malformed body {bad:?} must be rejected"
             );
         }
-        assert!(validate_json_object_body(&serde_json::json!({"raw": "x"}), "message").is_ok());
+        let mut ok = serde_json::json!({"raw": "x"});
+        assert!(coerce_and_validate_json_object_body(&mut ok, "message").is_ok());
     }
 
     // ── Story 9.3: Calendar + Drive parity gap-fill ──────────────────
