@@ -1350,6 +1350,9 @@ pub(crate) fn write_launchdaemon_plist(operator_uid: u32, operator_username: &st
 /// if the daemon is already bootstrapped, bootout it first.
 fn bootstrap_daemon() -> Result<()> {
     bootout_daemon()?;
+    // Wait for the label to drain before re-registering it — the same
+    // post-bootout domain-release race the setup path hits.
+    wait_for_label_released();
     launchctl_bootstrap_system()
 }
 
@@ -1405,6 +1408,14 @@ pub(crate) fn bootout_daemon() -> Result<()> {
     )
 }
 
+/// The substring `launchctl print system/<label>` (and `bootout`) emit
+/// once a service label is fully released from its domain. Source of
+/// truth for "is this label gone yet?" — used by the bootout
+/// not-loaded classifier, the bootout EPERM-fallback poll, and the
+/// pre-bootstrap [`wait_for_label_released`] gate.
+#[cfg(any(test, target_os = "macos"))]
+const LABEL_RELEASED_SUBSTRING: &str = "Could not find specified service";
+
 /// Classify whether a `launchctl bootout` stderr/exit indicates the
 /// service simply wasn't loaded (which is success for our purposes).
 /// The substring is the source of truth; exit codes 36/3 are an
@@ -1412,10 +1423,85 @@ pub(crate) fn bootout_daemon() -> Result<()> {
 #[cfg(any(test, target_os = "macos"))]
 fn bootout_not_loaded(success: bool, code: i32, stderr: &str) -> bool {
     !success
-        && (stderr.contains("Could not find specified service")
+        && (stderr.contains(LABEL_RELEASED_SUBSTRING)
             || stderr.contains("service not loaded")
             || code == 36
             || code == 3)
+}
+
+/// Closure-form inner of [`wait_for_label_released`]. Polls `print`
+/// (`launchctl print system/<label>`) until its output contains
+/// [`LABEL_RELEASED_SUBSTRING`] — the label has fully drained from its
+/// domain — or `budget` elapses. Mirrors the bootout EPERM-fallback poll
+/// loop's iteration-bounded shape so tiny-budget unit tests terminate
+/// deterministically.
+///
+/// **Infallible by design (returns `()`):** this is a best-effort gate in
+/// front of the `bootstrap` EIO-retry backstop. On budget exhaustion it
+/// logs `warn` and returns, letting `bootstrap` proceed (the retry absorbs
+/// any residual race). A `print` invocation error is swallowed and the
+/// poll continues — a transient `launchctl print` hiccup must not abort an
+/// upgrade.
+#[cfg(any(test, target_os = "macos"))]
+fn wait_for_label_released_inner<P, S>(
+    mut print: P,
+    mut sleep: S,
+    budget: Duration,
+    interval: Duration,
+) where
+    P: FnMut() -> Result<(String, String)>,
+    S: FnMut(Duration),
+{
+    let max_polls = (budget.as_millis() / interval.as_millis().max(1)).max(1) as usize;
+    for _ in 0..max_polls {
+        if let Ok((stdout, stderr)) = print() {
+            if stdout.contains(LABEL_RELEASED_SUBSTRING)
+                || stderr.contains(LABEL_RELEASED_SUBSTRING)
+            {
+                // Label drained — safe to bootstrap.
+                return;
+            }
+        }
+        sleep(interval);
+    }
+    tracing::warn!(
+        target: "install",
+        budget_ms = budget.as_millis() as u64,
+        "launchctl label still present after release wait; proceeding to bootstrap anyway \
+         (the EIO-retry backstop will absorb any residual service-domain race)",
+    );
+}
+
+/// Wait for `system/<label>` to be released after a `bootout`, BEFORE the
+/// following `bootstrap`. On a long-uptime daemon, launchd's service-domain
+/// release lags the `bootout` exit (proportional to prior uptime), so an
+/// immediate `bootstrap` returns `Bootstrap failed: 5: Input/output error`
+/// (see [`BOOTSTRAP_EIO_SUBSTRING`]). Polling the label to drain first
+/// converts that hard failure — which cascaded into a failed setup
+/// rollback and a DOWN daemon (live: rc.40 @23h, v1.2.1 angie-2
+/// @multi-hour) — into a clean bootstrap.
+///
+/// Budget 10s / interval 250ms: the bootout poll waits 5s for *process
+/// exit*; the *domain release* lags that and scales with uptime, and the
+/// live repros blew past the bootstrap EIO-retry's ~1.75s budget — so 10s
+/// (~40 polls) of headroom. Bounded + proceed-anyway, so it can never hang.
+#[cfg(any(test, target_os = "macos"))]
+pub(crate) fn wait_for_label_released() {
+    wait_for_label_released_inner(
+        || {
+            let out = Command::new("/bin/launchctl")
+                .args(["print", &format!("system/{DAEMON_LABEL}")])
+                .output()
+                .context("failed to invoke /bin/launchctl print")?;
+            Ok((
+                String::from_utf8_lossy(&out.stdout).into_owned(),
+                String::from_utf8_lossy(&out.stderr).into_owned(),
+            ))
+        },
+        std::thread::sleep,
+        Duration::from_secs(10),
+        Duration::from_millis(250),
+    )
 }
 
 /// Does this bootout stderr indicate the service is still in use (the
@@ -1512,9 +1598,7 @@ where
     for _ in 0..max_polls {
         let (stdout, stderr) = print()?;
         // Absent ⇒ the prior instance has exited; safe to proceed.
-        if stdout.contains("Could not find specified service")
-            || stderr.contains("Could not find specified service")
-        {
+        if stdout.contains(LABEL_RELEASED_SUBSTRING) || stderr.contains(LABEL_RELEASED_SUBSTRING) {
             gone = true;
             break;
         }
@@ -2000,6 +2084,115 @@ mod tests {
     }
     fn fail_bootout(stderr: &str) -> Result<(bool, i32, String)> {
         Ok((false, 5, stderr.to_owned()))
+    }
+
+    // ── wait_for_label_released_inner (pre-bootstrap poll gate) ──
+
+    #[test]
+    fn wait_for_label_released_passes_immediately_when_absent() {
+        // Label already gone on the first poll → return before any sleep.
+        let prints = std::cell::RefCell::new(0usize);
+        let sleeps = std::cell::RefCell::new(Vec::<Duration>::new());
+        wait_for_label_released_inner(
+            || {
+                *prints.borrow_mut() += 1;
+                Ok((String::new(), "Could not find specified service".to_owned()))
+            },
+            |d| sleeps.borrow_mut().push(d),
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+        );
+        assert_eq!(*prints.borrow(), 1, "should poll exactly once when already absent");
+        assert!(sleeps.borrow().is_empty(), "no sleep when the label is already gone");
+    }
+
+    #[test]
+    fn wait_for_label_released_matches_substring_in_stdout() {
+        // Symmetry with the stderr case above: the marker in STDOUT must
+        // also satisfy the gate (proves both branches of the `||`).
+        let prints = std::cell::RefCell::new(0usize);
+        wait_for_label_released_inner(
+            || {
+                *prints.borrow_mut() += 1;
+                Ok(("Could not find specified service".to_owned(), String::new()))
+            },
+            |_d| panic!("must not sleep when the label is already gone"),
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+        );
+        assert_eq!(*prints.borrow(), 1);
+    }
+
+    #[test]
+    fn wait_for_label_released_polls_then_passes_on_nth_poll() {
+        // Service still registered for 2 polls, released on the 3rd.
+        let prints = std::cell::RefCell::new(0usize);
+        let sleeps = std::cell::RefCell::new(Vec::<Duration>::new());
+        let interval = Duration::from_millis(5);
+        wait_for_label_released_inner(
+            || {
+                let mut n = prints.borrow_mut();
+                *n += 1;
+                if *n < 3 {
+                    Ok(("state = running\npid = 42".to_owned(), String::new()))
+                } else {
+                    Ok((String::new(), "Could not find specified service".to_owned()))
+                }
+            },
+            |d| sleeps.borrow_mut().push(d),
+            Duration::from_millis(50),
+            interval,
+        );
+        assert_eq!(*prints.borrow(), 3, "polls until released on the 3rd check");
+        assert_eq!(
+            sleeps.borrow().as_slice(),
+            &[interval, interval],
+            "one flat-interval sleep between each of the first 3 polls",
+        );
+    }
+
+    #[test]
+    fn wait_for_label_released_exhausts_budget_and_returns() {
+        // Never released → exhaust the budget, then return (proceed-anyway).
+        // budget/interval = 50/5 = 10 polls, 10 sleeps.
+        let prints = std::cell::RefCell::new(0usize);
+        let sleeps = std::cell::RefCell::new(Vec::<Duration>::new());
+        wait_for_label_released_inner(
+            || {
+                *prints.borrow_mut() += 1;
+                Ok(("state = running\npid = 42".to_owned(), String::new()))
+            },
+            |d| sleeps.borrow_mut().push(d),
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+        );
+        // Returns without panicking/erroring — the function is `()`; reaching
+        // here is the assertion that proceed-anyway holds.
+        assert_eq!(*prints.borrow(), 10, "polls exactly budget/interval times");
+        assert_eq!(sleeps.borrow().len(), 10, "sleeps once per poll on exhaustion");
+    }
+
+    #[test]
+    fn wait_for_label_released_keeps_polling_on_print_error() {
+        // A transient `launchctl print` error must NOT abort the gate.
+        let prints = std::cell::RefCell::new(0usize);
+        let sleeps = std::cell::RefCell::new(Vec::<Duration>::new());
+        wait_for_label_released_inner(
+            || {
+                let mut n = prints.borrow_mut();
+                *n += 1;
+                if *n == 1 {
+                    Err(anyhow::anyhow!("simulated launchctl print failure"))
+                } else {
+                    Ok((String::new(), "Could not find specified service".to_owned()))
+                }
+            },
+            |d| sleeps.borrow_mut().push(d),
+            Duration::from_millis(50),
+            Duration::from_millis(5),
+        );
+        assert_eq!(*prints.borrow(), 2, "print error is swallowed; poll continues to call 2");
+        assert_eq!(sleeps.borrow().len(), 1, "slept once after the swallowed error");
     }
 
     #[test]
