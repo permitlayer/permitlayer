@@ -26,6 +26,25 @@ is required when a method is dropped in a major bump.
 
 _No changes yet._
 
+## [1.2.2] - 2026-06-06 — `agentsso` binary
+
+Patch release. Fixes a macOS upgrade failure that could leave the daemon
+down. Workspace / binary version bump 1.2.1 → 1.2.2; the plugin host-API
+surface keeps its independent cadence (unchanged).
+
+### Fixed
+
+- **`sudo agentsso setup --upgrade` on a long-uptime macOS daemon no
+  longer fails and leaves the daemon down.** After `launchctl bootout`,
+  launchd's service-domain release lags proportional to prior uptime, so
+  the immediately-following `launchctl bootstrap` could return `Bootstrap
+  failed: 5: Input/output error`. The existing retry budget was too short
+  for a multi-hour-uptime daemon, and when the forward bootstrap exhausted
+  it, setup's rollback exhausted the same budget too
+  (`setup.rollback_incomplete`, `rebootstrapped=false`). setup (and
+  `doctor`'s stale-launchd fix) now poll until the label is fully released
+  before bootstrapping, with the existing retry kept as a backstop.
+
 ## [1.2.1] - 2026-06-05 — `agentsso` binary
 
 Patch release. Fixes the read-write onboarding path (`quickstart` /
