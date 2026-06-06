@@ -26,6 +26,33 @@ is required when a method is dropped in a major bump.
 
 _No changes yet._
 
+## [1.2.3] - 2026-06-06 — `agentsso` binary
+
+Patch release. Two MCP proxy fixes surfaced by live agent telemetry.
+Workspace / binary bump 1.2.2 → 1.2.3; plugin host-API unchanged.
+
+### Fixed
+
+- **Stringified-JSON object args are now coerced instead of rejected.**
+  MCP clients (LLMs) frequently pass an object-valued arg
+  (`event`/`message`/`draft`/`file`/`query`) as a JSON *string*. The proxy
+  rejected it (`must be a JSON object (got string)`), the model retried
+  identically, and ~3 consecutive failures tripped the client's circuit
+  breaker — taking the service unreachable for ~a minute (observed taking
+  calendar offline). A string that parses to a JSON object is now coerced
+  before validation; non-object / non-JSON strings still get the clear
+  error.
+
+### Changed
+
+- **Gmail `messages.get` / `threads.get` bodies are shaped more
+  aggressively** to curb context bloat (a summary job pulled ~60 KB bodies
+  that drove model context to ~51K tokens). Plain-text body cap lowered
+  64 KiB → 32 KiB; HTML-derived bodies capped at 16 KiB (markup is
+  token-dense); retained inline-part bytes capped at 8 KiB with larger
+  inline blobs dropped and flagged `inline_dropped`. All changes reduce
+  default payload; `format=raw`/`metadata`/`minimal` remain escape hatches.
+
 ## [1.2.2] - 2026-06-06 — `agentsso` binary
 
 Patch release. Fixes a macOS upgrade failure that could leave the daemon
