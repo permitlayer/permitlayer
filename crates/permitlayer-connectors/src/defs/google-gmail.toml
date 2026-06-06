@@ -1,0 +1,188 @@
+# Built-in connector definition — Gmail.
+# Story 11.2 (Epic 11). Embedded via include_str!; the source of truth for
+# routing, scope vocab, access tiers, and tool METADATA. Per-tool handler
+# logic (response shaping, attachment handling, validation, query building)
+# lives in Rust keyed by tool name (hybrid model — see 11.4). Metadata here
+# is pinned against the live handler table by tests.
+
+[connector]
+id = "google-gmail"
+display_name = "Gmail"
+version = "1.0.0"
+trust_tier = "built-in"
+
+[auth]
+flavor = "oauth2"
+auth_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url = "https://oauth2.googleapis.com/token"
+
+[upstream]
+base_url = "https://gmail.googleapis.com/gmail/v1/"
+allowed_hosts = ["gmail.googleapis.com"]
+
+[scopes]
+"gmail.readonly" = "https://www.googleapis.com/auth/gmail.readonly"
+"gmail.metadata" = "https://www.googleapis.com/auth/gmail.metadata"
+"gmail.modify" = "https://www.googleapis.com/auth/gmail.modify"
+"gmail.send" = "https://www.googleapis.com/auth/gmail.send"
+"gmail.compose" = "https://www.googleapis.com/auth/gmail.compose"
+
+[tiers]
+read = ["gmail.readonly"]
+read-write = ["gmail.readonly", "gmail.send", "gmail.compose", "gmail.modify"]
+
+[[tools]]
+name = "gmail.messages.list"
+required_scope = "gmail.readonly"
+method = "GET"
+path = "users/me/messages"
+
+[[tools]]
+name = "gmail.messages.get"
+required_scope = "gmail.readonly"
+method = "GET"
+path = "users/me/messages/{id}"
+
+[[tools]]
+name = "gmail.threads.list"
+required_scope = "gmail.readonly"
+method = "GET"
+path = "users/me/threads"
+
+[[tools]]
+name = "gmail.threads.get"
+required_scope = "gmail.readonly"
+method = "GET"
+path = "users/me/threads/{id}"
+
+[[tools]]
+name = "gmail.search"
+required_scope = "gmail.readonly"
+method = "GET"
+path = "users/me/messages"
+
+[[tools]]
+name = "gmail.attachments.get"
+required_scope = "gmail.readonly"
+method = "GET"
+path = "users/me/messages/{messageId}/attachments/{attachmentId}"
+
+[[tools]]
+name = "gmail.labels.list"
+required_scope = "gmail.readonly"
+method = "GET"
+path = "users/me/labels"
+
+[[tools]]
+name = "gmail.profile.get"
+required_scope = "gmail.readonly"
+method = "GET"
+path = "users/me/profile"
+
+[[tools]]
+name = "gmail.history.list"
+required_scope = "gmail.readonly"
+method = "GET"
+path = "users/me/history"
+
+[[tools]]
+name = "gmail.drafts.list"
+required_scope = "gmail.readonly"
+method = "GET"
+path = "users/me/drafts"
+
+[[tools]]
+name = "gmail.drafts.get"
+required_scope = "gmail.readonly"
+method = "GET"
+path = "users/me/drafts/{id}"
+
+[[tools]]
+name = "gmail.messages.send"
+required_scope = "gmail.send"
+method = "POST"
+path = "users/me/messages/send"
+
+[[tools]]
+name = "gmail.messages.modify"
+required_scope = "gmail.modify"
+method = "POST"
+path = "users/me/messages/{id}/modify"
+
+[[tools]]
+name = "gmail.messages.trash"
+required_scope = "gmail.modify"
+method = "POST"
+path = "users/me/messages/{id}/trash"
+
+[[tools]]
+name = "gmail.messages.untrash"
+required_scope = "gmail.modify"
+method = "POST"
+path = "users/me/messages/{id}/untrash"
+
+[[tools]]
+name = "gmail.drafts.create"
+required_scope = "gmail.compose"
+method = "POST"
+path = "users/me/drafts"
+
+[[tools]]
+name = "gmail.drafts.update"
+required_scope = "gmail.compose"
+method = "PUT"
+path = "users/me/drafts/{id}"
+
+[[tools]]
+name = "gmail.drafts.send"
+required_scope = "gmail.compose"
+method = "POST"
+path = "users/me/drafts/send"
+
+[[tools]]
+name = "gmail.settings.sendAs.list"
+required_scope = "gmail.readonly"
+method = "GET"
+path = "users/me/settings/sendAs"
+
+[[tools]]
+name = "gmail.settings.filters.list"
+required_scope = "gmail.readonly"
+method = "GET"
+path = "users/me/settings/filters"
+
+[[tools]]
+name = "gmail.settings.language.get"
+required_scope = "gmail.readonly"
+method = "GET"
+path = "users/me/settings/language"
+
+[[tools]]
+name = "gmail.settings.imap.get"
+required_scope = "gmail.readonly"
+method = "GET"
+path = "users/me/settings/imap"
+
+[[tools]]
+name = "gmail.settings.pop.get"
+required_scope = "gmail.readonly"
+method = "GET"
+path = "users/me/settings/pop"
+
+[[tools]]
+name = "gmail.settings.vacation.get"
+required_scope = "gmail.readonly"
+method = "GET"
+path = "users/me/settings/vacation"
+
+[[tools]]
+name = "gmail.settings.forwarding.list"
+required_scope = "gmail.readonly"
+method = "GET"
+path = "users/me/settings/forwardingAddresses"
+
+[[tools]]
+name = "gmail.settings.autoForwarding.get"
+required_scope = "gmail.readonly"
+method = "GET"
+path = "users/me/settings/autoForwarding"

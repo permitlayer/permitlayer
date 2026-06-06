@@ -18,7 +18,7 @@ For each story N: create-story (spec file) → dev-story (implement) → code-re
 
 ### Phase 1 — Connector-def format + registry + validator
 - [x] 11.1 — Connector-definition format (`connector.toml` schema + typed model) ✅ committed
-- [ ] 11.2 — Express built-in Gmail/Calendar/Drive as connector defs (embedded)
+- [x] 11.2 — Express built-in Gmail/Calendar/Drive as connector defs (embedded) ✅ committed (hybrid: metadata only)
 - [ ] 11.3 — Connector registry + load-time validator + host-installed discovery
 
 ### Phase 2 — Proxy reads from registry
@@ -45,3 +45,6 @@ For each story N: create-story (spec file) → dev-story (implement) → code-re
 
 ## Decision / event log
 - 2026-06-06: Branch created off main @ 1b9211b. Epic doc is `ready-for-dev`. No 11.x story files exist yet — creating them per story.
+- 2026-06-06: **11.1 done + committed** (5f46819). `ConnectorDef` typed model in permitlayer-connectors; gate green.
+- 2026-06-06: **CRITICAL ARCHITECTURE QUESTION raised at 11.2.** The epic plan treats built-in tool catalogs as declarative data, but the real `*McpServer` tools are hand-written Rust: 36 typed param structs, ~160 bespoke-logic call sites (query-string building, resource-id/calendar-id validation, JSON body coercion, 552-line Gmail response shaper, attachment-bytes-to-disk). A pure connector.toml `[[tools]]` can't reproduce that without either regressing behavior or building an unscoped declarative engine. Austin chose: **do web research to determine the best long-term / highest-UX / lowest-maintenance / most-compatible architecture** before implementing. Launched deep-research workflow (run wf_1c3f4177-d06). 11.2 BLOCKED on the research outcome + an architecture decision (likely an epic-doc amendment to 11.2/11.4/11.7).
+- 2026-06-06: **Research complete** (24/25 claims confirmed 3-0; 21 sources). Verdict: **HYBRID is the dominant, lowest-risk pattern.** Declarative owns identity/auth/routing/scope/tier/tool-advertisement; CODE owns the per-endpoint long tail (param→query, validation, body coercion, response shaping, attachments). Nango is the canonical hybrid (declarative auth+proxy routing, code sync/actions). n8n's own docs mandate code style for pagination/custom-request/response-transform. Pure-declarative has a hard ceiling (confirmed 3-0). Third-party trust: WASI capability-sandbox or out-of-process RPC. Recommendation written for Austin's decision.

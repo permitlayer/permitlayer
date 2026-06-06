@@ -1,0 +1,101 @@
+# Built-in connector definition — Google Calendar.
+# Story 11.2 (Epic 11). Embedded via include_str!; the source of truth for
+# routing, scope vocab, access tiers, and tool METADATA. Per-tool handler
+# logic (response shaping, attachment handling, validation, query building)
+# lives in Rust keyed by tool name (hybrid model — see 11.4). Metadata here
+# is pinned against the live handler table by tests.
+
+[connector]
+id = "google-calendar"
+display_name = "Google Calendar"
+version = "1.0.0"
+trust_tier = "built-in"
+
+[auth]
+flavor = "oauth2"
+auth_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url = "https://oauth2.googleapis.com/token"
+
+[upstream]
+base_url = "https://www.googleapis.com/calendar/v3/"
+allowed_hosts = ["www.googleapis.com"]
+
+[scopes]
+"calendar.readonly" = "https://www.googleapis.com/auth/calendar.readonly"
+"calendar.events" = "https://www.googleapis.com/auth/calendar.events"
+
+[tiers]
+read = ["calendar.readonly", "calendar.events"]
+read-write = ["calendar.readonly", "calendar.events"]
+
+[[tools]]
+name = "calendar.calendars.list"
+required_scope = "calendar.readonly"
+method = "GET"
+path = "users/me/calendarList"
+
+[[tools]]
+name = "calendar.events.list"
+required_scope = "calendar.readonly"
+method = "GET"
+path = "calendars/{calendarId}/events"
+
+[[tools]]
+name = "calendar.events.get"
+required_scope = "calendar.readonly"
+method = "GET"
+path = "calendars/{calendarId}/events/{eventId}"
+
+[[tools]]
+name = "calendar.events.create"
+required_scope = "calendar.events"
+method = "POST"
+path = "calendars/{calendarId}/events"
+
+[[tools]]
+name = "calendar.events.update"
+required_scope = "calendar.events"
+method = "PUT"
+path = "calendars/{calendarId}/events/{eventId}"
+
+[[tools]]
+name = "calendar.events.delete"
+required_scope = "calendar.events"
+method = "DELETE"
+path = "calendars/{calendarId}/events/{eventId}"
+
+[[tools]]
+name = "calendar.events.patch"
+required_scope = "calendar.events"
+method = "PATCH"
+path = "calendars/{calendarId}/events/{eventId}"
+
+[[tools]]
+name = "calendar.events.move"
+required_scope = "calendar.events"
+method = "POST"
+path = "calendars/{calendarId}/events/{eventId}/move"
+
+[[tools]]
+name = "calendar.events.quickAdd"
+required_scope = "calendar.events"
+method = "POST"
+path = "calendars/{calendarId}/events/quickAdd"
+
+[[tools]]
+name = "calendar.freebusy.query"
+required_scope = "calendar.readonly"
+method = "POST"
+path = "freeBusy"
+
+[[tools]]
+name = "calendar.settings.list"
+required_scope = "calendar.readonly"
+method = "GET"
+path = "users/me/settings"
+
+[[tools]]
+name = "calendar.colors.get"
+required_scope = "calendar.readonly"
+method = "GET"
+path = "colors"
