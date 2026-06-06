@@ -138,6 +138,17 @@ done
 sudo launchctl bootstrap system /Library/LaunchDaemons/dev.permitlayer.daemon.plist
 ```
 
+> **As of v1.2.2, `agentsso setup` and `agentsso doctor --fix` do this
+> poll-until-released wait for you** before every `bootstrap`. The
+> service-domain release lags the `bootout` exit proportional to the
+> daemon's uptime, so on a long-uptime daemon the old code could fail
+> the bootstrap (and its rollback) and leave the daemon down. The manual
+> loop above is only needed when you are driving `launchctl` by hand —
+> not when going through `setup`/`doctor`. (Upgrading *from* a pre-1.2.2
+> binary runs the old code for that one hop, so a single first-upgrade
+> failure can still occur; re-run `sudo agentsso setup --upgrade` and it
+> succeeds.)
+
 Worked example for the agentsso daemon (disabled case):
 
 ```sh
@@ -251,7 +262,11 @@ If `setup` rolled back after a post-cutover failure
 (`setup.rolled_back` / `setup.rollback_incomplete` /
 `setup.failed_no_rollback`), the message states whether the prior
 daemon was restored. Check `/Library/Logs/permitlayer/daemon.log`,
-then re-run `sudo agentsso setup`.
+then re-run `sudo agentsso setup`. (As of v1.2.2 the most common cause
+of `setup.rollback_incomplete` — the post-`bootout` bootstrap race on a
+long-uptime daemon — is gated by a poll-until-released wait, so this
+outcome should now be rare. If you do hit it, re-running `setup` clears
+it.)
 
 ## See also
 
