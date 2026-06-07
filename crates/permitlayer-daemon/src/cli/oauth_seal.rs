@@ -63,11 +63,19 @@ pub(crate) fn exit3() -> anyhow::Error {
 /// 3 system/retry).
 pub(crate) fn connection_exit_code(code: &str) -> i32 {
     match code {
+        // Connection verbs (Story 11.13).
         "connection.unknown_connector"
         | "connection.invalid_oauth_client"
         | "connection.daemon_must_run"
         | "connection.not_found"
-        | "connection.non_interactive_required" => 2,
+        | "connection.non_interactive_required"
+        // Binding verbs (Story 11.14): existence failures are
+        // operator-correctable (2); `binding.duplicate` is a conflict and
+        // `binding.*_failed` are system/retry (3, the default arm).
+        | "binding.unknown_agent"
+        | "binding.unknown_connection"
+        | "binding.unknown_policy"
+        | "binding.not_found" => 2,
         _ => 3,
     }
 }

@@ -1209,6 +1209,49 @@ pub fn seed_connection_and_binding_with_id(
     });
 }
 
+/// Seed ONLY a `ConnectionRecord` (no binding, no agent) and return its
+/// minted id. Story 11.14 tests need a connection to bind to via the REAL
+/// `bind` verb — the `seed_connection_and_binding*` helpers also write a
+/// binding, which would defeat the duplicate-binding test.
+#[allow(dead_code)]
+pub fn seed_connection_only(
+    home: &Path,
+    connector_id: &str,
+    name: &str,
+    tier: SeedTier,
+    granted_scopes: &[&str],
+) -> permitlayer_credential::ConnectionId {
+    use permitlayer_core::store::ConnectionStore;
+    use permitlayer_core::store::connection::{ConnectionRecord, ConnectionStatus, ConnectionTier};
+    use permitlayer_core::store::fs::ConnectionFsStore;
+    use permitlayer_credential::ConnectionId;
+
+    let id = ConnectionId::generate();
+    let core_tier = match tier {
+        SeedTier::Read => ConnectionTier::Read,
+        SeedTier::ReadWrite => ConnectionTier::ReadWrite,
+    };
+    let record = ConnectionRecord {
+        id,
+        connector_id: connector_id.to_owned(),
+        name: name.to_owned(),
+        account_hint: None,
+        granted_scopes: granted_scopes.iter().map(|s| (*s).to_owned()).collect(),
+        tier: core_tier,
+        created_at: chrono::Utc::now(),
+        status: ConnectionStatus::Active,
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current-thread runtime for seeding");
+    rt.block_on(async {
+        let conn_store = ConnectionFsStore::new(home.to_path_buf()).expect("connection store");
+        conn_store.put(record).await.expect("write connection record");
+    });
+    id
+}
+
 /// Decode a 64-char hex master key into 32 bytes. Panics on malformed
 /// input — acceptable for a test helper.
 #[allow(dead_code)]

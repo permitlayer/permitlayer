@@ -518,6 +518,50 @@ pub(crate) async fn post_credentials_seal(
     parse_outcome(status, &response_body)
 }
 
+/// Request body for `POST /v1/control/bindings` (Story 11.14). Mirrors
+/// `server::control::BindAgentRequest`.
+#[derive(Debug, Serialize)]
+pub(crate) struct BindRequest<'a> {
+    pub agent: &'a str,
+    pub connection_id: &'a str,
+    pub tier: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<&'a str>,
+}
+
+/// Response body for a successful bind. Only the fields the CLI renders
+/// are mirrored.
+#[derive(Debug, Deserialize)]
+pub(crate) struct BindResponse {
+    #[allow(dead_code)]
+    pub status: String,
+    pub connection_name: String,
+    pub tier: String,
+    #[serde(default)]
+    pub policy: Option<String>,
+    #[serde(default)]
+    pub alias: Option<String>,
+}
+
+/// Story 11.14: `bind` routes through the daemon so the optional
+/// `--policy` is checked against the live compiled `PolicySet`.
+pub(crate) async fn post_bind(
+    handle: &ConnectControlHandle,
+    req: &BindRequest<'_>,
+) -> Result<ControlOutcome<BindResponse>> {
+    let body = serde_json::to_string(req).context("serialize bind request")?;
+    let (status, response_body) = http_post_json_with_status_via(
+        &handle.endpoint,
+        "/v1/control/bindings",
+        &body,
+        handle.control_token.as_deref(),
+    )
+    .await?;
+    parse_outcome(status, &response_body)
+}
+
 /// Outcome of a connection-verify POST. The 200 body is `{ ok: true,
 /// ... }` or `{ ok: false, ... }` (the caller branches on `ok`
 /// dynamically); 4xx/5xx use the standard error envelope.

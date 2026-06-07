@@ -43,6 +43,7 @@ mod audit_drain_on_shutdown_e2e;
 mod audit_export_e2e;
 mod audit_follow;
 mod audit_query_e2e;
+mod bind_e2e;
 mod config_theme;
 mod connection_e2e;
 mod connectors_list_e2e;

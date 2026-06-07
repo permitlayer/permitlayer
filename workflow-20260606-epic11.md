@@ -34,7 +34,7 @@ For each story N: create-story (spec file) → dev-story (implement) → code-re
 
 ### Phase 4 — CLI re-split + control-plane seal API
 - [x] 11.12 + 11.13 — **MERGED, committed** (owner-approved 2026-06-07). Seal API → connection_id+slot (no `-meta.json`); `connection add/list/inspect/revoke`; daemon `conn_shim` + `CREDENTIAL_SUPPORTED_SERVICES` deleted; `connect`/`credentials list/status/refresh` removed (FR23 superseded); verify kept+reshaped to connection_id. Gate green (core 499, proxy 368, daemon 1222). 5 quickstart_e2e tests deferred to 11.15.
-- [ ] 11.14 — `bind`/`unbind`/`agent bindings`
+- [x] 11.14 — **committed** (2026-06-07). `bind` (control-plane, live-PolicySet `--policy` check) / `unbind` + `agent bindings` (in-process); bearer-immutable; 7 bind_e2e tests. Gate green (daemon 1229, proxy 368).
 - [ ] 11.15 — Re-pointed `quickstart`
 
 ### Phase 5 — Clean-install + multi-account validation

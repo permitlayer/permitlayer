@@ -56,6 +56,10 @@ pub enum AgentCommand {
     /// invalidated immediately after the new token is durably persisted.
     /// The new plaintext bearer is displayed once on stdout (Story 7.34).
     Rotate(RotateArgs),
+    /// List an agent's connection bindings (Story 11.14) — each grant's
+    /// connection (name + connector), tier, optional policy + alias.
+    /// Replaces the single-policy view deleted in 11.9 (FR47).
+    Bindings(BindingsArgs),
 }
 
 #[derive(Args)]
@@ -100,6 +104,12 @@ pub struct RemoveArgs {
 }
 
 #[derive(Args)]
+pub struct BindingsArgs {
+    /// Name of the agent whose bindings to list.
+    pub name: String,
+}
+
+#[derive(Args)]
 pub struct RotateArgs {
     /// Name of the agent to rotate.
     pub name: String,
@@ -118,7 +128,72 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         AgentCommand::List => list_agents().await,
         AgentCommand::Remove(a) => remove_agent(a).await,
         AgentCommand::Rotate(a) => rotate_agent(a).await,
+        AgentCommand::Bindings(a) => bindings_agent(a).await,
     }
+}
+
+/// `agentsso agent bindings <agent>` — list the agent's connection
+/// bindings (Story 11.14). In-process read of `BindingStore`, joined to
+/// each binding's `ConnectionRecord` (name + connector) for display.
+async fn bindings_agent(args: BindingsArgs) -> Result<()> {
+    use permitlayer_core::store::connection::ConnectionTier;
+    use permitlayer_core::store::{BindingStore, ConnectionStore};
+    use std::sync::Arc;
+
+    let home = crate::cli::agentsso_home()?;
+    let binding_store: Arc<dyn BindingStore> =
+        Arc::new(permitlayer_core::store::fs::BindingFsStore::new(home.clone())?);
+    let connection_store: Arc<dyn ConnectionStore> =
+        Arc::new(permitlayer_core::store::fs::ConnectionFsStore::new(home.clone())?);
+
+    let mut bindings = binding_store.get(&args.name).await?;
+    // Deterministic order: by connection id text.
+    bindings.sort_by(|a, b| a.connection_id.to_string().cmp(&b.connection_id.to_string()));
+
+    if bindings.is_empty() {
+        print!(
+            "{}",
+            empty_state(
+                &format!("agent '{}' has no bindings", args.name),
+                "bind it to a connection:  agentsso bind <agent> <connection> --grant read",
+            )
+        );
+        return Ok(());
+    }
+
+    let theme = Theme::load(&home);
+    let support = ColorSupport::detect();
+    let layout = TableLayout::detect();
+    let headers = &["CONNECTION", "CONNECTOR", "TIER", "POLICY", "ALIAS"];
+    let mut rows: Vec<Vec<TableCell>> = Vec::with_capacity(bindings.len());
+    for b in &bindings {
+        // Join to the connection record for the display name + connector.
+        // A binding whose connection is gone (e.g. revoked mid-flight)
+        // still lists — show the raw id so the operator can see the dangler.
+        let (name, connector) = match connection_store.get(b.connection_id).await? {
+            Some(rec) => (rec.name, rec.connector_id),
+            None => (format!("{} (missing)", b.connection_id), "-".to_owned()),
+        };
+        let tier = match b.tier {
+            ConnectionTier::Read => "read",
+            ConnectionTier::ReadWrite => "read-write",
+        };
+        rows.push(vec![
+            TableCell::Plain(name),
+            TableCell::Plain(connector),
+            TableCell::Plain(tier.to_owned()),
+            TableCell::Plain(b.policy.clone().unwrap_or_else(|| "-".to_owned())),
+            TableCell::Plain(b.alias.clone().unwrap_or_else(|| "-".to_owned())),
+        ]);
+    }
+    match table(headers, &rows, layout, &theme, support) {
+        Ok(rendered) => print!("{rendered}"),
+        Err(e) => {
+            tracing::error!(error = %e, "agent bindings table render failed");
+            anyhow::bail!("failed to render agent bindings: {e}");
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn policies_dir_remediation(home: &std::path::Path) -> String {

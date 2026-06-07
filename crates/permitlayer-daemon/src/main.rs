@@ -57,6 +57,13 @@ enum Commands {
     /// the retired `connect <service> --agent` verb (FR23) — bind an
     /// agent to a connection with `agentsso bind` (Story 11.14).
     Connection(cli::connection::ConnectionArgs),
+    /// Grant an agent use of a connection at a tier, with an optional
+    /// policy + selector alias (Epic 11, Story 11.14). One agent may hold
+    /// many bindings. Bearer-immutable — never touches the agent's token.
+    Bind(cli::bind::BindArgs),
+    /// Remove an agent's binding to a connection (Story 11.14). Touches
+    /// only the agent's binding set; the bearer token is unchanged.
+    Unbind(cli::bind::UnbindArgs),
     /// Inspect and validate loaded policies (Story 7.34)
     Policy(cli::policy::PolicyArgs),
     /// Connect ONE agent to ONE Google service in a single command
@@ -298,6 +305,10 @@ async fn main() -> ExitCode {
         Some(Commands::Connection(args)) => {
             connection_to_exit_code(cli::connection::run(args).await)
         }
+        // `bind`/`unbind` share the connection exit taxonomy (operator-
+        // correctable → 2; conflict/system → 3) via `cli::oauth_seal`.
+        Some(Commands::Bind(args)) => connection_to_exit_code(cli::bind::run_bind(args).await),
+        Some(Commands::Unbind(args)) => connection_to_exit_code(cli::bind::run_unbind(args).await),
         // Quickstart is a stub until Story 11.15 (it errors via
         // `oauth_seal::exit2`), routed through the same exit dispatcher.
         Some(Commands::Quickstart(args)) => {

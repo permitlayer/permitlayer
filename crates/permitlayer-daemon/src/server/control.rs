@@ -3620,6 +3620,319 @@ pub(crate) async fn credentials_verify_handler(
     }
 }
 
+/// Request body for `POST /v1/control/bindings` (Story 11.14).
+///
+/// `bind` routes through the control plane (not in-process) because the
+/// optional `policy` must be verified against the daemon's **live**
+/// compiled `PolicySet` — the same authoritative check `agent register`
+/// uses. The store write (`BindingStore::put_binding`) happens here only
+/// after agent/connection/policy existence is confirmed.
+#[derive(Debug, Deserialize)]
+pub(crate) struct BindAgentRequest {
+    pub agent: String,
+    /// The connection's ULID text (the CLI resolves a name|id selector to
+    /// the id before POSTing).
+    pub connection_id: String,
+    /// `"read"` | `"read-write"`.
+    pub tier: String,
+    #[serde(default)]
+    pub policy: Option<String>,
+    #[serde(default)]
+    pub alias: Option<String>,
+}
+
+/// Response body for a successful `POST /v1/control/bindings`.
+#[derive(Debug, Serialize)]
+pub(crate) struct BindAgentResponse {
+    pub status: &'static str,
+    pub agent: String,
+    pub connection_id: String,
+    pub connection_name: String,
+    pub tier: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+}
+
+/// `POST /v1/control/bindings` — grant an agent use of a connection at a
+/// tier (+ optional policy/alias). Loopback + control-token gated.
+///
+/// Order: agent exists → connection exists → (if `policy`) policy exists
+/// in the live `PolicySet` → `BindingStore::put_binding` (PK
+/// `(agent, connection_id)` rejects a duplicate as `binding.duplicate`).
+/// Bearer-immutable: touches only `bindings/<agent>.toml`.
+pub(crate) async fn bind_agent_handler(
+    State(state): State<ControlState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: axum::extract::Request,
+) -> Response {
+    if let Err(e) = require_loopback(peer) {
+        return e.into_response();
+    }
+    let request_id = read_request_id(&req);
+
+    let _permit = match state.agent_crud_semaphore.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return agent_error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "binding.rate_limited",
+                format!(
+                    "too many concurrent agent CRUD operations in flight \
+                     (max {AGENT_CRUD_MAX_CONCURRENT}); retry shortly"
+                ),
+                Some(request_id),
+            );
+        }
+    };
+
+    let (_parts, body) = req.into_parts();
+    let bytes = match axum::body::to_bytes(body, 16 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::BAD_REQUEST,
+                "binding.bad_request",
+                format!("failed to read request body: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+    let payload: BindAgentRequest = match serde_json::from_slice(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::BAD_REQUEST,
+                "binding.bad_request",
+                format!("invalid JSON body: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+
+    // Parse the connection id + tier.
+    let Some(connection) = ConnectionId::from_ulid_str(&payload.connection_id) else {
+        return agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "binding.bad_request",
+            format!("connection_id {:?} is not a valid ULID", payload.connection_id),
+            Some(request_id),
+        );
+    };
+    let tier = match payload.tier.as_str() {
+        "read" => permitlayer_core::store::connection::ConnectionTier::Read,
+        "read-write" => permitlayer_core::store::connection::ConnectionTier::ReadWrite,
+        other => {
+            return agent_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "binding.bad_request",
+                format!("tier {other:?} is not one of \"read\" | \"read-write\""),
+                Some(request_id),
+            );
+        }
+    };
+
+    if let Err(e) = validate_agent_name(&payload.agent) {
+        return agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "binding.invalid_agent_name",
+            format!("{e}"),
+            Some(request_id),
+        );
+    }
+
+    // 1. Agent must exist.
+    let Some(agent_store) = state.agent_store.clone() else {
+        return agent_error_response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "binding.store_unavailable",
+            "agent identity store is unavailable".to_owned(),
+            Some(request_id),
+        );
+    };
+    match agent_store.get(&payload.agent).await {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            return agent_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "binding.unknown_agent",
+                format!(
+                    "no agent named {:?} is registered. Register it first: \
+                     `agentsso agent register {} --policy <policy>`",
+                    payload.agent, payload.agent
+                ),
+                Some(request_id),
+            );
+        }
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "binding.store_io_failed",
+                format!("agent store read failed: {e}"),
+                Some(request_id),
+            );
+        }
+    }
+
+    let Some(home) = state.vault_dir.parent().map(std::path::Path::to_path_buf) else {
+        return agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "binding.store_unavailable",
+            format!("vault_dir {:?} has no parent — cannot derive store home", state.vault_dir),
+            Some(request_id),
+        );
+    };
+
+    // 2. Connection must exist.
+    let connection_store = match permitlayer_core::store::fs::ConnectionFsStore::new(home.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "binding.store_unavailable",
+                format!("connection store init failed: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+    let connection_record =
+        match permitlayer_core::store::ConnectionStore::get(&connection_store, connection).await {
+            Ok(Some(r)) => r,
+            Ok(None) => {
+                return agent_error_response(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "binding.unknown_connection",
+                    format!(
+                        "no connection with id {connection}. List connections: \
+                         `agentsso connection list`"
+                    ),
+                    Some(request_id),
+                );
+            }
+            Err(e) => {
+                return agent_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "binding.store_io_failed",
+                    format!("connection store read failed: {e}"),
+                    Some(request_id),
+                );
+            }
+        };
+
+    // 3. If a policy was named, it MUST exist in the live PolicySet
+    //    (authoritative — the binding store is policy-agnostic).
+    if let Some(policy) = payload.policy.as_deref() {
+        let snapshot = state.policy_set.load();
+        if snapshot.get(policy).is_none() {
+            let known = snapshot.policy_names();
+            let known_str =
+                if known.is_empty() { "(none registered)".to_owned() } else { known.join(", ") };
+            return agent_error_response(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "binding.unknown_policy",
+                format!("policy '{policy}' not found. Known policies: {known_str}"),
+                Some(request_id),
+            );
+        }
+    }
+
+    // 4. Write the binding (PK rejects a duplicate). Touches ONLY
+    //    `bindings/<agent>.toml` — never the agent identity file.
+    let binding_store = match permitlayer_core::store::fs::BindingFsStore::new(home.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "binding.store_unavailable",
+                format!("binding store init failed: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+    let binding = permitlayer_core::store::binding::Binding {
+        connection_id: connection,
+        tier,
+        policy: payload.policy.clone(),
+        alias: payload.alias.clone(),
+    };
+    match permitlayer_core::store::BindingStore::put_binding(
+        &binding_store,
+        &payload.agent,
+        binding,
+    )
+    .await
+    {
+        Ok(()) => {}
+        Err(permitlayer_core::store::StoreError::BindingAlreadyExists { .. }) => {
+            return agent_error_response(
+                StatusCode::CONFLICT,
+                "binding.duplicate",
+                format!(
+                    "agent {:?} is already bound to connection {} — unbind first to change \
+                     tier/policy/alias: `agentsso unbind {} {}`",
+                    payload.agent, connection_record.name, payload.agent, connection_record.name
+                ),
+                Some(request_id),
+            );
+        }
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "binding.store_io_failed",
+                format!("binding store write failed: {e}"),
+                Some(request_id),
+            );
+        }
+    }
+
+    if let Some(audit) = &state.audit_store {
+        let mut event = AuditEvent::with_request_id(
+            request_id.clone(),
+            payload.agent.clone(),
+            "permitlayer".to_owned(),
+            connection.to_string(),
+            "agent-bind".to_owned(),
+            "ok".to_owned(),
+            "agent-bound".to_owned(),
+        );
+        event.extra = serde_json::json!({
+            "agent": payload.agent,
+            "connection_id": connection.to_string(),
+            "connection_name": connection_record.name,
+            "tier": payload.tier,
+            "policy": payload.policy,
+            "alias": payload.alias,
+        });
+        if let Err(e) = audit.append(event).await {
+            tracing::warn!(error = %e, "agent-bound audit write failed (best-effort)");
+        }
+    }
+
+    tracing::info!(
+        target: "control",
+        request_id = %request_id,
+        agent = %payload.agent,
+        connection = %connection,
+        tier = %payload.tier,
+        "agent bound to connection via control endpoint"
+    );
+
+    (
+        StatusCode::OK,
+        Json(BindAgentResponse {
+            status: "ok",
+            agent: payload.agent,
+            connection_id: connection.to_string(),
+            connection_name: connection_record.name,
+            tier: payload.tier,
+            policy: payload.policy,
+            alias: payload.alias,
+        }),
+    )
+        .into_response()
+}
+
 /// Predicate: does this verify probe result represent an expired-access-
 /// token 401 (the case the self-heal targets)? Only a
 /// `VerificationFailed` with `status_code == 401` qualifies — every other
@@ -5107,6 +5420,7 @@ pub(crate) fn router(
         .route("/v1/control/agent/{name}/policy_name", get(agent_policy_name_handler))
         .route("/v1/control/credentials/seal", post(credentials_seal_handler))
         .route("/v1/control/connections/{connection_id}/verify", post(credentials_verify_handler))
+        .route("/v1/control/bindings", post(bind_agent_handler))
         .route("/v1/control/policy/{policy_name}/scopes", post(policy_scopes_handler))
         .route("/v1/control/policies/{name}", get(show_policy_handler))
         .route("/v1/control/policies", get(list_policies_handler))
