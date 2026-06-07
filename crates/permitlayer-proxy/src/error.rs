@@ -127,6 +127,15 @@ pub enum ProxyError {
     #[error("Upstream {service} unreachable: {message}")]
     UpstreamUnreachable { service: String, message: String, retry_after_seconds: u32 },
 
+    /// The resolved upstream URL failed the per-call connector SSRF
+    /// guard (Story 11.6, FR91/NFR52): the resolved host is not in the
+    /// connector's `allowed_hosts`, or — for a host-installed connector
+    /// — the URL is non-https or resolves to a private/loopback/
+    /// link-local/metadata IP range without `--allow-private-upstream`.
+    /// Fails closed before any bytes leave the process.
+    #[error("Upstream host for {service} blocked: {reason}")]
+    UpstreamHostBlocked { service: String, reason: String },
+
     /// Upstream refresh token was rejected server-side (revoked, expired, or
     /// otherwise invalid per RFC 6749 `invalid_grant`). The user must re-run
     /// `agentsso setup <service>` to mint a fresh refresh token — no amount
@@ -350,6 +359,7 @@ impl ProxyError {
             Self::NotFound { .. } => "route.not_found",
             Self::Internal { .. } => "internal.error",
             Self::UpstreamUnreachable { .. } => "upstream.unreachable",
+            Self::UpstreamHostBlocked { .. } => "upstream.host_blocked",
             Self::CredentialRevoked { .. } => "credential.revoked",
             Self::UpstreamRateLimited { .. } => "upstream.rate_limited",
             Self::UpstreamServerError { .. } => "upstream.server_error",
@@ -377,6 +387,11 @@ impl ProxyError {
             Self::NotFound { .. } => StatusCode::NOT_FOUND,
             Self::Internal { .. } => StatusCode::SERVICE_UNAVAILABLE,
             Self::UpstreamUnreachable { .. } => StatusCode::SERVICE_UNAVAILABLE,
+            // SSRF guard: a connector tried to reach a host outside its
+            // allowlist (or a host-installed connector hit a private
+            // range / non-https). 403 — the request is forbidden, not a
+            // transient upstream failure.
+            Self::UpstreamHostBlocked { .. } => StatusCode::FORBIDDEN,
             Self::CredentialRevoked { .. } => StatusCode::UNAUTHORIZED,
             Self::UpstreamRateLimited { .. } => StatusCode::TOO_MANY_REQUESTS,
             Self::UpstreamServerError { .. } => StatusCode::BAD_GATEWAY,

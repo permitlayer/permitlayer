@@ -24,7 +24,7 @@ For each story N: create-story (spec file) → dev-story (implement) → code-re
 ### Phase 2 — Proxy reads from registry
 - [x] 11.4 — Generic `ConnectorMcpServer` + dynamic `/mcp/{selector}` route ✅ committed (hybrid: ConnectorMcpService resolver; 3 servers retained as handler registry; mcp_conformance unchanged; host-installed passthrough stubbed for follow-up)
 - [x] 11.5 — `UpstreamClient::dispatch` takes resolved connector; delete `base_urls` ✅ committed (registry threaded into ProxyService; from_client test ctor; refresh-test virtual-clock fix)
-- [ ] 11.6 — Per-call resolved-host SSRF enforcement (FR91 / NFR52)
+- [x] 11.6 — Per-call resolved-host SSRF enforcement (FR91 / NFR52) ✅ committed (ssrf_guard: host-allowlist all + host-installed https/range deny; UpstreamHostBlocked 403)
 - [ ] 11.7 — Scope vocab + tier resolution from def; retire `scopes.rs` match + `SUPPORTED_SERVICES` ×3
 
 ### Phase 3 — Connection / Binding + crypto v2 (PoC gate)

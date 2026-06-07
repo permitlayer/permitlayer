@@ -89,6 +89,11 @@ pub struct ProxyService {
     /// map that used to live on `UpstreamClient`. Also the resolution
     /// point for scope/tier (11.7) and the full authz chain (11.10).
     connectors: Arc<permitlayer_connectors::ConnectorRegistry>,
+    /// Story 11.6: operator escape hatch (`--allow-private-upstream`).
+    /// When `false` (default), a host-installed connector may not use
+    /// http or resolve to a private/loopback/metadata IP range. Built-in
+    /// connectors are unaffected. Sourced from config at boot.
+    allow_private_upstream: bool,
     audit_store: Arc<dyn AuditStore>,
     scrub_engine: Arc<ScrubEngine>,
     /// Directory containing per-service sealed credentials and
@@ -152,12 +157,22 @@ impl ProxyService {
             token_issuer,
             upstream_client,
             connectors,
+            allow_private_upstream: false,
             audit_store,
             scrub_engine,
             vault_dir,
             media_dir,
             oauth_client_overrides: None,
         }
+    }
+
+    /// Set the `--allow-private-upstream` escape hatch (Story 11.6).
+    /// Builder-style so the many `new` call sites need no new argument;
+    /// defaults to `false`.
+    #[must_use]
+    pub fn with_allow_private_upstream(mut self, allow: bool) -> Self {
+        self.allow_private_upstream = allow;
+        self
     }
 
     /// Resolve a request's bare service name (`gmail`/`calendar`/`drive`)
@@ -167,14 +182,21 @@ impl ProxyService {
     /// canonical ids via [`crate::transport::mcp::selector_to_connector_id`]
     /// (Story 11.7 retires the bare names). Returns a typed `Internal`
     /// error for an unknown service rather than panicking.
-    fn resolve_upstream(&self, service: &str) -> Result<(url::Url, Vec<String>), ProxyError> {
+    fn resolve_upstream(
+        &self,
+        service: &str,
+    ) -> Result<(url::Url, Vec<String>, permitlayer_connectors::TrustTier), ProxyError> {
         let id = crate::transport::mcp::selector_to_connector_id(service).ok_or_else(|| {
             ProxyError::Internal { message: format!("unknown connector for service '{service}'") }
         })?;
         let conn = self.connectors.get(id).ok_or_else(|| ProxyError::Internal {
             message: format!("connector '{id}' not registered"),
         })?;
-        Ok((conn.def.upstream.base_url.clone(), conn.def.upstream.allowed_hosts.clone()))
+        Ok((
+            conn.def.upstream.base_url.clone(),
+            conn.def.upstream.allowed_hosts.clone(),
+            conn.def.connector.trust_tier,
+        ))
     }
 
     /// The directory where attachment bytes are materialized for the agent.
@@ -233,6 +255,7 @@ impl ProxyService {
             token_issuer,
             upstream_client,
             connectors,
+            allow_private_upstream: false,
             audit_store,
             scrub_engine,
             vault_dir,
@@ -614,13 +637,18 @@ impl ProxyService {
         // `retry_dispatch_failed` audit event before propagation.
         // This is the 11th outcome — the shared core cannot produce
         // it because it knows nothing about upstream dispatch.
-        let (base_url, allowed_hosts) = self.resolve_upstream(service)?;
+        let (base_url, allowed_hosts, trust_tier) = self.resolve_upstream(service)?;
+        let guard = crate::upstream::ssrf_guard::UpstreamGuard {
+            allowed_hosts: &allowed_hosts,
+            trust_tier,
+            allow_private_upstream: self.allow_private_upstream,
+        };
         let retry_dispatch = self
             .upstream_client
             .dispatch(
                 service,
                 &base_url,
-                &allowed_hosts,
+                &guard,
                 &replay.path,
                 replay.method.clone(),
                 replay.headers.clone(),
@@ -809,13 +837,18 @@ impl ProxyService {
         } else {
             crate::upstream::MAX_ATTACHMENT_BODY
         };
-        let (base_url, allowed_hosts) = self.resolve_upstream(&req.service)?;
+        let (base_url, allowed_hosts, trust_tier) = self.resolve_upstream(&req.service)?;
+        let guard = crate::upstream::ssrf_guard::UpstreamGuard {
+            allowed_hosts: &allowed_hosts,
+            trust_tier,
+            allow_private_upstream: self.allow_private_upstream,
+        };
         let upstream_result = self
             .upstream_client
             .dispatch(
                 &req.service,
                 &base_url,
-                &allowed_hosts,
+                &guard,
                 &req.path,
                 req.method,
                 req.headers,

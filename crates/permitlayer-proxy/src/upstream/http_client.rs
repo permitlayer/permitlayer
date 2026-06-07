@@ -79,16 +79,16 @@ impl UpstreamClient {
     /// Joins `path` onto the connector-resolved `base_url`, sets the
     /// `Authorization: Bearer` header, and forwards the request.
     /// `service` is the bare service label used only for error/audit
-    /// attribution. `allowed_hosts` is the connector's mandatory host
-    /// allowlist — the per-call resolved-host SSRF re-check (Story 11.6,
-    /// FR91/NFR52) is enforced against it; this story carries it into the
-    /// signature so the seam is TODO-free.
+    /// attribution. `guard` carries the connector's host allowlist + trust
+    /// tier + the `allow_private_upstream` escape hatch; the per-call
+    /// resolved-host SSRF re-check (Story 11.6, FR91/NFR52) runs on the
+    /// joined URL before any bytes leave the process.
     #[allow(clippy::too_many_arguments)] // HTTP dispatch: full request shape + body cap.
     pub async fn dispatch(
         &self,
         service: &str,
         base_url: &Url,
-        allowed_hosts: &[String],
+        guard: &super::ssrf_guard::UpstreamGuard<'_>,
         path: &str,
         method: Method,
         headers: HeaderMap,
@@ -96,14 +96,19 @@ impl UpstreamClient {
         access_token: &str,
         max_body: usize,
     ) -> Result<UpstreamResponse, ProxyError> {
-        // The `allowed_hosts`-based resolved-host SSRF re-check lands here
-        // in Story 11.6; for now the allowlist is threaded but the join +
-        // dispatch are behaviorally unchanged for the built-ins.
-        let _ = allowed_hosts;
-
         let url = base_url.join(path).map_err(|e| ProxyError::Internal {
             message: format!("invalid upstream URL path '{path}': {e}"),
         })?;
+
+        // FR91/NFR52: re-check the RESOLVED host against the connector's
+        // allowlist (+ host-installed range/scheme rules) — fail closed.
+        super::ssrf_guard::check_upstream(
+            service,
+            &url,
+            guard.allowed_hosts,
+            guard.trust_tier,
+            guard.allow_private_upstream,
+        )?;
 
         let reqwest_method = reqwest::Method::from_bytes(method.as_str().as_bytes())
             .map_err(|e| ProxyError::Internal { message: format!("invalid HTTP method: {e}") })?;
@@ -233,9 +238,21 @@ mod tests {
         UpstreamClient { client }
     }
 
-    /// Standard built-in host allowlist for the gmail test base URL.
-    fn gmail_hosts() -> Vec<String> {
-        vec!["gmail.googleapis.com".to_owned()]
+    /// Allowlist a base URL's own host (the real flow's invariant — a
+    /// connector's `allowed_hosts` contains its `base_url` host, validated
+    /// at load). The mock server runs on `127.0.0.1:PORT`, so the test
+    /// allowlist must contain that host for the SSRF guard (11.6) to pass.
+    fn allow_host_of(base: &Url) -> Vec<String> {
+        vec![base.host_str().expect("base has host").to_owned()]
+    }
+
+    /// A BuiltIn guard allowlisting the given base URL's host.
+    fn builtin_guard(hosts: &[String]) -> super::super::ssrf_guard::UpstreamGuard<'_> {
+        super::super::ssrf_guard::UpstreamGuard {
+            allowed_hosts: hosts,
+            trust_tier: permitlayer_connectors::TrustTier::BuiltIn,
+            allow_private_upstream: false,
+        }
     }
 
     #[tokio::test]
@@ -255,7 +272,7 @@ mod tests {
             .dispatch(
                 "gmail",
                 &base,
-                &gmail_hosts(),
+                &builtin_guard(&allow_host_of(&base)),
                 "users/me/messages",
                 Method::GET,
                 HeaderMap::new(),
@@ -287,7 +304,7 @@ mod tests {
             .dispatch(
                 "gmail",
                 &base,
-                &gmail_hosts(),
+                &builtin_guard(&allow_host_of(&base)),
                 "users/me/messages",
                 Method::GET,
                 HeaderMap::new(),
@@ -323,7 +340,7 @@ mod tests {
             .dispatch(
                 "gmail",
                 &base,
-                &gmail_hosts(),
+                &builtin_guard(&allow_host_of(&base)),
                 "users/me/messages",
                 Method::GET,
                 HeaderMap::new(),
@@ -357,7 +374,7 @@ mod tests {
             .dispatch(
                 "gmail",
                 &base,
-                &["nonexistent.invalid.local".to_owned()],
+                &builtin_guard(&allow_host_of(&base)),
                 "users/me/messages",
                 Method::GET,
                 HeaderMap::new(),
@@ -384,11 +401,14 @@ mod tests {
         // join fail with a typed Internal error rather than a panic.
         let base = Url::parse("mailto:nobody@example.com").unwrap();
         let client = test_client();
+        // `mailto:` has no host; the join fails before the SSRF guard runs,
+        // so the guard's allowlist is irrelevant — use a literal to avoid
+        // calling `allow_host_of` on a hostless URL.
         let result = client
             .dispatch(
                 "gmail",
                 &base,
-                &gmail_hosts(),
+                &builtin_guard(&["example.com".to_owned()]),
                 "path",
                 Method::GET,
                 HeaderMap::new(),
@@ -456,7 +476,7 @@ mod tests {
             .dispatch(
                 "calendar",
                 &base,
-                &["www.googleapis.com".to_owned()],
+                &builtin_guard(&allow_host_of(&base)),
                 "users/me/calendarList",
                 Method::GET,
                 HeaderMap::new(),
@@ -488,7 +508,7 @@ mod tests {
             .dispatch(
                 "drive",
                 &base,
-                &["www.googleapis.com".to_owned()],
+                &builtin_guard(&allow_host_of(&base)),
                 "files",
                 Method::GET,
                 HeaderMap::new(),
@@ -519,7 +539,7 @@ mod tests {
             .dispatch(
                 "gmail",
                 &base,
-                &gmail_hosts(),
+                &builtin_guard(&allow_host_of(&base)),
                 "users/me/messages/send",
                 Method::POST,
                 HeaderMap::new(),
