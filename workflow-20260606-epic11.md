@@ -38,7 +38,7 @@ For each story N: create-story (spec file) → dev-story (implement) → code-re
 - [ ] 11.15 — Re-pointed `quickstart`
 
 ### Phase 5 — Clean-install + multi-account validation
-- [ ] 11.16 — Clean-install path (v2-only)
+- [ ] 11.16 — Clean-install path (v2-only) · **FOLLOW-UP to catch here:** the proxy runtime refresh path (`ProxyService::build_oauth_client_for_service` / `unseal_byo_client_config`) still reads legacy `{service}-meta.json` + `{service}-client.sealed` naming instead of the connection-keyed Client slot. Not exercised by CI gates (proxy tests mock the OAuth client; no real Google refresh), so green — but a real v1-naming residue the 11.16 sweep must reshape to the `<ulid>-client.sealed` / ConnectionStore path. (Flagged by the 11.12/11.13 daemon agent 2026-06-07.)
 - [ ] 11.17 — Multi-account e2e validation on angie-2 (Chuck) — live angie pass is operator-run
 
 ## Decision / event log
