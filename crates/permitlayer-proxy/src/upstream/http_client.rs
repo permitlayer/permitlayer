@@ -1,6 +1,5 @@
 //! HTTP client for dispatching requests to upstream Google APIs.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use axum::body::Bytes;
@@ -37,14 +36,17 @@ pub struct UpstreamResponse {
 /// and configured timeouts. Maps upstream errors to `ProxyError` variants.
 pub struct UpstreamClient {
     client: reqwest::Client,
-    base_urls: HashMap<String, Url>,
 }
 
 impl UpstreamClient {
     /// Create a new upstream client.
     ///
     /// Configures: connect timeout (10s), request timeout (30s), rustls-tls.
-    /// Registers base URLs for Gmail, Calendar, and Drive.
+    ///
+    /// Story 11.5: the client no longer holds a hardcoded `base_urls`
+    /// map. The upstream base URL + host allowlist are resolved from the
+    /// connector definition (`UpstreamSpec`) by the caller and passed to
+    /// [`Self::dispatch`].
     pub fn new() -> Result<Self, ProxyError> {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
@@ -55,40 +57,38 @@ impl UpstreamClient {
                 message: format!("failed to build HTTP client: {e}"),
             })?;
 
-        let mut base_urls = HashMap::new();
-        #[allow(clippy::expect_used)]
-        {
-            let gmail_url = Url::parse("https://gmail.googleapis.com/gmail/v1/")
-                .expect("hardcoded URL is valid");
-            base_urls.insert("gmail".to_owned(), gmail_url);
-
-            let calendar_url = Url::parse("https://www.googleapis.com/calendar/v3/")
-                .expect("hardcoded URL is valid");
-            base_urls.insert("calendar".to_owned(), calendar_url);
-
-            let drive_url =
-                Url::parse("https://www.googleapis.com/drive/v3/").expect("hardcoded URL is valid");
-            base_urls.insert("drive".to_owned(), drive_url);
-        }
-
-        Ok(Self { client, base_urls })
+        Ok(Self { client })
     }
 
-    /// Create an upstream client with a custom reqwest client and base URLs.
+    /// Construct an `UpstreamClient` wrapping a caller-supplied
+    /// `reqwest::Client`.
     ///
-    /// Used in tests and integration wiring to inject custom base URLs.
-    pub fn with_client_and_urls(client: reqwest::Client, base_urls: HashMap<String, Url>) -> Self {
-        Self { client, base_urls }
+    /// Story 11.5: replaces the deleted `with_client_and_urls` — it
+    /// carries no base URLs (those come from the connector def now), only
+    /// the HTTP client. Used by integration tests that need a client
+    /// without `new()`'s 10s/30s timeouts (e.g. `start_paused` tests
+    /// whose virtualized clock would otherwise trip a real connect
+    /// timeout at virtual-time zero).
+    #[must_use]
+    pub fn from_client(client: reqwest::Client) -> Self {
+        Self { client }
     }
 
     /// Dispatch a request to the upstream API.
     ///
-    /// Builds the full upstream URL from the service's base URL and the path,
-    /// sets the `Authorization: Bearer` header, and forwards the request.
+    /// Joins `path` onto the connector-resolved `base_url`, sets the
+    /// `Authorization: Bearer` header, and forwards the request.
+    /// `service` is the bare service label used only for error/audit
+    /// attribution. `allowed_hosts` is the connector's mandatory host
+    /// allowlist — the per-call resolved-host SSRF re-check (Story 11.6,
+    /// FR91/NFR52) is enforced against it; this story carries it into the
+    /// signature so the seam is TODO-free.
     #[allow(clippy::too_many_arguments)] // HTTP dispatch: full request shape + body cap.
     pub async fn dispatch(
         &self,
         service: &str,
+        base_url: &Url,
+        allowed_hosts: &[String],
         path: &str,
         method: Method,
         headers: HeaderMap,
@@ -96,9 +96,10 @@ impl UpstreamClient {
         access_token: &str,
         max_body: usize,
     ) -> Result<UpstreamResponse, ProxyError> {
-        let base_url = self.base_urls.get(service).ok_or_else(|| ProxyError::Internal {
-            message: format!("no upstream URL configured for service '{service}'"),
-        })?;
+        // The `allowed_hosts`-based resolved-host SSRF re-check lands here
+        // in Story 11.6; for now the allowlist is threaded but the join +
+        // dispatch are behaviorally unchanged for the built-ins.
+        let _ = allowed_hosts;
 
         let url = base_url.join(path).map_err(|e| ProxyError::Internal {
             message: format!("invalid upstream URL path '{path}': {e}"),
@@ -223,17 +224,18 @@ fn convert_headers(reqwest_headers: &reqwest::header::HeaderMap) -> HeaderMap {
 mod tests {
     use super::*;
 
-    fn test_client(base_url: &str) -> UpstreamClient {
+    fn test_client() -> UpstreamClient {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .timeout(Duration::from_secs(5))
             .build()
             .unwrap();
+        UpstreamClient { client }
+    }
 
-        let mut base_urls = HashMap::new();
-        base_urls.insert("gmail".to_owned(), Url::parse(base_url).unwrap());
-
-        UpstreamClient::with_client_and_urls(client, base_urls)
+    /// Standard built-in host allowlist for the gmail test base URL.
+    fn gmail_hosts() -> Vec<String> {
+        vec!["gmail.googleapis.com".to_owned()]
     }
 
     #[tokio::test]
@@ -247,10 +249,13 @@ mod tests {
             .create_async()
             .await;
 
-        let client = test_client(&format!("{}/gmail/v1/", server.url()));
+        let client = test_client();
+        let base = Url::parse(&format!("{}/gmail/v1/", server.url())).unwrap();
         let result = client
             .dispatch(
                 "gmail",
+                &base,
+                &gmail_hosts(),
                 "users/me/messages",
                 Method::GET,
                 HeaderMap::new(),
@@ -276,10 +281,13 @@ mod tests {
             .create_async()
             .await;
 
-        let client = test_client(&format!("{}/gmail/v1/", server.url()));
+        let client = test_client();
+        let base = Url::parse(&format!("{}/gmail/v1/", server.url())).unwrap();
         let result = client
             .dispatch(
                 "gmail",
+                &base,
+                &gmail_hosts(),
                 "users/me/messages",
                 Method::GET,
                 HeaderMap::new(),
@@ -309,10 +317,13 @@ mod tests {
             .create_async()
             .await;
 
-        let client = test_client(&format!("{}/gmail/v1/", server.url()));
+        let client = test_client();
+        let base = Url::parse(&format!("{}/gmail/v1/", server.url())).unwrap();
         let result = client
             .dispatch(
                 "gmail",
+                &base,
+                &gmail_hosts(),
                 "users/me/messages",
                 Method::GET,
                 HeaderMap::new(),
@@ -334,21 +345,19 @@ mod tests {
 
     #[tokio::test]
     async fn dns_failure_returns_unreachable() {
-        let mut base_urls = HashMap::new();
-        base_urls.insert(
-            "gmail".to_owned(),
-            Url::parse("https://nonexistent.invalid.local/gmail/v1/").unwrap(),
-        );
+        let base = Url::parse("https://nonexistent.invalid.local/gmail/v1/").unwrap();
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(1))
             .timeout(Duration::from_secs(2))
             .build()
             .unwrap();
-        let upstream = UpstreamClient::with_client_and_urls(client, base_urls);
+        let upstream = UpstreamClient { client };
 
         let result = upstream
             .dispatch(
                 "gmail",
+                &base,
+                &["nonexistent.invalid.local".to_owned()],
                 "users/me/messages",
                 Method::GET,
                 HeaderMap::new(),
@@ -368,11 +377,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unknown_service_returns_error() {
-        let client = test_client("http://localhost:1234/");
+    async fn invalid_path_join_returns_internal_error() {
+        // Story 11.5: with the base_urls map gone, the former
+        // "unknown service" error class is replaced by a base_url-join
+        // failure. A base_url that cannot be a base (no host) makes the
+        // join fail with a typed Internal error rather than a panic.
+        let base = Url::parse("mailto:nobody@example.com").unwrap();
+        let client = test_client();
         let result = client
             .dispatch(
-                "unknown",
+                "gmail",
+                &base,
+                &gmail_hosts(),
                 "path",
                 Method::GET,
                 HeaderMap::new(),
@@ -381,7 +397,6 @@ mod tests {
                 MAX_RESPONSE_BODY,
             )
             .await;
-
         assert!(matches!(result, Err(ProxyError::Internal { .. })));
     }
 
@@ -408,17 +423,20 @@ mod tests {
     }
 
     #[test]
-    fn new_client_has_calendar_base_url() {
-        let client = UpstreamClient::new().unwrap();
-        let url = client.base_urls.get("calendar").expect("calendar URL should exist");
-        assert_eq!(url.as_str(), "https://www.googleapis.com/calendar/v3/");
-    }
-
-    #[test]
-    fn new_client_has_drive_base_url() {
-        let client = UpstreamClient::new().unwrap();
-        let url = client.base_urls.get("drive").expect("drive URL should exist");
-        assert_eq!(url.as_str(), "https://www.googleapis.com/drive/v3/");
+    fn builtin_defs_carry_todays_base_urls() {
+        // Story 11.5: the hardcoded base_urls map is gone; the built-in
+        // connector defs are the source of truth. Pin that they still
+        // carry today's upstream URLs (the values the deleted map held).
+        let defs = permitlayer_connectors::builtin_connector_defs().unwrap();
+        let url_of = |id: &str| {
+            defs.iter()
+                .find(|d| d.connector.id == id)
+                .map(|d| d.upstream.base_url.as_str().to_owned())
+                .unwrap()
+        };
+        assert_eq!(url_of("google-gmail"), "https://gmail.googleapis.com/gmail/v1/");
+        assert_eq!(url_of("google-calendar"), "https://www.googleapis.com/calendar/v3/");
+        assert_eq!(url_of("google-drive"), "https://www.googleapis.com/drive/v3/");
     }
 
     #[tokio::test]
@@ -432,21 +450,13 @@ mod tests {
             .create_async()
             .await;
 
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let mut base_urls = HashMap::new();
-        base_urls.insert(
-            "calendar".to_owned(),
-            Url::parse(&format!("{}/calendar/v3/", server.url())).unwrap(),
-        );
-        let upstream = UpstreamClient::with_client_and_urls(client, base_urls);
-
+        let upstream = test_client();
+        let base = Url::parse(&format!("{}/calendar/v3/", server.url())).unwrap();
         let result = upstream
             .dispatch(
                 "calendar",
+                &base,
+                &["www.googleapis.com".to_owned()],
                 "users/me/calendarList",
                 Method::GET,
                 HeaderMap::new(),
@@ -472,21 +482,13 @@ mod tests {
             .create_async()
             .await;
 
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let mut base_urls = HashMap::new();
-        base_urls.insert(
-            "drive".to_owned(),
-            Url::parse(&format!("{}/drive/v3/", server.url())).unwrap(),
-        );
-        let upstream = UpstreamClient::with_client_and_urls(client, base_urls);
-
+        let upstream = test_client();
+        let base = Url::parse(&format!("{}/drive/v3/", server.url())).unwrap();
         let result = upstream
             .dispatch(
                 "drive",
+                &base,
+                &["www.googleapis.com".to_owned()],
                 "files",
                 Method::GET,
                 HeaderMap::new(),
@@ -498,6 +500,35 @@ mod tests {
 
         let resp = result.unwrap();
         assert_eq!(resp.status, 200);
+        mock.assert_async().await;
+    }
+
+    #[tokio::test]
+    async fn post_tool_path_joins_onto_base_url() {
+        // AC #3: a POST tool path template joins correctly.
+        let mut server = mockito::Server::new_async().await;
+        let mock = server
+            .mock("POST", "/gmail/v1/users/me/messages/send")
+            .with_status(200)
+            .with_body(r#"{"id":"x"}"#)
+            .create_async()
+            .await;
+        let client = test_client();
+        let base = Url::parse(&format!("{}/gmail/v1/", server.url())).unwrap();
+        let result = client
+            .dispatch(
+                "gmail",
+                &base,
+                &gmail_hosts(),
+                "users/me/messages/send",
+                Method::POST,
+                HeaderMap::new(),
+                Bytes::from_static(b"{}"),
+                "test-token",
+                MAX_RESPONSE_BODY,
+            )
+            .await;
+        assert_eq!(result.unwrap().status, 200);
         mock.assert_async().await;
     }
 

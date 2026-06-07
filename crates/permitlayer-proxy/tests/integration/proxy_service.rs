@@ -18,7 +18,6 @@ use permitlayer_proxy::service::ProxyService;
 use permitlayer_proxy::token::ScopedTokenIssuer;
 use permitlayer_proxy::upstream::UpstreamClient;
 use permitlayer_vault::Vault;
-use url::Url;
 use zeroize::Zeroizing;
 
 // --- Test Helpers ---
@@ -113,18 +112,18 @@ async fn build_service_multi(
     services: &[(&str, &str, &[u8])],
 ) -> (Arc<ProxyService>, Arc<MockAuditStore>) {
     let mut cred_store = MockCredentialStore::new(TEST_MASTER_KEY);
-    let client = reqwest::Client::builder().build().unwrap();
-    let mut base_urls = HashMap::new();
+    let mut overrides: Vec<(&str, &str)> = Vec::new();
 
     for &(name, url, token) in services {
         cred_store.add_service(name, token);
-        base_urls.insert(name.to_owned(), Url::parse(url).unwrap());
+        overrides.push((name, url));
     }
 
     let credential_store: Arc<dyn CredentialStore> = Arc::new(cred_store);
     let vault = Arc::new(test_vault());
     let token_issuer = Arc::new(test_token_issuer());
-    let upstream_client = Arc::new(UpstreamClient::with_client_and_urls(client, base_urls));
+    let upstream_client = Arc::new(UpstreamClient::new().unwrap());
+    let connectors = super::common::connector_registry_with(&overrides);
     let audit_store = Arc::new(MockAuditStore::new());
 
     let service = Arc::new(ProxyService::new(
@@ -132,6 +131,7 @@ async fn build_service_multi(
         vault,
         token_issuer,
         upstream_client,
+        connectors,
         Arc::clone(&audit_store) as Arc<dyn AuditStore>,
         test_scrub_engine(),
         std::env::temp_dir(),
@@ -278,10 +278,9 @@ async fn missing_credentials_returns_503() {
     let credential_store: Arc<dyn CredentialStore> = Arc::new(cred_store);
     let vault = Arc::new(test_vault());
     let token_issuer = Arc::new(test_token_issuer());
-    let client = reqwest::Client::builder().build().unwrap();
-    let mut base_urls = HashMap::new();
-    base_urls.insert("gmail".to_owned(), Url::parse(&format!("{}/", server.url())).unwrap());
-    let upstream_client = Arc::new(UpstreamClient::with_client_and_urls(client, base_urls));
+    let upstream_client = Arc::new(UpstreamClient::new().unwrap());
+    let connectors =
+        super::common::connector_registry_with(&[("gmail", &format!("{}/", server.url()))]);
     let audit_store = Arc::new(MockAuditStore::new());
 
     let service = ProxyService::new(
@@ -289,6 +288,7 @@ async fn missing_credentials_returns_503() {
         vault,
         token_issuer,
         upstream_client,
+        connectors,
         audit_store,
         test_scrub_engine(),
         std::env::temp_dir(),
@@ -312,14 +312,8 @@ async fn upstream_unreachable_returns_503_with_audit() {
     let token_issuer = Arc::new(test_token_issuer());
 
     // Point to a port that's not listening.
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_millis(100))
-        .timeout(std::time::Duration::from_millis(200))
-        .build()
-        .unwrap();
-    let mut base_urls = HashMap::new();
-    base_urls.insert("gmail".to_owned(), Url::parse("http://127.0.0.1:1/").unwrap());
-    let upstream_client = Arc::new(UpstreamClient::with_client_and_urls(client, base_urls));
+    let upstream_client = Arc::new(UpstreamClient::new().unwrap());
+    let connectors = super::common::connector_registry_with(&[("gmail", "http://127.0.0.1:1/")]);
     let audit_store = Arc::new(MockAuditStore::new());
 
     let service = ProxyService::new(
@@ -327,6 +321,7 @@ async fn upstream_unreachable_returns_503_with_audit() {
         vault,
         token_issuer,
         upstream_client,
+        connectors,
         Arc::clone(&audit_store) as Arc<dyn AuditStore>,
         test_scrub_engine(),
         std::env::temp_dir(),
@@ -486,10 +481,9 @@ async fn scrub_before_log_otp_never_in_audit_file() {
     let vault = Arc::new(test_vault());
     let token_issuer = Arc::new(test_token_issuer());
 
-    let client = reqwest::Client::builder().build().unwrap();
-    let mut base_urls = HashMap::new();
-    base_urls.insert("gmail".to_owned(), Url::parse(&format!("{}/", server.url())).unwrap());
-    let upstream_client = Arc::new(UpstreamClient::with_client_and_urls(client, base_urls));
+    let upstream_client = Arc::new(UpstreamClient::new().unwrap());
+    let connectors =
+        super::common::connector_registry_with(&[("gmail", &format!("{}/", server.url()))]);
 
     let tmp = TempDir::new().unwrap();
     let audit_dir = tmp.path().join("audit");
@@ -503,6 +497,7 @@ async fn scrub_before_log_otp_never_in_audit_file() {
         vault,
         token_issuer,
         upstream_client,
+        connectors,
         audit_store as Arc<dyn AuditStore>,
         scrub_engine,
         tmp.path().to_path_buf(),

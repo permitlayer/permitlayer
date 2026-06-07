@@ -83,6 +83,12 @@ pub struct ProxyService {
     vault: Arc<Vault>,
     token_issuer: Arc<ScopedTokenIssuer>,
     upstream_client: Arc<UpstreamClient>,
+    /// Connector registry (Story 11.5). Resolves a request's bare
+    /// service name → the connector's upstream spec (`base_url` +
+    /// `allowed_hosts`) for dispatch. Replaces the hardcoded `base_urls`
+    /// map that used to live on `UpstreamClient`. Also the resolution
+    /// point for scope/tier (11.7) and the full authz chain (11.10).
+    connectors: Arc<permitlayer_connectors::ConnectorRegistry>,
     audit_store: Arc<dyn AuditStore>,
     scrub_engine: Arc<ScrubEngine>,
     /// Directory containing per-service sealed credentials and
@@ -128,11 +134,13 @@ impl ProxyService {
     /// the correct `OAuthClient` for each service being refreshed.
     #[must_use]
     #[allow(clippy::too_many_arguments)] // wiring constructor: all deps + vault_dir + media_dir.
+    #[allow(clippy::too_many_arguments)] // service wiring: all collaborators injected.
     pub fn new(
         credential_store: Arc<dyn CredentialStore>,
         vault: Arc<Vault>,
         token_issuer: Arc<ScopedTokenIssuer>,
         upstream_client: Arc<UpstreamClient>,
+        connectors: Arc<permitlayer_connectors::ConnectorRegistry>,
         audit_store: Arc<dyn AuditStore>,
         scrub_engine: Arc<ScrubEngine>,
         vault_dir: PathBuf,
@@ -143,12 +151,30 @@ impl ProxyService {
             vault,
             token_issuer,
             upstream_client,
+            connectors,
             audit_store,
             scrub_engine,
             vault_dir,
             media_dir,
             oauth_client_overrides: None,
         }
+    }
+
+    /// Resolve a request's bare service name (`gmail`/`calendar`/`drive`)
+    /// to the connector's upstream `base_url` + `allowed_hosts`.
+    ///
+    /// Bridges the legacy bare-name vocabulary to the registry's
+    /// canonical ids via [`crate::transport::mcp::selector_to_connector_id`]
+    /// (Story 11.7 retires the bare names). Returns a typed `Internal`
+    /// error for an unknown service rather than panicking.
+    fn resolve_upstream(&self, service: &str) -> Result<(url::Url, Vec<String>), ProxyError> {
+        let id = crate::transport::mcp::selector_to_connector_id(service).ok_or_else(|| {
+            ProxyError::Internal { message: format!("unknown connector for service '{service}'") }
+        })?;
+        let conn = self.connectors.get(id).ok_or_else(|| ProxyError::Internal {
+            message: format!("connector '{id}' not registered"),
+        })?;
+        Ok((conn.def.upstream.base_url.clone(), conn.def.upstream.allowed_hosts.clone()))
     }
 
     /// The directory where attachment bytes are materialized for the agent.
@@ -194,6 +220,7 @@ impl ProxyService {
         vault: Arc<Vault>,
         token_issuer: Arc<ScopedTokenIssuer>,
         upstream_client: Arc<UpstreamClient>,
+        connectors: Arc<permitlayer_connectors::ConnectorRegistry>,
         audit_store: Arc<dyn AuditStore>,
         scrub_engine: Arc<ScrubEngine>,
         vault_dir: PathBuf,
@@ -205,6 +232,7 @@ impl ProxyService {
             vault,
             token_issuer,
             upstream_client,
+            connectors,
             audit_store,
             scrub_engine,
             vault_dir,
@@ -586,10 +614,13 @@ impl ProxyService {
         // `retry_dispatch_failed` audit event before propagation.
         // This is the 11th outcome — the shared core cannot produce
         // it because it knows nothing about upstream dispatch.
+        let (base_url, allowed_hosts) = self.resolve_upstream(service)?;
         let retry_dispatch = self
             .upstream_client
             .dispatch(
                 service,
+                &base_url,
+                &allowed_hosts,
                 &replay.path,
                 replay.method.clone(),
                 replay.headers.clone(),
@@ -778,10 +809,13 @@ impl ProxyService {
         } else {
             crate::upstream::MAX_ATTACHMENT_BODY
         };
+        let (base_url, allowed_hosts) = self.resolve_upstream(&req.service)?;
         let upstream_result = self
             .upstream_client
             .dispatch(
                 &req.service,
+                &base_url,
+                &allowed_hosts,
                 &req.path,
                 req.method,
                 req.headers,
@@ -1249,6 +1283,45 @@ mod tests {
         Arc::new(ScrubEngine::new(builtin_rules().to_vec()).unwrap())
     }
 
+    /// A connector registry over the embedded built-in defs (real Google
+    /// upstreams). For tests that construct a `ProxyService` but never
+    /// dispatch upstream.
+    fn test_connector_registry() -> Arc<permitlayer_connectors::ConnectorRegistry> {
+        Arc::new(permitlayer_connectors::ConnectorRegistry::load(None).unwrap())
+    }
+
+    /// A connector registry whose named built-in service's `base_url`
+    /// (and `allowed_hosts`) point at `url` — the 1:1 replacement for the
+    /// old `base_urls` map. `svc` is the bare name (`gmail`/`calendar`/
+    /// `drive`).
+    fn test_connector_registry_with(
+        svc: &str,
+        url: &str,
+    ) -> Arc<permitlayer_connectors::ConnectorRegistry> {
+        let id = match svc {
+            "gmail" => "google-gmail",
+            "calendar" => "google-calendar",
+            "drive" => "google-drive",
+            other => other,
+        };
+        let parsed = Url::parse(url).expect("override base_url parses");
+        let defs: Vec<permitlayer_connectors::ConnectorDef> =
+            permitlayer_connectors::builtin_connector_defs()
+                .expect("built-in defs")
+                .into_iter()
+                .map(|mut def| {
+                    if def.connector.id == id {
+                        if let Some(host) = parsed.host_str() {
+                            def.upstream.allowed_hosts = vec![host.to_owned()];
+                        }
+                        def.upstream.base_url = parsed.clone();
+                    }
+                    def
+                })
+                .collect();
+        Arc::new(permitlayer_connectors::ConnectorRegistry::from_defs(defs))
+    }
+
     async fn build_service_with_mock_upstream(
         server_url: &str,
     ) -> (Arc<ProxyService>, Arc<MockAuditStore>, TempDir) {
@@ -1259,10 +1332,8 @@ mod tests {
         let vault = Arc::new(test_vault());
         let token_issuer = Arc::new(test_token_issuer());
 
-        let client = reqwest::Client::builder().build().unwrap();
-        let mut base_urls = HashMap::new();
-        base_urls.insert("gmail".to_owned(), Url::parse(server_url).unwrap());
-        let upstream_client = Arc::new(UpstreamClient::with_client_and_urls(client, base_urls));
+        let upstream_client = Arc::new(UpstreamClient::new().unwrap());
+        let connectors = test_connector_registry_with("gmail", server_url);
 
         let audit_store = Arc::new(MockAuditStore::new());
 
@@ -1275,6 +1346,7 @@ mod tests {
             vault,
             token_issuer,
             upstream_client,
+            connectors,
             Arc::clone(&audit_store) as Arc<dyn AuditStore>,
             test_scrub_engine(),
             tempdir.path().to_path_buf(),
@@ -1345,6 +1417,7 @@ mod tests {
             vault,
             token_issuer,
             upstream_client,
+            test_connector_registry(),
             audit_store,
             test_scrub_engine(),
             _tempdir.path().to_path_buf(),
@@ -1371,6 +1444,7 @@ mod tests {
             Arc::new(test_vault()),
             Arc::new(test_token_issuer()),
             Arc::new(UpstreamClient::new().unwrap()),
+            test_connector_registry(),
             Arc::new(MockAuditStore::new()) as Arc<dyn AuditStore>,
             test_scrub_engine(),
             dir.to_path_buf(),
@@ -1501,6 +1575,7 @@ mod tests {
             unseal_vault,
             token_issuer,
             upstream_client,
+            test_connector_registry(),
             audit_store,
             test_scrub_engine(),
             _tempdir.path().to_path_buf(),
@@ -1522,14 +1597,8 @@ mod tests {
         let vault = Arc::new(test_vault());
         let token_issuer = Arc::new(test_token_issuer());
 
-        let client = reqwest::Client::builder()
-            .connect_timeout(std::time::Duration::from_millis(100))
-            .timeout(std::time::Duration::from_millis(200))
-            .build()
-            .unwrap();
-        let mut base_urls = HashMap::new();
-        base_urls.insert("gmail".to_owned(), Url::parse("http://127.0.0.1:1/").unwrap());
-        let upstream_client = Arc::new(UpstreamClient::with_client_and_urls(client, base_urls));
+        let upstream_client = Arc::new(UpstreamClient::new().unwrap());
+        let connectors = test_connector_registry_with("gmail", "http://127.0.0.1:1/");
         let audit_store = Arc::new(MockAuditStore::new());
         let _tempdir = TempDir::new().unwrap();
 
@@ -1538,6 +1607,7 @@ mod tests {
             vault,
             token_issuer,
             upstream_client,
+            connectors,
             Arc::clone(&audit_store) as Arc<dyn AuditStore>,
             test_scrub_engine(),
             _tempdir.path().to_path_buf(),
@@ -1837,6 +1907,7 @@ mod tests {
             vault,
             token_issuer,
             upstream_client,
+            test_connector_registry(),
             audit_store,
             test_scrub_engine(),
             _tempdir.path().to_path_buf(),
@@ -1888,6 +1959,7 @@ mod tests {
             vault,
             token_issuer,
             upstream_client,
+            test_connector_registry(),
             audit_store,
             test_scrub_engine(),
             tempdir.path().to_path_buf(),

@@ -1063,11 +1063,28 @@ pub(crate) async fn try_build_proxy_service(
         }
     };
 
+    // Story 11.5: the connector registry resolves each request's service
+    // → upstream base_url + allowed_hosts (replacing the deleted base_urls
+    // map). Built-ins always load; host-installed connectors are scanned
+    // from `<state>/connectors/<id>/` (FR89). A built-in parse/validate
+    // failure is a ship-time bug — fall back to 501 routes rather than
+    // crash boot.
+    let connectors = match permitlayer_connectors::ConnectorRegistry::load(Some(
+        &config.paths.home.join("connectors"),
+    )) {
+        Ok(r) => Arc::new(r),
+        Err(e) => {
+            tracing::warn!(error = %e, "connector registry load failed — tool routes will serve 501");
+            return None;
+        }
+    };
+
     Some(Arc::new(permitlayer_proxy::ProxyService::new(
         credential_store,
         vault,
         token_issuer,
         upstream_client,
+        connectors,
         Arc::clone(audit_store),
         Arc::clone(scrub_engine),
         config.paths.home.join("vault"),

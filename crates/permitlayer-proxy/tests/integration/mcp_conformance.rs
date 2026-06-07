@@ -25,7 +25,6 @@ use permitlayer_proxy::token::ScopedTokenIssuer;
 use permitlayer_proxy::transport::mcp::mcp_service;
 use permitlayer_proxy::upstream::UpstreamClient;
 use permitlayer_vault::Vault;
-use url::Url;
 use zeroize::Zeroizing;
 
 const TEST_MASTER_KEY: [u8; 32] = [0x42; 32];
@@ -108,9 +107,7 @@ async fn start_mcp_server_with_agent(
     let mut cred_store = MockCredentialStore::new(TEST_MASTER_KEY);
     cred_store.add_service("gmail", b"test-oauth-access-token");
 
-    let client = reqwest::Client::builder().build().unwrap();
-    let mut base_urls = HashMap::new();
-    base_urls.insert("gmail".to_owned(), Url::parse(upstream_url).unwrap());
+    let connectors = super::common::connector_registry_with(&[("gmail", upstream_url)]);
 
     let audit_store = Arc::new(MockAuditStore::new());
 
@@ -122,7 +119,8 @@ async fn start_mcp_server_with_agent(
             rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);
             ScopedTokenIssuer::new(Zeroizing::new(key))
         }),
-        Arc::new(UpstreamClient::with_client_and_urls(client, base_urls)),
+        Arc::new(UpstreamClient::new().unwrap()),
+        connectors,
         Arc::clone(&audit_store) as Arc<dyn AuditStore>,
         Arc::new(ScrubEngine::new(builtin_rules().to_vec()).unwrap()),
         std::env::temp_dir(),

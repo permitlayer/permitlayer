@@ -54,7 +54,6 @@ use permitlayer_proxy::token::ScopedTokenIssuer;
 use permitlayer_proxy::upstream::UpstreamClient;
 use permitlayer_vault::Vault;
 use tempfile::TempDir;
-use url::Url;
 use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
@@ -476,14 +475,15 @@ async fn make_test_service_full(
         .expect("build mock oauth client"),
     );
 
-    // Build the upstream client pointing at the mock upstream.
-    let mut base_urls = HashMap::new();
-    base_urls.insert(
-        service_name.to_owned(),
-        Url::parse(&format!("{upstream_url}/")).expect("parse upstream url"),
-    );
+    // Build the upstream client pointing at the mock upstream. Use a
+    // default reqwest client (no connect/request timeout) via
+    // `from_client` — the `start_paused = true` tests virtualize the
+    // tokio clock, so `new()`'s real 10s connect timeout would fire at
+    // virtual-time zero and misclassify the OAuth-exhaustion path.
     let reqwest_client = reqwest::Client::builder().build().expect("build reqwest client");
-    let upstream_client = Arc::new(UpstreamClient::with_client_and_urls(reqwest_client, base_urls));
+    let upstream_client = Arc::new(UpstreamClient::from_client(reqwest_client));
+    let connectors =
+        super::common::connector_registry_with(&[(service_name, &format!("{upstream_url}/"))]);
 
     // Assemble the ProxyService with the OAuth override map.
     let mut overrides = HashMap::new();
@@ -495,6 +495,7 @@ async fn make_test_service_full(
         Arc::new(test_vault()),
         Arc::new(test_token_issuer()),
         upstream_client,
+        connectors,
         Arc::clone(&audit_store) as Arc<dyn AuditStore>,
         test_scrub_engine(),
         tempdir.path().to_path_buf(),

@@ -23,7 +23,6 @@ use permitlayer_proxy::transport::mcp::{CalendarMcpServer, DriveMcpServer, Gmail
 use permitlayer_proxy::upstream::UpstreamClient;
 use permitlayer_vault::Vault;
 use rmcp::ServerHandler;
-use url::Url;
 use zeroize::Zeroizing;
 
 // --- Test Helpers (same pattern as proxy_service.rs) ---
@@ -112,10 +111,8 @@ async fn build_service(server_url: &str) -> (Arc<ProxyService>, Arc<MockAuditSto
     let vault = Arc::new(test_vault());
     let token_issuer = Arc::new(test_token_issuer());
 
-    let client = reqwest::Client::builder().build().unwrap();
-    let mut base_urls = HashMap::new();
-    base_urls.insert("gmail".to_owned(), Url::parse(server_url).unwrap());
-    let upstream_client = Arc::new(UpstreamClient::with_client_and_urls(client, base_urls));
+    let upstream_client = Arc::new(UpstreamClient::new().unwrap());
+    let connectors = super::common::connector_registry_with(&[("gmail", server_url)]);
 
     let audit_store = Arc::new(MockAuditStore::new());
 
@@ -124,6 +121,7 @@ async fn build_service(server_url: &str) -> (Arc<ProxyService>, Arc<MockAuditSto
         vault,
         token_issuer,
         upstream_client,
+        connectors,
         Arc::clone(&audit_store) as Arc<dyn AuditStore>,
         test_scrub_engine(),
         std::env::temp_dir(),
@@ -148,6 +146,7 @@ fn mcp_tool_listing_returns_five_gmail_tools() {
         vault,
         token_issuer,
         Arc::new(upstream),
+        super::common::default_connector_registry(),
         audit_store as Arc<dyn AuditStore>,
         test_scrub_engine(),
         std::env::temp_dir(),
@@ -192,6 +191,7 @@ fn mcp_tool_input_schemas_have_no_meta_schema_declaration() {
         vault,
         token_issuer,
         Arc::new(upstream),
+        super::common::default_connector_registry(),
         audit_store as Arc<dyn AuditStore>,
         test_scrub_engine(),
         std::env::temp_dir(),
@@ -258,6 +258,7 @@ fn connector_mcp_service_resolves_builtins_and_rejects_unknown() {
         vault,
         token_issuer,
         Arc::new(upstream),
+        super::common::default_connector_registry(),
         audit_store as Arc<dyn AuditStore>,
         test_scrub_engine(),
         std::env::temp_dir(),
@@ -302,6 +303,7 @@ fn mcp_server_info_has_correct_name_and_version() {
         vault,
         token_issuer,
         Arc::new(upstream),
+        super::common::default_connector_registry(),
         audit_store as Arc<dyn AuditStore>,
         test_scrub_engine(),
         std::env::temp_dir(),
@@ -403,14 +405,8 @@ async fn mcp_search_constructs_correct_query_string() {
 #[tokio::test]
 async fn mcp_tool_error_returns_error_string_not_transport_error() {
     // Use an unreachable upstream to trigger an error.
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_millis(100))
-        .timeout(std::time::Duration::from_millis(200))
-        .build()
-        .unwrap();
-    let mut base_urls = HashMap::new();
-    base_urls.insert("gmail".to_owned(), Url::parse("http://127.0.0.1:1/").unwrap());
-    let upstream_client = Arc::new(UpstreamClient::with_client_and_urls(client, base_urls));
+    let upstream_client = Arc::new(UpstreamClient::new().unwrap());
+    let connectors = super::common::connector_registry_with(&[("gmail", "http://127.0.0.1:1/")]);
 
     let mut cred_store = MockCredentialStore::new(TEST_MASTER_KEY);
     cred_store.add_service("gmail", b"test-oauth-access-token");
@@ -420,6 +416,7 @@ async fn mcp_tool_error_returns_error_string_not_transport_error() {
         Arc::new(test_vault()),
         Arc::new(test_token_issuer()),
         upstream_client,
+        connectors,
         Arc::new(MockAuditStore::new()) as Arc<dyn AuditStore>,
         test_scrub_engine(),
         std::env::temp_dir(),

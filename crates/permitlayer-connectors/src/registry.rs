@@ -106,6 +106,23 @@ impl ConnectorRegistry {
         Ok(Self { inner: ArcSwap::from_pointee(map) })
     }
 
+    /// Build a registry directly from a set of definitions, keyed by each
+    /// def's `[connector].id`. No validation and no disk scan.
+    ///
+    /// Intended for tests and embedding scenarios that need a registry
+    /// pointing at non-default upstreams (e.g. a mock server). Production
+    /// boot uses [`Self::load`]. A later def with a duplicate id wins
+    /// (last-write), unlike `load`'s built-in-wins policy — callers
+    /// constructing test registries control the input set.
+    #[must_use]
+    pub fn from_defs(defs: impl IntoIterator<Item = ConnectorDef>) -> Self {
+        let map: BTreeMap<String, Arc<ResolvedConnector>> = defs
+            .into_iter()
+            .map(|def| (def.connector.id.clone(), Arc::new(ResolvedConnector { def })))
+            .collect();
+        Self { inner: ArcSwap::from_pointee(map) }
+    }
+
     /// Scan `dir/<id>/connector.toml`, validating each and inserting
     /// `HostInstalled` connectors. Malformed/invalid/colliding defs are
     /// skip-and-warned (never fatal). Built-ins already in `map` win id
