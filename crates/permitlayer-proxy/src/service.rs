@@ -243,7 +243,10 @@ impl ProxyService {
     ///   3. confirm the connection is `Active`,
     ///   4. gate the tool's `required_scope` (= `req.scope`, a short name)
     ///      on `connector.tiers[tier] ∩ connection.granted_scopes`,
-    ///   5. return the resolved [`ConnectionId`].
+    ///   5. return the resolved [`ConnectionId`] AND the connection's
+    ///      `connector_id` (so dispatch resolves the upstream from the
+    ///      connection's connector, not the raw selector — the selector is
+    ///      a per-account alias like `acct-a`, not a connector id).
     ///
     /// The optional per-binding `policy` is NOT evaluated here — it is
     /// surfaced upstream by `AuthService`, which stamps the matched
@@ -254,8 +257,8 @@ impl ProxyService {
     ///
     /// When the stores are absent (legacy unit tests), it returns the
     /// [`Self::legacy_connection_id_for_service`] derivation with no gate
-    /// (the tests pre-date the binding model; `PolicyLayer` and the unit
-    /// assertions own their own authz expectations).
+    /// and `connector_id = None` (the caller falls back to mapping the
+    /// selector to a connector id — the tests pre-date the binding model).
     ///
     /// [`ConnectionId`]: permitlayer_credential::ConnectionId
     async fn resolve_connection(
@@ -263,14 +266,15 @@ impl ProxyService {
         agent_id: &str,
         selector: &str,
         required_scope: &str,
-    ) -> Result<permitlayer_credential::ConnectionId, ProxyError> {
+    ) -> Result<(permitlayer_credential::ConnectionId, Option<String>), ProxyError> {
         use permitlayer_core::store::connection::ConnectionTier;
 
         let (Some(binding_store), Some(connection_store)) =
             (self.binding_store.as_ref(), self.connection_store.as_ref())
         else {
-            // Legacy fallback — no binding stores wired.
-            return Ok(Self::legacy_connection_id_for_service(selector));
+            // Legacy fallback — no binding stores wired. `None` connector_id
+            // tells the caller to map the selector → connector id itself.
+            return Ok((Self::legacy_connection_id_for_service(selector), None));
         };
 
         // 1+2+3. Load the agent's bindings and match by the shared
@@ -355,7 +359,7 @@ impl ProxyService {
         // deny; the two layers compose (either may deny independently).
         let _ = &binding;
 
-        Ok(connection.id)
+        Ok((connection.id, Some(connection.connector_id)))
     }
 
     /// Resolve a request's bare service name (`gmail`/`calendar`/`drive`)
@@ -365,16 +369,33 @@ impl ProxyService {
     /// canonical ids via [`crate::transport::mcp::selector_to_connector_id`]
     /// (Story 11.7 retires the bare names). Returns a typed `Internal`
     /// error for an unknown service rather than panicking.
+    /// `resolved_connector_id` is `Some` when binding resolution
+    /// (Story 11.10) already mapped the request to a connection's connector
+    /// — the selector is then a per-account alias (e.g. `acct-a`), NOT a
+    /// connector id, so we MUST use the resolved connector id. When `None`
+    /// (legacy/no-binding-stores path), the selector is mapped to a
+    /// connector id via `selector_to_connector_id`.
     fn resolve_upstream(
         &self,
         service: &str,
+        resolved_connector_id: Option<&str>,
     ) -> Result<(url::Url, Vec<String>, permitlayer_connectors::TrustTier), ProxyError> {
-        let id = crate::transport::mcp::selector_to_connector_id(service).ok_or_else(|| {
-            ProxyError::Internal { message: format!("unknown connector for service '{service}'") }
-        })?;
-        let conn = self.connectors.get(id).ok_or_else(|| ProxyError::Internal {
-            message: format!("connector '{id}' not registered"),
-        })?;
+        let conn = match resolved_connector_id {
+            Some(cid) => self.connectors.get(cid).ok_or_else(|| ProxyError::Internal {
+                message: format!("connector '{cid}' not registered"),
+            })?,
+            None => {
+                let id =
+                    crate::transport::mcp::selector_to_connector_id(service).ok_or_else(|| {
+                        ProxyError::Internal {
+                            message: format!("unknown connector for service '{service}'"),
+                        }
+                    })?;
+                self.connectors.get(id).ok_or_else(|| ProxyError::Internal {
+                    message: format!("connector '{id}' not registered"),
+                })?
+            }
+        };
         Ok((
             conn.def.upstream.base_url.clone(),
             conn.def.upstream.allowed_hosts.clone(),
@@ -675,10 +696,12 @@ impl ProxyService {
     /// a second refresh attempt. This structural bound is the entire
     /// defense against spurious-refresh loops for misconfigured scopes.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)] // refresh retry: full request context + resolved connector.
     async fn try_refresh_and_retry(
         &self,
         service: &str,
         connection: permitlayer_credential::ConnectionId,
+        resolved_connector_id: Option<&str>,
         request_id: &str,
         agent_id: &str,
         scope: &str,
@@ -835,7 +858,8 @@ impl ProxyService {
         // `retry_dispatch_failed` audit event before propagation.
         // This is the 11th outcome — the shared core cannot produce
         // it because it knows nothing about upstream dispatch.
-        let (base_url, allowed_hosts, trust_tier) = self.resolve_upstream(service)?;
+        let (base_url, allowed_hosts, trust_tier) =
+            self.resolve_upstream(service, resolved_connector_id)?;
         let guard = crate::upstream::ssrf_guard::UpstreamGuard {
             allowed_hosts: &allowed_hosts,
             trust_tier,
@@ -919,9 +943,9 @@ impl ProxyService {
         // back to the service-string derivation with no gate. A binding /
         // tier / scope denial is audited like credential-missing and
         // returned as a 403-class error.
-        let connection =
+        let (connection, resolved_connector_id) =
             match self.resolve_connection(&req.agent_id, &req.service, &req.scope).await {
-                Ok(id) => id,
+                Ok(pair) => pair,
                 Err(e) => {
                     let event_type = match &e {
                         ProxyError::BindingNotFound { .. } => "binding-not-found",
@@ -1068,7 +1092,8 @@ impl ProxyService {
         } else {
             crate::upstream::MAX_ATTACHMENT_BODY
         };
-        let (base_url, allowed_hosts, trust_tier) = self.resolve_upstream(&req.service)?;
+        let (base_url, allowed_hosts, trust_tier) =
+            self.resolve_upstream(&req.service, resolved_connector_id.as_deref())?;
         let guard = crate::upstream::ssrf_guard::UpstreamGuard {
             allowed_hosts: &allowed_hosts,
             trust_tier,
@@ -1141,6 +1166,7 @@ impl ProxyService {
                 .try_refresh_and_retry(
                     &req.service,
                     connection,
+                    resolved_connector_id.as_deref(),
                     &req.request_id,
                     &req.agent_id,
                     &req.scope,

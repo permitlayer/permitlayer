@@ -30,7 +30,7 @@ For each story N: create-story (spec file) → dev-story (implement) → code-re
 ### Phase 3 — Connection / Binding + crypto v2 (PoC gate)
 - [x] 11.8 — Crypto v2 domain: ConnectionId + Slot keying (NFR51) ✅ committed — vault keys on (ConnectionId, Slot); hard caller cutover (~13 files); from_service_shim bridge for 11.9; AC#5 v1-string clean; 536+363+1290 tests green
 - [x] 11.9 + 11.10 — **MERGED, committed** (owner-approved 2026-06-07). Stores re-key + binding-based request-time authz. Full workspace gate green: 2833 tests pass, fmt + clippy --all-features -D warnings clean.
-- [ ] 11.11 — **PoC GO/NO-GO gate** (auto-proceed if green)
+- [x] 11.11 — **PoC GO/NO-GO gate → GO** (2026-06-07). Vertical slice green (2 connections isolated, 1 agent / 2 bindings / 2 selectors, per-connection token routing, write-on-readonly denied). Caught + fixed a real 11.10 dispatch bug (upstream resolved from selector instead of the connection's connector_id). Phase 4 unblocked.
 
 ### Phase 4 — CLI re-split + control-plane seal API
 - [ ] 11.12 — Control-plane seal API: `{service}` → `connection_id` + `slot`
