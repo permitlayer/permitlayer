@@ -18,6 +18,7 @@ pub mod logs;
 pub mod migrations;
 pub mod oauth_render;
 pub mod oauth_seal;
+pub mod openclaw;
 pub mod policy;
 pub mod quickstart;
 pub mod reload;

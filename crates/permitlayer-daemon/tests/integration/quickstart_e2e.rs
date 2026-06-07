@@ -30,9 +30,6 @@
 //! (`policy_for`, the access-line parser, the service predicate) is
 //! unit-tested in-crate (`cli/quickstart.rs` `#[cfg(test)]`).
 
-use std::io::{Read, Write};
-#[cfg(not(target_os = "macos"))]
-use std::net::TcpStream;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -135,7 +132,6 @@ fn quickstart_appears_in_top_level_help() {
 // --------------------------------------------------------------------------
 
 #[test]
-#[ignore = "Story 11.15 re-points quickstart at connection add + bind; the stub doesn't run service validation"]
 fn quickstart_unknown_service_exits_2() {
     let home = tempfile::TempDir::new().unwrap();
     let (status, _stdout, stderr) =
@@ -153,19 +149,18 @@ fn quickstart_unknown_service_exits_2() {
 // --------------------------------------------------------------------------
 
 #[test]
-#[ignore = "Story 11.15 re-points quickstart at connection add + bind; the stub doesn't run the daemon gate"]
 fn quickstart_without_daemon_fails_with_must_run_and_setup_steer() {
     let home = tempfile::TempDir::new().unwrap();
     let (status, _stdout, stderr) =
         run_cli(home.path(), &["quickstart", "gmail", "--read", "--non-interactive"]);
 
     // `require_daemon_running` failure is operator-correctable → exit 2
-    // (it attaches connect's ConnectExitCode2 marker, same as
-    // `connect_without_daemon_exits_2_with_must_run_block`).
+    // (it attaches the `ConnectExitCode2` marker). Story 11.13 re-keyed
+    // the error code to `connection.daemon_must_run`.
     assert_eq!(status, Some(2), "no daemon → exit 2; stderr={stderr}");
     assert!(
-        stderr.contains("connect.daemon_must_run"),
-        "stderr should reuse connect's `connect.daemon_must_run` block: {stderr}"
+        stderr.contains("connection.daemon_must_run"),
+        "stderr should carry the `connection.daemon_must_run` block: {stderr}"
     );
     assert!(
         stderr.contains("sudo agentsso setup"),
@@ -194,7 +189,6 @@ fn quickstart_without_daemon_fails_with_must_run_and_setup_steer() {
 // --------------------------------------------------------------------------
 
 #[test]
-#[ignore = "Story 11.15 re-points quickstart at connection add + bind; the stub doesn't run the access gate"]
 fn quickstart_non_interactive_without_access_flag_errors() {
     let home = tempfile::TempDir::new().unwrap();
     let (status, _stdout, stderr) =
@@ -211,7 +205,7 @@ fn quickstart_non_interactive_without_access_flag_errors() {
     // The access gate fires before the daemon gate / registration: no
     // agent files, and stderr must NOT mention the daemon-running block.
     assert!(
-        !stderr.contains("connect.daemon_must_run"),
+        !stderr.contains("daemon_must_run"),
         "access gate must fire before the daemon gate: {stderr}"
     );
 }
@@ -230,181 +224,9 @@ fn quickstart_read_and_read_write_are_mutually_exclusive() {
     );
 }
 
-// --------------------------------------------------------------------------
-// (e)/(f) daemon up — agent is registered + bound to the resolved
-// policy BEFORE connect's OAuth stage.
-//
-// connect's non-interactive OAuth stage spins a local callback server
-// that waits up to 120s for a redirect that never comes (no real
-// Google round-trip in CI). Rather than block the suite for 2 minutes
-// per case, we spawn quickstart, poll `/v1/control/agent/list` until
-// the agent appears bound to the expected policy (proving register +
-// bind completed AND the flow advanced into connect's OAuth stage),
-// then terminate the child. This asserts exactly the spec contract —
-// register+bind happens first — without the wall-clock hang.
-// --------------------------------------------------------------------------
-
-/// Issue `GET /v1/control/agent/list` and return the parsed JSON, or
-/// `None` on ANY transient failure (control token not yet written,
-/// UDS not yet bound, short read, non-JSON body). On macOS control
-/// routes are UDS-only (Story 7.27); elsewhere TCP loopback. The token
-/// is read from `<home>/control.token`.
-///
-/// This helper is called in a poll loop against a freshly-spawned
-/// daemon on heavily-parallel CI runners (notably `macos-15-intel`,
-/// which is documented-slow under full nextest load). Every step here
-/// races daemon startup — the token file is minted DURING daemon boot,
-/// the UDS is bound DURING boot, etc. A single `.expect()`/`.unwrap()`
-/// on a transient (token-not-yet-there, connect race, partial read)
-/// would abort the whole poll instead of retrying. So this returns
-/// `None` for every recoverable condition and the caller keeps polling
-/// until its deadline; it only ever yields `Some(json)` on a clean
-/// round-trip.
-fn agent_list(home: &std::path::Path, port: u16) -> Option<serde_json::Value> {
-    let token = std::fs::read_to_string(home.join("control.token")).ok()?;
-    let token = token.trim().to_owned();
-    if token.is_empty() {
-        return None;
-    }
-    let request = format!(
-        "GET /v1/control/agent/list HTTP/1.1\r\nHost: localhost\r\n\
-         X-Agentsso-Control: {token}\r\nConnection: close\r\n\r\n"
-    );
-
-    let raw = {
-        #[cfg(target_os = "macos")]
-        {
-            use std::os::unix::net::UnixStream;
-            let _ = port;
-            let sock = home.join("run").join("control.sock");
-            let mut stream = UnixStream::connect(&sock).ok()?;
-            stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-            stream.write_all(request.as_bytes()).ok()?;
-            let mut buf = Vec::new();
-            stream.read_to_end(&mut buf).ok()?;
-            String::from_utf8_lossy(&buf).into_owned()
-        }
-        #[cfg(not(target_os = "macos"))]
-        {
-            let _ = home;
-            let mut stream = TcpStream::connect_timeout(
-                &format!("127.0.0.1:{port}").parse().ok()?,
-                Duration::from_secs(2),
-            )
-            .ok()?;
-            stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
-            stream.write_all(request.as_bytes()).ok()?;
-            let mut buf = Vec::new();
-            let _ = stream.read_to_end(&mut buf);
-            String::from_utf8_lossy(&buf).into_owned()
-        }
-    };
-
-    let body = raw.split_once("\r\n\r\n").map(|(_, b)| b).unwrap_or("").trim();
-    serde_json::from_str(body).ok()
-}
-
-/// Poll the agent list until `agent` appears, or the deadline elapses.
-/// Returns the observed binding's `policy_name` (the caller asserts it
-/// equals the expected policy — see `assert_quickstart_registers_then_oauth`).
-/// Outcome of waiting for the spawned `quickstart` child to register +
-/// bind its agent (the side effect under test, a synchronous control-
-/// plane POST that completes BEFORE connect's OAuth stage).
-enum BoundOutcome {
-    /// The agent appeared in `agent/list` bound to this policy.
-    Bound(String),
-    /// The child process exited before the agent was ever observed —
-    /// a genuine failure (quickstart died before/at register), carrying
-    /// the exit status + captured stderr for a diagnosable assertion
-    /// message rather than a bare timeout.
-    ChildExited { status: std::process::ExitStatus, stderr: String },
-    /// The safety-net deadline elapsed without either signal (should
-    /// only happen if the runner is pathologically wedged).
-    TimedOut,
-}
-
-/// Wait on the CAUSAL signal — the agent binding appearing, or the child
-/// exiting — rather than racing a wall-clock against the child's cold
-/// start.
-///
-/// Why this shape (research-backed, mirrors the repo's other subprocess
-/// e2e tests): the register+bind is a synchronous POST in quickstart
-/// Step 5 that finishes before `connect::run` is even called, so the
-/// binding is observable the instant the child reaches OAuth. The old
-/// 90s *wall-clock* poll wasn't waiting on OAuth — it was absorbing
-/// daemon-spawn + child cold-start, and on loaded macOS runners that
-/// guessed ceiling collided with cold start (`observed binding: None`).
-///
-/// In `--non-interactive` the child does NOT fail fast: connect's OAuth
-/// falls into the loopback-callback path which blocks ~120s before
-/// erroring (callback `DEFAULT_TIMEOUT_SECS`). So on the happy path the
-/// binding appears (fast) and we return long before the child exits; the
-/// caller SIGTERMs it immediately. The `child.try_wait()` branch only
-/// fires if quickstart genuinely dies before registering — which we now
-/// surface as an actionable error instead of a silent timeout. The
-/// deadline is therefore a pure backstop; keep it generous.
-fn wait_for_agent_bound(
-    child: &mut std::process::Child,
-    home: &std::path::Path,
-    port: u16,
-    agent: &str,
-) -> BoundOutcome {
-    let deadline = Instant::now() + Duration::from_secs(180);
-    while Instant::now() < deadline {
-        // 1. Causal success signal: the binding landed.
-        if let Some(list) = agent_list(home, port)
-            && let Some(agents) = list.get("agents").and_then(|a| a.as_array())
-        {
-            for a in agents {
-                if a.get("name").and_then(|n| n.as_str()) == Some(agent) {
-                    return BoundOutcome::Bound(
-                        a.get("policy_name")
-                            .and_then(|p| p.as_str())
-                            .map(str::to_owned)
-                            .unwrap_or_default(),
-                    );
-                }
-            }
-        }
-        // 2. Causal failure signal: the child exited before we ever saw
-        //    the binding. Drain its output for a diagnosable message.
-        if let Ok(Some(status)) = child.try_wait() {
-            // One more list check to avoid a race where the binding
-            // landed in the same tick the child exited.
-            if let Some(list) = agent_list(home, port)
-                && let Some(agents) = list.get("agents").and_then(|a| a.as_array())
-                && let Some(a) =
-                    agents.iter().find(|a| a.get("name").and_then(|n| n.as_str()) == Some(agent))
-            {
-                return BoundOutcome::Bound(
-                    a.get("policy_name")
-                        .and_then(|p| p.as_str())
-                        .map(str::to_owned)
-                        .unwrap_or_default(),
-                );
-            }
-            let stderr = child
-                .stderr
-                .take()
-                .map(|mut s| {
-                    use std::io::Read as _;
-                    let mut buf = String::new();
-                    let _ = s.read_to_string(&mut buf);
-                    buf
-                })
-                .unwrap_or_default();
-            return BoundOutcome::ChildExited { status, stderr };
-        }
-        std::thread::sleep(Duration::from_millis(150));
-    }
-    BoundOutcome::TimedOut
-}
-
 fn write_fake_oauth_client(home: &std::path::Path) -> std::path::PathBuf {
-    // Valid-shape Google "installed app" client JSON — connect's
-    // `resolve_oauth_client` parses it successfully so the flow
-    // advances PAST register+bind into the OAuth stage (where it
-    // would block on the never-arriving redirect; we kill it there).
+    // Valid-shape Google "installed app" client JSON — `resolve_oauth_client`
+    // parses it so the device-flow dance can use its client_id.
     let path = home.join("client_secret.json");
     std::fs::write(
         &path,
@@ -420,30 +242,43 @@ fn write_fake_oauth_client(home: &std::path::Path) -> std::path::PathBuf {
     path
 }
 
-#[cfg(unix)]
-fn terminate(child: &mut std::process::Child) {
-    use nix::sys::signal::{Signal, kill};
-    use nix::unistd::Pid;
-    let _ = kill(Pid::from_raw(child.id() as i32), Signal::SIGTERM);
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while Instant::now() < deadline {
-        if let Ok(Some(_)) = child.try_wait() {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    let _ = child.kill();
-    let _ = child.wait();
-}
+/// Story 11.15: drive the FULL quickstart flow (connection add → register
+/// → bind → snippet) to completion using a mock device-flow OAuth server
+/// (debug builds honor `AGENTSSO_DEVICE_FLOW_*_URL`), then assert the
+/// composed primitives produced a `ConnectionRecord` named
+/// `<agent>-<connector>` at the right tier AND a binding for the agent.
+///
+/// This INVERTS the old "register-before-OAuth" causality: the repointed
+/// quickstart does `connection add` (OAuth) FIRST, so the connection +
+/// binding only exist after the dance completes — which the mock device-
+/// flow lets happen deterministically in CI without real Google.
+///
+/// macOS bind-poll flake: under nextest load the daemon/CLI round-trips
+/// can be slow; `--retries 2` absorbs it (NOT a regression — see
+/// project_quickstart_e2e_macos_timing_flake).
+async fn assert_quickstart_creates_connection_and_binding(connector: &str, write: bool) {
+    let mut server = mockito::Server::new_async().await;
+    let _device = server
+        .mock("POST", "/device/code")
+        .with_status(200)
+        .with_body(
+            r#"{"device_code":"dc","user_code":"AAAA-BBBB","verification_url":"https://example.test/verify","expires_in":1800,"interval":1}"#,
+        )
+        .expect_at_least(1)
+        .create_async()
+        .await;
+    let _token = server
+        .mock("POST", "/token")
+        .with_status(200)
+        .with_body(
+            r#"{"access_token":"ya29.quickstart-fake","refresh_token":"1//quickstart-fake","expires_in":3600,"scope":"https://www.googleapis.com/auth/gmail.readonly"}"#,
+        )
+        .expect_at_least(1)
+        .create_async()
+        .await;
 
-#[cfg(not(unix))]
-fn terminate(child: &mut std::process::Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn assert_quickstart_registers_then_oauth(service: &str, write: bool) {
     let home = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(home.path().join("config")).unwrap();
     let daemon = start_daemon(DaemonTestConfig {
         port: 0,
         home: home.path().to_path_buf(),
@@ -451,81 +286,107 @@ fn assert_quickstart_registers_then_oauth(service: &str, write: bool) {
     });
     let port = daemon.port;
     assert!(wait_for_health(port), "daemon did not become healthy");
-    // Health (HTTP) up is NOT enough: the quickstart child's first act is
-    // a control-plane register POST, which races daemon startup if the
-    // control plane isn't serving yet. Wait until it actually answers.
-    assert!(
-        wait_for_control_ready(home.path(), port),
-        "daemon control plane did not become ready (whoami never returned 200)"
-    );
+    assert!(wait_for_control_ready(home.path(), port), "daemon control plane did not become ready");
 
     let oauth_client = write_fake_oauth_client(home.path());
-    let agent = format!("{service}-quickstart");
-    let expected_policy =
-        if write { format!("{service}-read-write") } else { format!("{service}-read-only") };
+    let agent = "me";
+    let bare = connector; // gmail/calendar/drive — bare selectors here
+    let expected_connection = format!("{agent}-{bare}");
+    let expected_tier = if write { "read-write" } else { "read" };
     let access_flag = if write { "--read-write" } else { "--read" };
 
-    let mut child = Command::new(agentsso_bin())
-        .args([
-            "quickstart",
-            service,
-            access_flag,
-            "--non-interactive",
-            "--oauth-client",
-            oauth_client.to_str().unwrap(),
-        ])
-        .env("AGENTSSO_PATHS__HOME", home.path().to_str().unwrap())
-        .env("AGENTSSO_HTTP__BIND_ADDR", format!("127.0.0.1:{port}"))
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn quickstart");
+    // Run quickstart to completion (subprocess; blocking call inside the
+    // async test — the mockito server runs in the background).
+    let device_code_url = format!("{}/device/code", server.url());
+    let token_url = format!("{}/token", server.url());
+    let home_path = home.path().to_path_buf();
+    let oauth_client_path = oauth_client.clone();
+    let connector_owned = connector.to_owned();
+    let (status, _stdout, stderr) = tokio::task::spawn_blocking(move || {
+        let output = Command::new(agentsso_bin())
+            .args([
+                "quickstart",
+                &connector_owned,
+                access_flag,
+                "--agent",
+                "me",
+                "--non-interactive",
+                "--device-flow",
+                "--device-flow-timeout",
+                "30",
+                "--oauth-client",
+                oauth_client_path.to_str().unwrap(),
+            ])
+            .env("AGENTSSO_PATHS__HOME", home_path.to_str().unwrap())
+            .env("AGENTSSO_HTTP__BIND_ADDR", format!("127.0.0.1:{port}"))
+            .env("AGENTSSO_TEST_MASTER_KEY_HEX", crate::common::TEST_MASTER_KEY_HEX)
+            .env("AGENTSSO_DEVICE_FLOW_DEVICE_CODE_URL", &device_code_url)
+            .env("AGENTSSO_DEVICE_FLOW_TOKEN_URL", &token_url)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn quickstart");
+        (
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout).into_owned(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
+        )
+    })
+    .await
+    .unwrap();
 
-    // Register+bind must complete (and the flow must advance into
-    // connect's OAuth stage, which is where the child blocks). We wait on
-    // the causal signal — the binding appearing or the child exiting —
-    // not a wall-clock, so a slow runner can't time us out spuriously.
-    let outcome = wait_for_agent_bound(&mut child, home.path(), port, &agent);
+    assert_eq!(status, Some(0), "quickstart should complete (exit 0); stderr={stderr}");
 
-    terminate(&mut child);
+    // Assert via the daemon control plane (the operator-observable surface):
+    // the connection appears in `connection list` and the agent's binding
+    // in `agent bindings`. Reading the on-disk stores would also work, but
+    // the CLI surface is the contract.
+    let conn_list = run_cli_capture(home.path(), port, &["connection", "list"]);
+    assert!(
+        conn_list.contains(&expected_connection),
+        "connection list should show `{expected_connection}`: {conn_list}"
+    );
+
+    let bindings = run_cli_capture(home.path(), port, &["agent", "bindings", agent]);
+    assert!(
+        bindings.contains(&expected_connection),
+        "agent bindings should list connection `{expected_connection}`: {bindings}"
+    );
+    assert!(
+        bindings.contains(expected_tier),
+        "agent bindings should show tier `{expected_tier}`: {bindings}"
+    );
+
     drop(daemon);
-
-    match outcome {
-        BoundOutcome::Bound(policy) => assert_eq!(
-            policy, expected_policy,
-            "quickstart must register `{agent}` bound to `{expected_policy}` BEFORE \
-             connect's OAuth stage (observed binding: {policy:?})"
-        ),
-        BoundOutcome::ChildExited { status, stderr } => panic!(
-            "quickstart child exited (status {status:?}) before registering `{agent}` — \
-             expected it to register+bind then block at OAuth.\nstderr:\n{stderr}"
-        ),
-        BoundOutcome::TimedOut => panic!(
-            "timed out (180s backstop) waiting for `{agent}` to bind — the runner is \
-             likely wedged; the register POST never landed and the child never exited"
-        ),
-    }
 }
 
-// Story 11.9/11.10: these two assert the registered agent's
-// `policy_name` (read from `/v1/control/agent/list`) equals the shipped
-// `<svc>-read-only` / `<svc>-read-write` policy. Story 11.9 removed the
-// per-agent `policy_name` field — an agent's authority is now its set of
-// bindings — and `quickstart` does NOT yet create a connection + binding
-// (so `agent/list` reports an empty policy). Re-pointing `quickstart` at
-// `connection add` + `bind` AND updating this test is the explicit scope
-// of Story 11.15 ("quickstart_e2e.rs updated + passes"), which depends on
-// 11.12 (control-plane seal API reshape) + 11.13 (`connection add`).
-// Ignored — NOT weakened — until 11.15 owns the rewrite. Owner: Story 11.15.
-#[test]
-#[ignore = "Story 11.15 re-points quickstart at connection add + bind and updates this test"]
-fn quickstart_calendar_read_registers_calendar_read_only_then_oauth() {
-    assert_quickstart_registers_then_oauth("calendar", false);
+/// Run an `agentsso` CLI subcommand against the running daemon and return
+/// its stdout (panicking on a non-zero exit).
+fn run_cli_capture(home: &std::path::Path, port: u16, args: &[&str]) -> String {
+    let output = Command::new(agentsso_bin())
+        .args(args)
+        .env("AGENTSSO_PATHS__HOME", home.to_str().unwrap())
+        .env("AGENTSSO_HTTP__BIND_ADDR", format!("127.0.0.1:{port}"))
+        .env("AGENTSSO_TEST_MASTER_KEY_HEX", crate::common::TEST_MASTER_KEY_HEX)
+        .output()
+        .expect("spawn agentsso CLI");
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "`agentsso {}` should exit 0; stderr={}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).into_owned()
 }
 
-#[test]
-#[ignore = "Story 11.15 re-points quickstart at connection add + bind and updates this test"]
-fn quickstart_gmail_read_write_registers_gmail_read_write_then_oauth() {
-    assert_quickstart_registers_then_oauth("gmail", true);
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quickstart_calendar_read_creates_connection_and_binding() {
+    assert_quickstart_creates_connection_and_binding("calendar", false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quickstart_gmail_read_write_creates_connection_and_binding() {
+    assert_quickstart_creates_connection_and_binding("gmail", true).await;
 }
