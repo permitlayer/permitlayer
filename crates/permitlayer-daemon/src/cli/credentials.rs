@@ -891,7 +891,12 @@ pub(crate) fn build_oauth_client_for_cli(
                 .map_err(|e| {
                     format!("corrupt sealed OAuth client bundle for service '{service}': {e}")
                 })?;
-            let token = vault.unseal(&client_service, &sealed).map_err(|e| {
+            // Story 11.8: the vault keys on `(ConnectionId, Slot)`. The
+            // `{service}-client` store key stays as-is; the vault unseal
+            // derives the base connection + `Slot::Client` from it.
+            let (client_connection, client_slot) =
+                permitlayer_credential::connection_slot_from_service_key(&client_service);
+            let token = vault.unseal(client_connection, client_slot, &sealed).map_err(|e| {
                 format!("could not unseal OAuth client bundle for service '{service}': {e}")
             })?;
             GoogleOAuthConfig::from_sealed_bundle_bytes(token.reveal()).map_err(|e| {
@@ -1254,7 +1259,10 @@ mod tests {
         })
         .to_string();
         let token = permitlayer_credential::OAuthToken::from_trusted_bytes(bundle.into_bytes());
-        let sealed = cr_test_vault().seal(&format!("{service}-client"), &token).unwrap();
+        let client_service = format!("{service}-client");
+        let (connection, slot) =
+            permitlayer_credential::connection_slot_from_service_key(&client_service);
+        let sealed = cr_test_vault().seal(connection, slot, &token).unwrap();
         let bytes = permitlayer_core::store::fs::credential_fs::encode_envelope(&sealed);
         std::fs::write(vault_dir.join(format!("{service}-client.sealed")), bytes).unwrap();
 
@@ -1335,20 +1343,30 @@ mod tests {
         let vault = cr_test_vault();
         let bundle = br#"{"client_id":"x.apps.googleusercontent.com","v":1}"#.to_vec();
         let token = permitlayer_credential::OAuthToken::from_trusted_bytes(bundle);
-        let sealed = vault.seal("gmail-client", &token).unwrap();
+        // Story 11.8: `connection_slot_from_service_key` maps each
+        // service-key string to the same `(ConnectionId, Slot)` the
+        // production seal/unseal paths derive, so this preserves the
+        // original cross-namespace isolation semantics: `gmail-client`
+        // → `(gmail, Client)`, `gmail` → `(gmail, Access)`,
+        // `gmail-refresh` → `(gmail, Refresh)`.
+        use permitlayer_credential::connection_slot_from_service_key;
+        let (client_conn, client_slot) = connection_slot_from_service_key("gmail-client");
+        let (access_conn, access_slot) = connection_slot_from_service_key("gmail");
+        let (refresh_conn, refresh_slot) = connection_slot_from_service_key("gmail-refresh");
+        let sealed = vault.seal(client_conn, client_slot, &token).unwrap();
 
-        // Same vault, wrong namespace → AEAD/AAD mismatch → error.
+        // Same vault, wrong slot → AEAD/AAD mismatch → error.
         assert!(
-            vault.unseal("gmail", &sealed).is_err(),
+            vault.unseal(access_conn, access_slot, &sealed).is_err(),
             "a gmail-client envelope must NOT unseal under the `gmail` namespace"
         );
         assert!(
-            vault.unseal("gmail-refresh", &sealed).is_err(),
+            vault.unseal(refresh_conn, refresh_slot, &sealed).is_err(),
             "a gmail-client envelope must NOT unseal under the `gmail-refresh` namespace"
         );
         // Sanity: it DOES unseal under its own namespace.
         assert!(
-            vault.unseal("gmail-client", &sealed).is_ok(),
+            vault.unseal(client_conn, client_slot, &sealed).is_ok(),
             "the envelope must unseal under its own `gmail-client` namespace"
         );
         let _ = dir;

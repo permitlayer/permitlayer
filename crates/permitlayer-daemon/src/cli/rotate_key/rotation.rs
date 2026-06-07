@@ -25,6 +25,7 @@ use permitlayer_core::agent::{
 };
 use permitlayer_core::store::fs::{AgentIdentityFsStore, CredentialFsStore};
 use permitlayer_core::store::{AgentIdentityStore, CredentialStore};
+use permitlayer_credential::connection_slot_from_service_key;
 use permitlayer_keystore::{KeyStore, MASTER_KEY_LEN};
 use permitlayer_vault::{MasterKey, Vault, reseal};
 use zeroize::Zeroizing;
@@ -456,7 +457,12 @@ pub(crate) async fn run_rotation(
             .await;
             return Err(exit5());
         }
-        let resealed = match reseal(&old_vault, &new_vault, &sealed_old, service) {
+        // Story 11.8: `reseal` keys on `(ConnectionId, Slot)`. The
+        // credential file's service key (`{service}`, `{service}-refresh`,
+        // or `{service}-client`) splits into the base connection + slot;
+        // the on-disk `{service}.sealed` path below is unchanged.
+        let (reseal_conn, reseal_slot) = connection_slot_from_service_key(service);
+        let resealed = match reseal(&old_vault, &new_vault, &sealed_old, reseal_conn, reseal_slot) {
             Ok(s) => s,
             Err(e) => {
                 tracing::error!(service, error = %e, "reseal failed during Phase D");
@@ -1668,7 +1674,8 @@ mod tests {
         for i in 0..n_credentials {
             let svc = format!("svc-{i}");
             let token = OAuthToken::from_trusted_bytes(format!("token-{i}").into_bytes());
-            let sealed = vault.seal(&svc, &token).unwrap();
+            let (conn, slot) = connection_slot_from_service_key(&svc);
+            let sealed = vault.seal(conn, slot, &token).unwrap();
             let bytes = permitlayer_core::store::fs::credential_fs::encode_envelope(&sealed);
             std::fs::write(home.path().join("vault").join(format!("{svc}.sealed")), bytes).unwrap();
         }
@@ -1750,7 +1757,8 @@ mod tests {
         // Old envelope at key_id=0.
         let old_vault = Vault::new(Zeroizing::new(old_key), 0);
         let old_token = OAuthToken::from_trusted_bytes(b"old".to_vec());
-        let old_sealed = old_vault.seal("old-svc", &old_token).unwrap();
+        let (old_conn, old_slot) = connection_slot_from_service_key("old-svc");
+        let old_sealed = old_vault.seal(old_conn, old_slot, &old_token).unwrap();
         std::fs::write(
             home.path().join("vault").join("old-svc.sealed"),
             permitlayer_core::store::fs::credential_fs::encode_envelope(&old_sealed),
@@ -1760,7 +1768,8 @@ mod tests {
         // New envelope at key_id=1 (already-rewritten by the crashed run).
         let new_vault = Vault::new(Zeroizing::new(new_key), 1);
         let new_token = OAuthToken::from_trusted_bytes(b"new".to_vec());
-        let new_sealed = new_vault.seal("new-svc", &new_token).unwrap();
+        let (new_conn, new_slot) = connection_slot_from_service_key("new-svc");
+        let new_sealed = new_vault.seal(new_conn, new_slot, &new_token).unwrap();
         std::fs::write(
             home.path().join("vault").join("new-svc.sealed"),
             permitlayer_core::store::fs::credential_fs::encode_envelope(&new_sealed),
@@ -1901,7 +1910,8 @@ mod tests {
         // Old envelope at key_id=0 (the to-be-resealed one).
         let old_vault = Vault::new(Zeroizing::new(old_key), 0);
         let old_token = OAuthToken::from_trusted_bytes(b"to-reseal".to_vec());
-        let old_sealed = old_vault.seal("svc-old", &old_token).unwrap();
+        let (old_conn, old_slot) = connection_slot_from_service_key("svc-old");
+        let old_sealed = old_vault.seal(old_conn, old_slot, &old_token).unwrap();
         std::fs::write(
             home.path().join("vault").join("svc-old.sealed"),
             permitlayer_core::store::fs::credential_fs::encode_envelope(&old_sealed),
@@ -1911,7 +1921,9 @@ mod tests {
         // Pre-resealed envelope at key_id=1 (must be skipped).
         let new_vault = Vault::new(Zeroizing::new(new_key), 1);
         let already_resealed_token = OAuthToken::from_trusted_bytes(b"already-done".to_vec());
-        let already_sealed = new_vault.seal("svc-already-done", &already_resealed_token).unwrap();
+        let (already_conn, already_slot) = connection_slot_from_service_key("svc-already-done");
+        let already_sealed =
+            new_vault.seal(already_conn, already_slot, &already_resealed_token).unwrap();
         let already_done_bytes =
             permitlayer_core::store::fs::credential_fs::encode_envelope(&already_sealed);
         let already_done_path = home.path().join("vault").join("svc-already-done.sealed");
@@ -2042,7 +2054,8 @@ mod tests {
         assert_eq!(sealed.key_id(), 1, "envelope must be at key_id=1 after rotation");
 
         let vault = Vault::new(Zeroizing::new(new_master), 1);
-        let plaintext = vault.unseal("svc-0", &sealed).unwrap();
+        let (svc0_conn, svc0_slot) = connection_slot_from_service_key("svc-0");
+        let plaintext = vault.unseal(svc0_conn, svc0_slot, &sealed).unwrap();
         assert_eq!(plaintext.reveal(), b"token-0");
     }
 
@@ -2090,7 +2103,8 @@ mod tests {
         // can reject this.
         let weird_vault = Vault::new(Zeroizing::new(old_key), 7);
         let token = OAuthToken::from_trusted_bytes(b"x".to_vec());
-        let sealed = weird_vault.seal("svc-weird", &token).unwrap();
+        let (weird_conn, weird_slot) = connection_slot_from_service_key("svc-weird");
+        let sealed = weird_vault.seal(weird_conn, weird_slot, &token).unwrap();
         std::fs::write(
             home.path().join("vault").join("svc-weird.sealed"),
             permitlayer_core::store::fs::credential_fs::encode_envelope(&sealed),
@@ -2149,7 +2163,8 @@ mod tests {
         let old_key = [0xAAu8; MASTER_KEY_LEN];
         let max_vault = Vault::new(Zeroizing::new(old_key), 255);
         let token = OAuthToken::from_trusted_bytes(b"x".to_vec());
-        let sealed = max_vault.seal("svc-max", &token).unwrap();
+        let (max_conn, max_slot) = connection_slot_from_service_key("svc-max");
+        let sealed = max_vault.seal(max_conn, max_slot, &token).unwrap();
         std::fs::write(
             home.path().join("vault").join("svc-max.sealed"),
             permitlayer_core::store::fs::credential_fs::encode_envelope(&sealed),

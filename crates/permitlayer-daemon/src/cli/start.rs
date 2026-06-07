@@ -4484,7 +4484,7 @@ mod tests {
         let sealed = SealedCredential::from_trusted_bytes(
             vec![0xAB; 48],
             [0x11u8; 12],
-            b"permitlayer-vault-v1:gmail".to_vec(),
+            b"test-envelope-aad:gmail".to_vec(),
             permitlayer_credential::SEALED_CREDENTIAL_VERSION,
             KeyId::new(key_id),
         );

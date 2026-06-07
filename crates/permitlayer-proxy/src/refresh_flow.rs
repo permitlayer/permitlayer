@@ -56,6 +56,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use permitlayer_core::store::{CredentialStore, StoreError};
+use permitlayer_credential::{ConnectionId, Slot};
 use permitlayer_oauth::{OAuthClient, OAuthError};
 use permitlayer_vault::Vault;
 use tracing::warn;
@@ -378,11 +379,15 @@ pub async fn refresh_service(
         }
     };
 
+    // The vault keys on `(ConnectionId, Slot)` (Story 11.8): the refresh
+    // token seals/unseals under the BASE connection + `Slot::Refresh`. The
+    // store key (`refresh_service_key`) stays the original service string.
+    let connection = ConnectionId::from_service_shim(service);
+
     // Step 2: Unseal the refresh token. Synchronous crypto → spawn_blocking.
     let vault_for_unseal = Arc::clone(vault);
-    let refresh_service_for_unseal = refresh_service_key.clone();
     let unseal_result = tokio::task::spawn_blocking(move || {
-        vault_for_unseal.unseal_refresh(&refresh_service_for_unseal, &sealed_refresh)
+        vault_for_unseal.unseal_refresh(connection, Slot::Refresh, &sealed_refresh)
     })
     .await;
 
@@ -465,9 +470,8 @@ pub async fn refresh_service(
     // can always recover via the old refresh token.
     if let Some(new_refresh) = refresh_result.new_refresh_token {
         let vault_for_seal = Arc::clone(vault);
-        let refresh_service_for_seal = refresh_service_key.clone();
         let seal_result = tokio::task::spawn_blocking(move || {
-            vault_for_seal.seal_refresh(&refresh_service_for_seal, &new_refresh)
+            vault_for_seal.seal_refresh(connection, Slot::Refresh, &new_refresh)
         })
         .await;
 
@@ -501,11 +505,10 @@ pub async fn refresh_service(
         }
     }
 
-    // Step 5b: Persist the new ACCESS token.
+    // Step 5b: Persist the new ACCESS token (base connection + Slot::Access).
     let vault_for_access_seal = Arc::clone(vault);
-    let service_for_access_seal = service.to_owned();
     let seal_result = tokio::task::spawn_blocking(move || {
-        vault_for_access_seal.seal(&service_for_access_seal, &new_access)
+        vault_for_access_seal.seal(connection, Slot::Access, &new_access)
     })
     .await;
 

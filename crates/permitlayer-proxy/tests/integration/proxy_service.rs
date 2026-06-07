@@ -11,7 +11,7 @@ use axum::http::{HeaderMap, Method, StatusCode};
 use permitlayer_core::audit::event::AuditEvent;
 use permitlayer_core::scrub::{ScrubEngine, ScrubSample, builtin_rules};
 use permitlayer_core::store::{AuditStore, CredentialStore, StoreError};
-use permitlayer_credential::{OAuthToken, SealedCredential};
+use permitlayer_credential::{ConnectionId, OAuthToken, SealedCredential, Slot};
 use permitlayer_proxy::error::ProxyError;
 use permitlayer_proxy::request::ProxyRequest;
 use permitlayer_proxy::service::ProxyService;
@@ -65,7 +65,8 @@ impl CredentialStore for MockCredentialStore {
             Some(token_bytes) => {
                 let vault = Vault::new(Zeroizing::new(self.master_key), 0);
                 let token = OAuthToken::from_trusted_bytes(token_bytes.clone());
-                match vault.seal(service, &token) {
+                let connection = ConnectionId::from_service_shim(service);
+                match vault.seal(connection, Slot::Access, &token) {
                     Ok(sealed) => Ok(Some(sealed)),
                     Err(_) => panic!("mock seal failed for {service}"),
                 }

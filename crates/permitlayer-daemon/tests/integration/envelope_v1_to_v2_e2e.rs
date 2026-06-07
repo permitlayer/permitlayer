@@ -63,7 +63,8 @@ fn write_v1_envelope_fixture(vault_dir: &std::path::Path, service: &str, plainte
     let key = [0x42u8; 32];
     let vault = Vault::new(Zeroizing::new(key), 0);
     let token = OAuthToken::from_trusted_bytes(plaintext.to_vec());
-    let sealed = vault.seal(service, &token).unwrap();
+    let (conn, slot) = permitlayer_credential::connection_slot_from_service_key(service);
+    let sealed = vault.seal(conn, slot, &token).unwrap();
     let v2 = encode_envelope(&sealed);
     // v2 → v1 splice: drop the key_id byte at offset 3, bump the
     // version u16 from 2 to 1.
@@ -232,7 +233,8 @@ fn daemon_boots_cleanly_with_v2_envelope_in_vault() {
     let key = [0x42u8; 32];
     let vault = Vault::new(Zeroizing::new(key), 0);
     let token = OAuthToken::from_trusted_bytes(b"fake-token-v2".to_vec());
-    let sealed = vault.seal("gmail", &token).unwrap();
+    let (conn, slot) = permitlayer_credential::connection_slot_from_service_key("gmail");
+    let sealed = vault.seal(conn, slot, &token).unwrap();
     let bytes = encode_envelope(&sealed);
     let vault_dir = home.path().join("vault");
     std::fs::create_dir_all(&vault_dir).unwrap();
@@ -294,12 +296,15 @@ fn daemon_refuses_to_boot_on_mixed_key_id_vault() {
 
     let vault_old = Vault::new(Zeroizing::new(key), 1);
     let token_old = OAuthToken::from_trusted_bytes(b"still-at-old-key".to_vec());
-    let sealed_old = vault_old.seal("gmail", &token_old).unwrap();
+    let (gmail_conn, gmail_slot) =
+        permitlayer_credential::connection_slot_from_service_key("gmail");
+    let sealed_old = vault_old.seal(gmail_conn, gmail_slot, &token_old).unwrap();
     std::fs::write(vault_dir.join("gmail.sealed"), encode_envelope(&sealed_old)).unwrap();
 
     let vault_new = Vault::new(Zeroizing::new(key), 2);
     let token_new = OAuthToken::from_trusted_bytes(b"already-at-new-key".to_vec());
-    let sealed_new = vault_new.seal("calendar", &token_new).unwrap();
+    let (cal_conn, cal_slot) = permitlayer_credential::connection_slot_from_service_key("calendar");
+    let sealed_new = vault_new.seal(cal_conn, cal_slot, &token_new).unwrap();
     std::fs::write(vault_dir.join("calendar.sealed"), encode_envelope(&sealed_new)).unwrap();
 
     let mut handle = start_daemon(DaemonTestConfig {

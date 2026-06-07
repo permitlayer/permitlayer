@@ -46,7 +46,9 @@ use axum::routing::{get, post};
 use permitlayer_core::audit::event::AuditEvent;
 use permitlayer_core::scrub::{ScrubEngine, builtin_rules};
 use permitlayer_core::store::{AuditStore, CredentialStore, StoreError};
-use permitlayer_credential::{OAuthRefreshToken, OAuthToken, SealedCredential};
+use permitlayer_credential::{
+    OAuthRefreshToken, OAuthToken, SealedCredential, connection_slot_from_service_key,
+};
 use permitlayer_oauth::{CredentialMeta, OAuthClient};
 use permitlayer_proxy::request::ProxyRequest;
 use permitlayer_proxy::service::ProxyService;
@@ -133,9 +135,16 @@ impl CredentialStore for PersistentMockCredentialStore {
         // the mock's prior behavior and masked exactly that class of
         // bug.
         let vault = Vault::new(Zeroizing::new(self.master_key), 0);
+        // Story 11.8: the vault keys on `(ConnectionId, Slot)`. The
+        // `-refresh` suffix maps to `Slot::Refresh`, everything else to
+        // `Slot::Access` — `connection_slot_from_service_key` performs
+        // exactly that split, so the cross-keying mismatch (sealing an
+        // access token then trying `unseal_refresh`, or vice versa) still
+        // fails closed on the slot mismatch.
+        let (connection, slot) = connection_slot_from_service_key(service);
         let bytes = if service.ends_with("-refresh") {
             vault
-                .unseal_refresh(service, &sealed)
+                .unseal_refresh(connection, slot, &sealed)
                 .map(|refresh| refresh.reveal().to_vec())
                 .map_err(|e| {
                     StoreError::IoError(std::io::Error::new(
@@ -148,16 +157,18 @@ impl CredentialStore for PersistentMockCredentialStore {
                     ))
                 })?
         } else {
-            vault.unseal(service, &sealed).map(|access| access.reveal().to_vec()).map_err(|e| {
-                StoreError::IoError(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    format!(
-                        "mock store: unseal failed for '{service}' \
+            vault.unseal(connection, slot, &sealed).map(|access| access.reveal().to_vec()).map_err(
+                |e| {
+                    StoreError::IoError(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "mock store: unseal failed for '{service}' \
                          (did production code call vault.seal_refresh() instead of \
                          vault.seal()?): {e}"
-                    ),
-                ))
-            })?
+                        ),
+                    ))
+                },
+            )?
         };
         self.services.lock().unwrap().insert(service.to_owned(), bytes);
         Ok(())
@@ -174,9 +185,10 @@ impl CredentialStore for PersistentMockCredentialStore {
         // `-refresh` tells us which sealing function to use at call
         // time, but we keep the logic identical across both paths to
         // keep the mock simple.
+        let (connection, slot) = connection_slot_from_service_key(service);
         let sealed = if service.ends_with("-refresh") {
             let token = OAuthRefreshToken::from_trusted_bytes(bytes);
-            vault.seal_refresh(service, &token).map_err(|_| {
+            vault.seal_refresh(connection, slot, &token).map_err(|_| {
                 StoreError::IoError(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "mock store: seal_refresh failed",
@@ -184,7 +196,7 @@ impl CredentialStore for PersistentMockCredentialStore {
             })?
         } else {
             let token = OAuthToken::from_trusted_bytes(bytes);
-            vault.seal(service, &token).map_err(|_| {
+            vault.seal(connection, slot, &token).map_err(|_| {
                 StoreError::IoError(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "mock store: seal failed",

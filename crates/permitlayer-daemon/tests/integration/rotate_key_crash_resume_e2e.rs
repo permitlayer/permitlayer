@@ -315,7 +315,8 @@ fn seed_credentials_under_current_primary(home: &std::path::Path, services: &[&s
     let vault = Vault::new(Zeroizing::new(key), key_id);
     for svc in services {
         let token = OAuthToken::from_trusted_bytes(format!("test-token-for-{svc}").into_bytes());
-        let sealed = vault.seal(svc, &token).unwrap();
+        let (conn, slot) = permitlayer_credential::connection_slot_from_service_key(svc);
+        let sealed = vault.seal(conn, slot, &token).unwrap();
         let bytes = encode_envelope(&sealed);
         std::fs::write(vault_dir.join(format!("{svc}.sealed")), bytes).unwrap();
     }

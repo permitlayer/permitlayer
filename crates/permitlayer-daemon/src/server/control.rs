@@ -78,6 +78,7 @@ use permitlayer_core::killswitch::{
 use permitlayer_core::policy::PolicySet;
 use permitlayer_core::policy::schema::TomlPolicyFile;
 use permitlayer_core::store::{AgentIdentityStore, CredentialStore};
+use permitlayer_credential::{ConnectionId, Slot};
 
 use crate::cli::start::ProxyActivationContext;
 
@@ -2885,7 +2886,12 @@ pub(crate) async fn credentials_seal_handler(
     let access_token = permitlayer_credential::OAuthToken::from_trusted_bytes(
         payload.access_token.as_bytes().to_vec(),
     );
-    let sealed_access = match state.vault.seal(&payload.service, &access_token) {
+    // Story 11.8: the vault keys on `(ConnectionId, Slot)`. The on-disk
+    // store keys (`{service}`, `{service}-refresh`, `{service}-client`)
+    // are unchanged — only the vault seal/unseal arguments switched to
+    // the connection + slot pair derived from `payload.service`.
+    let connection = ConnectionId::from_service_shim(&payload.service);
+    let sealed_access = match state.vault.seal(connection, Slot::Access, &access_token) {
         Ok(s) => s,
         Err(e) => {
             emit_seal_denied_audit(
@@ -2912,7 +2918,7 @@ pub(crate) async fn credentials_seal_handler(
                 refresh.as_bytes().to_vec(),
             );
             let refresh_service = format!("{}-refresh", payload.service);
-            match state.vault.seal_refresh(&refresh_service, &refresh_token) {
+            match state.vault.seal_refresh(connection, Slot::Refresh, &refresh_token) {
                 Ok(s) => Some((refresh_service, s)),
                 Err(e) => {
                     emit_seal_denied_audit(
@@ -2946,7 +2952,7 @@ pub(crate) async fn credentials_seal_handler(
         let client_token = permitlayer_credential::OAuthToken::from_trusted_bytes(
             payload.client_bundle_json.as_bytes().to_vec(),
         );
-        match state.vault.seal(&client_service, &client_token) {
+        match state.vault.seal(connection, Slot::Client, &client_token) {
             Ok(s) => s,
             Err(e) => {
                 emit_seal_denied_audit(
@@ -3547,7 +3553,8 @@ pub(crate) async fn credentials_verify_handler(
         }
     };
 
-    let access_token = match state.vault.unseal(&service, &sealed) {
+    let access_connection = ConnectionId::from_service_shim(&service);
+    let access_token = match state.vault.unseal(access_connection, Slot::Access, &sealed) {
         Ok(t) => t,
         Err(e) => {
             // Round-1 review P20: unseal failure usually means the
@@ -7940,7 +7947,9 @@ mod tests {
         let wrong_key = zeroize::Zeroizing::new([0xAAu8; permitlayer_keystore::MASTER_KEY_LEN]);
         let wrong_vault = permitlayer_vault::Vault::new(wrong_key, 0);
         let token = permitlayer_credential::OAuthToken::from_trusted_bytes(b"ya29.fake".to_vec());
-        let sealed = wrong_vault.seal("gmail", &token).expect("wrong-vault seal");
+        let sealed = wrong_vault
+            .seal(ConnectionId::from_service_shim("gmail"), Slot::Access, &token)
+            .expect("wrong-vault seal");
 
         // Write the sealed envelope to disk via the real store so
         // the bytes are in the format `CredentialFsStore::get`

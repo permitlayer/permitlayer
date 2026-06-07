@@ -48,7 +48,7 @@ const SENTINEL: &[u8] = b"test_plaintext_oauth_token_bytes_v1_sentinel";
 /// NOT contain `SENTINEL` — the fixture builder uses a distinct byte
 /// pattern for the ciphertext (0xAA).
 fn fixture_a() -> SealedCredential {
-    let aad = [b"permitlayer-vault-v1:", b"gmail" as &[u8]].concat();
+    let aad = [b"test-envelope-aad:", b"gmail" as &[u8]].concat();
     let ciphertext = vec![0xAAu8; 48];
     let nonce = [0x11u8; 12];
     SealedCredential::from_trusted_bytes(
@@ -61,7 +61,7 @@ fn fixture_a() -> SealedCredential {
 }
 
 fn fixture_b() -> SealedCredential {
-    let aad = [b"permitlayer-vault-v1:", b"gmail" as &[u8]].concat();
+    let aad = [b"test-envelope-aad:", b"gmail" as &[u8]].concat();
     let ciphertext = vec![0xBBu8; 48];
     let nonce = [0x22u8; 12];
     SealedCredential::from_trusted_bytes(

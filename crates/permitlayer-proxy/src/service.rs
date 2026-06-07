@@ -26,6 +26,7 @@ use zeroize::Zeroizing;
 use permitlayer_core::audit::event::AuditEvent;
 use permitlayer_core::scrub::{ScrubEngine, ScrubSample};
 use permitlayer_core::store::{AuditStore, CredentialStore};
+use permitlayer_credential::{ConnectionId, Slot, connection_slot_from_service_key};
 use permitlayer_oauth::{CredentialMeta, GoogleOAuthConfig, OAuthClient};
 use permitlayer_vault::Vault;
 
@@ -418,12 +419,14 @@ impl ProxyService {
                     ),
                 }
             })?;
-        let token =
-            self.vault.unseal(&client_service, &sealed).map_err(|e| ProxyError::Internal {
+        let (client_connection, client_slot) = connection_slot_from_service_key(&client_service);
+        let token = self.vault.unseal(client_connection, client_slot, &sealed).map_err(|e| {
+            ProxyError::Internal {
                 message: format!(
                     "could not unseal OAuth client bundle for service '{service}': {e}"
                 ),
-            })?;
+            }
+        })?;
         GoogleOAuthConfig::from_sealed_bundle_bytes(token.reveal()).map_err(|e| {
             ProxyError::Internal {
                 message: format!(
@@ -753,10 +756,12 @@ impl ProxyService {
         };
 
         // 2. Unseal to get OAuthToken (synchronous — wrap in spawn_blocking).
+        // Access token keys on the connection + Slot::Access (Story 11.8).
         let vault = Arc::clone(&self.vault);
-        let service_for_unseal = req.service.clone();
+        let connection = ConnectionId::from_service_shim(&req.service);
         let unseal_result =
-            tokio::task::spawn_blocking(move || vault.unseal(&service_for_unseal, &sealed)).await;
+            tokio::task::spawn_blocking(move || vault.unseal(connection, Slot::Access, &sealed))
+                .await;
 
         let oauth_token = match unseal_result {
             Ok(Ok(token)) => token,
@@ -1265,7 +1270,8 @@ mod tests {
                 Some(token_bytes) => {
                     let vault = Vault::new(Zeroizing::new(self.master_key), 0);
                     let token = OAuthToken::from_trusted_bytes(token_bytes.clone());
-                    match vault.seal(service, &token) {
+                    let connection = ConnectionId::from_service_shim(service);
+                    match vault.seal(connection, Slot::Access, &token) {
                         Ok(sealed) => Ok(Some(sealed)),
                         Err(_) => panic!("mock seal failed for {service}"),
                     }
@@ -1526,7 +1532,9 @@ mod tests {
         })
         .to_string();
         let token = permitlayer_credential::OAuthToken::from_trusted_bytes(bundle.into_bytes());
-        let sealed = test_vault().seal(&format!("{service}-client"), &token).unwrap();
+        let client_service = format!("{service}-client");
+        let (connection, slot) = connection_slot_from_service_key(&client_service);
+        let sealed = test_vault().seal(connection, slot, &token).unwrap();
         let bytes = permitlayer_core::store::fs::credential_fs::encode_envelope(&sealed);
         std::fs::write(vault_dir.join(format!("{service}-client.sealed")), bytes).unwrap();
     }

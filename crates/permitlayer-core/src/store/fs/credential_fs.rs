@@ -837,7 +837,7 @@ mod tests {
     // ciphertext doesn't need to be unsealable — the store only cares
     // that the envelope round-trips byte-for-byte.
     fn fake_sealed(service: &str, ct_filler: u8) -> SealedCredential {
-        let aad: Vec<u8> = [b"permitlayer-vault-v1:", service.as_bytes()].concat();
+        let aad: Vec<u8> = [b"test-envelope-aad:", service.as_bytes()].concat();
         let ciphertext = vec![ct_filler; 48]; // 32 bytes plaintext + 16-byte tag
         let nonce = [0x11u8; 12];
         // Story 7.6a: `key_id = 0` for the single-key world.
@@ -1043,7 +1043,7 @@ mod tests {
         let sealed = SealedCredential::from_trusted_bytes(
             vec![0xAB; 48],
             [0x11u8; 12],
-            b"permitlayer-vault-v1:gmail".to_vec(),
+            b"test-envelope-aad:gmail".to_vec(),
             SEALED_CREDENTIAL_VERSION,
             permitlayer_credential::KeyId::new(0x55),
         );
@@ -1062,7 +1062,7 @@ mod tests {
         let original = SealedCredential::from_trusted_bytes(
             vec![0xCD; 48],
             [0x11u8; 12],
-            b"permitlayer-vault-v1:gmail".to_vec(),
+            b"test-envelope-aad:gmail".to_vec(),
             SEALED_CREDENTIAL_VERSION,
             permitlayer_credential::KeyId::new(7),
         );
@@ -1082,7 +1082,7 @@ mod tests {
         // Build a v1 envelope manually: version=1, nonce_len=12, no
         // key_id byte, then nonce (12), aad_len (4), aad, ct_len (4),
         // ct.
-        let aad: Vec<u8> = b"permitlayer-vault-v1:gmail".to_vec();
+        let aad: Vec<u8> = b"test-envelope-aad:gmail".to_vec();
         let ct: Vec<u8> = vec![0x99; 48];
         let mut buf: Vec<u8> = Vec::new();
         buf.extend_from_slice(&1u16.to_le_bytes());
@@ -1107,7 +1107,7 @@ mod tests {
         let original = SealedCredential::from_trusted_bytes(
             vec![0xCD; 48],
             [0x11u8; 12],
-            b"permitlayer-vault-v1:gmail".to_vec(),
+            b"test-envelope-aad:gmail".to_vec(),
             SEALED_CREDENTIAL_VERSION,
             permitlayer_credential::KeyId::new(123),
         );
@@ -1138,7 +1138,7 @@ mod tests {
         let v1 = SealedCredential::from_trusted_bytes(
             vec![0xAA; 48],
             [0x11u8; 12],
-            b"permitlayer-vault-v1:gmail".to_vec(),
+            b"test-envelope-aad:gmail".to_vec(),
             1,
             permitlayer_credential::KeyId::ZERO,
         );

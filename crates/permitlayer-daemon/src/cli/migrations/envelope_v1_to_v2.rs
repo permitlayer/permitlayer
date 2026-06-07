@@ -468,7 +468,8 @@ mod tests {
         let key = [0x42u8; 32];
         let vault = Vault::new(Zeroizing::new(key), 0);
         let token = OAuthToken::from_trusted_bytes(format!("token-for-{service}").into_bytes());
-        let sealed = vault.seal(service, &token).unwrap();
+        let (conn, slot) = permitlayer_credential::connection_slot_from_service_key(service);
+        let sealed = vault.seal(conn, slot, &token).unwrap();
         let v2 = encode_envelope(&sealed);
         // v2 → v1 splice: drop the key_id byte at offset 3 and bump
         // version 2 → 1 in the leading two bytes.
@@ -480,7 +481,7 @@ mod tests {
     }
 
     fn v2_envelope_bytes(service: &str, key_id: u8) -> Vec<u8> {
-        let aad: Vec<u8> = [b"permitlayer-vault-v1:", service.as_bytes()].concat();
+        let aad: Vec<u8> = [b"test-envelope-aad:", service.as_bytes()].concat();
         // Build a synthetic SealedCredential carrying minimum
         // bounds-valid payload — encode_envelope round-trips it.
         let sealed = SealedCredential::from_trusted_bytes(
@@ -735,7 +736,9 @@ mod tests {
         let key = [0x42u8; 32];
         let vault = Vault::new(Zeroizing::new(key), 0);
         let token = OAuthToken::from_trusted_bytes(b"hello-from-v1".to_vec());
-        let sealed = vault.seal("gmail", &token).unwrap();
+        let (gmail_conn, gmail_slot) =
+            permitlayer_credential::connection_slot_from_service_key("gmail");
+        let sealed = vault.seal(gmail_conn, gmail_slot, &token).unwrap();
 
         // Re-emit the sealed envelope as v1 bytes (no key_id byte).
         let v2_bytes = encode_envelope(&sealed);
@@ -759,7 +762,7 @@ mod tests {
             let got = store.get("gmail").await.unwrap().expect("post-migration credential present");
             assert_eq!(got.version(), 2);
             assert_eq!(got.key_id(), 0);
-            let recovered = vault.unseal("gmail", &got).unwrap();
+            let recovered = vault.unseal(gmail_conn, gmail_slot, &got).unwrap();
             assert_eq!(recovered.reveal(), b"hello-from-v1");
         });
     }
