@@ -88,6 +88,11 @@ fn build_stub_router(kill_switch: Arc<KillSwitch>) -> Router {
         agent_registry,
         Arc::new(zeroize::Zeroizing::new([0u8; permitlayer_core::agent::LOOKUP_KEY_BYTES])),
         None,
+        // Story 11.10: binding + connection stores. This test hits only
+        // operational paths (health probes + 501 stubs off the
+        // auth-required allowlist), so binding resolution never runs.
+        None,
+        None,
         approval_service,
         Arc::new(std::sync::atomic::AtomicU64::new(30)),
         Arc::new(NoopConnTracker) as Arc<dyn ConnTrackerSink>,

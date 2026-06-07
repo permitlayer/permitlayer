@@ -30,7 +30,10 @@ use zeroize::Zeroizing;
 const TEST_MASTER_KEY: [u8; 32] = [0x42; 32];
 
 struct MockCredentialStore {
-    services: HashMap<String, Vec<u8>>,
+    // Keyed on `(ConnectionId bytes, Slot byte)` per the Story 11.9 store
+    // re-key; `add_service` seeds under the legacy connection-id derivation
+    // (no binding stores wired) + Slot::Access.
+    services: HashMap<([u8; 16], u8), Vec<u8>>,
     master_key: [u8; 32],
 }
 
@@ -40,31 +43,45 @@ impl MockCredentialStore {
     }
 
     fn add_service(&mut self, service: &str, token_bytes: &[u8]) {
-        self.services.insert(service.to_owned(), token_bytes.to_vec());
+        let connection = crate::common::legacy_connection_id_for_service(service);
+        self.services
+            .insert((*connection.as_bytes(), Slot::Access.slot_byte()), token_bytes.to_vec());
     }
 }
 
 #[async_trait::async_trait]
 impl CredentialStore for MockCredentialStore {
-    async fn put(&self, _service: &str, _sealed: SealedCredential) -> Result<(), StoreError> {
+    async fn put(
+        &self,
+        _id: ConnectionId,
+        _slot: Slot,
+        _sealed: SealedCredential,
+    ) -> Result<(), StoreError> {
         Ok(())
     }
-    async fn get(&self, service: &str) -> Result<Option<SealedCredential>, StoreError> {
-        match self.services.get(service) {
+    async fn get(
+        &self,
+        id: ConnectionId,
+        slot: Slot,
+    ) -> Result<Option<SealedCredential>, StoreError> {
+        match self.services.get(&(*id.as_bytes(), slot.slot_byte())) {
             Some(token_bytes) => {
                 let vault = Vault::new(Zeroizing::new(self.master_key), 0);
                 let token = OAuthToken::from_trusted_bytes(token_bytes.clone());
-                let connection = ConnectionId::from_service_shim(service);
-                match vault.seal(connection, Slot::Access, &token) {
+                match vault.seal(id, slot, &token) {
                     Ok(sealed) => Ok(Some(sealed)),
-                    Err(_) => panic!("mock seal failed for {service}"),
+                    Err(_) => panic!("mock seal failed for {id:?}/{slot:?}"),
                 }
             }
             None => Ok(None),
         }
     }
-    async fn list_services(&self) -> Result<Vec<String>, StoreError> {
-        Ok(self.services.keys().cloned().collect())
+    async fn list_connections(&self) -> Result<Vec<ConnectionId>, StoreError> {
+        Ok(self
+            .services
+            .keys()
+            .map(|(id_bytes, _slot)| ConnectionId::from_bytes(*id_bytes))
+            .collect())
     }
 }
 

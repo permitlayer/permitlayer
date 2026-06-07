@@ -1008,6 +1008,218 @@ pub fn path_str(p: &Path) -> &str {
     p.to_str().expect("tempdir paths are always UTF-8 in tests")
 }
 
+/// Story 11.9 test-side `service` string → `(ConnectionId, Slot)` shim.
+///
+/// Byte-identical to the daemon's private `conn_shim` (and the proxy's),
+/// so credentials sealed/stored by these helpers round-trip with the
+/// production paths. Integration tests can't reach the binary crate's
+/// private `crate::conn_shim`, so the small derivation is replicated
+/// here. Deleted by the Story 11.16 sweep once 11.10/11.12 land.
+#[allow(dead_code)]
+pub fn connection_id_for_service(service: &str) -> permitlayer_credential::ConnectionId {
+    use sha2::{Digest, Sha256};
+    const SHIM_DOMAIN: &[u8] = b"permitlayer-connectionid-shim-v1:";
+    let mut hasher = Sha256::new();
+    hasher.update(SHIM_DOMAIN);
+    hasher.update(service.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    permitlayer_credential::ConnectionId::from_bytes(bytes)
+}
+
+/// Byte-identical to the daemon's `conn_shim::connection_slot_for_service_key`.
+#[allow(dead_code)]
+pub fn connection_slot_for_service_key(
+    service_key: &str,
+) -> (permitlayer_credential::ConnectionId, permitlayer_credential::Slot) {
+    use permitlayer_credential::Slot;
+    let (base, slot) = if let Some(b) = service_key.strip_suffix("-refresh") {
+        (b, Slot::Refresh)
+    } else if let Some(b) = service_key.strip_suffix("-client") {
+        (b, Slot::Client)
+    } else {
+        (service_key, Slot::Access)
+    };
+    (connection_id_for_service(base), slot)
+}
+
+/// Test-harness tier selector for [`seed_connection_and_binding`].
+#[allow(dead_code)]
+#[derive(Clone, Copy)]
+pub enum SeedTier {
+    Read,
+    ReadWrite,
+}
+
+/// Seed the Story 11.10 request-time authority model into a running
+/// daemon's `home` dir: a [`ConnectionRecord`] + a [`Binding`] for
+/// `agent`, and (optionally) a sealed access credential keyed by the
+/// connection's real ULID.
+///
+/// The daemon reads `connections/`, `bindings/`, and the vault live
+/// (per-request fs reads + ArcSwap), so callers seed AFTER `agent
+/// register` and BEFORE the `/mcp/...` (or `/v1/tools/...`) request.
+///
+/// - `name` is the connection's selector (the first segment after
+///   `/mcp/` or `/v1/tools/`); the proxy's `binding_resolve` matches
+///   alias → connection name → id text, so set `name` to the selector
+///   the test hits (e.g. `"gmail"`).
+/// - `granted_scopes` must hold FULL OAuth URIs (the connection's
+///   actual grant); the tier→short-name bundle comes from the connector
+///   def. For a request whose `x-agentsso-scope` short name must pass
+///   the service's `tier ∩ granted_scopes` gate, the tier bundle must
+///   contain the short name AND `granted_scopes` must contain its URI.
+/// - `policy` is the binding's optional policy name, stamped into
+///   `AgentPolicyBinding` by `AuthService` and evaluated by
+///   `PolicyLayer` (incl. `Decision::Prompt` → approval).
+/// - `master_key_hex` is the daemon's `AGENTSSO_TEST_MASTER_KEY_HEX`;
+///   when `seal_access` is `Some(bytes)`, an access token is sealed
+///   under `(id, Slot::Access)` at `key_id=0` (fresh-install posture) so
+///   the daemon can unseal on a dispatch-reaching request. Paths that
+///   deny at PolicyLayer (e.g. approval-deny/timeout) never reach
+///   unseal, so they may pass `None`.
+///
+/// Returns the minted [`ConnectionId`] so callers can assert on it.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub fn seed_connection_and_binding(
+    home: &Path,
+    agent: &str,
+    connector_id: &str,
+    name: &str,
+    tier: SeedTier,
+    granted_scopes: &[&str],
+    policy: Option<&str>,
+    alias: Option<&str>,
+    master_key_hex: &str,
+    seal_access: Option<&[u8]>,
+) -> permitlayer_credential::ConnectionId {
+    use permitlayer_core::store::connection::{ConnectionRecord, ConnectionStatus, ConnectionTier};
+    use permitlayer_core::store::fs::{BindingFsStore, ConnectionFsStore, CredentialFsStore};
+    use permitlayer_core::store::{BindingStore, ConnectionStore, CredentialStore};
+    use permitlayer_credential::{ConnectionId, OAuthToken, Slot};
+
+    let id = ConnectionId::generate();
+    let core_tier = match tier {
+        SeedTier::Read => ConnectionTier::Read,
+        SeedTier::ReadWrite => ConnectionTier::ReadWrite,
+    };
+
+    let record = ConnectionRecord {
+        id,
+        connector_id: connector_id.to_owned(),
+        name: name.to_owned(),
+        account_hint: None,
+        granted_scopes: granted_scopes.iter().map(|s| (*s).to_owned()).collect(),
+        tier: core_tier,
+        created_at: chrono::Utc::now(),
+        status: ConnectionStatus::Active,
+    };
+    let binding = permitlayer_core::store::binding::Binding {
+        connection_id: id,
+        tier: core_tier,
+        policy: policy.map(str::to_owned),
+        alias: alias.map(str::to_owned),
+    };
+
+    // The fs stores are async; drive them on a private current-thread
+    // runtime so the sync `#[test]` body can call this helper directly.
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current-thread runtime for seeding");
+    rt.block_on(async {
+        let conn_store = ConnectionFsStore::new(home.to_path_buf()).expect("connection store");
+        conn_store.put(record).await.expect("write connection record");
+
+        let bind_store = BindingFsStore::new(home.to_path_buf()).expect("binding store");
+        bind_store.put_binding(agent, binding).await.expect("write binding");
+
+        if let Some(token_bytes) = seal_access {
+            let mut key = [0u8; permitlayer_keystore::MASTER_KEY_LEN];
+            let decoded = decode_master_key_hex(master_key_hex);
+            key.copy_from_slice(&decoded);
+            // Fresh-install posture: the daemon computes `active_key_id`
+            // from the vault scan, which is 0 when no other sealed file
+            // exists. Seal at key_id=0 so the daemon's vault unseals it.
+            let vault = permitlayer_vault::Vault::new(zeroize::Zeroizing::new(key), 0);
+            let token = OAuthToken::from_trusted_bytes(token_bytes.to_vec());
+            let sealed = vault.seal(id, Slot::Access, &token).expect("seal access token");
+            let cred_store = CredentialFsStore::new(home.to_path_buf()).expect("credential store");
+            cred_store.put(id, Slot::Access, sealed).await.expect("put sealed access");
+        }
+    });
+
+    id
+}
+
+/// Like [`seed_connection_and_binding`] but writes the connection +
+/// binding under a caller-supplied [`ConnectionId`] and never seals a
+/// credential. Used when the credential is sealed separately via the
+/// control-plane seal endpoint (which keys by the `conn_shim` id), so
+/// the seeded connection's id must match that derivation for dispatch
+/// to find the sealed credential.
+#[allow(dead_code)]
+#[allow(clippy::too_many_arguments)]
+pub fn seed_connection_and_binding_with_id(
+    home: &Path,
+    agent: &str,
+    id: permitlayer_credential::ConnectionId,
+    connector_id: &str,
+    name: &str,
+    tier: SeedTier,
+    granted_scopes: &[&str],
+    policy: Option<&str>,
+    alias: Option<&str>,
+) {
+    use permitlayer_core::store::connection::{ConnectionRecord, ConnectionStatus, ConnectionTier};
+    use permitlayer_core::store::fs::{BindingFsStore, ConnectionFsStore};
+    use permitlayer_core::store::{BindingStore, ConnectionStore};
+
+    let core_tier = match tier {
+        SeedTier::Read => ConnectionTier::Read,
+        SeedTier::ReadWrite => ConnectionTier::ReadWrite,
+    };
+    let record = ConnectionRecord {
+        id,
+        connector_id: connector_id.to_owned(),
+        name: name.to_owned(),
+        account_hint: None,
+        granted_scopes: granted_scopes.iter().map(|s| (*s).to_owned()).collect(),
+        tier: core_tier,
+        created_at: chrono::Utc::now(),
+        status: ConnectionStatus::Active,
+    };
+    let binding = permitlayer_core::store::binding::Binding {
+        connection_id: id,
+        tier: core_tier,
+        policy: policy.map(str::to_owned),
+        alias: alias.map(str::to_owned),
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("build current-thread runtime for seeding");
+    rt.block_on(async {
+        let conn_store = ConnectionFsStore::new(home.to_path_buf()).expect("connection store");
+        conn_store.put(record).await.expect("write connection record");
+        let bind_store = BindingFsStore::new(home.to_path_buf()).expect("binding store");
+        bind_store.put_binding(agent, binding).await.expect("write binding");
+    });
+}
+
+/// Decode a 64-char hex master key into 32 bytes. Panics on malformed
+/// input — acceptable for a test helper.
+#[allow(dead_code)]
+fn decode_master_key_hex(hex: &str) -> Vec<u8> {
+    assert_eq!(hex.len(), 64, "master key hex must be 64 chars");
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("valid hex byte"))
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

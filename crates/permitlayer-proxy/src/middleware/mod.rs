@@ -144,6 +144,14 @@ pub fn assemble_middleware(
     agent_registry: Arc<permitlayer_core::agent::AgentRegistry>,
     agent_lookup_key: Arc<zeroize::Zeroizing<[u8; permitlayer_core::agent::LOOKUP_KEY_BYTES]>>,
     agent_store: Option<Arc<dyn permitlayer_core::store::AgentIdentityStore>>,
+    // Story 11.10: optional binding + connection stores threaded into
+    // `AuthLayer` so it can resolve the request's binding and stamp the
+    // binding's `policy` into `AgentPolicyBinding` — making the policy
+    // visible to `PolicyLayer` + the approval engine (both run before the
+    // proxy service). `None` in legacy/unit setups (auth stamps an empty
+    // policy and `handle_inner` owns the authoritative deny).
+    binding_store: Option<Arc<dyn permitlayer_core::store::BindingStore>>,
+    connection_store: Option<Arc<dyn permitlayer_core::store::ConnectionStore>>,
     approval_service: Arc<dyn ApprovalService>,
     // Story 8.7 AC #2: approval timeout is now an atomic (seconds)
     // shared with the SIGHUP / `POST /v1/control/reload` paths. Each
@@ -177,6 +185,8 @@ pub fn assemble_middleware(
             agent_registry,
             agent_lookup_key,
             agent_store,
+            binding_store,
+            connection_store,
             Arc::clone(&audit_dispatcher),
         ))
         .layer(AgentIdentityLayer::new())
@@ -383,7 +393,9 @@ approval-mode = "auto"
             Arc::new(permitlayer_core::audit::dispatcher::AuditDispatcher::none()),
             agent_registry,
             agent_lookup_key,
-            None,
+            None, // agent_store
+            None, // binding_store (Story 11.10)
+            None, // connection_store (Story 11.10)
             approval_service,
             Arc::new(AtomicU64::new(30)),
             conn_tracker,

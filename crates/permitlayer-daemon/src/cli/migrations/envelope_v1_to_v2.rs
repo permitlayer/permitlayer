@@ -468,7 +468,7 @@ mod tests {
         let key = [0x42u8; 32];
         let vault = Vault::new(Zeroizing::new(key), 0);
         let token = OAuthToken::from_trusted_bytes(format!("token-for-{service}").into_bytes());
-        let (conn, slot) = permitlayer_credential::connection_slot_from_service_key(service);
+        let (conn, slot) = crate::conn_shim::connection_slot_for_service_key(service);
         let sealed = vault.seal(conn, slot, &token).unwrap();
         let v2 = encode_envelope(&sealed);
         // v2 → v1 splice: drop the key_id byte at offset 3 and bump
@@ -736,8 +736,7 @@ mod tests {
         let key = [0x42u8; 32];
         let vault = Vault::new(Zeroizing::new(key), 0);
         let token = OAuthToken::from_trusted_bytes(b"hello-from-v1".to_vec());
-        let (gmail_conn, gmail_slot) =
-            permitlayer_credential::connection_slot_from_service_key("gmail");
+        let (gmail_conn, gmail_slot) = crate::conn_shim::connection_slot_for_service_key("gmail");
         let sealed = vault.seal(gmail_conn, gmail_slot, &token).unwrap();
 
         // Re-emit the sealed envelope as v1 bytes (no key_id byte).
@@ -754,16 +753,16 @@ mod tests {
         // same key.
         let migrated = std::fs::read(tmp.path().join("vault/gmail.sealed")).unwrap();
         assert_eq!(u16::from_le_bytes([migrated[0], migrated[1]]), 2);
-        let store_home = tmp.path().to_path_buf();
-        let rt = tokio::runtime::Runtime::new().unwrap();
-        rt.block_on(async {
-            let store = permitlayer_core::store::fs::CredentialFsStore::new(store_home).unwrap();
-            use permitlayer_core::store::CredentialStore as _;
-            let got = store.get("gmail").await.unwrap().expect("post-migration credential present");
-            assert_eq!(got.version(), 2);
-            assert_eq!(got.key_id(), 0);
-            let recovered = vault.unseal(gmail_conn, gmail_slot, &got).unwrap();
-            assert_eq!(recovered.reveal(), b"hello-from-v1");
-        });
+        // Story 11.9: the envelope-format migration rewrites files in
+        // place under their existing names (`gmail.sealed`), so decode
+        // the migrated bytes directly rather than through the re-keyed
+        // `CredentialStore` (which now keys on `(ConnectionId, Slot)` →
+        // `<ulid>-<slot>.sealed`).
+        let got = permitlayer_core::store::fs::credential_fs::decode_envelope(&migrated)
+            .expect("post-migration envelope decodes");
+        assert_eq!(got.version(), 2);
+        assert_eq!(got.key_id(), 0);
+        let recovered = vault.unseal(gmail_conn, gmail_slot, &got).unwrap();
+        assert_eq!(recovered.reveal(), b"hello-from-v1");
     }
 }

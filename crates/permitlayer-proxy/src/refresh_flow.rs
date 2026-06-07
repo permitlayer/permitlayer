@@ -357,12 +357,18 @@ pub async fn refresh_service(
     credential_store: &Arc<dyn CredentialStore>,
     vault_dir: &Path,
     service: &str,
+    connection: ConnectionId,
     oauth_client_resolver: &OAuthClientResolver<'_>,
 ) -> Result<RefreshOutcome, RefreshFlowError> {
-    let refresh_service_key = format!("{service}-refresh");
+    // The vault + store key on `(ConnectionId, Slot)` (Story 11.8/11.9): the
+    // refresh token seals/unseals and stores under `connection` +
+    // `Slot::Refresh`; the access token under `connection` + `Slot::Access`.
+    // Story 11.10: `connection` is the real binding-resolved id passed in by
+    // the caller (`ProxyService::handle_inner` / the CLI refresh path), no
+    // longer derived from the service string.
 
     // Step 1: Fetch the sealed refresh credential.
-    let sealed_refresh = match credential_store.get(&refresh_service_key).await {
+    let sealed_refresh = match credential_store.get(connection, Slot::Refresh).await {
         Ok(Some(sealed)) => sealed,
         Ok(None) => {
             warn!(
@@ -378,11 +384,6 @@ pub async fn refresh_service(
             });
         }
     };
-
-    // The vault keys on `(ConnectionId, Slot)` (Story 11.8): the refresh
-    // token seals/unseals under the BASE connection + `Slot::Refresh`. The
-    // store key (`refresh_service_key`) stays the original service string.
-    let connection = ConnectionId::from_service_shim(service);
 
     // Step 2: Unseal the refresh token. Synchronous crypto → spawn_blocking.
     let vault_for_unseal = Arc::clone(vault);
@@ -496,7 +497,7 @@ pub async fn refresh_service(
             }
         };
 
-        if let Err(e) = credential_store.put(&refresh_service_key, sealed_new_refresh).await {
+        if let Err(e) = credential_store.put(connection, Slot::Refresh, sealed_new_refresh).await {
             return Err(RefreshFlowError::PersistenceFailed {
                 service: service.to_owned(),
                 stage: PersistStage::RefreshTokenStore,
@@ -531,7 +532,7 @@ pub async fn refresh_service(
         }
     };
 
-    if let Err(e) = credential_store.put(service, sealed_new_access).await {
+    if let Err(e) = credential_store.put(connection, Slot::Access, sealed_new_access).await {
         return Err(RefreshFlowError::PersistenceFailed {
             service: service.to_owned(),
             stage: PersistStage::AccessTokenStore,

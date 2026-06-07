@@ -315,10 +315,20 @@ mod tests {
         Vault::new(Zeroizing::new(TEST_MASTER_KEY), 0)
     }
 
-    /// A connection id for tests, derived from a label so different tests
-    /// get distinct ids without hand-writing 16-byte arrays.
+    /// A connection id for tests, derived deterministically from a label
+    /// so different tests get distinct ids without hand-writing 16-byte
+    /// arrays. (FNV-1a over the label, spread across all 16 bytes — no
+    /// crypto needed; the vault keys on the bytes, not their provenance.)
     fn cid(label: &str) -> ConnectionId {
-        ConnectionId::from_service_shim(label)
+        let mut bytes = [0u8; 16];
+        let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in label.as_bytes() {
+            hash ^= u64::from(b);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        bytes[..8].copy_from_slice(&hash.to_le_bytes());
+        bytes[8..].copy_from_slice(&hash.rotate_left(32).to_be_bytes());
+        ConnectionId::from_bytes(bytes)
     }
 
     // `OAuthToken` / `SealedCredential` are non-`Debug` (credential

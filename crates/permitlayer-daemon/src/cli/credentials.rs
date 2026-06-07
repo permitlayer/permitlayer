@@ -688,9 +688,19 @@ async fn refresh_credentials(args: RefreshArgs) -> anyhow::Result<()> {
     // could reuse it. Every outcome below — success, skipped, all
     // RefreshFlowError variants — emits a token-refresh audit event
     // with the same context, matching the proxy path's audit shape.
-    let flow_result =
-        refresh_flow::refresh_service(&vault, &credential_store, &vault_dir, &service, &resolver)
-            .await;
+    // Story 11.10: `refresh_service` takes the connection id explicitly.
+    // The CLI escape-hatch path still derives it from the service string via
+    // the local `conn_shim` (byte-identical to the proxy's former shim).
+    let refresh_connection = crate::conn_shim::connection_id_for_service(&service);
+    let flow_result = refresh_flow::refresh_service(
+        &vault,
+        &credential_store,
+        &vault_dir,
+        &service,
+        refresh_connection,
+        &resolver,
+    )
+    .await;
 
     // Emit the corresponding audit event and render output. The
     // `emit_cli_token_refresh_audit` helper below encapsulates the
@@ -895,7 +905,7 @@ pub(crate) fn build_oauth_client_for_cli(
             // `{service}-client` store key stays as-is; the vault unseal
             // derives the base connection + `Slot::Client` from it.
             let (client_connection, client_slot) =
-                permitlayer_credential::connection_slot_from_service_key(&client_service);
+                crate::conn_shim::connection_slot_for_service_key(&client_service);
             let token = vault.unseal(client_connection, client_slot, &sealed).map_err(|e| {
                 format!("could not unseal OAuth client bundle for service '{service}': {e}")
             })?;
@@ -1260,8 +1270,7 @@ mod tests {
         .to_string();
         let token = permitlayer_credential::OAuthToken::from_trusted_bytes(bundle.into_bytes());
         let client_service = format!("{service}-client");
-        let (connection, slot) =
-            permitlayer_credential::connection_slot_from_service_key(&client_service);
+        let (connection, slot) = crate::conn_shim::connection_slot_for_service_key(&client_service);
         let sealed = cr_test_vault().seal(connection, slot, &token).unwrap();
         let bytes = permitlayer_core::store::fs::credential_fs::encode_envelope(&sealed);
         std::fs::write(vault_dir.join(format!("{service}-client.sealed")), bytes).unwrap();
@@ -1349,10 +1358,10 @@ mod tests {
         // original cross-namespace isolation semantics: `gmail-client`
         // → `(gmail, Client)`, `gmail` → `(gmail, Access)`,
         // `gmail-refresh` → `(gmail, Refresh)`.
-        use permitlayer_credential::connection_slot_from_service_key;
-        let (client_conn, client_slot) = connection_slot_from_service_key("gmail-client");
-        let (access_conn, access_slot) = connection_slot_from_service_key("gmail");
-        let (refresh_conn, refresh_slot) = connection_slot_from_service_key("gmail-refresh");
+        use crate::conn_shim::connection_slot_for_service_key;
+        let (client_conn, client_slot) = connection_slot_for_service_key("gmail-client");
+        let (access_conn, access_slot) = connection_slot_for_service_key("gmail");
+        let (refresh_conn, refresh_slot) = connection_slot_for_service_key("gmail-refresh");
         let sealed = vault.seal(client_conn, client_slot, &token).unwrap();
 
         // Same vault, wrong slot → AEAD/AAD mismatch → error.

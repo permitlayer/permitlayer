@@ -10,6 +10,35 @@
 //! added the `ArcSwap`-based hot-swap on SIGHUP/reload. This layer
 //! holds the `Arc<ArcSwap<PolicySet>>` handle and evaluates every
 //! request against the current snapshot.
+//!
+//! ## Story 11.10 — authority moved to bindings; design choice
+//!
+//! Story 11.9 deleted `AgentIdentity.policy_name`. An agent's authority
+//! is now its *set of bindings* (`(agent, connection)` grants at a tier,
+//! with an optional per-binding policy), resolved at request time by
+//! `ProxyService::handle_inner` along the chain bearer → agent → binding
+//! → connection. That resolver owns the real default-deny authz:
+//!   - no matching binding → `binding.not_found` (403)
+//!   - tool's required scope ∉ connector tier bundle → `tier.denied` (403)
+//!   - required scope ∉ connection `granted_scopes` → `scope.not_granted` (403)
+//!   - optional `binding.policy` → evaluated against the active `PolicySet`
+//!     INSIDE `handle_inner` (so it sees the resolved binding, which the
+//!     middleware stack — running BEFORE the service — cannot).
+//!
+//! Because `handle_inner` now fully owns binding/tier/scope/policy authz,
+//! `AuthLayer` stamps an EMPTY `AgentPolicyBinding` after a successful
+//! bearer-token validation. `PolicyLayer` therefore treats:
+//!   - `AgentPolicyBinding` ABSENT → still `default-deny-no-agent-binding`
+//!     (no AuthLayer ran ⇒ no authenticated identity; fail closed),
+//!   - `AgentPolicyBinding` EMPTY → PASS-THROUGH (authenticated; authz is
+//!     downstream in `handle_inner`),
+//!   - `AgentPolicyBinding` NON-EMPTY → evaluate the named policy as before
+//!     (legacy/explicit callers + this crate's policy-engine unit tests).
+//!
+//! `PolicyLayer` is thus retained on the path — it keeps the fail-closed
+//! no-identity deny and the named-policy evaluation contract intact — but
+//! for the normal binding-driven request it is a pass-through, and the
+//! authoritative decision is made in `handle_inner`.
 
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
@@ -346,8 +375,33 @@ where
         // 4. Resolve which policy applies to this agent. Story 4.4
         //    reads the AgentPolicyBinding extension stamped by
         //    AuthLayer; the pre-Story-4.4 single-policy heuristic is
-        //    gone. Missing binding → default-deny.
+        //    gone.
+        //
+        //    Story 11.10 design choice (see module note below):
+        //    - extension ABSENT (`None`) → the request never passed
+        //      through AuthLayer (a raw unit-test harness, or a routing
+        //      bug). Keep the fail-closed `default-deny-no-agent-binding`
+        //      posture — there is no authenticated identity to authorize.
+        //    - extension PRESENT but EMPTY (`Some("")`) → AuthLayer ran
+        //      and authenticated the agent, but the per-request policy
+        //      authority now lives in the agent's *binding*, which is
+        //      resolved downstream in `ProxyService::handle_inner`
+        //      (bearer → agent → binding → connection), together with the
+        //      tier ∩ granted-scopes gate and the optional `binding.policy`
+        //      evaluation. So an empty binding string here is NOT a denial
+        //      basis — PolicyLayer passes through and lets handle_inner own
+        //      authz (default-deny still holds there: a missing binding ⇒
+        //      `binding.not_found` 403).
+        //    - extension PRESENT and NON-EMPTY (`Some("policy-x")`) → a
+        //      real policy name was stamped (legacy/explicit path); run
+        //      the policy engine exactly as before.
         let policy_name = match resolve_policy_name(&req) {
+            Some(name) if name.is_empty() => {
+                // Authenticated agent, authority deferred to binding
+                // resolution in handle_inner. Pass through.
+                let fut = self.inner.call(req);
+                return Box::pin(fut);
+            }
             Some(name) => name,
             None => {
                 // No policy binding — deny with informative error.

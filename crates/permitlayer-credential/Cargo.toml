@@ -12,10 +12,10 @@ description = "Sealed credential types for permitlayer. Non-Debug, ZeroizeOnDrop
 zeroize.workspace = true
 thiserror.workspace = true
 static_assertions.workspace = true
-# Story 11.8: deterministic ConnectionId::from_service_shim (a 11.8→11.9
-# bridge). Third-party only — the leaf-crate rule forbids permitlayer-* deps,
-# not crates.io crates.
-sha2.workspace = true
+# Story 11.9: ConnectionId::generate() draws 16 random bytes from OsRng to
+# mint a fresh per-connection ULID. Third-party only — the leaf-crate rule
+# forbids permitlayer-* deps, not crates.io crates.
+rand.workspace = true
 
 [dev-dependencies]
 # serde is used ONLY to name `serde::Serialize`/`serde::de::DeserializeOwned`

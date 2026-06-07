@@ -64,11 +64,12 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use permitlayer_credential::{MAX_PLAINTEXT_LEN, SEALED_CREDENTIAL_VERSION, SealedCredential};
+use permitlayer_credential::{
+    ConnectionId, MAX_PLAINTEXT_LEN, SEALED_CREDENTIAL_VERSION, SealedCredential, Slot,
+};
 
 use crate::store::CredentialStore;
 use crate::store::error::{EnvelopeParseError, StoreError};
-use crate::store::validate::validate_service_name;
 use crate::vault::lock::{VaultLock, VaultLockError};
 
 /// Fixed-size prefix of the v1 envelope: version (2) + nonce_len (1) +
@@ -146,11 +147,18 @@ impl CredentialFsStore {
         Ok(Self { home, io })
     }
 
-    fn target_path(&self, service: &str) -> PathBuf {
-        self.home.join("vault").join(format!("{service}.sealed"))
+    /// On-disk stem for a `(connection, slot)` credential:
+    /// `<26-char-ULID>-<slot-label>` (e.g. `01J...-access`). Both
+    /// components are machine-generated and path-safe.
+    fn stem(id: ConnectionId, slot: Slot) -> String {
+        format!("{id}-{}", slot.label())
     }
 
-    fn tempfile_path(&self, service: &str) -> PathBuf {
+    fn target_path(&self, id: ConnectionId, slot: Slot) -> PathBuf {
+        self.home.join("vault").join(format!("{}.sealed", Self::stem(id, slot)))
+    }
+
+    fn tempfile_path(&self, id: ConnectionId, slot: Slot) -> PathBuf {
         let pid = std::process::id();
         let counter = TEMPFILE_COUNTER.fetch_add(1, Ordering::Relaxed);
         // Random suffix prevents PID-reuse collisions: if a previous
@@ -165,14 +173,24 @@ impl CredentialFsStore {
             rand::rngs::OsRng.fill_bytes(&mut buf);
             u64::from_le_bytes(buf)
         };
-        self.home.join("vault").join(format!("{service}.sealed.tmp.{pid}.{counter}.{rand:016x}"))
+        self.home
+            .join("vault")
+            .join(format!("{}.sealed.tmp.{pid}.{counter}.{rand:016x}", Self::stem(id, slot)))
     }
 }
 
 #[async_trait]
 impl CredentialStore for CredentialFsStore {
-    async fn put(&self, service: &str, sealed: SealedCredential) -> Result<(), StoreError> {
-        validate_service_name(service)?;
+    async fn put(
+        &self,
+        id: ConnectionId,
+        slot: Slot,
+        sealed: SealedCredential,
+    ) -> Result<(), StoreError> {
+        // The key is typed `(ConnectionId, Slot)` — the filename derives
+        // from the machine-generated ULID + fixed slot label, so there is
+        // no caller-supplied string to validate against a path-traversal
+        // allowlist (Story 11.9).
 
         // Reject envelopes with an unsupported version before writing to
         // disk — prevents write-only poison (a stale envelope from a prior
@@ -191,8 +209,8 @@ impl CredentialStore for CredentialFsStore {
         let buffer = encode_envelope(&sealed);
         drop(sealed); // zeroize ciphertext/nonce/aad promptly
 
-        let target = self.target_path(service);
-        let tmp = self.tempfile_path(service);
+        let target = self.target_path(id, slot);
+        let tmp = self.tempfile_path(id, slot);
         let vault_dir = self.home.join("vault");
         // Story 7.6a AC #2: acquire the vault-level advisory lock for
         // the duration of the atomic write. The lock and the I/O
@@ -225,9 +243,12 @@ impl CredentialStore for CredentialFsStore {
         Ok(())
     }
 
-    async fn get(&self, service: &str) -> Result<Option<SealedCredential>, StoreError> {
-        validate_service_name(service)?;
-        let path = self.target_path(service);
+    async fn get(
+        &self,
+        id: ConnectionId,
+        slot: Slot,
+    ) -> Result<Option<SealedCredential>, StoreError> {
+        let path = self.target_path(id, slot);
         tokio::task::spawn_blocking(move || -> Result<Option<SealedCredential>, StoreError> {
             let bytes = match std::fs::read(&path) {
                 Ok(b) => b,
@@ -240,9 +261,13 @@ impl CredentialStore for CredentialFsStore {
         .await?
     }
 
-    async fn list_services(&self) -> Result<Vec<String>, StoreError> {
+    async fn list_connections(&self) -> Result<Vec<ConnectionId>, StoreError> {
         let vault_dir = self.home.join("vault");
-        tokio::task::spawn_blocking(move || -> Result<Vec<String>, StoreError> {
+        tokio::task::spawn_blocking(move || -> Result<Vec<ConnectionId>, StoreError> {
+            // Dedupe across slots: the three slots of one connection share
+            // a single ULID, so a connection with access+refresh+client
+            // appears once.
+            let mut seen = std::collections::BTreeSet::<[u8; 16]>::new();
             let mut out = Vec::new();
             let read_dir = match std::fs::read_dir(&vault_dir) {
                 Ok(rd) => rd,
@@ -268,9 +293,9 @@ impl CredentialStore for CredentialFsStore {
                 };
                 let path = entry.path();
                 let Some(file_name) = path.file_name().and_then(|n| n.to_str()) else {
-                    // Non-UTF-8 filename — skip silently. Vault writes
-                    // only ASCII-safe names through `validate_service_name`,
-                    // so this only fires on operator-edited dirs.
+                    // Non-UTF-8 filename — skip silently. The vault writes
+                    // only ASCII-safe `<ulid>-<slot>.sealed` names, so
+                    // this only fires on operator-edited dirs.
                     continue;
                 };
                 // Skip dotfiles, editor lockfiles, tempfiles, the
@@ -307,14 +332,33 @@ impl CredentialStore for CredentialFsStore {
                     );
                     continue;
                 }
-                if validate_service_name(stem).is_err() {
+                // Stem is `<26-char-ULID>-<slot>`. Split on the LAST
+                // hyphen so the ULID prefix and slot label parse
+                // independently; skip-and-warn on either failure.
+                let Some((id_part, slot_part)) = stem.rsplit_once('-') else {
                     tracing::warn!(
                         path = %path.display(),
-                        "skipping vault entry with invalid service name in stem"
+                        "skipping vault entry with no '<ulid>-<slot>' stem shape"
+                    );
+                    continue;
+                };
+                if Slot::from_label(slot_part).is_none() {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "skipping vault entry with unknown slot label"
                     );
                     continue;
                 }
-                out.push(stem.to_owned());
+                let Some(conn_id) = ConnectionId::from_ulid_str(id_part) else {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "skipping vault entry with non-ULID connection id in stem"
+                    );
+                    continue;
+                };
+                if seen.insert(*conn_id.as_bytes()) {
+                    out.push(conn_id);
+                }
             }
             Ok(out)
         })
@@ -836,8 +880,8 @@ mod tests {
     // Build a fake `SealedCredential` with deterministic fields. The
     // ciphertext doesn't need to be unsealable — the store only cares
     // that the envelope round-trips byte-for-byte.
-    fn fake_sealed(service: &str, ct_filler: u8) -> SealedCredential {
-        let aad: Vec<u8> = [b"test-envelope-aad:", service.as_bytes()].concat();
+    fn fake_sealed(label: &str, ct_filler: u8) -> SealedCredential {
+        let aad: Vec<u8> = [b"test-envelope-aad:", label.as_bytes()].concat();
         let ciphertext = vec![ct_filler; 48]; // 32 bytes plaintext + 16-byte tag
         let nonce = [0x11u8; 12];
         // Story 7.6a: `key_id = 0` for the single-key world.
@@ -848,6 +892,11 @@ mod tests {
             SEALED_CREDENTIAL_VERSION,
             permitlayer_credential::KeyId::ZERO,
         )
+    }
+
+    // A stable connection id for tests that need a fixed key.
+    fn test_id() -> ConnectionId {
+        ConnectionId::from_bytes([0x42; 16])
     }
 
     fn new_store(tmp: &TempDir) -> CredentialFsStore {
@@ -886,12 +935,13 @@ mod tests {
     async fn round_trip_put_get() {
         let tmp = TempDir::new().unwrap();
         let store = new_store(&tmp);
-        let sealed = fake_sealed("gmail", 0xAB);
+        let id = test_id();
+        let sealed = fake_sealed("access", 0xAB);
         let expected_ct = sealed.ciphertext().to_vec();
         let expected_aad = sealed.aad().to_vec();
         let expected_nonce = *sealed.nonce();
-        store.put("gmail", sealed).await.unwrap();
-        let got = store.get("gmail").await.unwrap();
+        store.put(id, Slot::Access, sealed).await.unwrap();
+        let got = store.get(id, Slot::Access).await.unwrap();
         let got = match got {
             Some(s) => s,
             None => panic!("expected Some after put"),
@@ -903,34 +953,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slots_under_one_id_are_independent() {
+        // The three slots of one connection are distinct files; reading
+        // a slot that was never written returns None even when sibling
+        // slots exist.
+        let tmp = TempDir::new().unwrap();
+        let store = new_store(&tmp);
+        let id = test_id();
+        store.put(id, Slot::Access, fake_sealed("access", 0xA1)).await.unwrap();
+        store.put(id, Slot::Refresh, fake_sealed("refresh", 0xB2)).await.unwrap();
+        assert_eq!(
+            store.get(id, Slot::Access).await.unwrap().expect("present").ciphertext()[0],
+            0xA1
+        );
+        assert_eq!(
+            store.get(id, Slot::Refresh).await.unwrap().expect("present").ciphertext()[0],
+            0xB2
+        );
+        assert!(store.get(id, Slot::Client).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
     async fn get_missing_returns_none() {
         let tmp = TempDir::new().unwrap();
         let store = new_store(&tmp);
-        assert!(store.get("gmail").await.unwrap().is_none());
+        assert!(store.get(test_id(), Slot::Access).await.unwrap().is_none());
     }
 
     #[tokio::test]
     async fn put_overwrites_existing() {
         let tmp = TempDir::new().unwrap();
         let store = new_store(&tmp);
-        store.put("gmail", fake_sealed("gmail", 0xAA)).await.unwrap();
-        store.put("gmail", fake_sealed("gmail", 0xBB)).await.unwrap();
-        let got = store.get("gmail").await.unwrap().expect("present");
+        let id = test_id();
+        store.put(id, Slot::Access, fake_sealed("access", 0xAA)).await.unwrap();
+        store.put(id, Slot::Access, fake_sealed("access", 0xBB)).await.unwrap();
+        let got = store.get(id, Slot::Access).await.unwrap().expect("present");
         assert_eq!(got.ciphertext()[0], 0xBB);
-    }
-
-    #[tokio::test]
-    async fn invalid_service_name_rejected_before_io() {
-        let tmp = TempDir::new().unwrap();
-        let store = new_store(&tmp);
-        let err = store.put("Bad/Name", fake_sealed("gmail", 0x00)).await.unwrap_err();
-        assert!(matches!(err, StoreError::InvalidServiceName { .. }));
-        // No tempfile should exist.
-        let entries: Vec<_> = std::fs::read_dir(tmp.path().join("vault"))
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert!(entries.is_empty(), "no files should be created: {entries:?}");
     }
 
     #[cfg(unix)]
@@ -939,10 +997,10 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
         let tmp = TempDir::new().unwrap();
         let store = new_store(&tmp);
-        store.put("gmail", fake_sealed("gmail", 0xAA)).await.unwrap();
-        let mode =
-            std::fs::metadata(tmp.path().join("vault/gmail.sealed")).unwrap().permissions().mode()
-                & 0o777;
+        let id = test_id();
+        store.put(id, Slot::Access, fake_sealed("access", 0xAA)).await.unwrap();
+        let path = tmp.path().join(format!("vault/{id}-access.sealed"));
+        let mode = std::fs::metadata(path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
     }
 
@@ -961,12 +1019,13 @@ mod tests {
     async fn truncated_file_returns_corrupt_envelope() {
         let tmp = TempDir::new().unwrap();
         let store = new_store(&tmp);
-        store.put("gmail", fake_sealed("gmail", 0xAA)).await.unwrap();
-        let target = tmp.path().join("vault/gmail.sealed");
+        let id = test_id();
+        store.put(id, Slot::Access, fake_sealed("access", 0xAA)).await.unwrap();
+        let target = tmp.path().join(format!("vault/{id}-access.sealed"));
         // Truncate to mid-header (10 bytes).
         let bytes = std::fs::read(&target).unwrap();
         std::fs::write(&target, &bytes[..10]).unwrap();
-        let err = get_err(store.get("gmail").await);
+        let err = get_err(store.get(id, Slot::Access).await);
         assert!(matches!(err, StoreError::CorruptEnvelope { .. }));
     }
 
@@ -974,12 +1033,13 @@ mod tests {
     async fn file_with_trailing_garbage_returns_corrupt_envelope() {
         let tmp = TempDir::new().unwrap();
         let store = new_store(&tmp);
-        store.put("gmail", fake_sealed("gmail", 0xAA)).await.unwrap();
-        let target = tmp.path().join("vault/gmail.sealed");
+        let id = test_id();
+        store.put(id, Slot::Access, fake_sealed("access", 0xAA)).await.unwrap();
+        let target = tmp.path().join(format!("vault/{id}-access.sealed"));
         let mut bytes = std::fs::read(&target).unwrap();
         bytes.extend_from_slice(b"trailing garbage");
         std::fs::write(&target, &bytes).unwrap();
-        let err = get_err(store.get("gmail").await);
+        let err = get_err(store.get(id, Slot::Access).await);
         assert!(matches!(
             err,
             StoreError::CorruptEnvelope { source: EnvelopeParseError::SizeMismatch { .. } }
@@ -1142,67 +1202,79 @@ mod tests {
             1,
             permitlayer_credential::KeyId::ZERO,
         );
-        let err = store.put("gmail", v1).await.unwrap_err();
+        let err = store.put(test_id(), Slot::Access, v1).await.unwrap_err();
         assert!(matches!(err, StoreError::UnsupportedVersion { got: 1, expected: 2 }));
     }
 
-    // ── Story 7.6: list_services tests ───────────────────────────────
+    // ── Story 11.9: list_connections tests ───────────────────────────
 
     #[tokio::test]
-    async fn list_services_returns_empty_when_vault_dir_absent() {
+    async fn list_connections_returns_empty_when_vault_dir_absent() {
         let tmp = TempDir::new().unwrap();
         let store = new_store(&tmp);
         // Delete the vault dir that `new_store` just created so we
         // exercise the NotFound branch.
         std::fs::remove_dir_all(tmp.path().join("vault")).unwrap();
-        let services = store.list_services().await.unwrap();
-        assert!(services.is_empty());
+        let conns = store.list_connections().await.unwrap();
+        assert!(conns.is_empty());
     }
 
     #[tokio::test]
-    async fn list_services_returns_all_persisted_services() {
+    async fn list_connections_dedupes_slots_and_returns_distinct_ids() {
         let tmp = TempDir::new().unwrap();
         let store = new_store(&tmp);
-        store.put("gmail", fake_sealed("gmail", 0xAA)).await.unwrap();
-        store.put("gmail-refresh", fake_sealed("gmail-refresh", 0xBB)).await.unwrap();
-        store.put("calendar", fake_sealed("calendar", 0xCC)).await.unwrap();
+        let a = ConnectionId::from_bytes([0x01; 16]);
+        let b = ConnectionId::from_bytes([0x02; 16]);
+        // Connection `a` has all three slots; `b` has only access.
+        store.put(a, Slot::Access, fake_sealed("access", 0xAA)).await.unwrap();
+        store.put(a, Slot::Refresh, fake_sealed("refresh", 0xAB)).await.unwrap();
+        store.put(a, Slot::Client, fake_sealed("client", 0xAC)).await.unwrap();
+        store.put(b, Slot::Access, fake_sealed("access", 0xBA)).await.unwrap();
 
-        let mut services = store.list_services().await.unwrap();
-        services.sort();
-        assert_eq!(services, vec!["calendar", "gmail", "gmail-refresh"]);
+        let mut conns = store.list_connections().await.unwrap();
+        conns.sort_by_key(|c| *c.as_bytes());
+        assert_eq!(conns, vec![a, b], "three slots of `a` collapse to one id");
     }
 
     #[tokio::test]
-    async fn list_services_skips_dotfiles_and_tempfiles_and_marker() {
+    async fn list_connections_skips_dotfiles_tempfiles_and_marker() {
         let tmp = TempDir::new().unwrap();
         let store = new_store(&tmp);
-        store.put("gmail", fake_sealed("gmail", 0xAA)).await.unwrap();
+        let id = test_id();
+        store.put(id, Slot::Access, fake_sealed("access", 0xAA)).await.unwrap();
 
         // Plant noise the rotate-key flow may legitimately produce.
         let vault_dir = tmp.path().join("vault");
         std::fs::write(vault_dir.join(".rotation.in-progress"), b"{}").unwrap();
         std::fs::write(vault_dir.join(".DS_Store"), b"").unwrap();
-        std::fs::write(vault_dir.join("gmail.sealed.tmp.999.0.deadbeef"), b"junk").unwrap();
-        std::fs::write(vault_dir.join("calendar.sealed.new"), b"in-flight").unwrap();
+        std::fs::write(vault_dir.join(format!("{id}-access.sealed.tmp.999.0.deadbeef")), b"junk")
+            .unwrap();
+        std::fs::write(vault_dir.join(format!("{id}-refresh.sealed.new")), b"in-flight").unwrap();
         std::fs::write(vault_dir.join("readme.txt"), b"not a sealed envelope").unwrap();
         std::fs::write(vault_dir.join("#editor#"), b"emacs lockfile").unwrap();
 
-        let services = store.list_services().await.unwrap();
-        assert_eq!(services, vec!["gmail"]);
+        let conns = store.list_connections().await.unwrap();
+        assert_eq!(conns, vec![id]);
     }
 
     #[tokio::test]
-    async fn list_services_skips_files_with_invalid_service_names() {
+    async fn list_connections_skips_files_with_non_ulid_or_bad_slot_stems() {
         let tmp = TempDir::new().unwrap();
         let store = new_store(&tmp);
-        store.put("gmail", fake_sealed("gmail", 0xAA)).await.unwrap();
+        let id = test_id();
+        store.put(id, Slot::Access, fake_sealed("access", 0xAA)).await.unwrap();
 
-        // Plant a file whose stem fails validate_service_name (uppercase).
         let vault_dir = tmp.path().join("vault");
-        std::fs::write(vault_dir.join("BadName.sealed"), b"impossible-via-put").unwrap();
+        // Non-ULID prefix.
+        std::fs::write(vault_dir.join("not-a-ulid-access.sealed"), b"x").unwrap();
+        // Valid ULID prefix but unknown slot label.
+        let other = ConnectionId::from_bytes([0x09; 16]);
+        std::fs::write(vault_dir.join(format!("{other}-bogus.sealed")), b"x").unwrap();
+        // No hyphen at all.
+        std::fs::write(vault_dir.join("noslot.sealed"), b"x").unwrap();
 
-        let services = store.list_services().await.unwrap();
-        assert_eq!(services, vec!["gmail"]);
+        let conns = store.list_connections().await.unwrap();
+        assert_eq!(conns, vec![id]);
     }
 
     // ── Story 7.6a AC #2: VaultLock acquired around put ──────────────
@@ -1312,13 +1384,20 @@ mod tests {
         let store = std::sync::Arc::new(
             CredentialFsStore::new_with_io(tmp.path().to_path_buf(), io).unwrap(),
         );
+        let id = test_id();
         let s1 = std::sync::Arc::clone(&store);
         let s2 = std::sync::Arc::clone(&store);
-        let h1 = tokio::spawn(async move { s1.put("gmail", fake_sealed("gmail", 0xAA)).await });
+        let h1 =
+            tokio::spawn(
+                async move { s1.put(id, Slot::Access, fake_sealed("access", 0xAA)).await },
+            );
         // Stagger second writer slightly so first wins the lock race
         // deterministically.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        let h2 = tokio::spawn(async move { s2.put("gmail", fake_sealed("gmail", 0xBB)).await });
+        let h2 =
+            tokio::spawn(
+                async move { s2.put(id, Slot::Access, fake_sealed("access", 0xBB)).await },
+            );
         h1.await.unwrap().expect("first put succeeded");
         h2.await.unwrap().expect("second put succeeded");
         let recorded = log.lock().unwrap().clone();
@@ -1328,7 +1407,7 @@ mod tests {
             "writes did not serialize via VaultLock — recorded order: {recorded:?}"
         );
         // Final state: one of the two values is on disk.
-        let got = store.get("gmail").await.unwrap().expect("present");
+        let got = store.get(id, Slot::Access).await.unwrap().expect("present");
         assert!(matches!(got.ciphertext()[0], 0xAA | 0xBB));
     }
 
@@ -1343,27 +1422,32 @@ mod tests {
             let _guard = VaultLock::try_acquire(tmp.path()).expect("acquire");
         }
         // Guard dropped — put can now acquire.
-        store.put("gmail", fake_sealed("gmail", 0x42)).await.expect("put after lock release");
+        store
+            .put(test_id(), Slot::Access, fake_sealed("access", 0x42))
+            .await
+            .expect("put after lock release");
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn list_services_skips_symlinks() {
+    async fn list_connections_skips_symlinks() {
         let tmp = TempDir::new().unwrap();
         let store = new_store(&tmp);
-        store.put("gmail", fake_sealed("gmail", 0xAA)).await.unwrap();
+        let id = test_id();
+        store.put(id, Slot::Access, fake_sealed("access", 0xAA)).await.unwrap();
 
-        // Create a symlink at <vault>/calendar.sealed pointing at the
-        // gmail file. Even though the *content* is valid, we treat the
+        // Create a symlink at <vault>/<other-id>-access.sealed pointing at
+        // the real file. Even though the *content* is valid, we treat the
         // symlink as suspicious and skip it (Story 7.3 P63 precedent).
+        let other = ConnectionId::from_bytes([0x09; 16]);
         let vault_dir = tmp.path().join("vault");
         std::os::unix::fs::symlink(
-            vault_dir.join("gmail.sealed"),
-            vault_dir.join("calendar.sealed"),
+            vault_dir.join(format!("{id}-access.sealed")),
+            vault_dir.join(format!("{other}-access.sealed")),
         )
         .unwrap();
 
-        let services = store.list_services().await.unwrap();
-        assert_eq!(services, vec!["gmail"]);
+        let conns = store.list_connections().await.unwrap();
+        assert_eq!(conns, vec![id]);
     }
 }

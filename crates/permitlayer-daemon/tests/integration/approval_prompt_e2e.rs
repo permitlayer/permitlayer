@@ -327,6 +327,43 @@ approval-mode = "auto"
     std::fs::write(policies_dir.join("auto.toml"), POLICY_AUTO_CAL_TOML).unwrap();
 }
 
+/// Full OAuth URIs for the gmail read-write tier, used so a request's
+/// `gmail.modify` / `gmail.readonly` short name passes the proxy's
+/// `tier ∩ granted_scopes` gate (Story 11.10). Mirrors the
+/// `google-gmail` connector def's `[scopes]` map.
+const GMAIL_RW_URIS: &[&str] = &[
+    "https://www.googleapis.com/auth/gmail.readonly",
+    "https://www.googleapis.com/auth/gmail.send",
+    "https://www.googleapis.com/auth/gmail.compose",
+    "https://www.googleapis.com/auth/gmail.modify",
+];
+const GMAIL_RO_URIS: &[&str] = &["https://www.googleapis.com/auth/gmail.readonly"];
+const CALENDAR_RW_URIS: &[&str] = &[
+    "https://www.googleapis.com/auth/calendar.readonly",
+    "https://www.googleapis.com/auth/calendar.events",
+];
+
+/// Story 11.10: seed a `gmail` connection (read-write tier so both
+/// `gmail.readonly` and `gmail.modify` pass the tier gate) + a binding
+/// for `agent` carrying `policy`, plus a sealed access token so a
+/// PolicyLayer-granted request can proceed through the service's tier
+/// gate to dispatch. The connection `name = "gmail"` matches the
+/// `/v1/tools/gmail/...` selector.
+fn seed_gmail_binding(home: &std::path::Path, agent: &str, policy: &str) {
+    crate::common::seed_connection_and_binding(
+        home,
+        agent,
+        "google-gmail",
+        "gmail",
+        crate::common::SeedTier::ReadWrite,
+        GMAIL_RW_URIS,
+        Some(policy),
+        None,
+        TEST_MASTER_KEY_HEX,
+        Some(b"ya29.test-access-token"),
+    );
+}
+
 fn register_agent(port: u16, home: &std::path::Path, name: &str, policy: &str) -> String {
     let body = serde_json::json!({"name": name, "policy_name": policy}).to_string();
     let ctl = crate::common::read_test_control_token(home);
@@ -542,6 +579,7 @@ fn granted_canned_response_allows_request_and_writes_approval_granted_audit() {
     assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
     let token = register_agent(port, home.path(), "test-agent", "policy-prompt");
+    seed_gmail_binding(home.path(), "test-agent", "policy-prompt");
 
     let (status, body) = http_get(
         port,
@@ -579,6 +617,7 @@ fn denied_canned_response_returns_403_and_writes_approval_denied_audit() {
     assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
     let token = register_agent(port, home.path(), "test-agent", "policy-prompt");
+    seed_gmail_binding(home.path(), "test-agent", "policy-prompt");
 
     let (status, body) = http_get(
         port,
@@ -620,6 +659,7 @@ fn always_canned_response_populates_cache_second_request_served_from_cache() {
     assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
     let token = register_agent(port, home.path(), "test-agent", "policy-prompt");
+    seed_gmail_binding(home.path(), "test-agent", "policy-prompt");
 
     // First request consumes the "always" canned decision.
     let (status1, body1) = http_get(
@@ -669,6 +709,7 @@ fn never_canned_response_populates_cache_second_request_cached_deny() {
     assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
     let token = register_agent(port, home.path(), "test-agent", "policy-prompt");
+    seed_gmail_binding(home.path(), "test-agent", "policy-prompt");
 
     let (status1, _) = http_get(
         port,
@@ -721,6 +762,7 @@ fn timeout_outcome_returns_403_approval_timeout_via_force_timeout_env() {
     assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
     let token = register_agent(port, home.path(), "test-agent", "policy-prompt");
+    seed_gmail_binding(home.path(), "test-agent", "policy-prompt");
 
     let (status, body) = http_get(
         port,
@@ -783,6 +825,7 @@ fn unavailable_no_tty_returns_503_approval_unavailable() {
     );
 
     let token = register_agent(port, home.path(), "test-agent", "policy-prompt");
+    seed_gmail_binding(home.path(), "test-agent", "policy-prompt");
 
     let (status, body) = http_get(
         port,
@@ -827,6 +870,7 @@ fn auto_approve_reads_bypasses_approval_service_for_readonly_scope() {
     assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
     let token = register_agent(port, home.path(), "test-agent", "policy-prompt-reads");
+    seed_gmail_binding(home.path(), "test-agent", "policy-prompt-reads");
 
     let (status, body) = http_get(
         port,
@@ -880,6 +924,7 @@ fn reload_clears_approval_cache() {
     assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
     let token = register_agent(port, home.path(), "test-agent", "policy-prompt");
+    seed_gmail_binding(home.path(), "test-agent", "policy-prompt");
 
     // First request: always → populates cache, should allow.
     let (status1, body1) = http_get(
@@ -944,7 +989,23 @@ fn auto_mode_dispatches_without_prompt_in_parallel_with_prompt_policy() {
     assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
     let prompt_token = register_agent(port, home.path(), "prompt-agent", "policy-prompt");
+    seed_gmail_binding(home.path(), "prompt-agent", "policy-prompt");
     let auto_token = register_agent(port, home.path(), "auto-agent", "policy-auto-cal");
+    // auto-agent → calendar connection (read tier covers `calendar.events`)
+    // + binding carrying `policy-auto-cal`. The connection `name =
+    // "calendar"` matches the `/v1/tools/calendar/...` selector.
+    crate::common::seed_connection_and_binding(
+        home.path(),
+        "auto-agent",
+        "google-calendar",
+        "calendar",
+        crate::common::SeedTier::Read,
+        CALENDAR_RW_URIS,
+        Some("policy-auto-cal"),
+        None,
+        TEST_MASTER_KEY_HEX,
+        Some(b"ya29.test-calendar-token"),
+    );
 
     // Dispatch both requests in parallel. `std::thread::spawn` suffices —
     // the test's http client is blocking, and the two agents route
@@ -1048,6 +1109,7 @@ fn approval_timeout_updates_via_sighup_without_restart() {
     assert_daemon_pid_matches(port, home.path(), daemon_pid);
 
     let token = register_agent(port, home.path(), "test-agent", "policy-prompt");
+    seed_gmail_binding(home.path(), "test-agent", "policy-prompt");
 
     // Swap the config to a 2-second timeout and hit the HTTP reload.
     std::fs::write(config_dir.join("daemon.toml"), "[approval]\ntimeout_seconds = 2\n").unwrap();
@@ -1166,6 +1228,25 @@ fn mcp_initialize_succeeds_after_credential_seal_without_restart() {
     );
 
     seal_gmail_credential(port, home.path(), "openclaw");
+    // Story 11.10: the request-time authz path needs a connection +
+    // binding. The credential was sealed via the control-plane seal
+    // endpoint, which keys by the `conn_shim` derivation of "gmail", so
+    // the seeded connection must carry that SAME id for dispatch to find
+    // the sealed credential. (Story 11.13's `connection add` will mint a
+    // real ULID + seal under it; until then the seal endpoint + this
+    // shimmed id agree.)
+    let gmail_conn_id = crate::common::connection_id_for_service("gmail");
+    crate::common::seed_connection_and_binding_with_id(
+        home.path(),
+        "openclaw",
+        gmail_conn_id,
+        "google-gmail",
+        "gmail",
+        crate::common::SeedTier::Read,
+        GMAIL_RO_URIS,
+        Some("gmail-read-only"),
+        None,
+    );
 
     let ctl_for_reload = crate::common::read_test_control_token(home.path());
     let (reload_status, reload_body) = crate::common::http_post_control(

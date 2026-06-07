@@ -35,7 +35,6 @@
 #[path = "../common/mod.rs"]
 mod common;
 
-mod agent_rebind_e2e;
 mod agent_register_scripted;
 mod agent_registry_e2e;
 mod agent_rotate_e2e;

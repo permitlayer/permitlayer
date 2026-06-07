@@ -69,6 +69,30 @@ pub enum ProxyError {
     #[error("agent identity missing — request did not pass through AuthLayer")]
     AuthMissingAgentId,
 
+    /// No binding matched the requested connection selector for this
+    /// agent (Story 11.10). The agent presented a valid bearer token but
+    /// holds no `(agent, connection)` grant addressable by the request's
+    /// service selector (alias, connection name, or id text). Default-deny
+    /// authority: absence of a binding is a denial, not an error. Returns
+    /// HTTP 403 with code `binding.not_found`.
+    #[error("agent '{agent}' has no binding for connection selector '{selector}'")]
+    BindingNotFound { agent: String, selector: String },
+
+    /// The tool's required scope is not in the connector's tier bundle for
+    /// the tier this binding was granted at (Story 11.10). E.g. a
+    /// `read`-tier binding cannot reach a `gmail.send` tool. Returns HTTP
+    /// 403 with code `tier.denied`.
+    #[error("tier '{tier}' for connection '{connection}' does not grant scope '{required_scope}'")]
+    TierDenied { connection: String, tier: String, required_scope: String },
+
+    /// The tool's required scope is within the tier bundle but the
+    /// connection's sealed token does not actually carry it
+    /// (`granted_scopes`) — the OAuth grant was narrower than the
+    /// requested tier (Story 11.10). Returns HTTP 403 with code
+    /// `scope.not_granted`.
+    #[error("connection '{connection}' was not granted scope '{required_scope}' at consent time")]
+    ScopeNotGranted { connection: String, required_scope: String },
+
     /// Policy evaluation denied the request (FR36, FR53).
     ///
     /// Carries the full violation context so the response body names the
@@ -344,6 +368,12 @@ impl ProxyError {
             // "policy_violation" (underscore). The codebase convention is
             // dotted codes. Keeping "policy.denied" for backward
             // compatibility with existing audit consumers and grep scripts.
+            // Story 11.10 binding-authz codes (distinct so agents and
+            // operators can tell "no grant" from "tier too low" from
+            // "scope was never consented").
+            Self::BindingNotFound { .. } => "binding.not_found",
+            Self::TierDenied { .. } => "tier.denied",
+            Self::ScopeNotGranted { .. } => "scope.not_granted",
             Self::PolicyDenied { .. } => "policy.denied",
             // NOTE: AC #3 literal is "policy_eval_failed" (underscore);
             // keeping the dotted convention for the same reason as above.
@@ -380,6 +410,11 @@ impl ProxyError {
             Self::AuthMissingToken | Self::AuthInvalidToken { .. } | Self::AuthMissingAgentId => {
                 StatusCode::UNAUTHORIZED
             }
+            // Story 11.10: all three binding-authz denials are 403 —
+            // the request is forbidden, not a transient failure.
+            Self::BindingNotFound { .. }
+            | Self::TierDenied { .. }
+            | Self::ScopeNotGranted { .. } => StatusCode::FORBIDDEN,
             Self::PolicyDenied { .. } => StatusCode::FORBIDDEN,
             Self::PolicyEvalFailed => StatusCode::SERVICE_UNAVAILABLE,
             Self::ApprovalRequired { .. } | Self::ApprovalTimeout { .. } => StatusCode::FORBIDDEN,

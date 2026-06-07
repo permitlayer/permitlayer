@@ -19,6 +19,7 @@ compile_error!(
 mod approval;
 mod cli;
 mod config;
+mod conn_shim;
 mod design;
 mod lifecycle;
 mod repair;

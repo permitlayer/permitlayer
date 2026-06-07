@@ -1079,19 +1079,44 @@ pub(crate) async fn try_build_proxy_service(
         }
     };
 
-    Some(Arc::new(permitlayer_proxy::ProxyService::new(
-        credential_store,
-        vault,
-        token_issuer,
-        upstream_client,
-        connectors,
-        Arc::clone(audit_store),
-        Arc::clone(scrub_engine),
-        config.paths.home.join("vault"),
-        // Decoded inbound attachments (Gmail `attachments.get`) are
-        // materialized here for the MCP agent to read by local path.
-        config.paths.home.join("media"),
-    )))
+    // Story 11.10: the request-time authz chain resolves
+    // bearer → agent → binding → connection → connector → tier. The proxy
+    // needs the binding + connection stores to map a request's selector to
+    // the agent's granted connection and key the credential vault by the
+    // connection's real ULID (not the legacy service string).
+    let binding_store: Arc<dyn permitlayer_core::store::BindingStore> =
+        match permitlayer_core::store::fs::BindingFsStore::new(config.paths.home.clone()) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                tracing::warn!(error = %e, "binding store init failed — tool routes will serve 501");
+                return None;
+            }
+        };
+    let connection_store: Arc<dyn permitlayer_core::store::ConnectionStore> =
+        match permitlayer_core::store::fs::ConnectionFsStore::new(config.paths.home.clone()) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                tracing::warn!(error = %e, "connection store init failed — tool routes will serve 501");
+                return None;
+            }
+        };
+
+    Some(Arc::new(
+        permitlayer_proxy::ProxyService::new(
+            credential_store,
+            vault,
+            token_issuer,
+            upstream_client,
+            connectors,
+            Arc::clone(audit_store),
+            Arc::clone(scrub_engine),
+            config.paths.home.join("vault"),
+            // Decoded inbound attachments (Gmail `attachments.get`) are
+            // materialized here for the MCP agent to read by local path.
+            config.paths.home.join("media"),
+        )
+        .with_binding_resolution(binding_store, connection_store),
+    ))
 }
 
 pub(crate) fn vault_has_sealed_credentials(vault_dir: &std::path::Path) -> std::io::Result<bool> {
@@ -1490,6 +1515,8 @@ async fn try_build_agent_runtime(
 ) -> Result<
     (
         Option<Arc<dyn AgentIdentityStore>>,
+        Option<Arc<dyn permitlayer_core::store::BindingStore>>,
+        Option<Arc<dyn permitlayer_core::store::ConnectionStore>>,
         Arc<AgentRegistry>,
         Arc<zeroize::Zeroizing<[u8; LOOKUP_KEY_BYTES]>>,
     ),
@@ -1507,6 +1534,31 @@ async fn try_build_agent_runtime(
                 error = %e,
                 "agent identity store creation failed — `agentsso agent register` will be unavailable; existing tool routes serve 401 auth.invalid_token"
             );
+            None
+        }
+    };
+
+    // Story 11.10: the binding + connection stores let the middleware
+    // resolve `(agent, selector) → binding → connection` so `PolicyLayer`
+    // can evaluate the binding's policy (incl. `Decision::Prompt` →
+    // approval) and `handle_inner` can gate on tier ∩ granted_scopes and
+    // key the credential vault by the connection's ULID. `Option<>` for
+    // the same graceful-degradation reason as `agent_store`.
+    let binding_store_mw = match permitlayer_core::store::fs::BindingFsStore::new(
+        config.paths.home.clone(),
+    ) {
+        Ok(s) => Some(Arc::new(s) as Arc<dyn permitlayer_core::store::BindingStore>),
+        Err(e) => {
+            tracing::warn!(error = %e, "binding store creation failed — binding-gated tool routes will default-deny");
+            None
+        }
+    };
+    let connection_store_mw = match permitlayer_core::store::fs::ConnectionFsStore::new(
+        config.paths.home.clone(),
+    ) {
+        Ok(s) => Some(Arc::new(s) as Arc<dyn permitlayer_core::store::ConnectionStore>),
+        Err(e) => {
+            tracing::warn!(error = %e, "connection store creation failed — binding-gated tool routes will default-deny");
             None
         }
     };
@@ -1586,7 +1638,7 @@ async fn try_build_agent_runtime(
         );
     }
 
-    Ok((agent_store, agent_registry, Arc::new(lookup_key)))
+    Ok((agent_store, binding_store_mw, connection_store_mw, agent_registry, Arc::new(lookup_key)))
 }
 
 /// Structured fail-fast errors from [`run`] at daemon startup.
@@ -3196,8 +3248,13 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     // subkey (Story 4.4). Always gets a real master-key-derived
     // subkey now that Story 1.15 has provisioned the master key
     // eagerly above — no more zero-placeholder branch.
-    let (agent_store, agent_registry, agent_lookup_key) =
+    let (agent_store, binding_store_mw, connection_store_mw, agent_registry, agent_lookup_key) =
         try_build_agent_runtime(&config, &master_key).await?;
+
+    // (Story 11.9/11.10: the `<home>/connections/` + `<home>/bindings/`
+    // directories are provisioned by the `BindingFsStore`/`ConnectionFsStore`
+    // constructors inside `try_build_agent_runtime` above — both 0o700, both
+    // created on first boot. The middleware + proxy authz consume them.)
 
     // 7c. Shared mutex guarding the load-diff-store sequence in
     // `reload_policies_with_diff_locked`. Prevents concurrent reloads
@@ -3480,6 +3537,8 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         Arc::clone(&agent_registry),
         Arc::clone(&agent_lookup_key),
         agent_store.clone(),
+        binding_store_mw.clone(),
+        connection_store_mw.clone(),
         Arc::clone(&approval_service),
         Arc::clone(&approval_timeout_atomic),
         conn_tracker_sink,

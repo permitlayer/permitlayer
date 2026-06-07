@@ -25,7 +25,7 @@ pub mod oauth_token;
 pub mod sealed;
 
 pub use agent_bearer::AgentBearerToken;
-pub use connection::{ConnectionId, Slot, connection_slot_from_service_key};
+pub use connection::{ConnectionId, Slot};
 pub use error::CryptoError;
 pub use oauth_token::{OAuthRefreshToken, OAuthToken};
 pub use sealed::{KeyId, MAX_PLAINTEXT_LEN, SEALED_CREDENTIAL_VERSION, SealedCredential};

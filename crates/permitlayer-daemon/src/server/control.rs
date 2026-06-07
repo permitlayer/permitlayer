@@ -1556,28 +1556,6 @@ pub(crate) struct RemoveAgentResponse {
     pub removed: bool,
 }
 
-/// Inbound JSON body for `POST /v1/control/agent/rebind` (Story 7.11).
-#[derive(Debug, serde::Deserialize)]
-pub(crate) struct RebindAgentRequest {
-    pub name: String,
-    pub policy_name: String,
-}
-
-/// Response body for `POST /v1/control/agent/rebind` (Story 7.11).
-///
-/// **CRITICAL INVARIANT:** This response MUST NOT include any
-/// bearer-token-bearing field. The bearer token is unchanged across
-/// rebind by design (architecture.md §"Authentication & Security" →
-/// "Bearer token immutability across policy rebind"); re-disclosing
-/// it here would defeat the invariant. The response uses the
-/// `AgentSummary` shape (no `bearer_token` field) and is asserted
-/// in `rebind_handler_response_does_not_include_bearer_token`.
-#[derive(Debug, serde::Serialize)]
-pub(crate) struct RebindAgentResponse {
-    pub status: &'static str,
-    pub agent: AgentSummary,
-}
-
 /// Response body for `POST /v1/control/agent/{name}/rotate` (Story 7.34).
 ///
 /// Includes the new plaintext bearer token — the operator MUST copy it
@@ -1790,9 +1768,13 @@ pub(crate) async fn register_agent_handler(
     let lookup_key_hex = lookup_key_to_hex(&lookup_key);
 
     let created_at = chrono::Utc::now();
+    // Story 11.9: `AgentIdentity` no longer carries `policy_name` — an
+    // agent's authority is its *set* of bindings (Story 11.14), not a
+    // single policy field. We still validate the operator-named policy
+    // exists (above) and echo it in the response, but it is not persisted
+    // on the identity.
     let identity = match AgentIdentity::new(
         payload.name.clone(),
-        payload.policy_name.clone(),
         token_hash,
         lookup_key_hex,
         created_at,
@@ -2109,7 +2091,10 @@ pub(crate) async fn list_agents_handler(
         .into_iter()
         .map(|a| AgentSummary {
             name: a.name().to_owned(),
-            policy_name: a.policy_name.clone(),
+            // Story 11.9: `policy_name` is no longer a per-agent field
+            // (bindings replace it in 11.14). The wire field is retained
+            // for now but carries no per-agent policy binding.
+            policy_name: String::new(),
             created_at: format_audit_timestamp(a.created_at),
             last_seen_at: a.last_seen_at.map(format_audit_timestamp),
         })
@@ -2172,35 +2157,17 @@ pub(crate) async fn agent_policy_name_handler(
 
     match store.get(&name).await {
         Ok(Some(identity)) => {
-            // Round-1 review P21: cross-check that the agent's bound
-            // policy still exists in the active set. If the policy was
-            // removed from disk between agent registration and this
-            // lookup, the CLI would otherwise POST to
-            // `/policy/<dangling>/scopes` and get 404 `policy.not_found`
-            // — two round-trips to discover the inconsistency. A 422
-            // here with `agent.dangling_policy_binding` points the
-            // operator at the right next step (`agent rebind`) one
-            // call earlier.
-            let snapshot = state.policy_set.load();
-            if snapshot.get(&identity.policy_name).is_none() {
-                return agent_error_response(
-                    StatusCode::UNPROCESSABLE_ENTITY,
-                    "agent.dangling_policy_binding",
-                    format!(
-                        "agent {name:?} is bound to policy {:?} which is not in the \
-                         active policy set. Either restore the policy file and run \
-                         `agentsso reload`, or rebind the agent: \
-                         `agentsso agent rebind {name} --policy <new-policy>`.",
-                        identity.policy_name
-                    ),
-                    Some(request_id),
-                );
-            }
+            // Story 11.9: `policy_name` is no longer a per-agent field
+            // — an agent's authority is its *set* of bindings (Story
+            // 11.14), so there is no single bound policy to resolve or
+            // dangling-check here. The endpoint still confirms the agent
+            // exists (404 below) and echoes an empty policy binding until
+            // 11.14 reshapes this into a bindings lookup.
             (
                 StatusCode::OK,
                 Json(AgentPolicyNameResponse {
                     name: identity.name().to_owned(),
-                    policy_name: identity.policy_name.clone(),
+                    policy_name: String::new(),
                 }),
             )
                 .into_response()
@@ -2679,9 +2646,15 @@ pub(crate) async fn credentials_seal_handler(
             // access envelope AND the `{service}-client.sealed` bundle.
             // If a partial cleanup removed either, fall through to a
             // fresh seal rather than lying with `sealed: true`.
-            let envelope_path = state.vault_dir.join(format!("{}.sealed", payload.service));
+            // Story 11.9: the credential store keys on `(ConnectionId,
+            // Slot)`; envelopes live at `<connection>-<slot>.sealed`. The
+            // access + client slots share the one connection id derived
+            // from `payload.service` via the local `conn_shim`.
+            let skip_connection = crate::conn_shim::connection_id_for_service(&payload.service);
+            let envelope_path =
+                state.vault_dir.join(format!("{skip_connection}-{}.sealed", Slot::Access.label()));
             let client_envelope_path =
-                state.vault_dir.join(format!("{}-client.sealed", payload.service));
+                state.vault_dir.join(format!("{skip_connection}-{}.sealed", Slot::Client.label()));
             let envelope_path_for_exists = envelope_path.clone();
             // bmad-code-review F8: check the two envelopes separately so
             // the fall-through warn can name whichever one is actually
@@ -2842,7 +2815,12 @@ pub(crate) async fn credentials_seal_handler(
     // error degrades to the pre-D1 behavior. Held inside the
     // per-service seal lock so no concurrent reader sees a half-state.
     if replaced_previous && payload.refresh_token.is_none() {
-        let refresh_envelope = state.vault_dir.join(format!("{}-refresh.sealed", payload.service));
+        // Story 11.9: the refresh envelope lives at
+        // `<connection>-refresh.sealed` (connection derived from
+        // `payload.service` via the local `conn_shim`).
+        let refresh_connection = crate::conn_shim::connection_id_for_service(&payload.service);
+        let refresh_envelope =
+            state.vault_dir.join(format!("{refresh_connection}-{}.sealed", Slot::Refresh.label()));
         let refresh_envelope_for_unlink = refresh_envelope.clone();
         let unlink_result = tokio::task::spawn_blocking(move || {
             match std::fs::remove_file(&refresh_envelope_for_unlink) {
@@ -2886,11 +2864,12 @@ pub(crate) async fn credentials_seal_handler(
     let access_token = permitlayer_credential::OAuthToken::from_trusted_bytes(
         payload.access_token.as_bytes().to_vec(),
     );
-    // Story 11.8: the vault keys on `(ConnectionId, Slot)`. The on-disk
-    // store keys (`{service}`, `{service}-refresh`, `{service}-client`)
-    // are unchanged — only the vault seal/unseal arguments switched to
-    // the connection + slot pair derived from `payload.service`.
-    let connection = ConnectionId::from_service_shim(&payload.service);
+    // Story 11.9: the vault and credential store both key on
+    // `(ConnectionId, Slot)`. The control-plane seal API still carries a
+    // bare `service` string until Story 11.12, so we derive the
+    // connection id via the local `conn_shim` (byte-identical to the
+    // proxy's) and seal/store each slot under the SAME connection id.
+    let connection = crate::conn_shim::connection_id_for_service(&payload.service);
     let sealed_access = match state.vault.seal(connection, Slot::Access, &access_token) {
         Ok(s) => s,
         Err(e) => {
@@ -2917,9 +2896,8 @@ pub(crate) async fn credentials_seal_handler(
             let refresh_token = permitlayer_credential::OAuthRefreshToken::from_trusted_bytes(
                 refresh.as_bytes().to_vec(),
             );
-            let refresh_service = format!("{}-refresh", payload.service);
             match state.vault.seal_refresh(connection, Slot::Refresh, &refresh_token) {
-                Ok(s) => Some((refresh_service, s)),
+                Ok(s) => Some(s),
                 Err(e) => {
                     emit_seal_denied_audit(
                         &state,
@@ -2942,12 +2920,11 @@ pub(crate) async fn credentials_seal_handler(
         None => None,
     };
 
-    // Story 7.35: seal the BYO OAuth client bundle under
-    // `{service}-client` (own HKDF subkey, mirrors `{service}-refresh`).
-    // The bundle JSON arrives over the same UDS that already carried
-    // the plaintext access/refresh tokens; sealing it here means the
-    // proxy/CLI never re-read a plaintext `client_secret.json` path.
-    let client_service = format!("{}-client", payload.service);
+    // Story 7.35: seal the BYO OAuth client bundle under the `Client`
+    // slot (own HKDF subkey, mirrors the `Refresh` slot). The bundle
+    // JSON arrives over the same UDS that already carried the plaintext
+    // access/refresh tokens; sealing it here means the proxy/CLI never
+    // re-read a plaintext `client_secret.json` path.
     let sealed_client = {
         let client_token = permitlayer_credential::OAuthToken::from_trusted_bytes(
             payload.client_bundle_json.as_bytes().to_vec(),
@@ -2997,11 +2974,12 @@ pub(crate) async fn credentials_seal_handler(
         }
     };
 
-    // Track which envelope files we wrote so we can roll them back on
-    // a downstream failure (round-1 review P1).
-    let mut written_services: Vec<String> = Vec::with_capacity(2);
+    // Track which envelope slots we wrote so we can roll them back on
+    // a downstream failure (round-1 review P1). All slots share the one
+    // connection id derived from `payload.service`.
+    let mut written_slots: Vec<(ConnectionId, Slot)> = Vec::with_capacity(3);
 
-    if let Err(e) = store.put(&payload.service, sealed_access).await {
+    if let Err(e) = store.put(connection, Slot::Access, sealed_access).await {
         emit_seal_denied_audit(
             &state,
             &request_id,
@@ -3018,12 +2996,12 @@ pub(crate) async fn credentials_seal_handler(
             Some(request_id),
         );
     }
-    written_services.push(payload.service.clone());
+    written_slots.push((connection, Slot::Access));
 
-    if let Some((refresh_service, sealed)) = sealed_refresh {
-        if let Err(e) = store.put(&refresh_service, sealed).await {
+    if let Some(sealed) = sealed_refresh {
+        if let Err(e) = store.put(connection, Slot::Refresh, sealed).await {
             // Roll back the access envelope we just wrote (P1).
-            rollback_sealed_envelopes(&state.vault_dir, &written_services).await;
+            rollback_sealed_envelopes(&state.vault_dir, &written_slots).await;
             emit_seal_denied_audit(
                 &state,
                 &request_id,
@@ -3040,14 +3018,14 @@ pub(crate) async fn credentials_seal_handler(
                 Some(request_id),
             );
         }
-        written_services.push(refresh_service);
+        written_slots.push((connection, Slot::Refresh));
     }
 
     // Story 7.35: persist the sealed client bundle. Same rollback
     // discipline as access/refresh — on failure, unwind every envelope
-    // written so far (incl. `{service}-client`).
-    if let Err(e) = store.put(&client_service, sealed_client).await {
-        rollback_sealed_envelopes(&state.vault_dir, &written_services).await;
+    // written so far (incl. the `Client` slot).
+    if let Err(e) = store.put(connection, Slot::Client, sealed_client).await {
+        rollback_sealed_envelopes(&state.vault_dir, &written_slots).await;
         emit_seal_denied_audit(
             &state,
             &request_id,
@@ -3064,7 +3042,7 @@ pub(crate) async fn credentials_seal_handler(
             Some(request_id),
         );
     }
-    written_services.push(client_service.clone());
+    written_slots.push((connection, Slot::Client));
 
     let meta = permitlayer_oauth::metadata::CredentialMeta {
         client_type: payload.client_type.clone(),
@@ -3095,7 +3073,7 @@ pub(crate) async fn credentials_seal_handler(
             // Round-1 review P1: roll back the sealed envelopes so
             // we don't leave orphan access/refresh files with no
             // meta sentinel.
-            rollback_sealed_envelopes(&state.vault_dir, &written_services).await;
+            rollback_sealed_envelopes(&state.vault_dir, &written_slots).await;
             emit_seal_denied_audit(
                 &state,
                 &request_id,
@@ -3113,7 +3091,7 @@ pub(crate) async fn credentials_seal_handler(
             );
         }
         Err(e) => {
-            rollback_sealed_envelopes(&state.vault_dir, &written_services).await;
+            rollback_sealed_envelopes(&state.vault_dir, &written_slots).await;
             emit_seal_denied_audit(
                 &state,
                 &request_id,
@@ -3174,10 +3152,9 @@ pub(crate) async fn credentials_seal_handler(
 }
 
 /// Round-1 review P17: emit `credentials-seal-denied` audit event on
-/// every seal-handler failure path. Mirror of
-/// `emit_rebind_denied_audit` from the agent-rebind handler. The
-/// `error_code` field names the daemon-side failure code so operators
-/// can correlate the audit row with the HTTP response.
+/// every seal-handler failure path. The `error_code` field names the
+/// daemon-side failure code so operators can correlate the audit row
+/// with the HTTP response.
 async fn emit_seal_denied_audit(
     state: &ControlState,
     request_id: &str,
@@ -3290,9 +3267,11 @@ async fn emit_policy_scopes_denied_audit(
 /// leaves orphan `*.sealed` files that the next call sees as
 /// `meta_path.exists() == false` and silently overwrites without
 /// reporting `replaced_previous: true`.
-async fn rollback_sealed_envelopes(vault_dir: &std::path::Path, services: &[String]) {
-    for service in services {
-        let envelope_path = vault_dir.join(format!("{service}.sealed"));
+async fn rollback_sealed_envelopes(vault_dir: &std::path::Path, slots: &[(ConnectionId, Slot)]) {
+    for (id, slot) in slots {
+        // Mirror `CredentialFsStore`'s `<ulid>-<slot>.sealed` naming so
+        // the orphan-cleanup targets the exact file the store wrote.
+        let envelope_path = vault_dir.join(format!("{id}-{}.sealed", slot.label()));
         let envelope_for_unlink = envelope_path.clone();
         let result =
             tokio::task::spawn_blocking(move || std::fs::remove_file(&envelope_for_unlink)).await;
@@ -3515,7 +3494,8 @@ pub(crate) async fn credentials_verify_handler(
         }
     };
 
-    let sealed = match store.get(&service).await {
+    let access_connection = crate::conn_shim::connection_id_for_service(&service);
+    let sealed = match store.get(access_connection, Slot::Access).await {
         Ok(Some(s)) => s,
         Ok(None) => {
             emit_verify_denied_audit(
@@ -3553,7 +3533,6 @@ pub(crate) async fn credentials_verify_handler(
         }
     };
 
-    let access_connection = ConnectionId::from_service_shim(&service);
     let access_token = match state.vault.unseal(access_connection, Slot::Access, &sealed) {
         Ok(t) => t,
         Err(e) => {
@@ -3856,9 +3835,20 @@ async fn try_self_heal_refresh(
         .map_err(|detail| RefreshFlowError::MetaInvalid { service: svc.to_owned(), detail })
     };
 
-    let outcome =
-        refresh_flow::refresh_service(&state.vault, &store, &state.vault_dir, service, &resolver)
-            .await;
+    // Story 11.10: `refresh_service` now takes the connection id explicitly.
+    // Daemon-side this is still derived from the service string via the local
+    // `conn_shim` (byte-identical to the proxy's former shim); the daemon
+    // workstream replaces this with real binding resolution.
+    let refresh_connection = crate::conn_shim::connection_id_for_service(service);
+    let outcome = refresh_flow::refresh_service(
+        &state.vault,
+        &store,
+        &state.vault_dir,
+        service,
+        refresh_connection,
+        &resolver,
+    )
+    .await;
 
     // Audit the self-heal attempt (best-effort).
     let (audit_outcome, audit_label, result): (&'static str, &'static str, _) = match &outcome {
@@ -4689,358 +4679,6 @@ pub(crate) async fn remove_agent_handler(
         .into_response()
 }
 
-/// `POST /v1/control/agent/rebind` — update an agent's policy binding
-/// WITHOUT rotating its bearer token (Story 7.11).
-///
-/// Loopback-only via `require_loopback`. Audit-emitting via
-/// `agent-rebound`. Daemon-LIVE: this handler does NOT touch the
-/// vault, only rewrites the plain TOML at `~/.agentsso/agents/<name>.toml`,
-/// so it can run while the daemon is serving requests.
-///
-/// Pre-flight order (mirroring register):
-/// 1. require_loopback (control-plane router middleware also enforces
-///    `X-Agentsso-Control` header)
-/// 2. agent_crud_semaphore rate-limit (429 if exhausted)
-/// 3. Parse JSON body
-/// 4. Validate agent name
-/// 5. Verify target policy exists in active PolicySet (422 if not)
-/// 6. Verify agent exists (404 if not)
-/// 7. Atomically rewrite policy_name via `update_policy`
-/// 8. Refresh in-memory registry via `replace_with`
-/// 9. Emit audit event `agent-rebound`
-/// 10. Return 200 with `RebindAgentResponse { agent: AgentSummary }`
-///     — NO bearer_token field by design.
-pub(crate) async fn rebind_agent_handler(
-    State(state): State<ControlState>,
-    ConnectInfo(peer): ConnectInfo<SocketAddr>,
-    req: axum::extract::Request,
-) -> Response {
-    if let Err(e) = require_loopback(peer) {
-        return e.into_response();
-    }
-
-    let request_id = read_request_id(&req);
-
-    // Snapshot peer creds before `req.into_parts()` consumes it.
-    // Story 7.27 AC #1 (review fix).
-    let peer_creds_for_audit: Option<crate::server::PeerCredentials> =
-        req.extensions().get::<crate::server::PeerCredentials>().copied();
-
-    // Rate-limit concurrent agent CRUD (same shape as register/remove).
-    let _permit = match state.agent_crud_semaphore.clone().try_acquire_owned() {
-        Ok(p) => p,
-        Err(_) => {
-            return agent_error_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                "agent.rate_limited",
-                format!(
-                    "too many concurrent agent CRUD operations in flight \
-                     (max {AGENT_CRUD_MAX_CONCURRENT}); retry shortly"
-                ),
-                Some(request_id.clone()),
-            );
-        }
-    };
-
-    // Parse JSON body.
-    let (_parts, body) = req.into_parts();
-    let bytes = match axum::body::to_bytes(body, 64 * 1024).await {
-        Ok(b) => b,
-        Err(e) => {
-            return agent_error_response(
-                StatusCode::BAD_REQUEST,
-                "agent.bad_request",
-                format!("failed to read request body: {e}"),
-                Some(request_id.clone()),
-            );
-        }
-    };
-    let payload: RebindAgentRequest = match serde_json::from_slice(&bytes) {
-        Ok(p) => p,
-        Err(e) => {
-            return agent_error_response(
-                StatusCode::BAD_REQUEST,
-                "agent.bad_request",
-                format!("invalid JSON body: {e}"),
-                Some(request_id.clone()),
-            );
-        }
-    };
-
-    // 1. Validate agent name.
-    if let Err(e) = validate_agent_name(&payload.name) {
-        return agent_error_response(
-            StatusCode::BAD_REQUEST,
-            "agent.invalid_name",
-            format!("{e}"),
-            Some(request_id.clone()),
-        );
-    }
-
-    // 2. Verify the target policy exists in the active PolicySet.
-    //    Mirrors register_agent_handler:1228-1242 verbatim — same
-    //    error code (`agent.unknown_policy`), same `known_str` shape.
-    {
-        let snapshot = state.policy_set.load();
-        if snapshot.get(&payload.policy_name).is_none() {
-            let known: Vec<String> = snapshot.policy_names();
-            let known_str =
-                if known.is_empty() { "(none registered)".to_owned() } else { known.join(", ") };
-            // Story 7.11 review-round-1 P6: audit denied rebind.
-            emit_rebind_denied_audit(
-                &state,
-                &request_id,
-                &payload.name,
-                "agent.unknown_policy",
-                Some(payload.policy_name.clone()),
-            )
-            .await;
-            return agent_error_response(
-                StatusCode::UNPROCESSABLE_ENTITY,
-                "agent.unknown_policy",
-                format!("policy '{}' not found. Known policies: {known_str}", payload.policy_name),
-                Some(request_id.clone()),
-            );
-        }
-    }
-
-    // 3. Agent store must be available (same posture as register/remove).
-    let Some(store) = state.agent_store.clone() else {
-        return agent_error_response(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "agent.store_unavailable",
-            "agent identity store is unavailable".to_owned(),
-            Some(request_id.clone()),
-        );
-    };
-
-    // 4. Verify the agent exists. Capture the OLD policy_name AND the
-    //    real `created_at` / `last_seen_at` so the synthesized response
-    //    fallback (step 8) doesn't fabricate timestamps under race.
-    //    Mirrors remove_agent_handler's "get-then-remove" race-aware
-    //    pattern.
-    //
-    //    Story 7.11 review-round-1 P1: prior code captured only
-    //    `policy_name` and reached for `chrono::Utc::now()` on the
-    //    fallback path, which is observable timestamp corruption when
-    //    a concurrent `agent remove` races with rebind. Carrying the
-    //    real values closes the gap.
-    let (old_policy_name, real_created_at, real_last_seen_at) = match store.get(&payload.name).await
-    {
-        Ok(Some(identity)) => {
-            (identity.policy_name.clone(), identity.created_at, identity.last_seen_at)
-        }
-        Ok(None) => {
-            // Story 7.11 review-round-1 P6: emit a `agent-rebind-denied`
-            // audit event on failure so compliance/forensics sees the
-            // attempted change. Best-effort — audit failure logged at
-            // warn but never blocks the response.
-            emit_rebind_denied_audit(
-                &state,
-                &request_id,
-                &payload.name,
-                "agent.not_found",
-                Some(payload.policy_name.clone()),
-            )
-            .await;
-            return agent_error_response(
-                StatusCode::NOT_FOUND,
-                "agent.not_found",
-                format!("agent '{}' was not registered", payload.name),
-                Some(request_id.clone()),
-            );
-        }
-        Err(e) => {
-            return agent_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "agent.lookup_failed",
-                format!("{e}"),
-                Some(request_id.clone()),
-            );
-        }
-    };
-
-    // 4b. Story 7.11 review-round-1 P5: short-circuit no-op rebind
-    //     (same policy as current). Avoids redundant write + audit +
-    //     reload, and keeps the audit log free of `old == new` rows
-    //     that confuse operators reading the trail.
-    if old_policy_name == payload.policy_name {
-        let agent = AgentSummary {
-            name: payload.name.clone(),
-            policy_name: payload.policy_name.clone(),
-            created_at: format_audit_timestamp(real_created_at),
-            last_seen_at: real_last_seen_at.map(format_audit_timestamp),
-        };
-        tracing::info!(
-            target: "control",
-            request_id = %request_id,
-            agent_name = %payload.name,
-            policy_name = %payload.policy_name,
-            "agent rebind no-op (already bound to target policy); skipping write+audit+reload"
-        );
-        return (StatusCode::OK, Json(RebindAgentResponse { status: "ok", agent })).into_response();
-    }
-
-    // 5. Atomically rewrite policy_name. The store enforces the
-    //    bearer-token-immutability invariant by typed contract:
-    //    `update_policy` cannot touch token_hash or lookup_key_hex.
-    match store.update_policy(&payload.name, payload.policy_name.clone()).await {
-        Ok(true) => { /* fall through */ }
-        Ok(false) => {
-            // Race: agent removed between step 4's `get` and this
-            // `update_policy` (concurrent operator action). Surface
-            // as 404 — same shape as the not-found-at-get case so
-            // CLI exit semantics stay consistent.
-            // Story 7.11 review-round-1 P6: audit denied rebind.
-            emit_rebind_denied_audit(
-                &state,
-                &request_id,
-                &payload.name,
-                "agent.not_found",
-                Some(payload.policy_name.clone()),
-            )
-            .await;
-            return agent_error_response(
-                StatusCode::NOT_FOUND,
-                "agent.not_found",
-                format!("agent '{}' was not registered", payload.name),
-                Some(request_id.clone()),
-            );
-        }
-        Err(e) => {
-            // Story 7.11 review-round-1 P6: audit denied rebind.
-            emit_rebind_denied_audit(
-                &state,
-                &request_id,
-                &payload.name,
-                "agent.persist_failed",
-                Some(payload.policy_name.clone()),
-            )
-            .await;
-            return agent_error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "agent.persist_failed",
-                format!("{e}"),
-                Some(request_id.clone()),
-            );
-        }
-    }
-
-    // 6. Refresh the in-memory registry so subsequent MCP requests
-    //    evaluate against the new policy without daemon restart.
-    //    Mirrors register_agent_handler's rollback discipline: if the
-    //    list/replace fails, the on-disk file is already mutated, but
-    //    the in-memory snapshot still has the OLD policy. Operators
-    //    can run `agentsso reload` to recover. Returning 500 here
-    //    surfaces the inconsistency loudly.
-    //
-    //    Story 7.11 review-round-2 Q4: serialize [list + replace_with]
-    //    via `agent_registry_reload_lock`. See `register_agent_handler`
-    //    for the full explanation.
-    //
-    //    Story 7.11 review-round-3 #5: scope the reload_lock to just
-    //    the list+swap. The error-handling path below runs after
-    //    the lock releases.
-    let reload_result = {
-        let _reload_lock = state.agent_registry_reload_lock.lock().await;
-        store.list().await.map(|agents| state.agent_registry.replace_with(agents))
-    };
-    if let Err(e) = reload_result {
-        tracing::error!(
-            error = %e,
-            agent_name = %payload.name,
-            "agent registry reload after rebind failed — on-disk policy is updated but in-memory snapshot is stale; run `agentsso reload`",
-        );
-        // Story 7.11 review-round-1 P6: audit the partial-failure
-        // path explicitly. Disk write succeeded but in-memory
-        // snapshot is stale — operators auditing post-incident
-        // need this row to correlate with the operator-visible
-        // `agent.registry_reload_failed` error and the recovery
-        // step `agentsso reload`.
-        emit_rebind_denied_audit(
-            &state,
-            &request_id,
-            &payload.name,
-            "agent.registry_reload_failed",
-            Some(payload.policy_name.clone()),
-        )
-        .await;
-        return agent_error_response(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "agent.registry_reload_failed",
-            "agent policy was rewritten on disk but registry reload failed; run `agentsso reload`"
-                .to_owned(),
-            Some(request_id.clone()),
-        );
-    }
-
-    // 7. Audit event `agent-rebound`. Same shape conventions as
-    //    `agent-registered` and `agent-removed` (B7 review fix).
-    if let Some(audit) = &state.audit_store {
-        let mut event = AuditEvent::with_request_id(
-            request_id.clone(),
-            payload.name.clone(),
-            "permitlayer".to_owned(),
-            "-".to_owned(),
-            "agent-rebind".to_owned(),
-            "ok".to_owned(),
-            "agent-rebound".to_owned(),
-        );
-        event.extra = serde_json::json!({
-            "old_policy_name": old_policy_name,
-            "new_policy_name": payload.policy_name,
-        });
-        enrich_audit_extra_with_peer_creds(&mut event.extra, peer_creds_for_audit);
-        if let Err(e) = audit.append(event).await {
-            tracing::warn!(error = %e, "agent-rebound audit write failed (best-effort)");
-        }
-    }
-
-    tracing::info!(
-        target: "control",
-        request_id = %request_id,
-        agent_name = %payload.name,
-        old_policy_name = %old_policy_name,
-        new_policy_name = %payload.policy_name,
-        "agent rebound via control endpoint (bearer token unchanged)"
-    );
-
-    // 8. Build response from the values THIS handler wrote, not from
-    //    the registry snapshot. Story 7.11 review-round-3 #1: under
-    //    concurrent rebinds for the same agent, the registry snapshot
-    //    can reflect ANOTHER concurrent rebind's write that landed
-    //    between this handler's update_policy and snapshot read. If
-    //    we read policy_name from the snapshot, we'd return "policyA"
-    //    for handler-A's response while the snapshot already shows
-    //    "policyB" (handler-B's later write). The operator sees a
-    //    response that contradicts the registry — silent consistency
-    //    bug.
-    //
-    //    Fix: each handler reports what IT wrote — `payload.policy_name`,
-    //    `payload.name`, the captured `real_created_at` / `real_last_seen_at`
-    //    from step 4. The registry snapshot is the wrong source of
-    //    truth for this handler's own response; the per-name lock
-    //    held inside `update_policy` already proves THIS handler's
-    //    write was the most recent for THIS name as of step 5.
-    //
-    //    Concurrent handler B that lands AFTER us will report B's
-    //    own write the same way. Operators reading the registry
-    //    later see whichever write was most recent on disk; there's
-    //    no false claim that A's write didn't happen.
-    //
-    //    INVARIANT: RebindAgentResponse / AgentSummary do NOT carry
-    //    a bearer_token field. Tests assert the response body
-    //    contains neither "bearer_token" nor "agt_v2_".
-    let agent = AgentSummary {
-        name: payload.name.clone(),
-        policy_name: payload.policy_name.clone(),
-        created_at: format_audit_timestamp(real_created_at),
-        last_seen_at: real_last_seen_at.map(format_audit_timestamp),
-    };
-
-    (StatusCode::OK, Json(RebindAgentResponse { status: "ok", agent })).into_response()
-}
-
 /// `POST /v1/control/agent/{name}/rotate` — atomically mint a new
 /// bearer token for an existing agent and invalidate the old one
 /// (Story 7.34 AC #4).
@@ -5120,8 +4758,10 @@ pub(crate) async fn rotate_agent_handler(
         );
     };
 
-    let existing = match store.get(&name).await {
-        Ok(Some(id)) => id,
+    // Existence check only — Story 11.9 dropped `policy_name`, so the
+    // fetched identity is no longer read after this point.
+    match store.get(&name).await {
+        Ok(Some(_)) => {}
         Ok(None) => {
             return agent_error_response(
                 StatusCode::NOT_FOUND,
@@ -5225,9 +4865,9 @@ pub(crate) async fn rotate_agent_handler(
             "ok".to_owned(),
             "agent-rotated".to_owned(),
         );
-        event.extra = serde_json::json!({
-            "policy_name": existing.policy_name,
-        });
+        // Story 11.9: `policy_name` is no longer a per-agent field;
+        // rotation only re-keys the bearer, so there is no policy
+        // binding to record here.
         enrich_audit_extra_with_peer_creds(&mut event.extra, peer_creds_for_audit);
         if let Err(e) = audit.append(event).await {
             tracing::warn!(error = %e, "agent-rotated audit write failed (best-effort)");
@@ -5309,38 +4949,6 @@ pub(crate) async fn rotate_agent_handler(
 #[cfg(target_os = "macos")]
 fn should_write_per_user_bearer_token(home_override: Option<&std::path::Path>) -> bool {
     home_override.is_none()
-}
-
-/// Story 7.11 review-round-1 P6: emit `agent-rebind-denied` audit
-/// event on rebind failure paths so compliance/forensics sees attempts
-/// (even unsuccessful ones). Best-effort — audit failure is logged but
-/// never blocks the operator-visible HTTP response.
-async fn emit_rebind_denied_audit(
-    state: &ControlState,
-    request_id: &str,
-    agent_name: &str,
-    error_code: &str,
-    target_policy: Option<String>,
-) {
-    let Some(audit) = &state.audit_store else {
-        return;
-    };
-    let mut event = AuditEvent::with_request_id(
-        request_id.to_owned(),
-        agent_name.to_owned(),
-        "permitlayer".to_owned(),
-        "-".to_owned(),
-        "agent-rebind".to_owned(),
-        "denied".to_owned(),
-        "agent-rebind-denied".to_owned(),
-    );
-    event.extra = serde_json::json!({
-        "error_code": error_code,
-        "target_policy_name": target_policy,
-    });
-    if let Err(e) = audit.append(event).await {
-        tracing::warn!(error = %e, "agent-rebind-denied audit write failed (best-effort)");
-    }
 }
 
 /// Read the `RequestId` extension or mint a sentinel string.
@@ -5645,7 +5253,6 @@ pub(crate) fn router(
         .route("/v1/control/policies/{name}", get(show_policy_handler))
         .route("/v1/control/policies", get(list_policies_handler))
         .route("/v1/control/agent/remove", post(remove_agent_handler))
-        .route("/v1/control/agent/rebind", post(rebind_agent_handler))
         .route("/v1/control/agent/{name}/rotate", post(rotate_agent_handler))
         .route("/v1/control/connections", get(connections_handler))
         .route("/v1/control/connectors", get(connectors_handler))
@@ -7131,10 +6738,9 @@ mod tests {
     }
 
     impl InMemoryAgentStore {
-        fn with_agent(name: &str, policy_name: &str) -> Self {
+        fn with_agent(name: &str) -> Self {
             let identity = permitlayer_core::agent::AgentIdentity::new(
                 name.to_owned(),
-                policy_name.to_owned(),
                 "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".to_owned(),
                 "0".repeat(64),
                 chrono::Utc::now(),
@@ -7184,13 +6790,6 @@ mod tests {
             _name: &str,
             _new_lookup_key_hex: String,
             _new_token_hash: String,
-        ) -> Result<bool, permitlayer_core::store::StoreError> {
-            Ok(false)
-        }
-        async fn update_policy(
-            &self,
-            _name: &str,
-            _new_policy_name: String,
         ) -> Result<bool, permitlayer_core::store::StoreError> {
             Ok(false)
         }
@@ -7274,9 +6873,7 @@ mod tests {
     async fn agent_policy_name_handler_returns_policy_for_existing_agent() {
         let switch = Arc::new(KillSwitch::new());
         let store: Arc<dyn permitlayer_core::store::AgentIdentityStore> =
-            Arc::new(InMemoryAgentStore::with_agent("claude-desktop", "gmail-read-only"));
-        // Round-1 review P21: stage the agent's policy so the
-        // dangling-binding cross-check passes.
+            Arc::new(InMemoryAgentStore::with_agent("claude-desktop"));
         let app = build_with_agent_store(Arc::clone(&switch), Some(store), &["gmail-read-only"]);
 
         let resp = app
@@ -7290,14 +6887,17 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let json = body_json(resp).await;
         assert_eq!(json["name"], "claude-desktop");
-        assert_eq!(json["policy_name"], "gmail-read-only");
+        // Story 11.9: `policy_name` is no longer a per-agent field —
+        // the endpoint echoes an empty binding until 11.14 reshapes it
+        // into a bindings lookup.
+        assert_eq!(json["policy_name"], "");
     }
 
     #[tokio::test]
     async fn agent_policy_name_handler_returns_404_for_missing_agent() {
         let switch = Arc::new(KillSwitch::new());
         let store: Arc<dyn permitlayer_core::store::AgentIdentityStore> =
-            Arc::new(InMemoryAgentStore::with_agent("claude-desktop", "gmail-read-only"));
+            Arc::new(InMemoryAgentStore::with_agent("claude-desktop"));
         let app = build_with_agent_store(Arc::clone(&switch), Some(store), &["gmail-read-only"]);
 
         let resp = app
@@ -7352,32 +6952,10 @@ mod tests {
         assert_eq!(json["code"], "agent.invalid_name");
     }
 
-    /// Round-1 review P21: agent's policy_name is no longer in the
-    /// active policy set (operator removed the file + reloaded).
-    /// Handler returns 422 with operator-actionable remediation.
-    #[tokio::test]
-    async fn agent_policy_name_handler_returns_422_for_dangling_policy_binding() {
-        let switch = Arc::new(KillSwitch::new());
-        let store: Arc<dyn permitlayer_core::store::AgentIdentityStore> =
-            Arc::new(InMemoryAgentStore::with_agent("claude-desktop", "removed-policy"));
-        // Stage a DIFFERENT policy in the active set; the agent's
-        // binding to "removed-policy" is dangling.
-        let app = build_with_agent_store(Arc::clone(&switch), Some(store), &["gmail-read-only"]);
-
-        let resp = app
-            .oneshot(req_with_peer(
-                Method::GET,
-                "/v1/control/agent/claude-desktop/policy_name",
-                loopback_v4(),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
-        let json = body_json(resp).await;
-        assert_eq!(json["code"], "agent.dangling_policy_binding");
-        let message = json["message"].as_str().unwrap_or_default();
-        assert!(message.contains("agentsso agent rebind"), "remediation hint missing: {message}");
-    }
+    // Story 11.9: the former `agent_policy_name_handler_returns_422_for_dangling_policy_binding`
+    // test was deleted — `policy_name` is no longer a per-agent field, so
+    // there is no per-agent policy binding to dangle. Bindings (Story
+    // 11.14) replace this concept entirely.
 
     // ── Story 7.30 Task 3: GET /v1/control/credentials/{service}/meta ──
 
@@ -7528,7 +7106,6 @@ mod tests {
 
         let identity = permitlayer_core::agent::AgentIdentity::new(
             agent_name.to_owned(),
-            "test-policy".to_owned(),
             "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".to_owned(),
             "0".repeat(64),
             chrono::Utc::now(),
@@ -7628,10 +7205,14 @@ mod tests {
         assert_eq!(json["replaced_previous"], false);
         assert_eq!(json["meta"]["client_type"], "byo");
 
-        // On-disk artifacts.
+        // On-disk artifacts. Story 11.9: sealed envelopes live at
+        // `<connection>-<slot>.sealed` (connection derived from the
+        // service via `conn_shim`); the meta sentinel keeps the
+        // service-named convention until Story 11.12.
         let vault_dir = home_tmp.path().join("vault");
-        assert!(vault_dir.join("gmail.sealed").is_file());
-        assert!(vault_dir.join("gmail-refresh.sealed").is_file());
+        let gmail_conn = crate::conn_shim::connection_id_for_service("gmail");
+        assert!(vault_dir.join(format!("{gmail_conn}-access.sealed")).is_file());
+        assert!(vault_dir.join(format!("{gmail_conn}-refresh.sealed")).is_file());
         assert!(vault_dir.join("gmail-meta.json").is_file());
     }
 
@@ -7675,7 +7256,6 @@ mod tests {
 
         let identity = permitlayer_core::agent::AgentIdentity::new(
             agent_name.to_owned(),
-            "test-policy".to_owned(),
             "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".to_owned(),
             "0".repeat(64),
             chrono::Utc::now(),
@@ -7912,7 +7492,14 @@ mod tests {
         let home_tmp = tempfile::tempdir().unwrap();
         let vault_dir = home_tmp.path().join("vault");
         std::fs::create_dir_all(&vault_dir).unwrap();
-        std::fs::write(vault_dir.join("gmail.sealed"), b"not-a-real-sealed-envelope").unwrap();
+        // Story 11.9: the verify handler reads the Access slot at
+        // `<connection>-access.sealed` (connection derived via `conn_shim`).
+        let gmail_conn = crate::conn_shim::connection_id_for_service("gmail");
+        std::fs::write(
+            vault_dir.join(format!("{gmail_conn}-access.sealed")),
+            b"not-a-real-sealed-envelope",
+        )
+        .unwrap();
 
         let app = build_with_seal_wiring_with_existing_home(
             "test-agent",
@@ -7947,9 +7534,8 @@ mod tests {
         let wrong_key = zeroize::Zeroizing::new([0xAAu8; permitlayer_keystore::MASTER_KEY_LEN]);
         let wrong_vault = permitlayer_vault::Vault::new(wrong_key, 0);
         let token = permitlayer_credential::OAuthToken::from_trusted_bytes(b"ya29.fake".to_vec());
-        let sealed = wrong_vault
-            .seal(ConnectionId::from_service_shim("gmail"), Slot::Access, &token)
-            .expect("wrong-vault seal");
+        let gmail_conn = crate::conn_shim::connection_id_for_service("gmail");
+        let sealed = wrong_vault.seal(gmail_conn, Slot::Access, &token).expect("wrong-vault seal");
 
         // Write the sealed envelope to disk via the real store so
         // the bytes are in the format `CredentialFsStore::get`
@@ -7957,9 +7543,14 @@ mod tests {
         let store_for_seal =
             permitlayer_core::store::fs::CredentialFsStore::new(home_tmp.path().to_path_buf())
                 .expect("store init");
-        permitlayer_core::store::CredentialStore::put(&store_for_seal, "gmail", sealed)
-            .await
-            .expect("put sealed");
+        permitlayer_core::store::CredentialStore::put(
+            &store_for_seal,
+            gmail_conn,
+            Slot::Access,
+            sealed,
+        )
+        .await
+        .expect("put sealed");
 
         // Build the handler with the canonical test_vault (key
         // `[0x55u8; ...]`) — different from the 0xAA we sealed
@@ -8573,10 +8164,9 @@ auto-approve-reads = true
     }
 
     impl RotatableAgentStore {
-        fn with_agent(name: &str, policy_name: &str) -> Self {
+        fn with_agent(name: &str) -> Self {
             let identity = permitlayer_core::agent::AgentIdentity::new(
                 name.to_owned(),
-                policy_name.to_owned(),
                 "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".to_owned(),
                 "0".repeat(64),
                 chrono::Utc::now(),
@@ -8629,13 +8219,6 @@ auto-approve-reads = true
         ) -> Result<bool, permitlayer_core::store::StoreError> {
             Ok(self.agents.contains_key(name))
         }
-        async fn update_policy(
-            &self,
-            _name: &str,
-            _new_policy_name: String,
-        ) -> Result<bool, permitlayer_core::store::StoreError> {
-            Ok(false)
-        }
     }
 
     fn build_with_rotatable_agent_store(
@@ -8673,7 +8256,7 @@ auto-approve-reads = true
 
     #[tokio::test]
     async fn rotate_agent_handler_returns_new_bearer_for_existing_agent() {
-        let store = Arc::new(RotatableAgentStore::with_agent("test-agent", "test-policy"));
+        let store = Arc::new(RotatableAgentStore::with_agent("test-agent"));
         let (app, _store) = build_with_rotatable_agent_store(store);
 
         let resp = app
@@ -8732,7 +8315,7 @@ auto-approve-reads = true
 
     #[tokio::test]
     async fn rotate_agent_handler_rejects_invalid_name() {
-        let store = Arc::new(RotatableAgentStore::with_agent("test-agent", "test-policy"));
+        let store = Arc::new(RotatableAgentStore::with_agent("test-agent"));
         let (app, _store) = build_with_rotatable_agent_store(store);
 
         let resp = app

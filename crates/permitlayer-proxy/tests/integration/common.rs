@@ -54,3 +54,42 @@ pub fn connector_registry_with(overrides: &[(&str, &str)]) -> Arc<ConnectorRegis
         .collect();
     Arc::new(ConnectorRegistry::from_defs(defs))
 }
+
+/// Test-side replica of `ProxyService::legacy_connection_id_for_service`
+/// (Story 11.10). These integration tests construct `ProxyService` WITHOUT
+/// wiring binding stores, so the proxy resolves the connection id from the
+/// bare `service` string via that private fallback. The fallback is private
+/// to the lib, so its byte-identical derivation is replicated here for the
+/// mocks to seed credentials under the same `(ConnectionId, Slot)` key the
+/// request path reads. Deleted when these tests seed real bindings.
+#[must_use]
+pub fn legacy_connection_id_for_service(service: &str) -> permitlayer_credential::ConnectionId {
+    use sha2::{Digest, Sha256};
+    const SHIM_DOMAIN: &[u8] = b"permitlayer-connectionid-shim-v1:";
+    let mut hasher = Sha256::new();
+    hasher.update(SHIM_DOMAIN);
+    hasher.update(service.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0u8; 16];
+    bytes.copy_from_slice(&digest[..16]);
+    permitlayer_credential::ConnectionId::from_bytes(bytes)
+}
+
+/// Test-side replica of the proxy's former
+/// `conn_shim::connection_slot_for_service_key` (Story 11.10): decompose a
+/// legacy `service` key (`gmail`, `gmail-refresh`, `gmail-client`) into
+/// `(ConnectionId, Slot)` using [`legacy_connection_id_for_service`].
+#[must_use]
+pub fn legacy_connection_slot_for_service_key(
+    service_key: &str,
+) -> (permitlayer_credential::ConnectionId, permitlayer_credential::Slot) {
+    use permitlayer_credential::Slot;
+    let (base, slot) = if let Some(b) = service_key.strip_suffix("-refresh") {
+        (b, Slot::Refresh)
+    } else if let Some(b) = service_key.strip_suffix("-client") {
+        (b, Slot::Client)
+    } else {
+        (service_key, Slot::Access)
+    };
+    (legacy_connection_id_for_service(base), slot)
+}

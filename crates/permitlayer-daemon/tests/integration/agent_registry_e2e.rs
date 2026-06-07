@@ -242,6 +242,47 @@ fn full_register_auth_policy_lifecycle() {
     let token_readonly = register_agent(port, home.path(), "readonly-agent", "policy-readonly");
     let token_write = register_agent(port, home.path(), "write-agent", "policy-write");
 
+    // Story 11.10: an agent's authority is now its set of bindings, not a
+    // per-agent `policy_name`. Seed each agent a `gmail` connection +
+    // binding carrying the policy the old test expected. The binding's
+    // tier gates scope at the SERVICE; the binding's `policy` is stamped
+    // into `AgentPolicyBinding` and evaluated by `PolicyLayer` (which runs
+    // FIRST), so the `gmail.modify`-on-readonly deny is still
+    // `policy.denied` from `policy-readonly` — the existing assertions
+    // hold. No credential is sealed: every assertion below either denies
+    // at PolicyLayer or only checks the code is not `policy.denied`/`auth.*`.
+    const GMAIL_RO_URI: &[&str] = &["https://www.googleapis.com/auth/gmail.readonly"];
+    const GMAIL_RW_URIS: &[&str] = &[
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.send",
+        "https://www.googleapis.com/auth/gmail.compose",
+        "https://www.googleapis.com/auth/gmail.modify",
+    ];
+    crate::common::seed_connection_and_binding(
+        home.path(),
+        "readonly-agent",
+        "google-gmail",
+        "gmail",
+        crate::common::SeedTier::Read,
+        GMAIL_RO_URI,
+        Some("policy-readonly"),
+        None,
+        crate::common::TEST_MASTER_KEY_HEX,
+        None,
+    );
+    crate::common::seed_connection_and_binding(
+        home.path(),
+        "write-agent",
+        "google-gmail",
+        "gmail",
+        crate::common::SeedTier::ReadWrite,
+        GMAIL_RW_URIS,
+        Some("policy-write"),
+        None,
+        crate::common::TEST_MASTER_KEY_HEX,
+        None,
+    );
+
     // 2. Authenticated request matching the readonly agent's scope:
     //    PolicyLayer ALLOWS the request through. Without upstream
     //    credentials the proxy then returns a downstream error, but

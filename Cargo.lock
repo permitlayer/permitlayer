@@ -2265,8 +2265,8 @@ dependencies = [
 name = "permitlayer-credential"
 version = "1.2.3"
 dependencies = [
+ "rand 0.8.5",
  "serde",
- "sha2",
  "static_assertions",
  "thiserror 2.0.18",
  "zeroize",

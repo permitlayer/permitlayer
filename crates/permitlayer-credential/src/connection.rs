@@ -7,8 +7,8 @@
 //!
 //! - [`ConnectionId`] — a 16-byte ULID identifying ONE connection (one
 //!   upstream account on one connector). Minted by the `ConnectionStore`
-//!   in Story 11.9; until then call sites use
-//!   [`ConnectionId::from_service_shim`] (see its docs).
+//!   (Story 11.9); parsed back from its canonical 26-char text form via
+//!   [`ConnectionId::from_ulid_str`].
 //! - [`Slot`] — which credential within the connection: `Access`,
 //!   `Refresh`, or `Client`. Each slot derives a DISTINCT subkey under
 //!   the same connection (the `-refresh` / `-client` string suffixes are
@@ -54,35 +54,55 @@ impl ConnectionId {
         &self.0
     }
 
-    /// **11.8→11.9 bridge — deterministic shim from a service name.**
+    /// Generate a fresh random `ConnectionId` (the 16-byte ULID value
+    /// space; this constructor fills all 128 bits from the OS RNG rather
+    /// than splitting timestamp/randomness, which is sufficient for a
+    /// collision-free unique identifier). Used by the `ConnectionStore`
+    /// (Story 11.9 / `connection add` in 11.13) to mint one id per
+    /// connection.
     ///
-    /// The real per-connection ULIDs are minted by the `ConnectionStore`
-    /// in Story 11.9. Until then, callers that only hold a legacy
-    /// `service` string (e.g. `"gmail"`) derive a STABLE id from it so the
-    /// vault can key on `(ConnectionId, Slot)` today without inventing the
-    /// store early.
-    ///
-    /// The id is a domain-separated SHA-256 of the service name, truncated
-    /// to 16 bytes — a pure function of the input, so it is 1:1 with the
-    /// service name. That means cross-connection isolation in 11.8 is the
-    /// per-connection analog of today's per-service isolation; true
-    /// distinct-account ULIDs arrive with the `ConnectionStore` in 11.9,
-    /// which REPLACES every call to this shim.
-    ///
-    /// The `SHIM_DOMAIN` prefix guarantees a shim id can never collide
-    /// with a real ULID's value space by accident in tests that mix both.
-    #[doc(hidden)]
+    /// `OsRng` panics on entropy failure — the same fail-stop policy the
+    /// vault uses for nonce generation (OS RNG failure is catastrophic
+    /// and non-recoverable).
     #[must_use]
-    pub fn from_service_shim(service: &str) -> Self {
-        use sha2::{Digest, Sha256};
-        const SHIM_DOMAIN: &[u8] = b"permitlayer-connectionid-shim-v1:";
-        let mut hasher = Sha256::new();
-        hasher.update(SHIM_DOMAIN);
-        hasher.update(service.as_bytes());
-        let digest = hasher.finalize();
+    pub fn generate() -> Self {
+        use rand::RngCore;
         let mut bytes = [0u8; 16];
-        bytes.copy_from_slice(&digest[..16]);
+        rand::rngs::OsRng.fill_bytes(&mut bytes);
         Self(bytes)
+    }
+
+    /// Parse a `ConnectionId` from its canonical 26-character Crockford
+    /// base32 ULID text form (the inverse of [`Display`]). Used by the
+    /// `CredentialStore` to recover ids from `<ulid>-<slot>.sealed`
+    /// filenames and by `connection inspect`/CLI selectors (Story 11.13).
+    ///
+    /// Returns `None` if `s` is not exactly 26 chars or contains a
+    /// character outside the Crockford alphabet (case-insensitive on the
+    /// ambiguous letters is NOT accepted — the canonical form is
+    /// uppercase, no `I`/`L`/`O`/`U`).
+    #[must_use]
+    pub fn from_ulid_str(s: &str) -> Option<Self> {
+        if s.len() != 26 {
+            return None;
+        }
+        let mut value: u128 = 0;
+        for &b in s.as_bytes() {
+            let digit = match b {
+                b'0'..=b'9' => b - b'0',
+                b'A'..=b'H' => b - b'A' + 10,
+                b'J' | b'K' => b - b'J' + 18,
+                b'M' | b'N' => b - b'M' + 20,
+                b'P'..=b'T' => b - b'P' + 22,
+                b'V'..=b'Z' => b - b'V' + 27,
+                _ => return None,
+            };
+            // 26 base32 chars encode 130 bits; the top char carries only
+            // the high 2 bits, so an overflowing shift can never happen
+            // for a well-formed 26-char string (we never shift past 128).
+            value = (value << 5) | u128::from(digit);
+        }
+        Some(Self(value.to_be_bytes()))
     }
 }
 
@@ -149,32 +169,19 @@ impl fmt::Display for Slot {
     }
 }
 
-/// **11.8→11.9 bridge — decompose a legacy `service` key string into
-/// `(ConnectionId, Slot)`.**
-///
-/// Pre-v2 call sites encoded the slot as a suffix on the service string:
-/// `"gmail"` = access, `"gmail-refresh"` = refresh, `"gmail-client"` =
-/// client. This splits that convention back apart so the vault can key on
-/// `(ConnectionId, Slot)`:
-///
-/// - strip a trailing `-refresh` / `-client` to recover the base service,
-/// - map the suffix (or its absence) to the [`Slot`],
-/// - shim the base service to a [`ConnectionId`] via
-///   [`ConnectionId::from_service_shim`].
-///
-/// Story 11.9 replaces every caller of this with a real store-issued
-/// `(ConnectionId, Slot)` and deletes this bridge.
-#[doc(hidden)]
-#[must_use]
-pub fn connection_slot_from_service_key(service_key: &str) -> (ConnectionId, Slot) {
-    let (base, slot) = if let Some(b) = service_key.strip_suffix("-refresh") {
-        (b, Slot::Refresh)
-    } else if let Some(b) = service_key.strip_suffix("-client") {
-        (b, Slot::Client)
-    } else {
-        (service_key, Slot::Access)
-    };
-    (ConnectionId::from_service_shim(base), slot)
+impl Slot {
+    /// Parse a slot from its [`label`](Slot::label) text form (the
+    /// inverse of `label()`). Used by the `CredentialStore` to recover the
+    /// slot from a `<ulid>-<slot>.sealed` filename.
+    #[must_use]
+    pub fn from_label(s: &str) -> Option<Self> {
+        match s {
+            "access" => Some(Slot::Access),
+            "refresh" => Some(Slot::Refresh),
+            "client" => Some(Slot::Client),
+            _ => None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -190,27 +197,43 @@ mod tests {
     }
 
     #[test]
-    fn from_service_shim_is_deterministic() {
-        assert_eq!(
-            ConnectionId::from_service_shim("gmail"),
-            ConnectionId::from_service_shim("gmail")
-        );
+    fn generate_produces_distinct_ids() {
+        // Two fresh ids are distinct with overwhelming probability
+        // (128-bit random space). A collision here is a ~2^-128 event,
+        // so a single inequality is a sound smoke test.
+        assert_ne!(ConnectionId::generate(), ConnectionId::generate());
     }
 
     #[test]
-    fn from_service_shim_distinguishes_services() {
-        assert_ne!(
-            ConnectionId::from_service_shim("gmail"),
-            ConnectionId::from_service_shim("calendar")
-        );
-        // The slot suffixes are NOT part of the connection id under v2 —
-        // but the shim takes whatever string it's given, so callers must
-        // strip the suffix first. These are different inputs → different
-        // ids, which is exactly why the caller strips before shimming.
-        assert_ne!(
-            ConnectionId::from_service_shim("gmail"),
-            ConnectionId::from_service_shim("gmail-refresh")
-        );
+    fn from_ulid_str_round_trips_display() {
+        let id = ConnectionId::from_bytes([
+            0x01, 0x23, 0x45, 0x67, 0x89, 0xab, 0xcd, 0xef, 0xfe, 0xdc, 0xba, 0x98, 0x76, 0x54,
+            0x32, 0x10,
+        ]);
+        let text = id.to_string();
+        let parsed = ConnectionId::from_ulid_str(&text).expect("canonical ULID parses");
+        assert_eq!(parsed, id);
+        // A freshly generated id also survives the text round-trip.
+        let fresh = ConnectionId::generate();
+        assert_eq!(ConnectionId::from_ulid_str(&fresh.to_string()), Some(fresh));
+    }
+
+    #[test]
+    fn from_ulid_str_rejects_malformed() {
+        assert_eq!(ConnectionId::from_ulid_str(""), None);
+        assert_eq!(ConnectionId::from_ulid_str("tooshort"), None);
+        // 26 chars but an out-of-alphabet letter (I/L/O/U excluded).
+        assert_eq!(ConnectionId::from_ulid_str("0000000000000000000000000I"), None);
+        // 27 chars.
+        assert_eq!(ConnectionId::from_ulid_str("000000000000000000000000000"), None);
+    }
+
+    #[test]
+    fn slot_from_label_round_trips() {
+        for slot in [Slot::Access, Slot::Refresh, Slot::Client] {
+            assert_eq!(Slot::from_label(slot.label()), Some(slot));
+        }
+        assert_eq!(Slot::from_label("nope"), None);
     }
 
     #[test]
@@ -244,23 +267,5 @@ mod tests {
         assert_eq!(Slot::Access.label(), "access");
         assert_eq!(Slot::Refresh.to_string(), "refresh");
         assert_eq!(Slot::Client.label(), "client");
-    }
-
-    #[test]
-    fn service_key_decomposes_into_connection_and_slot() {
-        let (id_access, slot_access) = connection_slot_from_service_key("gmail");
-        let (id_refresh, slot_refresh) = connection_slot_from_service_key("gmail-refresh");
-        let (id_client, slot_client) = connection_slot_from_service_key("gmail-client");
-        // Same base service → same connection id across all three slots.
-        assert_eq!(id_access, id_refresh);
-        assert_eq!(id_access, id_client);
-        assert_eq!(id_access, ConnectionId::from_service_shim("gmail"));
-        // Suffix → slot.
-        assert_eq!(slot_access, Slot::Access);
-        assert_eq!(slot_refresh, Slot::Refresh);
-        assert_eq!(slot_client, Slot::Client);
-        // A different base service → a different connection id.
-        let (id_cal, _) = connection_slot_from_service_key("calendar");
-        assert_ne!(id_access, id_cal);
     }
 }

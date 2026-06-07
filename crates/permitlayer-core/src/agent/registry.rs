@@ -860,7 +860,6 @@ mod tests {
     fn fake_agent(name: &str, lookup_key: [u8; LOOKUP_KEY_BYTES]) -> AgentIdentity {
         AgentIdentity::new(
             name.to_owned(),
-            "default".to_owned(),
             "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".to_owned(),
             lookup_key_to_hex(&lookup_key),
             Utc::now(),
@@ -1166,7 +1165,6 @@ mod tests {
         // lookup_key_hex via the raw type's deserialize gate.
         let raw = super::super::identity::AgentIdentityRaw {
             name: "broken".to_owned(),
-            policy_name: "default".to_owned(),
             token_hash: "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".to_owned(),
             lookup_key_hex: "not-hex".to_owned(),
             created_at: Utc::now(),
@@ -1386,8 +1384,8 @@ mod tests {
     async fn concurrent_lookups_during_swap() {
         // Spawn 16 reader tasks doing 1000 lookups each, alongside one
         // writer task doing 100 swaps. Assert no panics, no torn reads
-        // (every lookup result is internally consistent — name and
-        // policy_name match the same snapshot).
+        // (every lookup result is internally consistent — name matches
+        // the same snapshot).
         let key_a = [0xAAu8; LOOKUP_KEY_BYTES];
         let key_b = [0xBBu8; LOOKUP_KEY_BYTES];
 
@@ -1401,11 +1399,9 @@ mod tests {
                     let snap = r.snapshot();
                     if let Some(agent) = snap.lookup_by_key(&key_a) {
                         assert_eq!(agent.name(), "a-agent");
-                        assert_eq!(agent.policy_name, "default");
                     }
                     if let Some(agent) = snap.lookup_by_key(&key_b) {
                         assert_eq!(agent.name(), "b-agent");
-                        assert_eq!(agent.policy_name, "default");
                     }
                 }
             }));

@@ -26,7 +26,7 @@ use zeroize::Zeroizing;
 use permitlayer_core::audit::event::AuditEvent;
 use permitlayer_core::scrub::{ScrubEngine, ScrubSample};
 use permitlayer_core::store::{AuditStore, CredentialStore};
-use permitlayer_credential::{ConnectionId, Slot, connection_slot_from_service_key};
+use permitlayer_credential::Slot;
 use permitlayer_oauth::{CredentialMeta, GoogleOAuthConfig, OAuthClient};
 use permitlayer_vault::Vault;
 
@@ -129,6 +129,16 @@ pub struct ProxyService {
     /// rejection of the `CredentialMeta.token_endpoint_override`
     /// alternative is documented in the story's Dev Notes).
     oauth_client_overrides: Option<HashMap<String, Arc<OAuthClient>>>,
+    /// Story 11.10: per-agent binding store. `Some` in production (and the
+    /// 11.10 e2e harness) wires real binding resolution; `None` keeps the
+    /// legacy proxy unit tests — which construct `ProxyService` directly
+    /// without binding stores — working via the
+    /// [`Self::legacy_connection_id_for_service`] fallback. Both stores are
+    /// `Some` or both `None`; mixing is a wiring bug (the builder sets them
+    /// together).
+    binding_store: Option<Arc<dyn permitlayer_core::store::BindingStore>>,
+    /// Story 11.10: connection metadata store. See `binding_store`.
+    connection_store: Option<Arc<dyn permitlayer_core::store::ConnectionStore>>,
 }
 
 impl ProxyService {
@@ -164,7 +174,29 @@ impl ProxyService {
             vault_dir,
             media_dir,
             oauth_client_overrides: None,
+            binding_store: None,
+            connection_store: None,
         }
+    }
+
+    /// Wire real per-request binding resolution (Story 11.10).
+    ///
+    /// When both stores are present, [`Self::handle_inner`] resolves the
+    /// connection id for `(agent, selector)` from the agent's bindings and
+    /// gates the request on `tier ∩ granted_scopes ∩ binding.policy`
+    /// (default-deny). When absent, the proxy falls back to the legacy
+    /// service-string → connection-id derivation used by the existing unit
+    /// tests. Builder-style so the many `new` call sites need no new
+    /// argument.
+    #[must_use]
+    pub fn with_binding_resolution(
+        mut self,
+        binding_store: Arc<dyn permitlayer_core::store::BindingStore>,
+        connection_store: Arc<dyn permitlayer_core::store::ConnectionStore>,
+    ) -> Self {
+        self.binding_store = Some(binding_store);
+        self.connection_store = Some(connection_store);
+        self
     }
 
     /// Set the `--allow-private-upstream` escape hatch (Story 11.6).
@@ -174,6 +206,156 @@ impl ProxyService {
     pub fn with_allow_private_upstream(mut self, allow: bool) -> Self {
         self.allow_private_upstream = allow;
         self
+    }
+
+    /// Test-only fallback: derive a stable [`ConnectionId`] from a bare
+    /// `service` string when no [`BindingStore`] is wired. Production
+    /// always wires binding resolution via [`Self::with_binding_resolution`],
+    /// so this path is only taken by the legacy proxy unit tests that
+    /// construct a `ProxyService` directly and seed credentials by service
+    /// name. Byte-identical to the daemon control-plane seal handler's
+    /// equivalent derivation, so a credential sealed under `<service>`
+    /// round-trips here.
+    ///
+    /// Remove when all proxy unit tests seed a binding + connection.
+    ///
+    /// [`BindingStore`]: permitlayer_core::store::BindingStore
+    /// [`ConnectionId`]: permitlayer_credential::ConnectionId
+    #[doc(hidden)]
+    fn legacy_connection_id_for_service(service: &str) -> permitlayer_credential::ConnectionId {
+        use sha2::{Digest, Sha256};
+        const SHIM_DOMAIN: &[u8] = b"permitlayer-connectionid-shim-v1:";
+        let mut hasher = Sha256::new();
+        hasher.update(SHIM_DOMAIN);
+        hasher.update(service.as_bytes());
+        let digest = hasher.finalize();
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        permitlayer_credential::ConnectionId::from_bytes(bytes)
+    }
+
+    /// Resolve the connection id for `(agent, selector)` and run the
+    /// default-deny binding authz gate (Story 11.10).
+    ///
+    /// When both binding stores are wired, this is the production path:
+    ///   1. load the agent's bindings,
+    ///   2. match one by `alias`, then connection `name`, then id text,
+    ///   3. confirm the connection is `Active`,
+    ///   4. gate the tool's `required_scope` (= `req.scope`, a short name)
+    ///      on `connector.tiers[tier] ∩ connection.granted_scopes`,
+    ///   5. return the resolved [`ConnectionId`].
+    ///
+    /// The optional per-binding `policy` is NOT evaluated here — it is
+    /// surfaced upstream by `AuthService`, which stamps the matched
+    /// binding's `policy` into `AgentPolicyBinding` so `PolicyLayer` + the
+    /// approval engine (which run before this service) evaluate it. This
+    /// resolver and that stamp use the SAME `crate::binding_resolve` match,
+    /// so they always agree on which binding the selector addresses.
+    ///
+    /// When the stores are absent (legacy unit tests), it returns the
+    /// [`Self::legacy_connection_id_for_service`] derivation with no gate
+    /// (the tests pre-date the binding model; `PolicyLayer` and the unit
+    /// assertions own their own authz expectations).
+    ///
+    /// [`ConnectionId`]: permitlayer_credential::ConnectionId
+    async fn resolve_connection(
+        &self,
+        agent_id: &str,
+        selector: &str,
+        required_scope: &str,
+    ) -> Result<permitlayer_credential::ConnectionId, ProxyError> {
+        use permitlayer_core::store::connection::ConnectionTier;
+
+        let (Some(binding_store), Some(connection_store)) =
+            (self.binding_store.as_ref(), self.connection_store.as_ref())
+        else {
+            // Legacy fallback — no binding stores wired.
+            return Ok(Self::legacy_connection_id_for_service(selector));
+        };
+
+        // 1+2+3. Load the agent's bindings and match by the shared
+        //   precedence (alias → connection name → id text), skipping
+        //   revoked connections. Factored into `crate::binding_resolve` so
+        //   `AuthService` (which stamps the binding's policy upstream) and
+        //   this authoritative resolver agree on exactly which binding a
+        //   selector addresses.
+        let (binding, connection) = crate::binding_resolve::resolve_agent_binding(
+            binding_store,
+            connection_store,
+            agent_id,
+            selector,
+        )
+        .await
+        .map_err(|e| ProxyError::Internal {
+            message: format!("binding/connection store read failed for agent '{agent_id}': {e}"),
+        })?
+        .ok_or_else(|| ProxyError::BindingNotFound {
+            agent: agent_id.to_owned(),
+            selector: selector.to_owned(),
+        })?;
+
+        // 4. AUTHZ gate (default-deny): tier ∩ granted_scopes.
+        //    `required_scope` (req.scope) is a connector short name (e.g.
+        //    `gmail.send`); tier bundles hold short names; granted_scopes
+        //    holds full OAuth URIs. So the tier check compares short names
+        //    and the granted check compares the short name's URI.
+        let connector =
+            self.connectors.get(&connection.connector_id).ok_or_else(|| ProxyError::Internal {
+                message: format!(
+                    "connection '{}' references unknown connector '{}'",
+                    connection.id, connection.connector_id
+                ),
+            })?;
+
+        let tier_name = match binding.tier {
+            ConnectionTier::Read => "read",
+            ConnectionTier::ReadWrite => "read-write",
+        };
+        let tier_bundle =
+            connector.def.tiers.get(tier_name).ok_or_else(|| ProxyError::Internal {
+                message: format!(
+                    "connector '{}' does not declare tier '{tier_name}'",
+                    connection.connector_id
+                ),
+            })?;
+
+        // Tier gate: required short name must be in the tier bundle.
+        if !tier_bundle.scopes().iter().any(|s| s == required_scope) {
+            return Err(ProxyError::TierDenied {
+                connection: connection.id.to_string(),
+                tier: tier_name.to_owned(),
+                required_scope: required_scope.to_owned(),
+            });
+        }
+
+        // Granted gate: the short name's full URI must be in the
+        // connection's granted_scopes. A short name absent from the
+        // connector vocab is impossible for a validated def, but treat a
+        // miss as not-granted (fail closed) rather than panicking.
+        let required_uri = connector.def.scopes.get(required_scope).ok_or_else(|| {
+            ProxyError::ScopeNotGranted {
+                connection: connection.id.to_string(),
+                required_scope: required_scope.to_owned(),
+            }
+        })?;
+        if !connection.granted_scopes.iter().any(|g| g == required_uri) {
+            return Err(ProxyError::ScopeNotGranted {
+                connection: connection.id.to_string(),
+                required_scope: required_scope.to_owned(),
+            });
+        }
+
+        // The optional per-binding `policy` is enforced UPSTREAM, not here:
+        // `AuthService` resolves the same binding (via `crate::binding_resolve`)
+        // and stamps `binding.policy` into `AgentPolicyBinding`, so
+        // `PolicyLayer` + the approval engine — which run before this
+        // service and hold the `PolicySet` — evaluate it (incl.
+        // `Decision::Prompt` → approval). This resolver owns the
+        // `tier ∩ granted_scopes` gate + the authoritative `binding.not_found`
+        // deny; the two layers compose (either may deny independently).
+        let _ = &binding;
+
+        Ok(connection.id)
     }
 
     /// Resolve a request's bare service name (`gmail`/`calendar`/`drive`)
@@ -262,6 +444,8 @@ impl ProxyService {
             vault_dir,
             media_dir,
             oauth_client_overrides: Some(oauth_client_overrides),
+            binding_store: None,
+            connection_store: None,
         }
     }
 
@@ -317,6 +501,7 @@ impl ProxyService {
     fn build_oauth_client_for_service(
         &self,
         service: &str,
+        connection: permitlayer_credential::ConnectionId,
     ) -> Result<Arc<OAuthClient>, ProxyError> {
         // Test-only fast path: if the integration test harness injected an
         // override client for this service via `with_oauth_client_override`,
@@ -379,7 +564,7 @@ impl ProxyService {
                         ),
                     });
                 }
-                self.unseal_byo_client_config(service)?
+                self.unseal_byo_client_config(service, connection)?
             }
             other => {
                 return Err(ProxyError::Internal {
@@ -402,7 +587,11 @@ impl ProxyService {
     /// path. Mirrors this fn's existing sync `std::fs` discipline (the
     /// `{service}-client.sealed` file is decoded with the same public
     /// `decode_envelope` the credential store uses, then `vault.unseal`).
-    fn unseal_byo_client_config(&self, service: &str) -> Result<GoogleOAuthConfig, ProxyError> {
+    fn unseal_byo_client_config(
+        &self,
+        service: &str,
+        connection: permitlayer_credential::ConnectionId,
+    ) -> Result<GoogleOAuthConfig, ProxyError> {
         let client_service = format!("{service}-client");
         let sealed_path = self.vault_dir.join(format!("{client_service}.sealed"));
         let bytes = std::fs::read(&sealed_path).map_err(|e| ProxyError::Internal {
@@ -419,8 +608,10 @@ impl ProxyService {
                     ),
                 }
             })?;
-        let (client_connection, client_slot) = connection_slot_from_service_key(&client_service);
-        let token = self.vault.unseal(client_connection, client_slot, &sealed).map_err(|e| {
+        // Story 11.10: the BYO client bundle is sealed under the resolved
+        // connection + `Slot::Client` (the `{service}-client.sealed` filename
+        // is just on-disk naming; the crypto keys on the id, Story 11.8).
+        let token = self.vault.unseal(connection, Slot::Client, &sealed).map_err(|e| {
             ProxyError::Internal {
                 message: format!(
                     "could not unseal OAuth client bundle for service '{service}': {e}"
@@ -487,6 +678,7 @@ impl ProxyService {
     async fn try_refresh_and_retry(
         &self,
         service: &str,
+        connection: permitlayer_credential::ConnectionId,
         request_id: &str,
         agent_id: &str,
         scope: &str,
@@ -502,12 +694,14 @@ impl ProxyService {
         // integration-test seam. The CLI path (`refresh_credentials`)
         // builds a simpler production-only resolver in its own module.
         let resolver = |svc: &str| -> Result<Arc<OAuthClient>, RefreshFlowError> {
-            self.build_oauth_client_for_service(svc).map_err(|e| RefreshFlowError::MetaInvalid {
-                service: svc.to_owned(),
-                detail: match e {
-                    ProxyError::Internal { message } => message,
-                    other => format!("{other}"),
-                },
+            self.build_oauth_client_for_service(svc, connection).map_err(|e| {
+                RefreshFlowError::MetaInvalid {
+                    service: svc.to_owned(),
+                    detail: match e {
+                        ProxyError::Internal { message } => message,
+                        other => format!("{other}"),
+                    },
+                }
             })
         };
 
@@ -518,6 +712,7 @@ impl ProxyService {
             &self.credential_store,
             &self.vault_dir,
             service,
+            connection,
             &resolver,
         )
         .await;
@@ -718,8 +913,40 @@ impl ProxyService {
         req: ProxyRequest,
         scrub_response: bool,
     ) -> Result<ProxyResponse, ProxyError> {
-        // 1. Fetch sealed credential.
-        let sealed = match self.credential_store.get(&req.service).await {
+        // 0. Resolve the connection id from the agent's binding and run the
+        // Story 11.10 default-deny authz gate (tier ∩ granted_scopes). In
+        // production both binding stores are wired; legacy unit tests fall
+        // back to the service-string derivation with no gate. A binding /
+        // tier / scope denial is audited like credential-missing and
+        // returned as a 403-class error.
+        let connection =
+            match self.resolve_connection(&req.agent_id, &req.service, &req.scope).await {
+                Ok(id) => id,
+                Err(e) => {
+                    let event_type = match &e {
+                        ProxyError::BindingNotFound { .. } => "binding-not-found",
+                        ProxyError::TierDenied { .. } => "tier-denied",
+                        ProxyError::ScopeNotGranted { .. } => "scope-not-granted",
+                        _ => "binding-resolution-failed",
+                    };
+                    self.write_audit(
+                        &req.request_id,
+                        &req.agent_id,
+                        &req.service,
+                        &req.scope,
+                        &req.resource,
+                        "error",
+                        event_type,
+                        None,
+                    )
+                    .await;
+                    return Err(e);
+                }
+            };
+
+        // 1. Fetch sealed credential. The store keys on `(ConnectionId, Slot)`
+        // (Story 11.8); the access token lives under the connection + Slot::Access.
+        let sealed = match self.credential_store.get(connection, Slot::Access).await {
             Ok(Some(sealed)) => sealed,
             Ok(None) => {
                 self.write_audit(
@@ -758,7 +985,6 @@ impl ProxyService {
         // 2. Unseal to get OAuthToken (synchronous — wrap in spawn_blocking).
         // Access token keys on the connection + Slot::Access (Story 11.8).
         let vault = Arc::clone(&self.vault);
-        let connection = ConnectionId::from_service_shim(&req.service);
         let unseal_result =
             tokio::task::spawn_blocking(move || vault.unseal(connection, Slot::Access, &sealed))
                 .await;
@@ -914,6 +1140,7 @@ impl ProxyService {
             match self
                 .try_refresh_and_retry(
                     &req.service,
+                    connection,
                     &req.request_id,
                     &req.agent_id,
                     &req.scope,
@@ -1233,7 +1460,7 @@ mod tests {
     use axum::http::{HeaderMap, Method};
     use permitlayer_core::scrub::builtin_rules;
     use permitlayer_core::store::StoreError;
-    use permitlayer_credential::{OAuthToken, SealedCredential};
+    use permitlayer_credential::{ConnectionId, OAuthToken, SealedCredential};
     use tempfile::TempDir;
     use url::Url;
     use zeroize::Zeroizing;
@@ -1244,9 +1471,11 @@ mod tests {
     // to reconstruct it and seal a fresh copy on each `get()` call.
 
     struct MockCredentialStore {
-        /// Maps service name → (master_key, token_bytes) so we can seal fresh
-        /// on each get() call.
-        services: HashMap<String, Vec<u8>>,
+        /// Maps `(ConnectionId bytes, Slot byte)` → token_bytes so we can
+        /// seal fresh on each get() call. Story 11.9 re-keyed the store on
+        /// `(ConnectionId, Slot)`; `add_service` seeds under the shim id +
+        /// `Slot::Access` so the proxy request path reads it back.
+        services: HashMap<([u8; 16], u8), Vec<u8>>,
         master_key: [u8; 32],
     }
 
@@ -1256,31 +1485,50 @@ mod tests {
         }
 
         fn add_service(&mut self, service: &str, token_bytes: &[u8]) {
-            self.services.insert(service.to_owned(), token_bytes.to_vec());
+            // These unit tests construct `ProxyService` without binding
+            // stores, so `handle_inner` resolves the connection id via
+            // `ProxyService::legacy_connection_id_for_service`. Seed under
+            // the same derivation + `Slot::Access` so the request path reads
+            // it back.
+            let connection = ProxyService::legacy_connection_id_for_service(service);
+            self.services
+                .insert((*connection.as_bytes(), Slot::Access.slot_byte()), token_bytes.to_vec());
         }
     }
 
     #[async_trait::async_trait]
     impl CredentialStore for MockCredentialStore {
-        async fn put(&self, _service: &str, _sealed: SealedCredential) -> Result<(), StoreError> {
+        async fn put(
+            &self,
+            _id: ConnectionId,
+            _slot: Slot,
+            _sealed: SealedCredential,
+        ) -> Result<(), StoreError> {
             Ok(())
         }
-        async fn get(&self, service: &str) -> Result<Option<SealedCredential>, StoreError> {
-            match self.services.get(service) {
+        async fn get(
+            &self,
+            id: ConnectionId,
+            slot: Slot,
+        ) -> Result<Option<SealedCredential>, StoreError> {
+            match self.services.get(&(*id.as_bytes(), slot.slot_byte())) {
                 Some(token_bytes) => {
                     let vault = Vault::new(Zeroizing::new(self.master_key), 0);
                     let token = OAuthToken::from_trusted_bytes(token_bytes.clone());
-                    let connection = ConnectionId::from_service_shim(service);
-                    match vault.seal(connection, Slot::Access, &token) {
+                    match vault.seal(id, slot, &token) {
                         Ok(sealed) => Ok(Some(sealed)),
-                        Err(_) => panic!("mock seal failed for {service}"),
+                        Err(_) => panic!("mock seal failed for {id:?}/{slot:?}"),
                     }
                 }
                 None => Ok(None),
             }
         }
-        async fn list_services(&self) -> Result<Vec<String>, StoreError> {
-            Ok(self.services.keys().cloned().collect())
+        async fn list_connections(&self) -> Result<Vec<ConnectionId>, StoreError> {
+            Ok(self
+                .services
+                .keys()
+                .map(|(id_bytes, _slot)| ConnectionId::from_bytes(*id_bytes))
+                .collect())
         }
     }
 
@@ -1532,9 +1780,12 @@ mod tests {
         })
         .to_string();
         let token = permitlayer_credential::OAuthToken::from_trusted_bytes(bundle.into_bytes());
-        let client_service = format!("{service}-client");
-        let (connection, slot) = connection_slot_from_service_key(&client_service);
-        let sealed = test_vault().seal(connection, slot, &token).unwrap();
+        // No binding stores wired in these unit tests → `handle_inner`
+        // resolves the connection id via
+        // `ProxyService::legacy_connection_id_for_service`, and the BYO
+        // client bundle keys on that id + `Slot::Client`.
+        let connection = ProxyService::legacy_connection_id_for_service(service);
+        let sealed = test_vault().seal(connection, Slot::Client, &token).unwrap();
         let bytes = permitlayer_core::store::fs::credential_fs::encode_envelope(&sealed);
         std::fs::write(vault_dir.join(format!("{service}-client.sealed")), bytes).unwrap();
     }
@@ -1556,12 +1807,13 @@ mod tests {
         // Success here proves the BYO client was reconstructed by
         // unsealing `gmail-client.sealed` — there is no client JSON on
         // disk, so any plaintext-path fallback would error instead.
+        let gmail_conn = ProxyService::legacy_connection_id_for_service("gmail");
         let _client = service
-            .build_oauth_client_for_service("gmail")
+            .build_oauth_client_for_service("gmail", gmail_conn)
             .expect("sealed byo client must reconstruct from the vault with no file read");
 
         // And the underlying unseal yields exactly the sealed bundle.
-        let cfg = service.unseal_byo_client_config("gmail").unwrap();
+        let cfg = service.unseal_byo_client_config("gmail", gmail_conn).unwrap();
         assert_eq!(cfg.client_id(), "123.apps.googleusercontent.com");
         assert_eq!(cfg.client_secret(), Some("GOCSPX-sealed-secret"));
     }
@@ -1581,7 +1833,8 @@ mod tests {
         let service = service_with_vault_dir(dir.path());
         // `OAuthClient` isn't `Debug`, so `expect_err` won't compile —
         // match the error out explicitly.
-        let err = match service.build_oauth_client_for_service("gmail") {
+        let gmail_conn = ProxyService::legacy_connection_id_for_service("gmail");
+        let err = match service.build_oauth_client_for_service("gmail", gmail_conn) {
             Ok(_) => panic!("legacy non-sealed byo record must be rejected, not path-read"),
             Err(e) => e,
         };
@@ -2008,10 +2261,15 @@ mod tests {
             overrides,
         );
 
-        // Override is present for gmail.
+        // Override is present for gmail. The override map is keyed by
+        // service name, so the connection arg is irrelevant on this path;
+        // pass the legacy derivation for consistency.
         assert!(service.oauth_client_overrides.is_some());
         let got = service
-            .build_oauth_client_for_service("gmail")
+            .build_oauth_client_for_service(
+                "gmail",
+                ProxyService::legacy_connection_id_for_service("gmail"),
+            )
             .expect("override lookup should succeed");
         // Both Arcs point at the same underlying OAuthClient.
         assert!(Arc::ptr_eq(&got, &mock_client));
@@ -2021,7 +2279,10 @@ mod tests {
         // contains no `calendar-meta.json`. This asserts the
         // fallthrough behavior: services absent from the override map
         // go through the production path.
-        let fall_through = service.build_oauth_client_for_service("calendar");
+        let fall_through = service.build_oauth_client_for_service(
+            "calendar",
+            ProxyService::legacy_connection_id_for_service("calendar"),
+        );
         assert!(
             fall_through.is_err(),
             "services absent from override map should fall through to metadata read (and fail, in this test)"
