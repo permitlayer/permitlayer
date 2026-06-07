@@ -59,18 +59,6 @@ use clap::Args;
 use crate::cli::silent_cli_error;
 use crate::design::render;
 
-// ── Service allowlist ───────────────────────────────────────────────
-//
-// Same set `connect.rs` uses (`SUPPORTED_SERVICES`); kept as a private
-// const here rather than re-exporting connect's private one so the
-// two stay independently greppable and a future divergence is loud.
-
-const SUPPORTED_SERVICES: &[&str] = &["gmail", "calendar", "drive"];
-
-fn is_supported_service(service: &str) -> bool {
-    SUPPORTED_SERVICES.contains(&service)
-}
-
 // ── Access level → shipped policy name ──────────────────────────────
 
 /// The binary access capability. NOT a tier, NOT an approval mode —
@@ -95,8 +83,8 @@ fn policy_for(service: &str, write: bool) -> &'static str {
         ("calendar", true) => "calendar-read-write",
         ("drive", false) => "drive-read-only",
         ("drive", true) => "drive-read-write",
-        // Unreachable: callers validate `service` against
-        // `SUPPORTED_SERVICES` first. Kept total so the fn has no
+        // Unreachable: callers validate `service` against the connector
+        // registry (`resolve_selector`) first. Kept total so the fn has no
         // panic path; the empty string would surface as a daemon-side
         // `agent.unknown_policy` (loud) rather than a silent misbind.
         _ => "",
@@ -185,26 +173,32 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
 
     let service = args.service.trim().to_lowercase();
 
-    // ── Step 1 — service allowlist ──────────────────────────────────
-    if !is_supported_service(&service) {
-        eprint!(
-            "{}",
-            render::error_block(
-                "quickstart.unknown_service",
-                &format!(
-                    "unsupported service '{service}'. Supported services: {}",
-                    SUPPORTED_SERVICES.join(", ")
-                ),
-                &format!(
-                    "agentsso quickstart <service> --read | --read-write\n\n  \
-                     supported services: {}",
-                    SUPPORTED_SERVICES.join(", ")
-                ),
-                None,
-            )
-        );
-        return Err(crate::cli::connect::exit2());
-    }
+    // ── Step 1 — service allowlist (registry-resolved, Story 11.7) ──
+    let registry = permitlayer_connectors::ConnectorRegistry::load(Some(
+        &permitlayer_core::paths::connectors_dir(
+            permitlayer_core::paths::home_override().as_deref(),
+        ),
+    ))
+    .context("connector registry load failed")?;
+    let connector = match registry.resolve_selector(&service) {
+        Some(c) => c,
+        None => {
+            let supported = registry.selectors().join(", ");
+            eprint!(
+                "{}",
+                render::error_block(
+                    "quickstart.unknown_service",
+                    &format!("unsupported service '{service}'. Supported services: {supported}"),
+                    &format!(
+                        "agentsso quickstart <service> --read | --read-write\n\n  \
+                         supported services: {supported}"
+                    ),
+                    None,
+                )
+            );
+            return Err(crate::cli::connect::exit2());
+        }
+    };
 
     // ── Step 2 — resolve the access level ───────────────────────────
     //
@@ -314,7 +308,7 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
     .await?;
 
     // ── Step 7 — plain-language summary ─────────────────────────────
-    print_summary(&service, &agent_name, access, args.verbose);
+    print_summary(&connector, &service, &agent_name, access, args.verbose);
 
     Ok(())
 }
@@ -365,7 +359,13 @@ fn prompt_access(service: &str) -> Access {
 /// Default = headline + the single capability line. The "runs headless …
 /// capability is fixed by the access level chosen" sentence restates the
 /// capability line, so it only renders under `-v` (Rule of Silence).
-fn print_summary(service: &str, agent: &str, access: Access, verbose: bool) {
+fn print_summary(
+    connector: &permitlayer_connectors::ResolvedConnector,
+    service: &str,
+    agent: &str,
+    access: Access,
+    verbose: bool,
+) {
     use crate::design::terminal::ColorSupport;
     use crate::design::theme::Theme;
 
@@ -392,7 +392,10 @@ fn print_summary(service: &str, agent: &str, access: Access, verbose: bool) {
         // the operator can confirm a `--read-write` connect really pulled in
         // send/compose/modify (the RC1 fix). Short names, policy-file shape.
         let write = matches!(access, Access::ReadWrite);
-        let scope_names = permitlayer_oauth::google::scopes::scopes_for_access(service, write)
+        let tier = if write { "read-write" } else { "read" };
+        let scope_names = connector
+            .tier_scope_uris(tier)
+            .unwrap_or_default()
             .into_iter()
             .filter_map(permitlayer_oauth::google::scopes::uri_to_short_name)
             .collect::<Vec<_>>()
@@ -715,11 +718,16 @@ mod tests {
 
     #[test]
     fn service_predicate_accepts_known_rejects_others() {
+        // Story 11.7: existence now resolves through the connector registry
+        // (built-ins). `run` lowercases/trims the arg first, so the registry
+        // sees a normalized selector; the registry itself is exact-match
+        // (`Gmail`/`drive ` resolve to None).
+        let registry = permitlayer_connectors::ConnectorRegistry::load(None).unwrap();
         for ok in ["gmail", "calendar", "drive"] {
-            assert!(is_supported_service(ok), "{ok} should be supported");
+            assert!(registry.resolve_selector(ok).is_some(), "{ok} should be supported");
         }
         for bad in ["salesforce", "Gmail", "", "drive ", "slack"] {
-            assert!(!is_supported_service(bad), "{bad:?} must be rejected");
+            assert!(registry.resolve_selector(bad).is_none(), "{bad:?} must be rejected");
         }
     }
 

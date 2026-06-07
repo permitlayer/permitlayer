@@ -2219,13 +2219,21 @@ pub(crate) async fn agent_policy_name_handler(
     }
 }
 
-/// Service set the credential endpoints accept (Story 7.30 AC #2
-/// + #3). Mirrors `crates/permitlayer-daemon/src/cli/connect.rs::SUPPORTED_SERVICES`;
-///   kept private until Task 12 deduplicates the constant.
-pub(crate) const CREDENTIAL_SUPPORTED_SERVICES: &[&str] = &["gmail", "calendar", "drive"];
-
+/// Whether the credential endpoints accept `service` (Story 7.30
+/// AC #2/#3). Resolved through the connector registry's selector alias
+/// map (Story 11.7), the single source of truth for which connectors
+/// exist, rather than a hand-maintained constant.
 fn credential_service_supported(service: &str) -> bool {
-    CREDENTIAL_SUPPORTED_SERVICES.contains(&service)
+    permitlayer_connectors::canonical_selector_id(service).is_some()
+}
+
+/// The credential-supported selectors, for the "unknown service" error
+/// message (Story 11.7). Derived from the built-in connector defs so the
+/// message lists the live set, deterministic order.
+fn credential_supported_services() -> String {
+    permitlayer_connectors::ConnectorRegistry::load(None)
+        .map(|r| r.selectors().join(", "))
+        .unwrap_or_default()
 }
 
 /// Response body for `GET /v1/control/credentials/{service}/meta`
@@ -2267,7 +2275,7 @@ pub(crate) async fn credentials_meta_handler(
             format!(
                 "service {:?} is not supported; allowed: {}",
                 service,
-                CREDENTIAL_SUPPORTED_SERVICES.join(", ")
+                credential_supported_services()
             ),
             Some(request_id),
         );
@@ -2527,7 +2535,7 @@ pub(crate) async fn credentials_seal_handler(
             format!(
                 "service {:?} is not supported; allowed: {}",
                 payload.service,
-                CREDENTIAL_SUPPORTED_SERVICES.join(", ")
+                credential_supported_services()
             ),
             Some(request_id),
         );
@@ -3411,7 +3419,7 @@ pub(crate) async fn credentials_verify_handler(
             format!(
                 "service {:?} is not supported; allowed: {}",
                 service,
-                CREDENTIAL_SUPPORTED_SERVICES.join(", ")
+                credential_supported_services()
             ),
             Some(request_id),
         );

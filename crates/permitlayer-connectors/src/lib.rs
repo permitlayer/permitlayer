@@ -48,7 +48,7 @@ pub use def::{
     AuthSpec, ConnectorDef, ConnectorMeta, TierBundle, ToolDef, TrustTier, UpstreamSpec,
 };
 pub use error::ConnectorError;
-pub use registry::{ConnectorRegistry, ResolvedConnector};
+pub use registry::{ConnectorRegistry, ResolvedConnector, canonical_selector_id};
 pub use validate::{ValidationError, validate_def};
 
 /// A built-in connector — one of Gmail/Calendar/Drive — shipped

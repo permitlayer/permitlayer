@@ -2217,7 +2217,14 @@ checksum = "9b4f627cb1b25917193a259e49bdad08f671f8d9708acfd5fe0a8c1455d87220"
 name = "permitlayer-connectors"
 version = "1.2.3"
 dependencies = [
+ "arc-swap",
+ "serde",
+ "serde_json",
+ "tempfile",
  "thiserror 2.0.18",
+ "toml 0.8.23",
+ "tracing",
+ "url",
 ]
 
 [[package]]
@@ -2290,6 +2297,7 @@ dependencies = [
  "mockito",
  "nix",
  "notify",
+ "permitlayer-connectors",
  "permitlayer-core",
  "permitlayer-credential",
  "permitlayer-keystore",

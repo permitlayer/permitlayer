@@ -2222,14 +2222,13 @@ impl ConnectorMcpService {
 /// (`google-gmail`). Returns `None` for an unrecognized selector. A
 /// selector that is already a canonical id passes through unchanged so
 /// a future `/mcp/google-gmail` form also resolves.
+///
+/// Delegates to [`permitlayer_connectors::canonical_selector_id`] — the
+/// single home for the alias mapping (Story 11.7), shared with the daemon
+/// CLI so the proxy and CLI can never disagree on what `gmail` resolves to.
 #[must_use]
 pub fn selector_to_connector_id(selector: &str) -> Option<&'static str> {
-    match selector {
-        "gmail" | "google-gmail" => Some("google-gmail"),
-        "calendar" | "google-calendar" => Some("google-calendar"),
-        "drive" | "google-drive" => Some("google-drive"),
-        _ => None,
-    }
+    permitlayer_connectors::canonical_selector_id(selector)
 }
 
 /// Build the [`ConnectorMcpService`] for a built-in connector id.

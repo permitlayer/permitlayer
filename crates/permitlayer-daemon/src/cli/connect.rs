@@ -379,7 +379,23 @@ pub(crate) fn silent_err_for_code(code: &str, internal_msg: &'static str) -> any
     marker_attached.context(crate::cli::SilentCliError).context(internal_msg)
 }
 
-const SUPPORTED_SERVICES: &[&str] = &["gmail", "calendar", "drive"];
+/// Resolve the OAuth scope URIs to request for a connect, keyed off the
+/// access level (Story 11.7).
+///
+/// The access level maps to a connector access tier (`read-write` when
+/// `--read-write`, else `read`); the connector's def is the single source
+/// of truth for which scope URIs that tier grants (replaces the deleted
+/// `scopes::scopes_for_access` per-service match). A connector missing the
+/// requested tier yields an empty set — but the built-ins always declare
+/// both tiers (pinned by `tier_scope_uris_pin_to_legacy_scope_sets`), so in
+/// practice this never empties for a shipped binary.
+fn requested_scope_uris(
+    connector: &permitlayer_connectors::ResolvedConnector,
+    read_write: bool,
+) -> Vec<&str> {
+    let tier = if read_write { "read-write" } else { "read" };
+    connector.tier_scope_uris(tier).unwrap_or_default()
+}
 
 /// Resolve device-flow endpoints. Production: Google's hardcoded URLs.
 ///
@@ -645,26 +661,36 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
         std::env::var("SUDO_USER").ok().as_deref(),
     )?;
 
-    // Step 1a — service allowlist.
-    if !SUPPORTED_SERVICES.contains(&service.as_str()) {
-        eprint!(
-            "{}",
-            render::error_block(
-                "connect.unknown_service",
-                &format!(
-                    "unsupported service '{service}'. Supported services: {}",
-                    SUPPORTED_SERVICES.join(", ")
-                ),
-                &format!(
-                    "agentsso connect <service> --agent <name> --oauth-client <path>\n\n  \
-                     supported services: {}",
-                    SUPPORTED_SERVICES.join(", ")
-                ),
-                None,
-            )
-        );
-        return Err(exit2());
-    }
+    // Step 1a — service allowlist, resolved through the connector registry
+    // (Story 11.7). The registry (built-ins + any host-installed defs) is
+    // the single source of truth for which services exist and what scopes
+    // each access tier grants; `connect` no longer hand-maintains a service
+    // list or a scope match.
+    let registry = permitlayer_connectors::ConnectorRegistry::load(Some(
+        &permitlayer_core::paths::connectors_dir(
+            permitlayer_core::paths::home_override().as_deref(),
+        ),
+    ))
+    .context("connector registry load failed")?;
+    let connector = match registry.resolve_selector(&service) {
+        Some(c) => c,
+        None => {
+            let supported = registry.selectors().join(", ");
+            eprint!(
+                "{}",
+                render::error_block(
+                    "connect.unknown_service",
+                    &format!("unsupported service '{service}'. Supported services: {supported}"),
+                    &format!(
+                        "agentsso connect <service> --agent <name> --oauth-client <path>\n\n  \
+                         supported services: {supported}"
+                    ),
+                    None,
+                )
+            );
+            return Err(exit2());
+        }
+    };
 
     // Round-1 P12: when `--headless` is set, the paste-redirect-URL
     // flow needs STDIN to be a TTY (operator types/pastes the URL),
@@ -953,7 +979,7 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
                 // also what stops a read-write agent from silently riding a
                 // pre-existing read-only service credential.)
                 let needed: std::collections::HashSet<&str> =
-                    scopes::scopes_for_access(&service, args.read_write).into_iter().collect();
+                    requested_scope_uris(&connector, args.read_write).into_iter().collect();
                 let have: std::collections::HashSet<&str> =
                     m.scopes.iter().map(String::as_str).collect();
                 needed.is_subset(&have)
@@ -1000,7 +1026,7 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
         }
         // Capture scopes from existing meta for downstream policy merge.
         existing_meta.meta.as_ref().map(|m| m.scopes.clone()).unwrap_or_else(|| {
-            scopes::scopes_for_access(&service, args.read_write)
+            requested_scope_uris(&connector, args.read_write)
                 .into_iter()
                 .map(str::to_owned)
                 .collect()
@@ -1052,7 +1078,13 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
                 }
                 println!();
             }
-            let scope_infos = scopes::scope_infos_for_access(&service, args.read_write);
+            // Map the connector's resolved tier URIs through the (provider-
+            // generic) `scope_info` display metadata (Story 11.7).
+            let scope_infos: Vec<scopes::ScopeInfo> =
+                requested_scope_uris(&connector, args.read_write)
+                    .into_iter()
+                    .filter_map(scopes::scope_info)
+                    .collect();
             let styled_service = styled(&service, theme.tokens().accent, color_support);
             println!("  {styled_service} \u{00b7} scopes to request:");
             for info in &scope_infos {
@@ -1094,7 +1126,7 @@ pub async fn run(args: ConnectArgs) -> anyhow::Result<()> {
         // off the access level so `--read-write` widens the grant to include
         // the write scopes (the whole point of RC1 — without this the sealed
         // credential is read-only no matter the policy binding).
-        let requested_scopes = scopes::scopes_for_access(&service, args.read_write);
+        let requested_scopes = requested_scope_uris(&connector, args.read_write);
         let scopes_owned: Vec<String> = requested_scopes.iter().map(|s| (*s).to_owned()).collect();
 
         let result = if args.device_flow {

@@ -74,51 +74,26 @@ fn from_client_json_wrong_structure_returns_invalid_error() {
 }
 
 // ── Scope tests ──────────────────────────────────────────────────────
+//
+// Story 11.7: the per-service scope *data* (`default_scopes_for_service`
+// / `read_write_scopes_for_service` / `scopes_for_access`) moved out of
+// `scopes.rs` into the connector defs. The byte-identical-scope-set
+// regression pin now lives in `permitlayer-connectors`
+// (`registry::tests::tier_scope_uris_pin_to_legacy_scope_sets`), which
+// asserts the same gmail read-write = readonly+send+compose+modify
+// contract this file used to cover. `scopes.rs` keeps only the provider-
+// generic display metadata (`scope_info` / `uri_to_short_name`), exercised
+// by its own unit tests.
 
 #[test]
-fn gmail_default_scopes() {
-    let scopes = scopes::default_scopes_for_service("gmail");
-    assert_eq!(scopes, vec![scopes::GMAIL_READONLY]);
-}
-
-#[test]
-fn calendar_default_scopes() {
-    let scopes = scopes::default_scopes_for_service("calendar");
-    assert_eq!(scopes, vec![scopes::CALENDAR_READONLY, scopes::CALENDAR_EVENTS]);
-}
-
-#[test]
-fn drive_default_scopes() {
-    let scopes = scopes::default_scopes_for_service("drive");
-    assert_eq!(scopes, vec![scopes::DRIVE_READONLY, scopes::DRIVE_FILE]);
-}
-
-#[test]
-fn unknown_service_returns_empty_scopes() {
-    let scopes = scopes::default_scopes_for_service("slack");
-    assert!(scopes.is_empty());
-}
-
-/// RC1 contract at the consent boundary: a read-WRITE gmail connect must
-/// ask Google for the write scopes, not just readonly. Before the fix,
-/// `--read-write` requested only `gmail.readonly`, so the sealed credential
-/// could never send/modify and every write 403'd `scope-insufficient`.
-#[test]
-fn gmail_read_write_consent_requests_write_scopes() {
-    let scopes = scopes::scopes_for_access("gmail", true);
-    assert!(scopes.contains(&scopes::GMAIL_READONLY));
-    assert!(scopes.contains(&scopes::GMAIL_SEND), "read-write consent must request gmail.send");
-    assert!(scopes.contains(&scopes::GMAIL_COMPOSE), "must request gmail.compose for drafts");
-    assert!(scopes.contains(&scopes::GMAIL_MODIFY), "must request gmail.modify");
-}
-
-/// And the read path is unchanged: `scopes_for_access(_, false)` equals the
-/// historical default grant for every service (back-compat).
-#[test]
-fn read_access_consent_matches_default_grant() {
-    for svc in ["gmail", "calendar", "drive", "slack"] {
-        assert_eq!(scopes::scopes_for_access(svc, false), scopes::default_scopes_for_service(svc),);
-    }
+fn scope_info_round_trips_for_known_uris() {
+    // The display-metadata surface `scopes.rs` retains: a granted URI maps
+    // to its policy short name + a human description.
+    let info = scopes::scope_info(scopes::GMAIL_SEND).expect("gmail.send has scope_info");
+    assert_eq!(info.short_name, "gmail.send");
+    assert!(!info.description.is_empty());
+    assert_eq!(scopes::uri_to_short_name(scopes::GMAIL_READONLY), Some("gmail.readonly"));
+    assert!(scopes::scope_info("https://example.com/unknown").is_none());
 }
 
 // ── CredentialMeta tests ─────────────────────────────────────────────

@@ -60,6 +60,50 @@ impl ResolvedConnector {
     pub fn trust_tier(&self) -> TrustTier {
         self.def.connector.trust_tier
     }
+
+    /// Resolve an access tier (`read` / `read-write` / a custom tier name)
+    /// to the **full OAuth scope URIs** it grants, in tier-declaration
+    /// order (Story 11.7).
+    ///
+    /// Each scope short name in the tier's bundle is mapped through the
+    /// connector's `[scopes]` vocabulary to its full URI. Returns `None`
+    /// if the tier is not declared by this connector; the caller maps that
+    /// to "unknown access tier". A short name present in a tier but absent
+    /// from `[scopes]` is impossible for a validated def (the 11.3
+    /// validator rejects it at load), so it is silently skipped here rather
+    /// than surfaced — a defensive no-op, not a supported path.
+    #[must_use]
+    pub fn tier_scope_uris(&self, tier: &str) -> Option<Vec<&str>> {
+        let bundle = self.def.tiers.get(tier)?;
+        Some(
+            bundle
+                .scopes()
+                .iter()
+                .filter_map(|short| self.def.scopes.get(short).map(String::as_str))
+                .collect(),
+        )
+    }
+}
+
+/// Map a route/CLI **selector** to its canonical connector id (Story 11.7).
+///
+/// The CLI + MCP-route vocabulary stays the bare service name
+/// (`gmail`/`calendar`/`drive`) for client compatibility; the registry
+/// keys on the canonical id (`google-gmail`/…). A selector that is already
+/// a canonical id passes through unchanged. Returns `None` for an
+/// unrecognized selector.
+///
+/// This is the single home for the alias mapping — `permitlayer-proxy`'s
+/// `selector_to_connector_id` delegates here so the proxy and the daemon
+/// CLI can never disagree on what `gmail` resolves to.
+#[must_use]
+pub fn canonical_selector_id(selector: &str) -> Option<&'static str> {
+    match selector {
+        "gmail" | "google-gmail" => Some("google-gmail"),
+        "calendar" | "google-calendar" => Some("google-calendar"),
+        "drive" | "google-drive" => Some("google-drive"),
+        _ => None,
+    }
 }
 
 /// Registry of connector definitions keyed by id.
@@ -195,6 +239,43 @@ impl ConnectorRegistry {
     #[must_use]
     pub fn get(&self, id: &str) -> Option<Arc<ResolvedConnector>> {
         self.snapshot().get(id).cloned()
+    }
+
+    /// Resolve one connector by a route/CLI **selector** — either a bare
+    /// alias (`gmail`) or a canonical id (`google-gmail`) — via
+    /// [`canonical_selector_id`] (Story 11.7).
+    ///
+    /// Returns `None` if the selector is unrecognized *or* the resolved id
+    /// is not registered (e.g. a built-in alias whose connector somehow
+    /// failed to load — never the case for a shipped binary).
+    #[must_use]
+    pub fn resolve_selector(&self, selector: &str) -> Option<Arc<ResolvedConnector>> {
+        let id = canonical_selector_id(selector)?;
+        self.get(id)
+    }
+
+    /// The set of route/CLI selectors this registry can resolve, in
+    /// deterministic (sorted-by-canonical-id) order (Story 11.7).
+    ///
+    /// Used for the CLI's "unsupported service" error message so it lists
+    /// the live connector set rather than a hand-maintained constant. Each
+    /// built-in is surfaced under its bare alias (`gmail`), the form users
+    /// type; host-installed connectors surface under their canonical id
+    /// (no bare alias exists for them).
+    #[must_use]
+    pub fn selectors(&self) -> Vec<&'static str> {
+        // BTreeMap → ids already sorted. Map each known built-in id back to
+        // its bare alias; anything else (host-installed) keeps its id.
+        self.snapshot()
+            .keys()
+            .map(|id| match id.as_str() {
+                "google-gmail" => "gmail",
+                "google-calendar" => "calendar",
+                "google-drive" => "drive",
+                _ => "",
+            })
+            .filter(|s| !s.is_empty())
+            .collect()
     }
 
     /// Number of registered connectors.
@@ -348,6 +429,68 @@ path = "things"
     fn absent_connectors_dir_is_builtins_only() {
         let reg = ConnectorRegistry::load(Some(Path::new("/nonexistent/path/xyz"))).unwrap();
         assert_eq!(reg.len(), 3);
+    }
+
+    // ---- Story 11.7: selector + tier→scope resolution ----
+
+    #[test]
+    fn canonical_selector_id_maps_aliases_and_ids() {
+        assert_eq!(canonical_selector_id("gmail"), Some("google-gmail"));
+        assert_eq!(canonical_selector_id("google-gmail"), Some("google-gmail"));
+        assert_eq!(canonical_selector_id("calendar"), Some("google-calendar"));
+        assert_eq!(canonical_selector_id("drive"), Some("google-drive"));
+        assert_eq!(canonical_selector_id("nope"), None);
+        assert_eq!(canonical_selector_id(""), None);
+    }
+
+    #[test]
+    fn resolve_selector_and_selectors_list() {
+        let reg = ConnectorRegistry::load(None).unwrap();
+        assert_eq!(reg.resolve_selector("gmail").unwrap().id(), "google-gmail");
+        assert_eq!(reg.resolve_selector("google-drive").unwrap().id(), "google-drive");
+        assert!(reg.resolve_selector("slack").is_none());
+        // Deterministic, bare-alias form, sorted by canonical id.
+        assert_eq!(reg.selectors(), vec!["calendar", "drive", "gmail"]);
+    }
+
+    /// AC #1 — the drift tripwire. Registry tier resolution must return the
+    /// EXACT OAuth scope URIs (and order) that `oauth/google/scopes.rs`'s
+    /// deleted `default_scopes_for_service` / `read_write_scopes_for_service`
+    /// returned. The literal URIs below are copied from the `scopes.rs`
+    /// constants (`GMAIL_READONLY` etc.); if a connector.toml tier or the
+    /// `[scopes]` vocab is edited and this drifts, this test fails.
+    #[test]
+    fn tier_scope_uris_pin_to_legacy_scope_sets() {
+        let reg = ConnectorRegistry::load(None).unwrap();
+
+        const GMAIL_READONLY: &str = "https://www.googleapis.com/auth/gmail.readonly";
+        const GMAIL_SEND: &str = "https://www.googleapis.com/auth/gmail.send";
+        const GMAIL_COMPOSE: &str = "https://www.googleapis.com/auth/gmail.compose";
+        const GMAIL_MODIFY: &str = "https://www.googleapis.com/auth/gmail.modify";
+        const CALENDAR_READONLY: &str = "https://www.googleapis.com/auth/calendar.readonly";
+        const CALENDAR_EVENTS: &str = "https://www.googleapis.com/auth/calendar.events";
+        const DRIVE_READONLY: &str = "https://www.googleapis.com/auth/drive.readonly";
+        const DRIVE_FILE: &str = "https://www.googleapis.com/auth/drive.file";
+
+        let gmail = reg.resolve_selector("gmail").unwrap();
+        assert_eq!(gmail.tier_scope_uris("read").unwrap(), vec![GMAIL_READONLY]);
+        assert_eq!(
+            gmail.tier_scope_uris("read-write").unwrap(),
+            vec![GMAIL_READONLY, GMAIL_SEND, GMAIL_COMPOSE, GMAIL_MODIFY]
+        );
+
+        let calendar = reg.resolve_selector("calendar").unwrap();
+        let cal_expected = vec![CALENDAR_READONLY, CALENDAR_EVENTS];
+        assert_eq!(calendar.tier_scope_uris("read").unwrap(), cal_expected);
+        assert_eq!(calendar.tier_scope_uris("read-write").unwrap(), cal_expected);
+
+        let drive = reg.resolve_selector("drive").unwrap();
+        let drive_expected = vec![DRIVE_READONLY, DRIVE_FILE];
+        assert_eq!(drive.tier_scope_uris("read").unwrap(), drive_expected);
+        assert_eq!(drive.tier_scope_uris("read-write").unwrap(), drive_expected);
+
+        // Unknown tier → None (caller maps to an error, never an empty grant).
+        assert!(gmail.tier_scope_uris("admin").is_none());
     }
 
     #[test]
