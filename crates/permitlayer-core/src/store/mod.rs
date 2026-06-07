@@ -86,6 +86,12 @@ pub trait CredentialStore: Send + Sync {
     /// entry that needs re-encryption under a fresh master key, and by
     /// `connection list` (Story 11.13).
     async fn list_connections(&self) -> Result<Vec<ConnectionId>, StoreError>;
+
+    /// Remove the sealed credential for `(id, slot)`. Returns `Ok(true)` if
+    /// a sealed envelope was deleted, `Ok(false)` if none existed (absence
+    /// is not an error). Used by `connection revoke` (Story 11.13) to drop
+    /// every sealed slot of a revoked connection.
+    async fn remove(&self, id: ConnectionId, slot: Slot) -> Result<bool, StoreError>;
 }
 
 /// Append audit events to a durable log.

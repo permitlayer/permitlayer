@@ -1592,12 +1592,25 @@ mod tests {
     use async_trait::async_trait;
     use chrono::Utc;
     use permitlayer_core::agent::{AgentIdentity, parse_v2_token};
-    use permitlayer_credential::OAuthToken;
+    use permitlayer_credential::{ConnectionId, OAuthToken};
     use permitlayer_keystore::{
         DeleteOutcome, KeyStore, KeyStoreError, KeyStoreKind, MASTER_KEY_LEN,
     };
     use std::sync::Mutex;
     use tempfile::TempDir;
+
+    /// Deterministic test-fixture `ConnectionId` from a label: distinct
+    /// labels → distinct ids, same label → same id (the round-trip
+    /// property these vault-fixture tests rely on). Replaces the deleted
+    /// `conn_shim` derivation (Story 11.12) — these tests only need a
+    /// stable id to seal/read under, not service semantics.
+    fn fixed_conn(label: &str) -> ConnectionId {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(label.as_bytes());
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        ConnectionId::from_bytes(bytes)
+    }
 
     /// Test KeyStore that tracks the primary + previous slots. Mirrors
     /// the FakeKeyStore in `cli::start::tests` but lives in the
@@ -1683,7 +1696,7 @@ mod tests {
         for i in 0..n_credentials {
             let svc = format!("svc-{i}");
             let token = OAuthToken::from_trusted_bytes(format!("token-{i}").into_bytes());
-            let (conn, slot) = crate::conn_shim::connection_slot_for_service_key(&svc);
+            let (conn, slot) = (fixed_conn(&svc), Slot::Access);
             let sealed = vault.seal(conn, slot, &token).unwrap();
             let bytes = permitlayer_core::store::fs::credential_fs::encode_envelope(&sealed);
             // Story 11.9: the credential store keys on `(ConnectionId,
@@ -1771,7 +1784,7 @@ mod tests {
         // Old envelope at key_id=0.
         let old_vault = Vault::new(Zeroizing::new(old_key), 0);
         let old_token = OAuthToken::from_trusted_bytes(b"old".to_vec());
-        let (old_conn, old_slot) = crate::conn_shim::connection_slot_for_service_key("old-svc");
+        let (old_conn, old_slot) = (fixed_conn("old-svc"), Slot::Access);
         let old_sealed = old_vault.seal(old_conn, old_slot, &old_token).unwrap();
         let old_path =
             home.path().join("vault").join(format!("{old_conn}-{}.sealed", old_slot.label()));
@@ -1784,7 +1797,7 @@ mod tests {
         // New envelope at key_id=1 (already-rewritten by the crashed run).
         let new_vault = Vault::new(Zeroizing::new(new_key), 1);
         let new_token = OAuthToken::from_trusted_bytes(b"new".to_vec());
-        let (new_conn, new_slot) = crate::conn_shim::connection_slot_for_service_key("new-svc");
+        let (new_conn, new_slot) = (fixed_conn("new-svc"), Slot::Access);
         let new_sealed = new_vault.seal(new_conn, new_slot, &new_token).unwrap();
         let new_path =
             home.path().join("vault").join(format!("{new_conn}-{}.sealed", new_slot.label()));
@@ -1928,7 +1941,7 @@ mod tests {
         // Old envelope at key_id=0 (the to-be-resealed one).
         let old_vault = Vault::new(Zeroizing::new(old_key), 0);
         let old_token = OAuthToken::from_trusted_bytes(b"to-reseal".to_vec());
-        let (old_conn, old_slot) = crate::conn_shim::connection_slot_for_service_key("svc-old");
+        let (old_conn, old_slot) = (fixed_conn("svc-old"), Slot::Access);
         let old_sealed = old_vault.seal(old_conn, old_slot, &old_token).unwrap();
         let svc_old_path =
             home.path().join("vault").join(format!("{old_conn}-{}.sealed", old_slot.label()));
@@ -1941,8 +1954,7 @@ mod tests {
         // Pre-resealed envelope at key_id=1 (must be skipped).
         let new_vault = Vault::new(Zeroizing::new(new_key), 1);
         let already_resealed_token = OAuthToken::from_trusted_bytes(b"already-done".to_vec());
-        let (already_conn, already_slot) =
-            crate::conn_shim::connection_slot_for_service_key("svc-already-done");
+        let (already_conn, already_slot) = (fixed_conn("svc-already-done"), Slot::Access);
         let already_sealed =
             new_vault.seal(already_conn, already_slot, &already_resealed_token).unwrap();
         let already_done_bytes =
@@ -2074,7 +2086,7 @@ mod tests {
 
         let new_master = *keystore.primary.lock().unwrap().as_ref().unwrap();
         let store = CredentialFsStore::new(home.path().to_path_buf()).unwrap();
-        let (svc0_conn, svc0_slot) = crate::conn_shim::connection_slot_for_service_key("svc-0");
+        let (svc0_conn, svc0_slot) = (fixed_conn("svc-0"), Slot::Access);
         let sealed = store.get(svc0_conn, svc0_slot).await.unwrap().unwrap();
         assert_eq!(sealed.key_id(), 1, "envelope must be at key_id=1 after rotation");
 
@@ -2127,8 +2139,7 @@ mod tests {
         // can reject this.
         let weird_vault = Vault::new(Zeroizing::new(old_key), 7);
         let token = OAuthToken::from_trusted_bytes(b"x".to_vec());
-        let (weird_conn, weird_slot) =
-            crate::conn_shim::connection_slot_for_service_key("svc-weird");
+        let (weird_conn, weird_slot) = (fixed_conn("svc-weird"), Slot::Access);
         let sealed = weird_vault.seal(weird_conn, weird_slot, &token).unwrap();
         std::fs::write(
             home.path().join("vault").join(format!("{weird_conn}-{}.sealed", weird_slot.label())),
@@ -2188,7 +2199,7 @@ mod tests {
         let old_key = [0xAAu8; MASTER_KEY_LEN];
         let max_vault = Vault::new(Zeroizing::new(old_key), 255);
         let token = OAuthToken::from_trusted_bytes(b"x".to_vec());
-        let (max_conn, max_slot) = crate::conn_shim::connection_slot_for_service_key("svc-max");
+        let (max_conn, max_slot) = (fixed_conn("svc-max"), Slot::Access);
         let sealed = max_vault.seal(max_conn, max_slot, &token).unwrap();
         std::fs::write(
             home.path().join("vault").join(format!("{max_conn}-{}.sealed", max_slot.label())),

@@ -452,8 +452,19 @@ fn _unused_buffers() -> PathBuf {
 mod tests {
     use super::*;
     use permitlayer_core::store::fs::credential_fs::encode_envelope;
-    use permitlayer_credential::SealedCredential;
+    use permitlayer_credential::{ConnectionId, SealedCredential, Slot};
     use tempfile::TempDir;
+
+    /// Deterministic test-fixture `(ConnectionId, Slot)` from a label —
+    /// replaces the deleted `conn_shim` derivation (Story 11.12). These
+    /// envelope-format tests only need a stable id to seal/read under.
+    fn fixed_conn_slot(label: &str) -> (ConnectionId, Slot) {
+        use sha2::{Digest, Sha256};
+        let digest = Sha256::digest(label.as_bytes());
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&digest[..16]);
+        (ConnectionId::from_bytes(bytes), Slot::Access)
+    }
 
     /// Build a v1 envelope manually (23-byte header, no `key_id`).
     /// Constructs a real (cryptographically valid post-migration)
@@ -468,7 +479,7 @@ mod tests {
         let key = [0x42u8; 32];
         let vault = Vault::new(Zeroizing::new(key), 0);
         let token = OAuthToken::from_trusted_bytes(format!("token-for-{service}").into_bytes());
-        let (conn, slot) = crate::conn_shim::connection_slot_for_service_key(service);
+        let (conn, slot) = fixed_conn_slot(service);
         let sealed = vault.seal(conn, slot, &token).unwrap();
         let v2 = encode_envelope(&sealed);
         // v2 → v1 splice: drop the key_id byte at offset 3 and bump
@@ -736,7 +747,7 @@ mod tests {
         let key = [0x42u8; 32];
         let vault = Vault::new(Zeroizing::new(key), 0);
         let token = OAuthToken::from_trusted_bytes(b"hello-from-v1".to_vec());
-        let (gmail_conn, gmail_slot) = crate::conn_shim::connection_slot_for_service_key("gmail");
+        let (gmail_conn, gmail_slot) = fixed_conn_slot("gmail");
         let sealed = vault.seal(gmail_conn, gmail_slot, &token).unwrap();
 
         // Re-emit the sealed envelope as v1 bytes (no key_id byte).

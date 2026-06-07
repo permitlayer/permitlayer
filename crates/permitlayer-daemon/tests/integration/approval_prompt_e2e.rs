@@ -379,11 +379,15 @@ fn register_agent(port: u16, home: &std::path::Path, name: &str, policy: &str) -
     parsed["bearer_token"].as_str().unwrap().to_owned()
 }
 
-fn seal_gmail_credential(port: u16, home: &std::path::Path, agent: &str) {
+fn seal_gmail_credential(
+    port: u16,
+    home: &std::path::Path,
+    connection_id: permitlayer_credential::ConnectionId,
+) {
     let ctl = crate::common::read_test_control_token(home);
-    // Story 7.35: the seal request carries the parsed BYO client
-    // bundle as canonical SealedClientBundle JSON (sealed under
-    // `{service}-client`), not a `client_source` path.
+    // Story 11.12: the seal request keys on a real `connection_id` +
+    // `connector_id`/`name`/`tier`; it seals the slots AND writes the
+    // ConnectionRecord. The BYO client bundle is sealed into the Client slot.
     let client_bundle_json = serde_json::json!({
         "client_id": "123.apps.googleusercontent.com",
         "client_secret": "GOCSPX-test-client-secret",
@@ -392,8 +396,10 @@ fn seal_gmail_credential(port: u16, home: &std::path::Path, agent: &str) {
     })
     .to_string();
     let body = serde_json::json!({
-        "service": "gmail",
-        "agent": agent,
+        "connection_id": connection_id.to_string(),
+        "connector_id": "google-gmail",
+        "name": "gmail",
+        "tier": "read",
         "access_token": "ya29.test-access-token",
         "refresh_token": "1//test-refresh-token",
         "granted_scopes": ["https://www.googleapis.com/auth/gmail.readonly"],
@@ -1227,15 +1233,13 @@ fn mcp_initialize_succeeds_after_credential_seal_without_restart() {
         "stub response should list the post-7.32 Gmail route: {stub_body}"
     );
 
-    seal_gmail_credential(port, home.path(), "openclaw");
-    // Story 11.10: the request-time authz path needs a connection +
-    // binding. The credential was sealed via the control-plane seal
-    // endpoint, which keys by the `conn_shim` derivation of "gmail", so
-    // the seeded connection must carry that SAME id for dispatch to find
-    // the sealed credential. (Story 11.13's `connection add` will mint a
-    // real ULID + seal under it; until then the seal endpoint + this
-    // shimmed id agree.)
-    let gmail_conn_id = crate::common::connection_id_for_service("gmail");
+    // Story 11.12/11.13: seal under a real minted ULID via the reshaped
+    // seal endpoint (which also writes the ConnectionRecord named
+    // "gmail"). Then seed the agent→connection BINDING under the SAME id
+    // so the proxy authz path (bearer → agent → binding → connection)
+    // resolves on `/mcp/gmail`.
+    let gmail_conn_id = permitlayer_credential::ConnectionId::generate();
+    seal_gmail_credential(port, home.path(), gmail_conn_id);
     crate::common::seed_connection_and_binding_with_id(
         home.path(),
         "openclaw",

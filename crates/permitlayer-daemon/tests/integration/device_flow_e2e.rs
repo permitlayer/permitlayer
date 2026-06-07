@@ -62,14 +62,16 @@ fn write_oauth_client(home: &std::path::Path) -> std::path::PathBuf {
 
 #[test]
 fn device_flow_and_headless_are_mutually_exclusive() {
-    // AC #5: clap-level conflict. Doesn't need a daemon or keystore.
+    // AC #5: clap-level conflict on `connection add` (Story 11.13
+    // repoint of the device-flow flags off the retired `connect` verb).
     let home = tempfile::tempdir().unwrap();
     let oauth_client = write_oauth_client(home.path());
     let output = Command::new(agentsso_bin())
         .args([
-            "connect",
-            "gmail",
-            "--agent",
+            "connection",
+            "add",
+            "google-gmail",
+            "--name",
             "x",
             "--oauth-client",
             oauth_client.to_str().unwrap(),
@@ -79,7 +81,7 @@ fn device_flow_and_headless_are_mutually_exclusive() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .expect("failed to run connect");
+        .expect("failed to run connection add");
     assert_eq!(output.status.code(), Some(2), "clap conflict must exit 2");
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -91,14 +93,15 @@ fn device_flow_and_headless_are_mutually_exclusive() {
 #[test]
 fn device_flow_timeout_requires_device_flow_flag() {
     // `--device-flow-timeout` without `--device-flow` is meaningless;
-    // clap should reject it (Story 7.17 Task 3.1 — `requires` attribute).
+    // clap should reject it (`requires` attribute on `connection add`).
     let home = tempfile::tempdir().unwrap();
     let oauth_client = write_oauth_client(home.path());
     let output = Command::new(agentsso_bin())
         .args([
-            "connect",
-            "gmail",
-            "--agent",
+            "connection",
+            "add",
+            "google-gmail",
+            "--name",
             "x",
             "--oauth-client",
             oauth_client.to_str().unwrap(),
@@ -108,25 +111,26 @@ fn device_flow_timeout_requires_device_flow_flag() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .expect("failed to run connect");
+        .expect("failed to run connection add");
     assert_eq!(output.status.code(), Some(2), "clap requires-violation must exit 2");
 }
 
 #[test]
 fn device_flow_with_non_interactive_is_accepted_by_clap() {
-    // Codex review 3 fix: `--device-flow` MUST coexist with
-    // `--non-interactive` (the canonical scripted-headless invocation).
-    // The agent-not-found gate fires after clap, exiting 2 with the
-    // structured error block.
+    // `--device-flow` MUST coexist with `--non-interactive` (the
+    // canonical scripted-headless invocation). With no daemon running in
+    // this test home, the daemon-must-run gate fires AFTER clap, exiting
+    // 2 — proving clap accepted the flag combo.
     let home = tempfile::tempdir().unwrap();
     let oauth_client = write_oauth_client(home.path());
     let output = Command::new(agentsso_bin())
         .env("AGENTSSO_PATHS__HOME", home.path())
         .args([
-            "connect",
-            "gmail",
-            "--agent",
-            "does-not-exist",
+            "connection",
+            "add",
+            "google-gmail",
+            "--name",
+            "x",
             "--oauth-client",
             oauth_client.to_str().unwrap(),
             "--device-flow",
@@ -135,19 +139,13 @@ fn device_flow_with_non_interactive_is_accepted_by_clap() {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .output()
-        .expect("failed to run connect");
+        .expect("failed to run connection add");
     let stderr = String::from_utf8_lossy(&output.stderr);
-    // Clap-conflict exit 2 would name the flag in stderr; reaching
-    // EITHER the agent-not-found gate (rc.21 path, still wired on
-    // Linux + Windows) OR the daemon-must-run gate (rc.22 macOS
-    // path: `connect` now goes through the daemon's UDS first, and
-    // the gate runs before agent lookup) proves clap accepted the
-    // combo. The bug we're guarding against is clap rejecting
-    // `--device-flow --non-interactive` with a hard-coded conflict.
+    // Reaching the daemon-must-run gate proves clap accepted the combo.
     assert_eq!(output.status.code(), Some(2));
     assert!(
-        stderr.contains("connect.agent_not_found") || stderr.contains("connect.daemon_must_run"),
-        "should reach a connect-flow gate (agent-not-found or daemon-must-run), not a clap conflict; stderr={stderr}"
+        stderr.contains("connection.daemon_must_run"),
+        "should reach the daemon-must-run gate, not a clap conflict; stderr={stderr}"
     );
     assert!(
         !stderr.contains("cannot be used with"),

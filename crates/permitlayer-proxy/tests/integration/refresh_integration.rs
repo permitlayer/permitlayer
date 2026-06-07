@@ -223,6 +223,9 @@ impl CredentialStore for PersistentMockCredentialStore {
             .map(|(id_bytes, _slot)| ConnectionId::from_bytes(*id_bytes))
             .collect())
     }
+    async fn remove(&self, _id: ConnectionId, _slot: Slot) -> Result<bool, StoreError> {
+        Ok(false)
+    }
 }
 
 // ---------------------------------------------------------------------------

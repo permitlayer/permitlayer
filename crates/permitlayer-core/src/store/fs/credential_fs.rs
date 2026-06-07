@@ -364,6 +364,18 @@ impl CredentialStore for CredentialFsStore {
         })
         .await?
     }
+
+    async fn remove(&self, id: ConnectionId, slot: Slot) -> Result<bool, StoreError> {
+        let path = self.target_path(id, slot);
+        tokio::task::spawn_blocking(move || -> Result<bool, StoreError> {
+            match std::fs::remove_file(&path) {
+                Ok(()) => Ok(true),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false),
+                Err(e) => Err(StoreError::IoError(e)),
+            }
+        })
+        .await?
+    }
 }
 
 /// Encode a `SealedCredential` to the on-disk envelope format.
@@ -978,6 +990,29 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let store = new_store(&tmp);
         assert!(store.get(test_id(), Slot::Access).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn remove_deletes_slot_and_is_idempotent() {
+        // Story 11.13: `connection revoke` drops each sealed slot via
+        // `remove(id, slot)`. Removing a present slot returns Ok(true);
+        // removing an absent slot is a no-op Ok(false); sibling slots are
+        // untouched.
+        let tmp = TempDir::new().unwrap();
+        let store = new_store(&tmp);
+        let id = test_id();
+        store.put(id, Slot::Access, fake_sealed("access", 0xA1)).await.unwrap();
+        store.put(id, Slot::Refresh, fake_sealed("refresh", 0xB2)).await.unwrap();
+
+        // Removing a present slot reports true and the slot is gone.
+        assert!(store.remove(id, Slot::Access).await.unwrap());
+        assert!(store.get(id, Slot::Access).await.unwrap().is_none());
+        // Sibling slot is untouched.
+        assert!(store.get(id, Slot::Refresh).await.unwrap().is_some());
+        // Removing an already-absent slot is a no-op (false), not an error.
+        assert!(!store.remove(id, Slot::Access).await.unwrap());
+        // Removing a never-written slot of a present connection: false.
+        assert!(!store.remove(id, Slot::Client).await.unwrap());
     }
 
     #[tokio::test]

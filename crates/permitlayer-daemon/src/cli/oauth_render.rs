@@ -72,12 +72,13 @@ pub(crate) fn build_teal_theme(theme: &Theme) -> dialoguer::theme::ColorfulTheme
 }
 
 /// Severity of an `OAuthError` for the non-interactive tracing-log
-/// dispatch path. Phase 3 errors are fatal; Phase 5 (verify) errors
-/// are non-fatal (credentials were sealed in Phase 4).
+/// dispatch path. Story 11.13: the OAuth dance (`oauth_seal`) only ever
+/// reports `Fatal` now — verify-on-seal is a separate daemon-side probe
+/// (not routed through this renderer), so the former `NonFatal` arm was
+/// removed with the retired `connect` verb.
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum OAuthErrorSeverity {
     Fatal,
-    NonFatal,
 }
 
 /// Render an [`OAuthError`] using the design system or structured
@@ -109,14 +110,6 @@ pub(crate) fn render_oauth_error(
         let remediation_single_line = remediation.replace('\r', "").replace('\n', "\\n");
         match severity {
             OAuthErrorSeverity::Fatal => tracing::error!(
-                service = %service,
-                error_code = %e.error_code(),
-                error = %e,
-                remediation = %remediation_single_line,
-                "{}",
-                log_context
-            ),
-            OAuthErrorSeverity::NonFatal => tracing::warn!(
                 service = %service,
                 error_code = %e.error_code(),
                 error = %e,

@@ -33,8 +33,7 @@ For each story N: create-story (spec file) → dev-story (implement) → code-re
 - [x] 11.11 — **PoC GO/NO-GO gate → GO** (2026-06-07). Vertical slice green (2 connections isolated, 1 agent / 2 bindings / 2 selectors, per-connection token routing, write-on-readonly denied). Caught + fixed a real 11.10 dispatch bug (upstream resolved from selector instead of the connection's connector_id). Phase 4 unblocked.
 
 ### Phase 4 — CLI re-split + control-plane seal API
-- [ ] 11.12 — Control-plane seal API: `{service}` → `connection_id` + `slot`
-- [ ] 11.13 — `connection add`/`list`/`inspect`/`revoke`
+- [x] 11.12 + 11.13 — **MERGED, committed** (owner-approved 2026-06-07). Seal API → connection_id+slot (no `-meta.json`); `connection add/list/inspect/revoke`; daemon `conn_shim` + `CREDENTIAL_SUPPORTED_SERVICES` deleted; `connect`/`credentials list/status/refresh` removed (FR23 superseded); verify kept+reshaped to connection_id. Gate green (core 499, proxy 368, daemon 1222). 5 quickstart_e2e tests deferred to 11.15.
 - [ ] 11.14 — `bind`/`unbind`/`agent bindings`
 - [ ] 11.15 — Re-pointed `quickstart`
 
