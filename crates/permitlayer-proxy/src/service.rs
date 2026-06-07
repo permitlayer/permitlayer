@@ -27,7 +27,7 @@ use permitlayer_core::audit::event::AuditEvent;
 use permitlayer_core::scrub::{ScrubEngine, ScrubSample};
 use permitlayer_core::store::{AuditStore, CredentialStore};
 use permitlayer_credential::Slot;
-use permitlayer_oauth::{CredentialMeta, GoogleOAuthConfig, OAuthClient};
+use permitlayer_oauth::{GoogleOAuthConfig, OAuthClient};
 use permitlayer_vault::Vault;
 
 use crate::error::{AgentId, ProxyError, RequestId};
@@ -97,10 +97,10 @@ pub struct ProxyService {
     allow_private_upstream: bool,
     audit_store: Arc<dyn AuditStore>,
     scrub_engine: Arc<ScrubEngine>,
-    /// Directory containing per-service sealed credentials and
-    /// `{service}-meta.json` provenance files. Used by the refresh path
-    /// to reconstruct the correct `OAuthClient` on demand (Story 1.14).
-    /// Typically `~/.agentsso/vault`.
+    /// Directory containing per-connection sealed credentials
+    /// (`<connection_id>-<slot>.sealed`, Story 11.9). The refresh path
+    /// unseals the `Client` slot here to reconstruct the `OAuthClient` on
+    /// demand. Typically `~/.agentsso/vault`.
     vault_dir: PathBuf,
     /// Directory where decoded inbound attachments are materialized for
     /// the MCP agent to read by local path (Gmail `attachments.get`). Per
@@ -497,28 +497,22 @@ impl ProxyService {
         &self.vault_dir
     }
 
-    /// Reconstruct the correct `OAuthClient` for a given service by
-    /// reading its metadata file from the vault directory.
+    /// Reconstruct the correct `OAuthClient` for a connection by
+    /// unsealing its `Client` slot.
     ///
-    /// This is the lazy extension point for non-Google services: every
-    /// connected service writes a `{service}-meta.json` during setup
-    /// recording its `client_type` (currently `"byo"` for Google, with
-    /// historical `"shared-casa"` records needing re-setup; future
-    /// connectors will add their own). The refresh path dispatches on
-    /// `client_type` to rebuild the right client.
+    /// **Story 11.16:** the pre-Epic-11 path read a `{service}-meta.json`
+    /// provenance file to dispatch on `client_type`. Epic 11 deleted that
+    /// file (Story 11.12 — the `ConnectionRecord` is the provenance now)
+    /// and every v2 connection is a sealed BYO client by construction
+    /// (`connection add` always seals the `Client` slot). So the meta read
+    /// is gone: this resolves the client straight from the connection's
+    /// `(connection_id, Slot::Client)` envelope. A missing/corrupt Client
+    /// slot is a clean error directing the operator to re-add the
+    /// connection.
     ///
-    /// Called once per refresh attempt. At MVP volumes the per-refresh
-    /// file read is negligible; caching is a future optimization if
-    /// refresh storms become measured.
-    ///
-    /// Returns an `Arc<OAuthClient>` rather than `OAuthClient` by value
-    /// because (a) `OAuthClient` wraps types that are already
-    /// `Arc`-wrapped internally, so handing out an `Arc` is zero-cost
-    /// wrapping over the underlying state, and (b) the test-only
-    /// override path in [`Self::oauth_client_overrides`] stores the
-    /// client as `Arc<OAuthClient>` and needs to hand out cheap clones
-    /// via `Arc::clone` — this return type lets the override path be
-    /// trivially correct and the production path a single `Arc::new`.
+    /// Called once per refresh attempt. Returns an `Arc<OAuthClient>` so
+    /// the test override path (`oauth_client_overrides`) can hand out cheap
+    /// `Arc::clone`s and the production path is a single `Arc::new`.
     fn build_oauth_client_for_service(
         &self,
         service: &str,
@@ -526,75 +520,17 @@ impl ProxyService {
     ) -> Result<Arc<OAuthClient>, ProxyError> {
         // Test-only fast path: if the integration test harness injected an
         // override client for this service via `with_oauth_client_override`,
-        // clone the stored `Arc` and skip the metadata read entirely. This
-        // is how tests point the refresh path at a mock OAuth server on
-        // localhost without polluting production data structures.
-        // `oauth_client_overrides` is always `None` in production.
+        // clone the stored `Arc`. `oauth_client_overrides` is always `None`
+        // in production.
         if let Some(ref overrides) = self.oauth_client_overrides
             && let Some(client) = overrides.get(service)
         {
             return Ok(Arc::clone(client));
         }
 
-        // Story 1.14b code-review m3 fix: error messages used to be
-        // prefixed with `"refresh: "`, but the wrapper at the
-        // resolver-closure site (in `try_refresh_and_retry`) wraps
-        // these messages in `RefreshFlowError::MetaInvalid` whose
-        // `Display` adds its own `"refresh: OAuth client build
-        // failed for service '{}': "` prefix. The result was a
-        // double-prefix like `"refresh: OAuth client build failed
-        // for service 'gmail': refresh: could not read metadata..."`.
-        // The CLI's inlined copy (`build_oauth_client_for_cli`)
-        // never had the prefix; the proxy version has been
-        // harmonized to match.
-        let meta_path = self.vault_dir.join(format!("{service}-meta.json"));
-        let meta_contents =
-            std::fs::read_to_string(&meta_path).map_err(|e| ProxyError::Internal {
-                message: format!(
-                    "could not read metadata for service '{service}' at {}: {e}",
-                    meta_path.display()
-                ),
-            })?;
-        let meta: CredentialMeta =
-            serde_json::from_str(&meta_contents).map_err(|e| ProxyError::Internal {
-                message: format!(
-                    "malformed metadata for service '{service}' at {}: {e}",
-                    meta_path.display()
-                ),
-            })?;
-
-        let config = match meta.client_type.as_str() {
-            "shared-casa" => {
-                return Err(ProxyError::Internal {
-                    message: format!(
-                        "metadata for service '{service}' was stored against the removed shared-casa client; re-run `agentsso setup {service} --oauth-client <path>` to migrate to a bring-your-own OAuth client"
-                    ),
-                });
-            }
-            "byo" => {
-                // Story 7.35: the BYO client credentials are sealed in
-                // the vault under `{service}-client`. A legacy
-                // path-based record (`client_sealed == false`) is NOT
-                // silently re-read from a plaintext path anymore —
-                // single-machine scope means reset-and-reconnect.
-                if !meta.client_sealed {
-                    return Err(ProxyError::Internal {
-                        message: format!(
-                            "OAuth client for service '{service}' is not sealed (legacy/path-based record). \
-                             Re-run: agentsso connect {service} --agent <agent> --oauth-client <path/to/client_secret.json>"
-                        ),
-                    });
-                }
-                self.unseal_byo_client_config(service, connection)?
-            }
-            other => {
-                return Err(ProxyError::Internal {
-                    message: format!(
-                        "metadata for service '{service}' has unknown client_type '{other}'"
-                    ),
-                });
-            }
-        };
+        // Story 11.16: no `-meta.json` dispatch — the v2 connection's BYO
+        // client config is sealed under `(connection_id, Slot::Client)`.
+        let config = self.unseal_byo_client_config(service, connection)?;
 
         OAuthClient::new(config.client_id().to_owned(), config.client_secret().map(str::to_owned))
             .map(Arc::new)
@@ -613,11 +549,16 @@ impl ProxyService {
         service: &str,
         connection: permitlayer_credential::ConnectionId,
     ) -> Result<GoogleOAuthConfig, ProxyError> {
-        let client_service = format!("{service}-client");
-        let sealed_path = self.vault_dir.join(format!("{client_service}.sealed"));
+        // Story 11.16: the on-disk credential file is named
+        // `<connection_id>-<slot>.sealed` (Story 11.9 store re-key), NOT the
+        // legacy `{service}-client.sealed`. The Client slot holds the sealed
+        // BYO client bundle for this connection.
+        let sealed_path =
+            self.vault_dir.join(format!("{connection}-{}.sealed", Slot::Client.label()));
         let bytes = std::fs::read(&sealed_path).map_err(|e| ProxyError::Internal {
             message: format!(
-                "could not read sealed OAuth client bundle for service '{service}' at {}: {e}",
+                "could not read sealed OAuth client bundle for service '{service}' at {} \
+                 (re-add the connection: agentsso connection add): {e}",
                 sealed_path.display()
             ),
         })?;
@@ -730,15 +671,9 @@ impl ProxyService {
 
         // Call the shared core. This is the bulk of the refresh state
         // machine — see crate::refresh_flow for details.
-        let flow_result = refresh_service(
-            &self.vault,
-            &self.credential_store,
-            &self.vault_dir,
-            service,
-            connection,
-            &resolver,
-        )
-        .await;
+        let flow_result =
+            refresh_service(&self.vault, &self.credential_store, service, connection, &resolver)
+                .await;
 
         // Match on the shared core's result. The two `Ok` arms are
         // proxy-flavored because they emit the proxy-context audit
@@ -751,12 +686,7 @@ impl ProxyService {
         // `extra.stage` — it gets a dedicated branch that calls
         // `emit_persistence_failed_audit` instead.
         let new_access_bytes: Zeroizing<Vec<u8>> = match flow_result {
-            Ok(RefreshOutcome::Refreshed {
-                rotated,
-                new_access_bytes,
-                new_expiry_at: _,
-                last_refreshed_at: _,
-            }) => {
+            Ok(RefreshOutcome::Refreshed { rotated, new_access_bytes, new_expiry_at: _ }) => {
                 // Success audit BEFORE the retry dispatch. Matches
                 // Story 1.14a's ordering: "refresh succeeded"
                 // appears in the audit log even if the retry dispatch
@@ -1768,33 +1698,10 @@ mod tests {
         )
     }
 
-    /// Write `{service}-meta.json` into `vault_dir` with the given
-    /// `client_sealed` flag (byo client_type).
-    fn write_byo_meta(vault_dir: &std::path::Path, service: &str, client_sealed: bool) {
-        let meta = CredentialMeta {
-            client_type: "byo".to_owned(),
-            client_source: if client_sealed {
-                None
-            } else {
-                Some("/Users/op/Downloads/client_secret.json".to_owned())
-            },
-            client_sealed,
-            connected_at: "2026-05-16T00:00:00Z".to_owned(),
-            last_refreshed_at: None,
-            scopes: vec!["https://mail.google.com/".to_owned()],
-            expires_in_secs: Some(3599),
-        };
-        std::fs::write(
-            vault_dir.join(format!("{service}-meta.json")),
-            serde_json::to_string(&meta).unwrap(),
-        )
-        .unwrap();
-    }
-
-    /// Seal a BYO client bundle into `{service}-client.sealed` exactly
+    /// Seal a BYO client bundle into `<connection>-client.sealed` exactly
     /// as the daemon's seal handler does: `OAuthToken::from_trusted_bytes`
-    /// over the canonical bundle JSON → `vault.seal("{service}-client")`
-    /// → `encode_envelope` to disk.
+    /// over the canonical bundle JSON → `vault.seal(connection, Slot::Client)`
+    /// → `encode_envelope` to disk under the v2 `<ulid>-client.sealed` name.
     fn seal_client_bundle(
         vault_dir: &std::path::Path,
         service: &str,
@@ -1812,17 +1719,24 @@ mod tests {
         // No binding stores wired in these unit tests → `handle_inner`
         // resolves the connection id via
         // `ProxyService::legacy_connection_id_for_service`, and the BYO
-        // client bundle keys on that id + `Slot::Client`.
+        // client bundle keys on that id + `Slot::Client`. Story 11.16: the
+        // on-disk file is `<connection_id>-client.sealed` (the v2 store
+        // naming), NOT the legacy `{service}-client.sealed`.
         let connection = ProxyService::legacy_connection_id_for_service(service);
         let sealed = test_vault().seal(connection, Slot::Client, &token).unwrap();
         let bytes = permitlayer_core::store::fs::credential_fs::encode_envelope(&sealed);
-        std::fs::write(vault_dir.join(format!("{service}-client.sealed")), bytes).unwrap();
+        std::fs::write(
+            vault_dir.join(format!("{connection}-{}.sealed", Slot::Client.label())),
+            bytes,
+        )
+        .unwrap();
     }
 
     #[tokio::test]
     async fn byo_client_is_reconstructed_from_sealed_bundle_not_a_file() {
         let dir = TempDir::new().unwrap();
-        write_byo_meta(dir.path(), "gmail", /* client_sealed */ true);
+        // Story 11.16: no `-meta.json` is written; the refresh path
+        // reconstructs the client straight from the sealed `Client` slot.
         seal_client_bundle(
             dir.path(),
             "gmail",
@@ -1834,8 +1748,8 @@ mod tests {
 
         let service = service_with_vault_dir(dir.path());
         // Success here proves the BYO client was reconstructed by
-        // unsealing `gmail-client.sealed` — there is no client JSON on
-        // disk, so any plaintext-path fallback would error instead.
+        // unsealing the `Client` slot — there is no client JSON on disk
+        // and no meta file, so any fallback would error instead.
         let gmail_conn = ProxyService::legacy_connection_id_for_service("gmail");
         let _client = service
             .build_oauth_client_for_service("gmail", gmail_conn)
@@ -1848,11 +1762,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn legacy_non_sealed_byo_record_fails_with_actionable_error_no_path_fallback() {
+    async fn missing_client_slot_fails_with_actionable_error_no_path_fallback() {
+        // Story 11.16: with the `-meta.json` provenance scheme gone, a
+        // connection whose `Client` slot is absent (e.g. a partial cleanup,
+        // or an access-only seed) must fail with a clean re-add hint — never
+        // a plaintext-path fallback.
         let dir = TempDir::new().unwrap();
-        write_byo_meta(dir.path(), "gmail", /* client_sealed */ false);
         // A real client_secret.json sitting right there must NOT be
-        // silently re-read — the legacy record is hard-rejected.
+        // silently re-read.
         std::fs::write(
             dir.path().join("legacy_client_secret.json"),
             r#"{"installed":{"client_id":"x","client_secret":"y"}}"#,
@@ -1864,18 +1781,18 @@ mod tests {
         // match the error out explicitly.
         let gmail_conn = ProxyService::legacy_connection_id_for_service("gmail");
         let err = match service.build_oauth_client_for_service("gmail", gmail_conn) {
-            Ok(_) => panic!("legacy non-sealed byo record must be rejected, not path-read"),
+            Ok(_) => panic!("a connection with no sealed Client slot must be rejected"),
             Err(e) => e,
         };
 
         let msg = err.to_string();
         assert!(
-            msg.contains("not sealed") && msg.contains("legacy/path-based"),
-            "error must explain the record is legacy/non-sealed; got: {msg}"
+            msg.contains("could not read sealed OAuth client bundle"),
+            "error must name the missing sealed client bundle; got: {msg}"
         );
         assert!(
-            msg.contains("agentsso connect") && msg.contains("--oauth-client"),
-            "error must name the actionable fix (re-run connect); got: {msg}"
+            msg.contains("connection add"),
+            "error must name the actionable fix (re-add the connection); got: {msg}"
         );
     }
 

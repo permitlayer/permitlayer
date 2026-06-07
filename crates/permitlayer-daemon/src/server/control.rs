@@ -4012,15 +4012,8 @@ async fn try_self_heal_refresh(
 
     // Story 11.12: `connection` is the real id resolved by the verify
     // handler from the `ConnectionRecord` — no service→id derivation.
-    let outcome = refresh_flow::refresh_service(
-        &state.vault,
-        &store,
-        &state.vault_dir,
-        service,
-        connection,
-        &resolver,
-    )
-    .await;
+    let outcome =
+        refresh_flow::refresh_service(&state.vault, &store, service, connection, &resolver).await;
 
     // Audit the self-heal attempt (best-effort).
     let (audit_outcome, audit_label, result): (&'static str, &'static str, _) = match &outcome {

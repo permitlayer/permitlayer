@@ -38,7 +38,7 @@ For each story N: create-story (spec file) → dev-story (implement) → code-re
 - [x] 11.15 — **committed** (2026-06-07). `quickstart` un-stubbed: composes `connection add` (oauth_dance_and_seal) → auto-register → `bind --alias` → `/mcp/<name>` snippet (openclaw emitter re-added). All 5 quickstart_e2e #[ignore]s GONE → 8 passing tests (2 OAuth-dance rewritten to assert connection+binding via device-flow mock seam). **Phase 4 COMPLETE.** Gate green (daemon 1246, proxy 368).
 
 ### Phase 5 — Clean-install + multi-account validation
-- [ ] 11.16 — Clean-install path (v2-only) · **FOLLOW-UP to catch here:** the proxy runtime refresh path (`ProxyService::build_oauth_client_for_service` / `unseal_byo_client_config`) still reads legacy `{service}-meta.json` + `{service}-client.sealed` naming instead of the connection-keyed Client slot. Not exercised by CI gates (proxy tests mock the OAuth client; no real Google refresh), so green — but a real v1-naming residue the 11.16 sweep must reshape to the `<ulid>-client.sealed` / ConnectionStore path. (Flagged by the 11.12/11.13 daemon agent 2026-06-07.)
+- [x] 11.16 — **committed** (2026-06-07). v2-only: durable `clean_install_v2_guard` test (5 checks) is the AC#2 backstop — it caught 2 more production `-meta.json` residue sites beyond the flagged one (listConnectedServices host API → ConnectionStore records; deleted update_last_refreshed_at) + the proxy refresh-client fix (reads `<id>-client.sealed`, not `-meta.json`). All residue gone. Gate green (daemon 1251, proxy 368). (CredentialMeta type left — test-only consumers, lower-priority future cleanup.)
 - [ ] 11.17 — Multi-account e2e validation on angie-2 (Chuck) — live angie pass is operator-run
 
 ## Decision / event log
