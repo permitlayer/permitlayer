@@ -393,27 +393,26 @@ async fn route_not_found_handler(request: Request) -> Response {
     )
 }
 
+/// Map of selector → resolved connector MCP service, swapped atomically
+/// when the proxy (re)activates. Keyed by the route selector vocabulary
+/// (bare service name, e.g. `gmail`).
+type ConnectorServiceMap =
+    std::collections::BTreeMap<String, Arc<permitlayer_proxy::transport::mcp::ConnectorMcpService>>;
+
 #[derive(Clone)]
 pub(crate) struct ProxyRouteSlots {
     proxy: Arc<ArcSwapOption<permitlayer_proxy::ProxyService>>,
-    gmail_mcp: Arc<ArcSwapOption<permitlayer_proxy::transport::mcp::GmailMcpService>>,
-    calendar_mcp: Arc<ArcSwapOption<permitlayer_proxy::transport::mcp::CalendarMcpService>>,
-    drive_mcp: Arc<ArcSwapOption<permitlayer_proxy::transport::mcp::DriveMcpService>>,
+    /// Story 11.4: one generic connector-service map replacing the three
+    /// per-service `ArcSwapOption` slots. The dynamic `/mcp/{selector}`
+    /// route resolves a selector against this map.
+    connectors: Arc<arc_swap::ArcSwap<ConnectorServiceMap>>,
 }
 
 impl ProxyRouteSlots {
     pub(crate) fn new(proxy: Option<&Arc<permitlayer_proxy::ProxyService>>) -> Self {
         let slots = Self {
             proxy: Arc::new(ArcSwapOption::from(None::<Arc<permitlayer_proxy::ProxyService>>)),
-            gmail_mcp: Arc::new(ArcSwapOption::from(
-                None::<Arc<permitlayer_proxy::transport::mcp::GmailMcpService>>,
-            )),
-            calendar_mcp: Arc::new(ArcSwapOption::from(
-                None::<Arc<permitlayer_proxy::transport::mcp::CalendarMcpService>>,
-            )),
-            drive_mcp: Arc::new(ArcSwapOption::from(
-                None::<Arc<permitlayer_proxy::transport::mcp::DriveMcpService>>,
-            )),
+            connectors: Arc::new(arc_swap::ArcSwap::from_pointee(ConnectorServiceMap::new())),
         };
         if let Some(proxy) = proxy {
             slots.activate(Arc::clone(proxy));
@@ -422,13 +421,21 @@ impl ProxyRouteSlots {
     }
 
     pub(crate) fn activate(&self, proxy: Arc<permitlayer_proxy::ProxyService>) {
-        let gmail = permitlayer_proxy::transport::mcp::mcp_service(Arc::clone(&proxy));
-        let calendar = permitlayer_proxy::transport::mcp::calendar_mcp_service(Arc::clone(&proxy));
-        let drive = permitlayer_proxy::transport::mcp::drive_mcp_service(Arc::clone(&proxy));
+        use permitlayer_proxy::transport::mcp::{connector_mcp_service, selector_to_connector_id};
 
-        self.gmail_mcp.store(Some(Arc::new(gmail)));
-        self.calendar_mcp.store(Some(Arc::new(calendar)));
-        self.drive_mcp.store(Some(Arc::new(drive)));
+        // Build the built-in connector services under their route
+        // selectors. Host-installed connectors gain entries here with the
+        // declarative-passthrough story; `connector_mcp_service` returns
+        // None for any non-built-in id today.
+        let mut map = ConnectorServiceMap::new();
+        for selector in ["gmail", "calendar", "drive"] {
+            if let Some(id) = selector_to_connector_id(selector)
+                && let Some(svc) = connector_mcp_service(id, Arc::clone(&proxy))
+            {
+                map.insert(selector.to_owned(), Arc::new(svc));
+            }
+        }
+        self.connectors.store(Arc::new(map));
         self.proxy.store(Some(proxy));
     }
 }
@@ -442,32 +449,19 @@ pub(crate) struct ProxyActivationContext {
     pub routes: ProxyRouteSlots,
 }
 
-async fn dynamic_gmail_mcp_handler(
-    slot: Arc<ArcSwapOption<permitlayer_proxy::transport::mcp::GmailMcpService>>,
+/// Story 11.4: the single dynamic connector-MCP route handler. Resolves
+/// `{selector}` against the activated connector-service map and forwards
+/// to the matching service. An unknown selector (or a connector not yet
+/// activated) falls through to `not_implemented_handler` — MCP
+/// not-found, never a panic. This is also the host-installed stub
+/// surface (a non-built-in selector resolves to no service today).
+async fn dynamic_connector_mcp_handler(
+    connectors: Arc<arc_swap::ArcSwap<ConnectorServiceMap>>,
+    Path(selector): Path<String>,
     request: Request,
 ) -> Response {
-    match slot.load_full() {
-        Some(service) => service.handle(request).await.into_response(),
-        None => not_implemented_handler(request).await,
-    }
-}
-
-async fn dynamic_calendar_mcp_handler(
-    slot: Arc<ArcSwapOption<permitlayer_proxy::transport::mcp::CalendarMcpService>>,
-    request: Request,
-) -> Response {
-    match slot.load_full() {
-        Some(service) => service.handle(request).await.into_response(),
-        None => not_implemented_handler(request).await,
-    }
-}
-
-async fn dynamic_drive_mcp_handler(
-    slot: Arc<ArcSwapOption<permitlayer_proxy::transport::mcp::DriveMcpService>>,
-    request: Request,
-) -> Response {
-    match slot.load_full() {
-        Some(service) => service.handle(request).await.into_response(),
+    match connectors.load().get(&selector) {
+        Some(service) => service.handle(request).await,
         None => not_implemented_handler(request).await,
     }
 }
@@ -3534,11 +3528,7 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         // out of the middleware chain so unauthenticated unknown paths hit
         // the JSON 404 body instead of AuthLayer's 401.
         #[cfg(debug_assertions)]
-        let gmail_slot = Arc::clone(&proxy_route_slots.gmail_mcp);
-        #[cfg(debug_assertions)]
-        let calendar_slot = Arc::clone(&proxy_route_slots.calendar_mcp);
-        #[cfg(debug_assertions)]
-        let drive_slot = Arc::clone(&proxy_route_slots.drive_mcp);
+        let connectors_slot = Arc::clone(&proxy_route_slots.connectors);
         #[cfg(debug_assertions)]
         let proxy_slot = Arc::clone(&proxy_route_slots.proxy);
         #[cfg(debug_assertions)]
@@ -3546,27 +3536,17 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
             .route("/health", get(health_handler))
             .route("/v1/health", get(health_handler))
             .route(
-                "/mcp/gmail",
-                any(move |req| dynamic_gmail_mcp_handler(Arc::clone(&gmail_slot), req)),
-            )
-            .route(
-                "/mcp/calendar",
-                any(move |req| dynamic_calendar_mcp_handler(Arc::clone(&calendar_slot), req)),
-            )
-            .route(
-                "/mcp/drive",
-                any(move |req| dynamic_drive_mcp_handler(Arc::clone(&drive_slot), req)),
+                "/mcp/{selector}",
+                any(move |path, req| {
+                    dynamic_connector_mcp_handler(Arc::clone(&connectors_slot), path, req)
+                }),
             )
             .route(
                 "/v1/tools/{service}/{*path}",
                 any(move |path, req| dynamic_proxy_handler(Arc::clone(&proxy_slot), path, req)),
             );
         #[cfg(not(debug_assertions))]
-        let gmail_slot = Arc::clone(&proxy_route_slots.gmail_mcp);
-        #[cfg(not(debug_assertions))]
-        let calendar_slot = Arc::clone(&proxy_route_slots.calendar_mcp);
-        #[cfg(not(debug_assertions))]
-        let drive_slot = Arc::clone(&proxy_route_slots.drive_mcp);
+        let connectors_slot = Arc::clone(&proxy_route_slots.connectors);
         #[cfg(not(debug_assertions))]
         let proxy_slot = Arc::clone(&proxy_route_slots.proxy);
         #[cfg(not(debug_assertions))]
@@ -3574,16 +3554,10 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
             .route("/health", get(health_handler))
             .route("/v1/health", get(health_handler))
             .route(
-                "/mcp/gmail",
-                any(move |req| dynamic_gmail_mcp_handler(Arc::clone(&gmail_slot), req)),
-            )
-            .route(
-                "/mcp/calendar",
-                any(move |req| dynamic_calendar_mcp_handler(Arc::clone(&calendar_slot), req)),
-            )
-            .route(
-                "/mcp/drive",
-                any(move |req| dynamic_drive_mcp_handler(Arc::clone(&drive_slot), req)),
+                "/mcp/{selector}",
+                any(move |path, req| {
+                    dynamic_connector_mcp_handler(Arc::clone(&connectors_slot), path, req)
+                }),
             )
             .route(
                 "/v1/tools/{service}/{*path}",

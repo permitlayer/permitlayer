@@ -239,6 +239,55 @@ fn mcp_tool_input_schemas_have_no_meta_schema_declaration() {
 }
 
 #[test]
+fn connector_mcp_service_resolves_builtins_and_rejects_unknown() {
+    // Story 11.4: the generic resolver builds a service for each built-in
+    // connector id and returns None for any non-built-in id (the
+    // host-installed passthrough is stubbed — the route maps None to MCP
+    // not-found, never a panic).
+    use permitlayer_proxy::transport::mcp::{
+        ConnectorMcpService, connector_mcp_service, selector_to_connector_id,
+    };
+
+    let vault = Arc::new(test_vault());
+    let cred_store = MockCredentialStore::new(TEST_MASTER_KEY);
+    let upstream = UpstreamClient::new().unwrap();
+    let audit_store = Arc::new(MockAuditStore::new());
+    let token_issuer = Arc::new(test_token_issuer());
+    let proxy = Arc::new(ProxyService::new(
+        Arc::new(cred_store) as Arc<dyn CredentialStore>,
+        vault,
+        token_issuer,
+        Arc::new(upstream),
+        audit_store as Arc<dyn AuditStore>,
+        test_scrub_engine(),
+        std::env::temp_dir(),
+        std::env::temp_dir().join("permitlayer-test-media"),
+    ));
+
+    // Selector vocabulary maps to canonical ids.
+    assert_eq!(selector_to_connector_id("gmail"), Some("google-gmail"));
+    assert_eq!(selector_to_connector_id("calendar"), Some("google-calendar"));
+    assert_eq!(selector_to_connector_id("drive"), Some("google-drive"));
+    assert_eq!(selector_to_connector_id("acme"), None);
+
+    // Each built-in id yields its matching service arm.
+    assert!(matches!(
+        connector_mcp_service("google-gmail", Arc::clone(&proxy)),
+        Some(ConnectorMcpService::Gmail(_))
+    ));
+    assert!(matches!(
+        connector_mcp_service("google-calendar", Arc::clone(&proxy)),
+        Some(ConnectorMcpService::Calendar(_))
+    ));
+    assert!(matches!(
+        connector_mcp_service("google-drive", Arc::clone(&proxy)),
+        Some(ConnectorMcpService::Drive(_))
+    ));
+    // A non-built-in id resolves to no service (stub for host-installed).
+    assert!(connector_mcp_service("acme-widgets", proxy).is_none());
+}
+
+#[test]
 fn mcp_server_info_has_correct_name_and_version() {
     // Build a minimal GmailMcpServer (needs a real ProxyService, but we
     // only call get_info which doesn't touch it).

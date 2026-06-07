@@ -2167,6 +2167,92 @@ pub fn drive_mcp_service(proxy_service: Arc<ProxyService>) -> DriveMcpService {
     )
 }
 
+// ─────────────────────────────────────────────────────────────────────
+// Generic connector dispatch (Story 11.4 — hybrid model).
+// ─────────────────────────────────────────────────────────────────────
+//
+// The three typed servers above ARE the per-connector handler registry
+// for the built-in Google connectors: each owns the bespoke Rust logic
+// (response shaping, attachment-to-disk, query building, id validation)
+// that the declarative `connector.toml` deliberately does not express.
+// `ConnectorMcpService` is the single generic dispatch entrypoint that
+// the dynamic `/mcp/{selector}` route forwards to — "one generic
+// connector MCP server" realized at the service/routing layer rather
+// than as one rmcp `ServerHandler` type (which would force re-binding
+// every handler and break the conformance parity gate).
+//
+// Host-installed connectors get a generic declarative passthrough arm
+// in a follow-up Phase 2 story; until then, a selector that does not
+// resolve to a built-in returns MCP not-found (never panics).
+
+/// A resolved per-connector MCP service. Each arm is a real rmcp
+/// `StreamableHttpService` over the connector's typed server, so each
+/// advertises exactly that connector's tools + input schemas.
+pub enum ConnectorMcpService {
+    /// The built-in Gmail connector (`google-gmail`).
+    Gmail(GmailMcpService),
+    /// The built-in Calendar connector (`google-calendar`).
+    Calendar(CalendarMcpService),
+    /// The built-in Drive connector (`google-drive`).
+    Drive(DriveMcpService),
+}
+
+impl ConnectorMcpService {
+    /// Forward an inbound MCP HTTP request to the resolved connector's
+    /// service. `StreamableHttpService::handle` dispatches on the HTTP
+    /// method and ignores the URL path, so the dynamic-route prefix
+    /// (`/mcp/{selector}`) needs no stripping.
+    pub async fn handle(
+        &self,
+        request: axum::http::Request<axum::body::Body>,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        match self {
+            ConnectorMcpService::Gmail(s) => s.handle(request).await.into_response(),
+            ConnectorMcpService::Calendar(s) => s.handle(request).await.into_response(),
+            ConnectorMcpService::Drive(s) => s.handle(request).await.into_response(),
+        }
+    }
+}
+
+/// Map a route **selector** to its canonical connector id.
+///
+/// The route vocabulary stays the bare service name (`/mcp/gmail`) for
+/// client compatibility; the registry keys on the canonical id
+/// (`google-gmail`). Returns `None` for an unrecognized selector. A
+/// selector that is already a canonical id passes through unchanged so
+/// a future `/mcp/google-gmail` form also resolves.
+#[must_use]
+pub fn selector_to_connector_id(selector: &str) -> Option<&'static str> {
+    match selector {
+        "gmail" | "google-gmail" => Some("google-gmail"),
+        "calendar" | "google-calendar" => Some("google-calendar"),
+        "drive" | "google-drive" => Some("google-drive"),
+        _ => None,
+    }
+}
+
+/// Build the [`ConnectorMcpService`] for a built-in connector id.
+///
+/// Returns `None` for any id that is not a shipped built-in — the
+/// caller maps that to an MCP not-found response. Host-installed
+/// connectors will gain an arm here with the declarative-passthrough
+/// story; for now they resolve to `None` (no panic, FR89 surface).
+#[must_use]
+pub fn connector_mcp_service(
+    connector_id: &str,
+    proxy_service: Arc<ProxyService>,
+) -> Option<ConnectorMcpService> {
+    match connector_id {
+        "google-gmail" => Some(ConnectorMcpService::Gmail(mcp_service(proxy_service))),
+        "google-calendar" => {
+            Some(ConnectorMcpService::Calendar(calendar_mcp_service(proxy_service)))
+        }
+        "google-drive" => Some(ConnectorMcpService::Drive(drive_mcp_service(proxy_service))),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
@@ -2746,6 +2832,26 @@ mod tests {
         assert_eq!(CalendarMcpServer::tool_router().map.len(), 12, "Calendar tool count");
         assert_eq!(DriveMcpServer::tool_router().map.len(), 8, "Drive tool count");
     }
+
+    // ---- Story 11.4: generic connector dispatch resolver ----
+
+    #[test]
+    fn selector_maps_bare_and_canonical_to_connector_id() {
+        // Bare service names (the route vocabulary) and canonical ids
+        // both resolve; an unknown selector does not.
+        assert_eq!(selector_to_connector_id("gmail"), Some("google-gmail"));
+        assert_eq!(selector_to_connector_id("google-gmail"), Some("google-gmail"));
+        assert_eq!(selector_to_connector_id("calendar"), Some("google-calendar"));
+        assert_eq!(selector_to_connector_id("drive"), Some("google-drive"));
+        assert_eq!(selector_to_connector_id("nope"), None);
+        assert_eq!(selector_to_connector_id(""), None);
+    }
+
+    // `connector_mcp_service(...)` requires a constructed `ProxyService`
+    // (several mock deps); its built-in-resolves / unknown-is-None
+    // behavior is covered in the integration suite (mcp_transport.rs)
+    // where a real ProxyService builder exists. The pure selector map
+    // above is the unit-level guard.
 
     /// The Story 9.3 tools are registered under their dotted names.
     #[test]

@@ -22,7 +22,7 @@ For each story N: create-story (spec file) → dev-story (implement) → code-re
 - [x] 11.3 — Connector registry + load-time validator + host-installed discovery ✅ committed
 
 ### Phase 2 — Proxy reads from registry
-- [ ] 11.4 — Generic `ConnectorMcpServer` + dynamic `/mcp/{selector}` route
+- [x] 11.4 — Generic `ConnectorMcpServer` + dynamic `/mcp/{selector}` route ✅ committed (hybrid: ConnectorMcpService resolver; 3 servers retained as handler registry; mcp_conformance unchanged; host-installed passthrough stubbed for follow-up)
 - [ ] 11.5 — `UpstreamClient::dispatch` takes resolved connector; delete `base_urls`
 - [ ] 11.6 — Per-call resolved-host SSRF enforcement (FR91 / NFR52)
 - [ ] 11.7 — Scope vocab + tier resolution from def; retire `scopes.rs` match + `SUPPORTED_SERVICES` ×3
