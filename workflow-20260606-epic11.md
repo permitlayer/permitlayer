@@ -39,7 +39,7 @@ For each story N: create-story (spec file) → dev-story (implement) → code-re
 
 ### Phase 5 — Clean-install + multi-account validation
 - [x] 11.16 — **committed** (2026-06-07). v2-only: durable `clean_install_v2_guard` test (5 checks) is the AC#2 backstop — it caught 2 more production `-meta.json` residue sites beyond the flagged one (listConnectedServices host API → ConnectionStore records; deleted update_last_refreshed_at) + the proxy refresh-client fix (reads `<id>-client.sealed`, not `-meta.json`). All residue gone. Gate green (daemon 1251, proxy 368). (CredentialMeta type left — test-only consumers, lower-priority future cleanup.)
-- [ ] 11.17 — Multi-account e2e validation on angie-2 (Chuck) — live angie pass is operator-run
+- [x] 11.17 — **automated DONE + committed** (2026-06-07). `multi_account_e2e.rs` (2 tests): full-daemon one-agent/two-gmail-connections/distinct-selectors → write-on-readonly `tier.denied`, reads pass authz, unknown→`binding.not_found`; + store-level NFR51 crypto-isolation. Gate green (daemon 1253, proxy 368). Found: binding-by-name addressing flows through `/v1/tools/<selector>` (not `/mcp/`); proxy needs creds-at-boot. **LIVE angie-2 pass = operator hand-off (closeout).** **EPIC 11 AUTOMATED SCOPE COMPLETE.**
 
 ## Decision / event log
 - 2026-06-06: Branch created off main @ 1b9211b. Epic doc is `ready-for-dev`. No 11.x story files exist yet — creating them per story.

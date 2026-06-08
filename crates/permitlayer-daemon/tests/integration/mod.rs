@@ -60,6 +60,7 @@ mod kill_switch_e2e;
 mod logs_audit_isolation_e2e;
 mod logs_command_e2e;
 mod master_key_bootstrap_e2e;
+mod multi_account_e2e;
 mod plugin_loader_e2e;
 mod policy_compile_startup;
 mod policy_enforcement_e2e;

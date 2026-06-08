@@ -1255,7 +1255,7 @@ pub fn seed_connection_only(
 /// Decode a 64-char hex master key into 32 bytes. Panics on malformed
 /// input — acceptable for a test helper.
 #[allow(dead_code)]
-fn decode_master_key_hex(hex: &str) -> Vec<u8> {
+pub fn decode_master_key_hex(hex: &str) -> Vec<u8> {
     assert_eq!(hex.len(), 64, "master key hex must be 64 chars");
     (0..hex.len())
         .step_by(2)
