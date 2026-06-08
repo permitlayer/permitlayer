@@ -254,8 +254,10 @@ fn write_fake_oauth_client(home: &std::path::Path) -> std::path::PathBuf {
 /// flow lets happen deterministically in CI without real Google.
 ///
 /// macOS bind-poll flake: under nextest load the daemon/CLI round-trips
-/// can be slow; `--retries 2` absorbs it (NOT a regression — see
-/// project_quickstart_e2e_macos_timing_flake).
+/// can be slow. This is a known timing flake (NOT a regression — see
+/// project_quickstart_e2e_macos_timing_flake); if it recurs, re-run the
+/// suite (e.g. `cargo nextest run --retries 2` at the runner level — the
+/// test body itself wires no retry).
 async fn assert_quickstart_creates_connection_and_binding(connector: &str, write: bool) {
     let mut server = mockito::Server::new_async().await;
     let _device = server

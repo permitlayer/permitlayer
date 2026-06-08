@@ -47,7 +47,7 @@ use permitlayer_core::audit::event::AuditEvent;
 use permitlayer_core::scrub::{ScrubEngine, builtin_rules};
 use permitlayer_core::store::{AuditStore, CredentialStore, StoreError};
 use permitlayer_credential::{ConnectionId, OAuthRefreshToken, OAuthToken, SealedCredential, Slot};
-use permitlayer_oauth::{CredentialMeta, OAuthClient};
+use permitlayer_oauth::OAuthClient;
 use permitlayer_proxy::request::ProxyRequest;
 use permitlayer_proxy::service::ProxyService;
 use permitlayer_proxy::token::ScopedTokenIssuer;
@@ -467,23 +467,12 @@ async fn make_test_service_full(
         spawn_mock_upstream_with_stale_bearer(upstream_responses, reject_bearer).await;
     let (oauth_url, oauth_state) = spawn_mock_oauth(oauth_behavior).await;
 
-    // Create a tempdir to serve as vault_dir and write a shared-casa
-    // meta file. This is defense in depth — the oauth_client_overrides
-    // map we inject takes precedence over metadata reads for the
-    // override path, but a valid meta file means any unintended
-    // fallthrough produces a useful error instead of a cryptic one.
+    // The refresh path resolves the OAuth client via the injected
+    // `oauth_client_overrides` map (set on the ProxyService below), so no
+    // on-disk provenance file is needed. (The pre-Epic-11 `-meta.json`
+    // "defense in depth" write was removed with the meta scheme in Story
+    // 11.16 — the override path never reads it.)
     let tempdir = TempDir::new().expect("tempdir");
-    let meta = CredentialMeta {
-        client_type: "shared-casa".to_owned(),
-        client_source: None,
-        client_sealed: false,
-        connected_at: "2026-04-09T12:00:00Z".to_owned(),
-        last_refreshed_at: None,
-        scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".to_owned()],
-        expires_in_secs: Some(3600),
-    };
-    let meta_path = tempdir.path().join(format!("{service_name}-meta.json"));
-    std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).expect("write meta");
 
     // Build the persistent credential store and seed tokens.
     let cred_store = Arc::new(PersistentMockCredentialStore::new(TEST_MASTER_KEY));

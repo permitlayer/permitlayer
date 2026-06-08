@@ -331,3 +331,156 @@ async fn poc_ac4_write_tool_on_readonly_selector_is_denied() {
     // dispatch) — `expect(0)` above + this assert fail if it was.
     leak_guard.assert_async().await;
 }
+
+/// F3 (review 2026-06-07) — the granted-scopes gate, DISTINCT from the
+/// tier gate, denies a tool the tier WOULD allow when the connection's
+/// `granted_scopes` lacks the scope's URI → 403 `scope.not_granted`.
+/// Previously no test exercised this charter deny-class (Story 11.10).
+#[tokio::test]
+async fn poc_scope_not_granted_when_tier_allows_but_connection_lacks_scope() {
+    let home = tempfile::TempDir::new().unwrap();
+    let mut server = mockito::Server::new_async().await;
+    // Any upstream hit is a failure — the request must be denied at the
+    // granted-scopes gate, before dispatch.
+    let leak_guard = server
+        .mock("POST", "/users/me/messages/send")
+        .expect(0)
+        .with_status(200)
+        .create_async()
+        .await;
+
+    // Read-WRITE tier (so gmail.send IS in the tier bundle), but the
+    // connection was granted ONLY the readonly URI — so the granted-scopes
+    // gate must deny gmail.send even though the tier permits it.
+    let id = ConnectionId::generate();
+    write_connection(home.path(), id, "acct-rw", ConnectionTier::ReadWrite, &[GMAIL_READONLY_URI])
+        .await;
+    seal_access(home.path(), id, TOKEN_A).await;
+    write_binding(home.path(), "poc-agent", id, ConnectionTier::ReadWrite, "acct-rw").await;
+
+    let (service, _audit) = build_poc_service(home.path(), &format!("{}/", server.url()));
+
+    let err = service
+        .handle(req("acct-rw", "gmail.send", Method::POST, "users/me/messages/send"))
+        .await
+        .expect_err("tier permits gmail.send but the connection lacks the granted scope");
+    assert!(
+        matches!(err, ProxyError::ScopeNotGranted { .. }),
+        "expected scope.not_granted (granted-scopes gate, distinct from tier), got {err:?}"
+    );
+    leak_guard.assert_async().await;
+}
+
+/// F11 (review 2026-06-07) — the selector→binding match precedence is
+/// alias → connection.name → id. Prove the ALIAS pass resolves at the
+/// request path with an alias that DIFFERS from the connection name (all
+/// prior tests set alias == name, so they couldn't distinguish the passes).
+#[tokio::test]
+async fn poc_alias_resolves_when_alias_differs_from_connection_name() {
+    let home = tempfile::TempDir::new().unwrap();
+    let mut server = mockito::Server::new_async().await;
+    let bearer = format!("Bearer {}", std::str::from_utf8(TOKEN_A).unwrap());
+    let mock = server
+        .mock("GET", "/users/me/messages")
+        .match_header("authorization", bearer.as_str())
+        .with_status(200)
+        .with_body(r#"{"via":"alias"}"#)
+        .create_async()
+        .await;
+
+    // Connection name is "real-account-name"; the binding aliases it as
+    // "my-alias". A request to /mcp/my-alias must resolve via the alias
+    // pass (the name pass would NOT match "my-alias").
+    let id = ConnectionId::generate();
+    write_connection(
+        home.path(),
+        id,
+        "real-account-name",
+        ConnectionTier::Read,
+        &[GMAIL_READONLY_URI],
+    )
+    .await;
+    seal_access(home.path(), id, TOKEN_A).await;
+    write_binding(home.path(), "poc-agent", id, ConnectionTier::Read, "my-alias").await;
+
+    let (service, _audit) = build_poc_service(home.path(), &format!("{}/", server.url()));
+
+    // The ALIAS resolves (Pass-1) — alias != connection name, so this
+    // exercises the alias pass specifically.
+    let resp = service
+        .handle(req("my-alias", "gmail.readonly", Method::GET, "users/me/messages"))
+        .await
+        .expect("the alias selector must resolve via the alias pass");
+    assert_eq!(resp.status, StatusCode::OK);
+    assert_eq!(resp.body.as_ref(), br#"{"via":"alias"}"# as &[u8]);
+    mock.assert_async().await;
+
+    // The connection NAME also resolves (Pass-2) — alias and name are BOTH
+    // valid selectors for the same binding (alias is tried first but a name
+    // match is a valid fallback; setting an alias is additive, not exclusive).
+    let mock2 = server
+        .mock("GET", "/users/me/messages")
+        .match_header("authorization", bearer.as_str())
+        .with_status(200)
+        .with_body(r#"{"via":"name"}"#)
+        .create_async()
+        .await;
+    let resp2 = service
+        .handle(req("real-account-name", "gmail.readonly", Method::GET, "users/me/messages"))
+        .await
+        .expect("the connection name must also resolve via the name pass");
+    assert_eq!(resp2.status, StatusCode::OK);
+    assert_eq!(resp2.body.as_ref(), br#"{"via":"name"}"# as &[u8]);
+    mock2.assert_async().await;
+
+    // A selector matching NEITHER alias nor name nor id → binding.not_found.
+    let err = service
+        .handle(req("no-such-selector", "gmail.readonly", Method::GET, "users/me/messages"))
+        .await
+        .expect_err("an unrelated selector must not resolve");
+    assert!(
+        matches!(err, ProxyError::BindingNotFound { .. }),
+        "expected binding.not_found for an unrelated selector, got {err:?}"
+    );
+}
+
+/// F10 (review 2026-06-07) — defensive guard: a binding whose connection
+/// record is `status = Revoked` must NOT resolve (the production `revoke`
+/// verb DELETES the record, so this only fires on a hand-edited/partial
+/// state, but the resolver must still fail closed). No prior test drove a
+/// persisted Revoked record through resolution.
+#[tokio::test]
+async fn poc_revoked_connection_record_does_not_resolve() {
+    let home = tempfile::TempDir::new().unwrap();
+    let mut server = mockito::Server::new_async().await;
+    let leak_guard = server.mock("GET", "/users/me/messages").expect(0).create_async().await;
+
+    // Write a REVOKED connection record directly (production revoke would
+    // have deleted it; this simulates a hand-edited / partial-cleanup state).
+    let id = ConnectionId::generate();
+    let revoked = ConnectionRecord {
+        id,
+        connector_id: "google-gmail".to_owned(),
+        name: "revoked-acct".to_owned(),
+        account_hint: None,
+        granted_scopes: vec![GMAIL_READONLY_URI.to_owned()],
+        tier: ConnectionTier::Read,
+        created_at: chrono::Utc::now(),
+        status: ConnectionStatus::Revoked,
+    };
+    ConnectionFsStore::new(home.path().to_path_buf()).unwrap().put(revoked).await.unwrap();
+    seal_access(home.path(), id, TOKEN_A).await;
+    write_binding(home.path(), "poc-agent", id, ConnectionTier::Read, "revoked-acct").await;
+
+    let (service, _audit) = build_poc_service(home.path(), &format!("{}/", server.url()));
+
+    let err = service
+        .handle(req("revoked-acct", "gmail.readonly", Method::GET, "users/me/messages"))
+        .await
+        .expect_err("a revoked connection must not resolve (fail closed)");
+    assert!(
+        matches!(err, ProxyError::BindingNotFound { .. }),
+        "expected binding.not_found for a revoked connection, got {err:?}"
+    );
+    leak_guard.assert_async().await;
+}

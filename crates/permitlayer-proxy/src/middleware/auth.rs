@@ -386,13 +386,21 @@ where
             //     here — `handle_inner` produces the single, authoritative
             //     `binding.not_found` deny (one source of truth),
             //   - stores `None` (legacy/unit) → stamp empty.
-            let policy_binding = resolve_policy_binding(
+            let policy_binding = match resolve_policy_binding(
                 binding_store.as_ref(),
                 connection_store.as_ref(),
                 &agent_name,
                 &request_path,
             )
-            .await;
+            .await
+            {
+                Ok(p) => p,
+                // F2 fail-closed: a binding-store read error denies the
+                // request (5xx) rather than stamping empty (pass-through),
+                // so a restrictive binding.policy can't be bypassed by an
+                // I/O flake while the sibling tier/scope gates still deny.
+                Err(e) => return Ok(e.into_response_with_request_id(request_id)),
+            };
             req.extensions_mut().insert(AgentId(agent_name.clone()));
             req.extensions_mut().insert(AgentPolicyBinding(policy_binding));
 
@@ -436,23 +444,30 @@ where
 ///
 /// Returns the matched binding's `policy` (empty string when the binding
 /// names no policy → `PolicyLayer` pass-through), or an empty string when
-/// the stores are not wired, the path carries no connection selector, a
-/// store read fails, or the agent holds no live binding for the selector.
-/// A miss is deliberately NOT a deny here — `ProxyService::handle_inner`
-/// owns the single authoritative `binding.not_found` 403. A store-read
-/// error is logged and degrades to an empty stamp (fail-open at this
-/// surfacing step; `handle_inner` still gates authoritatively).
+/// the stores are not wired, the path carries no connection selector, or
+/// the agent holds no live binding for the selector. A *miss* is
+/// deliberately NOT a deny here — `ProxyService::handle_inner` owns the
+/// single authoritative `binding.not_found` 403.
+///
+/// **F2 fix (review 2026-06-07): a store-read ERROR fails CLOSED.** It
+/// returns `Err(ProxyError::Internal)` so the caller denies the request,
+/// matching the fail-closed posture of the tier/granted-scope gates in
+/// `handle_inner` (which return `Internal` on the same store-read error).
+/// Previously this degraded to an empty stamp (pass-through), so an I/O
+/// flake on the binding-store read could silently bypass a restrictive
+/// `binding.policy` while the sibling gates still denied — an asymmetric
+/// fail-open on a security control. The two surfaces now agree.
 async fn resolve_policy_binding(
     binding_store: Option<&Arc<dyn permitlayer_core::store::BindingStore>>,
     connection_store: Option<&Arc<dyn permitlayer_core::store::ConnectionStore>>,
     agent_name: &str,
     request_path: &str,
-) -> String {
+) -> Result<String, ProxyError> {
     let (Some(binding_store), Some(connection_store)) = (binding_store, connection_store) else {
-        return String::new();
+        return Ok(String::new());
     };
     let Some(selector) = crate::binding_resolve::selector_from_path(request_path) else {
-        return String::new();
+        return Ok(String::new());
     };
     match crate::binding_resolve::resolve_agent_binding(
         binding_store,
@@ -462,17 +477,19 @@ async fn resolve_policy_binding(
     )
     .await
     {
-        Ok(Some((binding, _connection))) => binding.policy.unwrap_or_default(),
-        Ok(None) => String::new(),
+        Ok(Some((binding, _connection))) => Ok(binding.policy.unwrap_or_default()),
+        Ok(None) => Ok(String::new()),
         Err(e) => {
             warn!(
                 agent_name = %agent_name,
                 selector = %selector,
                 error = %e,
-                "auth: binding lookup for policy stamp failed; \
-                 stamping empty policy (handle_inner remains authoritative)"
+                "auth: binding lookup for policy stamp failed; denying (fail-closed, \
+                 symmetric with the handle_inner tier/scope gates)"
             );
-            String::new()
+            Err(ProxyError::Internal {
+                message: format!("binding store read failed during policy resolution: {e}"),
+            })
         }
     }
 }

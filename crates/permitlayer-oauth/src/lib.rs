@@ -21,11 +21,9 @@ pub mod client;
 pub mod error;
 pub mod google;
 pub(crate) mod headless;
-pub mod metadata;
 pub mod pkce;
 pub mod refresh;
 
 pub use client::OAuthClient;
 pub use error::OAuthError;
 pub use google::consent::GoogleOAuthConfig;
-pub use metadata::CredentialMeta;

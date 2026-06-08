@@ -6,10 +6,12 @@
 //!
 //! On upstream 401 responses the service attempts a single transparent token
 //! refresh via [`permitlayer_oauth::OAuthClient::refresh`] (Story 1.14), bounded
-//! to one refresh per request. The OAuth client is reconstructed lazily from
-//! `{vault_dir}/{service}-meta.json` at refresh time — there is no eager client
-//! state on the service. See architecture.md "Credential Lifecycle and OAuth
-//! Refresh" for the full invariant set.
+//! to one refresh per request. The OAuth client is reconstructed lazily by
+//! unsealing the connection's `Client` slot (`<connection_id>-client.sealed`,
+//! Story 11.16) at refresh time — there is no eager client state on the service,
+//! and no `-meta.json` provenance file (deleted in Story 11.12). See
+//! architecture.md "Credential Lifecycle and OAuth Refresh" for the full
+//! invariant set.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
@@ -144,10 +146,10 @@ pub struct ProxyService {
 impl ProxyService {
     /// Create a new proxy service with all required dependencies.
     ///
-    /// `vault_dir` is the filesystem directory where per-service sealed
-    /// credential blobs and `{service}-meta.json` metadata files live.
-    /// The refresh path reads these meta files on demand to reconstruct
-    /// the correct `OAuthClient` for each service being refreshed.
+    /// `vault_dir` is the filesystem directory where per-connection sealed
+    /// credential blobs live (`<connection_id>-<slot>.sealed`, Story 11.9).
+    /// The refresh path unseals the connection's `Client` slot on demand to
+    /// reconstruct the correct `OAuthClient` (Story 11.16 — no `-meta.json`).
     #[must_use]
     #[allow(clippy::too_many_arguments)] // wiring constructor: all deps + vault_dir + media_dir.
     #[allow(clippy::too_many_arguments)] // service wiring: all collaborators injected.
@@ -489,9 +491,10 @@ impl ProxyService {
         Arc::clone(&self.token_issuer)
     }
 
-    /// Accessor: vault directory. Used by Story 6.2's
-    /// `ProxyHostServices` for `agentsso.oauth.listConnectedServices`
-    /// (enumerates `*-meta.json` entries).
+    /// Accessor: vault directory (`<connection_id>-<slot>.sealed` blobs).
+    /// `ProxyHostServices` derives the sibling `connections/` directory
+    /// from its parent for `agentsso.oauth.listConnectedServices`, which
+    /// reads `ConnectionStore` records (Story 11.16 — no `*-meta.json`).
     #[must_use]
     pub fn vault_dir(&self) -> &std::path::Path {
         &self.vault_dir
@@ -1317,6 +1320,29 @@ struct ScrubPayload<'a> {
 
 /// Axum handler that extracts path parameters and request extensions,
 /// constructs a `ProxyRequest`, and delegates to `ProxyService::handle`.
+///
+/// # Scope trust boundary on the REST path (documented, F6)
+///
+/// On this REST surface the request's `required_scope` is the
+/// agent-supplied `x-agentsso-scope` header. The authz gate constrains
+/// *which* scope the binding+connection permit (tier ∩ granted_scopes,
+/// default-deny), but it does NOT cross-check the declared scope against
+/// the HTTP method — an agent could declare a read scope while issuing a
+/// write (e.g. `POST .../messages/send` with `x-agentsso-scope:
+/// gmail.readonly`). This is a deliberate REST contract: the proxy trusts
+/// the caller's scope DECLARATION here, unlike the MCP path
+/// (`gmail_request`/`calendar_request`/…) where the scope is derived
+/// server-side from the tool definition and is not agent-controllable.
+///
+/// The real write-effect backstop is the CONNECTION's `granted_scopes`: a
+/// request can only ever carry the connection's actual OAuth token, and a
+/// read-only connection's token physically lacks write scope, so the
+/// upstream rejects the write regardless of the declared scope. The
+/// declared-scope trust therefore cannot escalate beyond what the
+/// connection was actually granted — it only lets a caller mislabel a
+/// call within its own granted set. Tightening this to a method↔scope
+/// consistency check would require a connector-level scope→effect map
+/// (tool-metadata layer), out of scope for the proxy ingress.
 async fn proxy_handler(
     service: Arc<ProxyService>,
     Path((svc, raw_path)): Path<(String, String)>,
@@ -1348,6 +1374,10 @@ async fn proxy_handler(
         }
     };
 
+    // F6: agent-supplied required_scope. Trusted as a DECLARATION on the
+    // REST path (see the handler doc) — constrained by tier ∩
+    // granted_scopes but not cross-checked against the HTTP method; the
+    // connection's granted token is the actual write-effect backstop.
     let scope = match request.headers().get("x-agentsso-scope") {
         Some(v) => match v.to_str() {
             Ok(s) => s.to_owned(),

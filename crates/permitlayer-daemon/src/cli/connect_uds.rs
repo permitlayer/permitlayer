@@ -1,18 +1,23 @@
-//! UDS client glue for `agentsso connect` (Story 7.30).
+//! UDS client glue for the connection/bind control-plane verbs.
 //!
-//! The connect flow used to read the agent store, vault, and master
-//! key directly. Post-7.30 those touchpoints all move daemon-side:
-//! - `GET /v1/control/agent/{name}/policy_name` — resolve policy.
-//! - `GET /v1/control/credentials/{service}/meta` — idempotent re-run check.
-//! - `POST /v1/control/credentials/seal` — seal access/refresh + meta.
-//! - `POST /v1/control/credentials/{service}/verify` — verify probe.
-//! - `POST /v1/control/policy/{policy_name}/scopes` — merge scopes + reload.
+//! The CLI never reads the agent store, vault, or master key directly —
+//! every credential touchpoint is daemon-side. Post-Epic-11 the live
+//! endpoints this module calls are:
+//! - `POST /v1/control/credentials/seal` — seal access/refresh/client under
+//!   `(connection_id, slot)` + write the `ConnectionRecord` (Story 11.12).
+//! - `POST /v1/control/connections/{connection_id}/verify` — verify probe
+//!   keyed on the connection id (Story 11.12 Fork 4).
+//! - `POST /v1/control/bindings` — create an (agent, connection) binding
+//!   after a live-PolicySet check (Story 11.14).
+//!
+//! (The pre-Epic-11 `{service}/meta` read and `{service}/verify` /
+//! `agent/{name}/policy_name` / `policy/{name}/scopes` endpoints + the
+//! `connect` verb were removed in Stories 11.12/11.13.)
 //!
 //! This module owns the typed request/response shapes (mirrored from
-//! `crates/permitlayer-daemon/src/server/control.rs` Story 7.30
-//! endpoint definitions) and the daemon-must-be-running gate that
-//! renders structured remediation when the operator hasn't installed
-//! or started the daemon yet.
+//! `crates/permitlayer-daemon/src/server/control.rs`) and the
+//! daemon-must-be-running gate that renders structured remediation when
+//! the operator hasn't installed or started the daemon yet.
 
 use std::path::Path;
 

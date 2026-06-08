@@ -4,7 +4,6 @@ use std::path::PathBuf;
 
 use permitlayer_oauth::google::consent::GoogleOAuthConfig;
 use permitlayer_oauth::google::scopes;
-use permitlayer_oauth::metadata::CredentialMeta;
 
 // ── GoogleOAuthConfig tests ──────────────────────────────────────────
 
@@ -96,47 +95,9 @@ fn scope_info_round_trips_for_known_uris() {
     assert!(scopes::scope_info("https://example.com/unknown").is_none());
 }
 
-// ── CredentialMeta tests ─────────────────────────────────────────────
-
-#[test]
-fn credential_meta_roundtrip_shared_casa() {
-    let meta = CredentialMeta {
-        client_type: "shared-casa".to_owned(),
-        client_source: None,
-        client_sealed: false,
-        connected_at: "2026-04-06T12:00:00Z".to_owned(),
-        last_refreshed_at: None,
-        scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".to_owned()],
-        expires_in_secs: Some(3600),
-    };
-
-    let json = serde_json::to_string(&meta).unwrap();
-    let deserialized: CredentialMeta = serde_json::from_str(&json).unwrap();
-    assert_eq!(deserialized.client_type, "shared-casa");
-    assert!(deserialized.client_source.is_none());
-}
-
-#[test]
-fn credential_meta_roundtrip_byo() {
-    let meta = CredentialMeta {
-        client_type: "byo".to_owned(),
-        client_source: Some("./my-client.json".to_owned()),
-        client_sealed: false,
-        connected_at: "2026-04-06T12:00:00Z".to_owned(),
-        last_refreshed_at: None,
-        scopes: vec![
-            "https://www.googleapis.com/auth/gmail.readonly".to_owned(),
-            "https://www.googleapis.com/auth/gmail.modify".to_owned(),
-        ],
-        expires_in_secs: None,
-    };
-
-    let json = serde_json::to_string(&meta).unwrap();
-    let deserialized: CredentialMeta = serde_json::from_str(&json).unwrap();
-    assert_eq!(deserialized.client_type, "byo");
-    assert_eq!(deserialized.client_source.as_deref(), Some("./my-client.json"));
-    assert_eq!(deserialized.scopes.len(), 2);
-}
+// (CredentialMeta serde round-trip tests removed in Story 11.16 — the
+// `-meta.json` provenance type was deleted; the ConnectionRecord is the
+// provenance now, tested in permitlayer-core's connection_fs.rs.)
 
 // ── Error display safety ─────────────────────────────────────────────
 

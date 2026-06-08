@@ -163,6 +163,36 @@ async fn add(args: AddArgs) -> Result<()> {
 
     let home = crate::cli::agentsso_home()?;
 
+    // F7 fix: reject a duplicate connection name BEFORE doing any OAuth
+    // work. Names are the CLI/`/mcp/<name>` selector; the store keys files
+    // on the ULID id and does not enforce name-uniqueness, so two
+    // same-named connections would make `inspect`/`bind`/`revoke <name>`
+    // resolve nondeterministically (first directory-walk match). Fail fast
+    // with an actionable error instead.
+    {
+        let store = open_connection_store(&home)?;
+        if let Some(existing) = resolve_by_name(&store, &name).await? {
+            eprint!(
+                "{}",
+                render::error_block(
+                    "connection.duplicate_name",
+                    &format!(
+                        "a connection named '{name}' already exists (id {}). Connection names \
+                         must be unique — they are the `/mcp/<name>` selector.",
+                        existing.id
+                    ),
+                    &format!(
+                        "pick a different --name, or inspect/revoke the existing one:\n\n    \
+                         agentsso connection inspect {name}\n    \
+                         agentsso connection revoke {name}"
+                    ),
+                    None,
+                )
+            );
+            return Err(oauth_seal::exit2());
+        }
+    }
+
     // Kill-switch gate before any OAuth flow.
     oauth_seal::probe_daemon_kill_state_or_exit().await?;
 
@@ -265,7 +295,15 @@ async fn add(args: AddArgs) -> Result<()> {
     }
 
     println!();
-    println!("  bind an agent to it:  agentsso bind <agent> --connection {}", record.name);
+    // F4 fix: match the real `bind` surface (cli/bind.rs BindArgs) —
+    // `connection` is a POSITIONAL and `--grant` is REQUIRED. The prior
+    // hint used a nonexistent `--connection` flag + omitted `--grant`, so
+    // a copy-paste hit a clap error on the happy path.
+    let grant = match record.tier {
+        ConnectionTier::ReadWrite => "read-write",
+        ConnectionTier::Read => "read",
+    };
+    println!("  bind an agent to it:  agentsso bind <agent> {} --grant {grant}", record.name);
     println!();
     Ok(())
 }
@@ -289,6 +327,17 @@ async fn resolve_selector(
     }
     let all = store.list().await?;
     Ok(all.into_iter().find(|r| r.name == selector))
+}
+
+/// Resolve a connection by its display `name` only (no id matching). Used
+/// by the `add` name-uniqueness guard (F7) — a fresh `--name` collision is
+/// a name collision, not an id one.
+async fn resolve_by_name(
+    store: &Arc<dyn ConnectionStore>,
+    name: &str,
+) -> Result<Option<ConnectionRecord>> {
+    let all = store.list().await?;
+    Ok(all.into_iter().find(|r| r.name == name))
 }
 
 // ── list ────────────────────────────────────────────────────────────

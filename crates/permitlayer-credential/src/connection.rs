@@ -77,17 +77,20 @@ impl ConnectionId {
     /// `CredentialStore` to recover ids from `<ulid>-<slot>.sealed`
     /// filenames and by `connection inspect`/CLI selectors (Story 11.13).
     ///
-    /// Returns `None` if `s` is not exactly 26 chars or contains a
-    /// character outside the Crockford alphabet (case-insensitive on the
-    /// ambiguous letters is NOT accepted — the canonical form is
-    /// uppercase, no `I`/`L`/`O`/`U`).
+    /// Returns `None` if `s` is not exactly 26 chars, contains a character
+    /// outside the Crockford alphabet (no `I`/`L`/`O`/`U`; uppercase only),
+    /// or is non-canonical — a leading char > `7` would overflow the 128-bit
+    /// value (the top char carries only 2 meaningful bits), so it is
+    /// rejected rather than silently truncated. This guarantees the
+    /// round-trip invariant `from_ulid_str(s).map(|id| id.to_string()) ==
+    /// Some(s)` for every accepted `s`.
     #[must_use]
     pub fn from_ulid_str(s: &str) -> Option<Self> {
         if s.len() != 26 {
             return None;
         }
         let mut value: u128 = 0;
-        for &b in s.as_bytes() {
+        for (pos, &b) in s.as_bytes().iter().enumerate() {
             let digit = match b {
                 b'0'..=b'9' => b - b'0',
                 b'A'..=b'H' => b - b'A' + 10,
@@ -97,9 +100,19 @@ impl ConnectionId {
                 b'V'..=b'Z' => b - b'V' + 27,
                 _ => return None,
             };
-            // 26 base32 chars encode 130 bits; the top char carries only
-            // the high 2 bits, so an overflowing shift can never happen
-            // for a well-formed 26-char string (we never shift past 128).
+            // 26 base32 chars encode 130 bits but a ConnectionId is only
+            // 128: the LEADING char carries just 2 meaningful bits (its
+            // top 3 are unused), so the canonical leading digit is 0..=7.
+            // F5 fix (review 2026-06-07): reject any leading digit > 7 —
+            // otherwise `value = (value << 5) | digit` would silently
+            // truncate the overflowing bits via u128 wraparound, aliasing a
+            // non-canonical string (e.g. "8ZZ…") onto the SAME id as its
+            // canonical form ("0ZZ…") and breaking the round-trip invariant
+            // `from_ulid_str(s).map(to_string) == Some(s)`. The 25 trailing
+            // chars use all 5 bits, so only `pos == 0` is constrained.
+            if pos == 0 && digit > 0x07 {
+                return None;
+            }
             value = (value << 5) | u128::from(digit);
         }
         Some(Self(value.to_be_bytes()))
@@ -226,6 +239,42 @@ mod tests {
         assert_eq!(ConnectionId::from_ulid_str("0000000000000000000000000I"), None);
         // 27 chars.
         assert_eq!(ConnectionId::from_ulid_str("000000000000000000000000000"), None);
+    }
+
+    #[test]
+    fn from_ulid_str_rejects_non_canonical_leading_char() {
+        // F5: the leading char carries only 2 meaningful bits, so a
+        // canonical leading digit is 0..=7. A leading digit > 7 (e.g. '8',
+        // or letters which map to >=10) would overflow 128 bits and alias
+        // onto a canonical id; it must be REJECTED, not silently truncated.
+        let trailing = "Z".repeat(25);
+        // '0'..='7' are the only valid leading chars.
+        assert!(ConnectionId::from_ulid_str(&format!("7{trailing}")).is_some());
+        for bad_lead in ['8', '9', 'A', 'Z'] {
+            assert_eq!(
+                ConnectionId::from_ulid_str(&format!("{bad_lead}{trailing}")),
+                None,
+                "leading '{bad_lead}' must be rejected (non-canonical / overflows 128 bits)"
+            );
+        }
+    }
+
+    #[test]
+    fn from_ulid_str_round_trip_invariant_holds_for_all_accepted() {
+        // F5: every string from_ulid_str ACCEPTS must round-trip through
+        // Display unchanged — proving no non-canonical aliasing remains.
+        for _ in 0..256 {
+            let id = ConnectionId::generate();
+            let text = id.to_string();
+            let parsed = ConnectionId::from_ulid_str(&text).expect("canonical parses");
+            assert_eq!(parsed.to_string(), text, "round-trip must be exact");
+        }
+        // And the historically-aliasing pair no longer both parse: only
+        // the canonical "0ZZ…" is accepted; "8ZZ…" is rejected.
+        let canonical = format!("0{}", "Z".repeat(25));
+        let non_canonical = format!("8{}", "Z".repeat(25));
+        assert!(ConnectionId::from_ulid_str(&canonical).is_some());
+        assert_eq!(ConnectionId::from_ulid_str(&non_canonical), None);
     }
 
     #[test]

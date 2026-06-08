@@ -62,15 +62,8 @@ fn assert_no_code_hit(needle: &str, why: &str, allow: impl Fn(&Path, &str) -> bo
     let mut hits = Vec::new();
     for f in iter_src_files() {
         let body = std::fs::read_to_string(&f).unwrap_or_default();
-        for (i, line) in body.lines().enumerate() {
-            // Stop at the file's test module: `#[cfg(test)]` fixtures are
-            // not production residue (and may legitimately exercise the
-            // removed shapes for regression coverage).
-            let trimmed = line.trim_start();
-            if trimmed.starts_with("#[cfg(test)]") || trimmed == "mod tests {" {
-                break;
-            }
-            if is_code_line(line) && line.contains(needle) && !allow(&f, line) {
+        for (i, line) in code_lines_excluding_test_blocks(&body) {
+            if line.contains(needle) && !allow(&f, line) {
                 hits.push(format!("{}:{}: {}", f.display(), i + 1, line.trim()));
             }
         }
@@ -80,6 +73,97 @@ fn assert_no_code_hit(needle: &str, why: &str, allow: impl Fn(&Path, &str) -> bo
         "forbidden v1-keying residue `{needle}` in source code ({why}):\n{}",
         hits.join("\n")
     );
+}
+
+/// Yield the `(0-based-index, line)` of every PRODUCTION code line in a
+/// source file — i.e. non-comment, non-blank lines that are NOT inside a
+/// `#[cfg(test)]`-gated item.
+///
+/// F1 fix (review 2026-06-07): the old guard `break`-ed the whole-file
+/// scan at the FIRST `#[cfg(test)]`, including an INDENTED inline
+/// `#[cfg(test)]` attribute on a production helper — so production code
+/// BELOW such an attribute (e.g. the public `refresh()` in oauth/client.rs)
+/// was never scanned. Now we skip exactly the gated item by brace depth:
+/// on a `#[cfg(test)]` attribute we enter a skip region that ends when the
+/// brace depth opened by the gated item returns to its starting level
+/// (handles both the file-level `mod tests { ... }` and inline test-only
+/// fns/impls), then resume scanning the rest of the file.
+fn code_lines_excluding_test_blocks(body: &str) -> Vec<(usize, &str)> {
+    let mut out = Vec::new();
+    // `Some(depth)` while inside a #[cfg(test)] item: `depth` is the brace
+    // nesting AT WHICH the gated item's body closes (we leave the region
+    // when depth falls back to it). `pending` means we've seen the
+    // attribute and are waiting for the item's opening brace.
+    let mut skip_close_depth: Option<i32> = None;
+    let mut pending_test_attr = false;
+    let mut depth: i32 = 0;
+
+    for (i, line) in body.lines().enumerate() {
+        let trimmed = line.trim_start();
+        let net = brace_delta(line);
+
+        if skip_close_depth.is_none() && !pending_test_attr {
+            // Production region.
+            if trimmed.starts_with("#[cfg(test)]") {
+                // The next braced item is test-gated. (Covers both an
+                // indented inline attr and the file-level test mod.)
+                pending_test_attr = true;
+                depth += net;
+                continue;
+            }
+            if is_code_line(line) {
+                out.push((i, line));
+            }
+            depth += net;
+        } else if pending_test_attr {
+            // Waiting for the gated item's opening brace. A one-liner
+            // like `#[cfg(test)] fn x() {}` opens and closes on this line.
+            let before = depth;
+            depth += net;
+            if depth > before {
+                // Item opened; skip until depth returns to `before`.
+                skip_close_depth = Some(before);
+                pending_test_attr = depth <= before; // (false unless it also closed)
+                if depth <= before {
+                    skip_close_depth = None; // opened and closed on one line
+                }
+            } else if net != 0 {
+                // Brace count net-zero-or-negative without opening — e.g.
+                // a `#[cfg(test)] use ...;` item with no braces: the attr
+                // gated a single non-braced item; stop skipping.
+                pending_test_attr = false;
+            }
+            // If net == 0 and not opened, keep waiting (attr + signature
+            // spread across lines before the `{`).
+        } else if let Some(close_at) = skip_close_depth {
+            // Inside a test-gated braced item; skip its lines.
+            depth += net;
+            if depth <= close_at {
+                skip_close_depth = None;
+            }
+        }
+    }
+    out
+}
+
+/// Net brace delta of a line, ignoring braces inside `//` line comments.
+/// (String-literal braces are rare in this codebase's item structure and
+/// would only ever cause us to skip MORE — never to scan a test line as
+/// production — so the conservative miscount is safe for a residue guard.)
+fn brace_delta(line: &str) -> i32 {
+    let code = match line.find("//") {
+        Some(idx) => &line[..idx],
+        None => line,
+    };
+    let mut d = 0i32;
+    for c in code.chars() {
+        match c {
+            '{' => d += 1,
+            '}' => d -= 1,
+            _ => {}
+        }
+    }
+    d
 }
 
 #[test]
