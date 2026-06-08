@@ -107,49 +107,9 @@ pub(crate) fn sanitize_for_terminal(s: &str) -> String {
         .collect()
 }
 
-/// Partially mask an account hint (the Google account email captured at
-/// seal time) for human-facing CLI output.
-///
-/// The hint is PII the operator already holds — they authenticated as
-/// this account moments earlier — and it is never persisted to a log or
-/// the audit store; the only consumers are `connection add`/`list`/
-/// `inspect` terminal output and the `--json` path (which keeps the full
-/// value). We still mask it in the formatted output so a full cleartext
-/// email never reaches a print sink, while preserving the operator's
-/// at-a-glance "which account did this bind?" verification signal: the
-/// local-part prefix + domain are enough to confirm `chuck@…` vs
-/// `austin@…` across two connections of the same connector.
-///
-/// Masking rules:
-/// - `local@domain` → first ≤2 chars of `local`, then `•••`, then
-///   `@domain` (e.g. `chuck@gmail.com` → `ch•••@gmail.com`). A local of
-///   ≤2 chars is fully replaced with `•••` so nothing is leaked by
-///   length (e.g. `ab@x.com` → `•••@x.com`).
-/// - No `@` (not an email-shaped hint) → first ≤2 chars + `•••`
-///   (e.g. `account-123` → `ac•••`), so an opaque hint is never echoed
-///   whole either.
-/// - Empty input → empty string.
-pub(crate) fn mask_account_hint(hint: &str) -> String {
-    if hint.is_empty() {
-        return String::new();
-    }
-    let mask_prefix = |s: &str| -> String {
-        let prefix: String = s.chars().take(2).collect();
-        // Only keep the prefix when it does not reveal the whole value.
-        if s.chars().count() > 2 {
-            format!("{prefix}\u{2022}\u{2022}\u{2022}")
-        } else {
-            "\u{2022}\u{2022}\u{2022}".to_owned()
-        }
-    };
-    match hint.split_once('@') {
-        Some((local, domain)) if !domain.is_empty() => {
-            format!("{}@{domain}", mask_prefix(local))
-        }
-        // No '@', or a trailing '@' with empty domain: mask as opaque.
-        _ => mask_prefix(hint),
-    }
-}
+// Account-hint masking now lives on the type itself:
+// `permitlayer_core::store::AccountHint` masks on `Display`/`Debug`, so
+// every print site is masked by construction (no per-call-site helper).
 
 // ──────────────────────────────────────────────────────────────────
 // OAuth scope / endpoint resolution
@@ -563,51 +523,5 @@ pub(crate) async fn oauth_dance_and_seal(
             );
             Err(silent_err_for_code("connection.seal_failed", "credential seal transport failure"))
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::mask_account_hint;
-
-    #[test]
-    fn masks_typical_email_keeping_prefix_and_domain() {
-        assert_eq!(mask_account_hint("chuck@gmail.com"), "ch\u{2022}\u{2022}\u{2022}@gmail.com");
-        assert_eq!(mask_account_hint("austin@gmail.com"), "au\u{2022}\u{2022}\u{2022}@gmail.com");
-    }
-
-    #[test]
-    fn short_local_part_is_fully_masked_so_length_is_not_leaked() {
-        // 2-char local: prefix would BE the whole local, so mask fully.
-        assert_eq!(mask_account_hint("ab@example.com"), "\u{2022}\u{2022}\u{2022}@example.com");
-        // 1-char local.
-        assert_eq!(mask_account_hint("a@example.com"), "\u{2022}\u{2022}\u{2022}@example.com");
-    }
-
-    #[test]
-    fn non_email_hint_is_masked_as_opaque_prefix() {
-        assert_eq!(mask_account_hint("account-123"), "ac\u{2022}\u{2022}\u{2022}");
-        // Short opaque hint masks fully.
-        assert_eq!(mask_account_hint("xy"), "\u{2022}\u{2022}\u{2022}");
-    }
-
-    #[test]
-    fn empty_hint_stays_empty() {
-        assert_eq!(mask_account_hint(""), "");
-    }
-
-    #[test]
-    fn trailing_at_with_empty_domain_is_treated_as_opaque() {
-        // No real domain to preserve → opaque mask, never echo whole.
-        assert_eq!(mask_account_hint("user@"), "us\u{2022}\u{2022}\u{2022}");
-    }
-
-    #[test]
-    fn domain_is_preserved_verbatim_for_account_disambiguation() {
-        // The whole point: operator must distinguish accounts by domain.
-        assert_eq!(
-            mask_account_hint("longname@corp.example.org"),
-            "lo\u{2022}\u{2022}\u{2022}@corp.example.org"
-        );
     }
 }

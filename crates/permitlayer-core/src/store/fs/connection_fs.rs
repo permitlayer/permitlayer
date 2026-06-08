@@ -210,7 +210,7 @@ fn parse_record(id_text: &str, bytes: &[u8]) -> Result<ConnectionRecord, StoreEr
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use crate::store::connection::{ConnectionStatus, ConnectionTier};
+    use crate::store::connection::{AccountHint, ConnectionStatus, ConnectionTier};
     use chrono::Utc;
     use tempfile::TempDir;
 
@@ -219,7 +219,7 @@ mod tests {
             id: ConnectionId::generate(),
             connector_id: "google-gmail".to_owned(),
             name: name.to_owned(),
-            account_hint: Some("austin@gmail.com".to_owned()),
+            account_hint: Some(AccountHint::new("test-user@example.com")),
             granted_scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".to_owned()],
             tier: ConnectionTier::Read,
             created_at: Utc::now(),

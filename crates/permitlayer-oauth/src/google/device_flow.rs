@@ -1,6 +1,7 @@
 //! Google OAuth 2.0 device flow per RFC 8628 — Story 7.17 Task 2.
 //!
-//! Used by `agentsso connect <service> --device-flow` to onboard
+//! Used by `agentsso connection add <connector> --device-flow` (the
+//! Epic-11 successor to the retired `agentsso connect`) to onboard
 //! agents on truly headless boxes (no browser, no SSH-from-laptop
 //! redirect-paste). Operator opens the printed URL on any device with
 //! a browser and enters the printed user code; this module polls

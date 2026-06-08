@@ -632,10 +632,11 @@ fn hmac_hit_argon2id_miss_message() -> &'static str {
      client is presenting a STALE or ROTATED bearer token — the agent \
      was re-registered / rotated / reconnected and its token changed, \
      but this client still holds the old one. Fix: re-fetch the MCP \
-     client snippet (re-run `agentsso connect` / `agentsso agent \
-     register` and redeploy the new bearer). Far less likely: genuine \
-     in-memory agent-map corruption (would require process \
-     compromise). The agent_name is in the structured fields below."
+     client snippet (re-run `agentsso quickstart <service>` or rotate \
+     with `agentsso agent rotate <agent>` and redeploy the new bearer). \
+     Far less likely: genuine in-memory agent-map corruption (would \
+     require process compromise). The agent_name is in the structured \
+     fields below."
 }
 
 #[cfg(test)]
@@ -1092,8 +1093,8 @@ mod tests {
             "message must lead with the stale/rotated-token cause: {msg:?}"
         );
         assert!(
-            lower.contains("re-fetch") && lower.contains("agentsso connect"),
-            "message must give the actionable fix (re-fetch the snippet via agentsso connect): {msg:?}"
+            lower.contains("re-fetch") && lower.contains("agentsso quickstart"),
+            "message must give the actionable fix (re-fetch the snippet via agentsso quickstart): {msg:?}"
         );
 
         // It must NOT *lead* with corruption. Corruption may still be

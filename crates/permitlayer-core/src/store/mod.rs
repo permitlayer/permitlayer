@@ -28,7 +28,9 @@ use crate::agent::AgentIdentity;
 use crate::audit::event::AuditEvent;
 
 pub use binding::{Binding, BindingStore};
-pub use connection::{ConnectionRecord, ConnectionStatus, ConnectionStore, ConnectionTier};
+pub use connection::{
+    AccountHint, ConnectionRecord, ConnectionStatus, ConnectionStore, ConnectionTier,
+};
 pub use error::{EnvelopeParseError, StoreError};
 pub use validate::validate_service_name;
 

@@ -2121,8 +2121,9 @@ pub(crate) struct AgentPolicyNameResponse {
 /// `GET /v1/control/agent/{name}/policy_name` — return the policy
 /// binding for a single agent (Story 7.30 AC #1).
 ///
-/// The CLI's `agentsso connect` flow needs to resolve an agent's
-/// policy name early so it can update the policy's scope set later in
+/// The CLI's credential-seal flow (`agentsso connection add`, formerly
+/// `agentsso connect`) needs to resolve an agent's policy name early so
+/// it can update the policy's scope set later in
 /// the same flow. Before Story 7.30 the CLI opened the agent store
 /// directly; now the daemon owns every fs touch, so this read-only
 /// lookup moves daemon-side.
@@ -2275,7 +2276,8 @@ pub(crate) struct CredentialsSealResponse {
 /// into the daemon's vault, write the provenance meta JSON, and emit
 /// an audit event (Story 7.30 AC #3).
 ///
-/// The CLI's `agentsso connect` flow drives the operator-interactive
+/// The CLI's credential-seal flow (`agentsso connection add`, formerly
+/// `agentsso connect`) drives the operator-interactive
 /// OAuth dance, then POSTs the resulting tokens to this endpoint. The
 /// daemon owns every fs touch + every vault-key access; the CLI never
 /// reads the master key, never touches `vault/`, never writes
@@ -2861,7 +2863,7 @@ pub(crate) async fn credentials_seal_handler(
         id: connection,
         connector_id: payload.connector_id.clone(),
         name: payload.name.clone(),
-        account_hint: payload.account_hint.clone(),
+        account_hint: payload.account_hint.clone().map(permitlayer_core::store::AccountHint::new),
         granted_scopes: payload.granted_scopes.clone(),
         tier,
         created_at: chrono::Utc::now(),
@@ -3158,7 +3160,8 @@ fn verify_service_for_connector_id(connector_id: &str) -> Option<&'static str> {
 /// probe daemon-side (Story 7.30 AC #4; re-keyed to connection_id in
 /// Story 11.12).
 ///
-/// The CLI's `agentsso connect` flow drove the verify probe locally
+/// The CLI's credential-seal flow (`agentsso connection add`, formerly
+/// `agentsso connect`) drove the verify probe locally
 /// pre-7.30 — which required CLI-side vault unseal access, which
 /// requires the master key, which only the daemon should hold. This
 /// handler keeps verify daemon-side while the CLI retains the
@@ -3177,8 +3180,8 @@ fn verify_service_for_connector_id(connector_id: &str) -> Option<&'static str> {
 ///   missing credential, unseal failure, transport-to-Google failure).
 ///
 /// **Round-1 review P20 unseal-hint.** `credentials.unseal_failed`
-/// surfaces "re-run `agentsso connect <service>`" remediation so
-/// operators who triggered key rotation between seal and verify get
+/// surfaces "re-run `agentsso connection add <connector>`" remediation
+/// so operators who triggered key rotation between seal and verify get
 /// an actionable next step.
 pub(crate) async fn credentials_verify_handler(
     State(state): State<ControlState>,
@@ -8151,8 +8154,8 @@ mod tests {
         assert_eq!(json["code"], "credentials.unseal_failed");
         let message = json["message"].as_str().unwrap_or_default();
         assert!(
-            message.contains("agentsso connect"),
-            "unseal-fail message should suggest re-running connect; got: {message}",
+            message.contains("agentsso connection add"),
+            "unseal-fail message should suggest re-sealing via `agentsso connection add`; got: {message}",
         );
     }
 

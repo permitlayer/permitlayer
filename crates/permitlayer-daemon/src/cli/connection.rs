@@ -299,7 +299,8 @@ async fn add(args: AddArgs) -> Result<()> {
     println!("\u{2713} connection '{}' created \u{00b7} {}", record.name, record.connector_id);
     println!("  id:      {}", record.id);
     if let Some(hint) = &record.account_hint {
-        println!("  account: {}", oauth_seal::mask_account_hint(hint));
+        // `AccountHint`'s Display masks (type-enforced); no per-site masking.
+        println!("  account: {hint}");
     }
     println!("  tier:    {tier_label}");
 
@@ -443,9 +444,10 @@ async fn list() -> Result<()> {
                 TableCell::Plain(r.name.clone()),
                 TableCell::Plain(r.connector_id.clone()),
                 TableCell::Plain(
+                    // `AccountHint`'s Display masks (type-enforced).
                     r.account_hint
-                        .as_deref()
-                        .map(oauth_seal::mask_account_hint)
+                        .as_ref()
+                        .map(ToString::to_string)
                         .unwrap_or_else(|| "-".to_owned()),
                 ),
                 TableCell::Plain(tier_label(r.tier).to_owned()),
@@ -500,11 +502,8 @@ async fn inspect(args: InspectArgs) -> Result<()> {
     println!("  trust_tier:  {trust_tier}");
     println!(
         "  account:     {}",
-        record
-            .account_hint
-            .as_deref()
-            .map(oauth_seal::mask_account_hint)
-            .unwrap_or_else(|| "-".to_owned())
+        // `AccountHint`'s Display masks (type-enforced).
+        record.account_hint.as_ref().map(ToString::to_string).unwrap_or_else(|| "-".to_owned())
     );
     println!("  tier:        {}", tier_label(record.tier));
     println!("  status:      {}", status_label(record.status));

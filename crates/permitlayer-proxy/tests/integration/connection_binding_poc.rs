@@ -102,7 +102,9 @@ async fn write_connection(
         id,
         connector_id: "google-gmail".to_owned(),
         name: name.to_owned(),
-        account_hint: Some(format!("{name}@example.com")),
+        account_hint: Some(permitlayer_core::store::AccountHint::new(format!(
+            "{name}@example.com"
+        ))),
         granted_scopes: granted.iter().map(|s| (*s).to_owned()).collect(),
         tier,
         created_at: chrono::Utc::now(),

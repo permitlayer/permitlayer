@@ -1,9 +1,10 @@
 //! OpenClaw MCP-config snippet emission — Story 7.13.
 //!
-//! `agentsso connect <service>` ends by emitting an OpenClaw MCP-
+//! `agentsso quickstart <service>` ends by emitting an OpenClaw MCP-
 //! client-config snippet so the operator can configure their MCP
 //! client (OpenClaw, Claude Desktop, Cursor, etc.) to route requests
-//! through permitlayer.
+//! through permitlayer. (Pre-Epic-11 this was the now-retired
+//! `agentsso connect <service>` verb.)
 //!
 //! # Admin → user handoff
 //!

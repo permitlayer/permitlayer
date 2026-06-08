@@ -511,8 +511,8 @@ impl ProxyError {
                     "This request sent no usable `x-agentsso-scope` (the header was \
                      missing, empty, or literally `*`, none of which any policy \
                      grants). Add an `x-agentsso-scope` header naming a scope this \
-                     policy allows — the correct value is in the `agentsso connect` \
-                     / MCP-config snippet output for this service (e.g. \
+                     policy allows — the correct value is in the `agentsso quickstart` \
+                     MCP-config snippet output for this service (e.g. \
                      `x-agentsso-scope: calendar.readonly`)."
                         .to_owned()
                 } else {
