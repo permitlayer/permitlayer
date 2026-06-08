@@ -13,14 +13,12 @@
 //! separate verbs (`connection add` here; `bind` in Story 11.14).
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use anyhow::Result;
 use clap::{Args, Subcommand};
 
 use permitlayer_core::store::connection::{ConnectionRecord, ConnectionStatus, ConnectionTier};
-use permitlayer_core::store::{BindingStore, ConnectionStore, CredentialStore};
-use permitlayer_credential::{ConnectionId, Slot};
+use permitlayer_credential::ConnectionId;
 
 use crate::cli::oauth_seal;
 use crate::design::render;
@@ -163,15 +161,26 @@ async fn add(args: AddArgs) -> Result<()> {
 
     let home = crate::cli::agentsso_home()?;
 
+    // Kill-switch gate before any OAuth flow.
+    oauth_seal::probe_daemon_kill_state_or_exit().await?;
+
+    // Daemon-reachable gate (the daemon owns the seal/vault writes — and,
+    // Story 11.18, the store reads too: the operator can't read the
+    // root-private state dir, so the F7 name-check below also goes
+    // control-plane).
+    let handle = match crate::cli::connect_uds::require_daemon_running(&home).await {
+        Ok(h) => h,
+        Err(e) => return Err(e.context("connection add: daemon not reachable")),
+    };
+
     // F7 fix: reject a duplicate connection name BEFORE doing any OAuth
     // work. Names are the CLI/`/mcp/<name>` selector; the store keys files
     // on the ULID id and does not enforce name-uniqueness, so two
     // same-named connections would make `inspect`/`bind`/`revoke <name>`
     // resolve nondeterministically (first directory-walk match). Fail fast
-    // with an actionable error instead.
-    {
-        let store = open_connection_store(&home)?;
-        if let Some(existing) = resolve_by_name(&store, &name).await? {
+    // with an actionable error instead. Resolved daemon-side (Story 11.18).
+    match crate::cli::connect_uds::get_connection_record(&handle, &name).await {
+        Ok(crate::cli::connect_uds::ControlOutcome::Ok(resp)) => {
             eprint!(
                 "{}",
                 render::error_block(
@@ -179,7 +188,7 @@ async fn add(args: AddArgs) -> Result<()> {
                     &format!(
                         "a connection named '{name}' already exists (id {}). Connection names \
                          must be unique — they are the `/mcp/<name>` selector.",
-                        existing.id
+                        resp.connection.id
                     ),
                     &format!(
                         "pick a different --name, or inspect/revoke the existing one:\n\n    \
@@ -191,16 +200,62 @@ async fn add(args: AddArgs) -> Result<()> {
             );
             return Err(oauth_seal::exit2());
         }
+        // 404 `connection.not_found` is the happy path here (name is free).
+        Ok(crate::cli::connect_uds::ControlOutcome::Err { body, .. })
+            if body.code == "connection.not_found" => {}
+        // Any other control-plane error or parse/transport failure is a
+        // genuine problem — surface it rather than silently proceeding.
+        Ok(crate::cli::connect_uds::ControlOutcome::Err { status_code, body }) => {
+            eprint!(
+                "{}",
+                render::error_block(
+                    "connection.precheck_failed",
+                    &format!(
+                        "duplicate-name pre-check failed (HTTP {status_code}): {}",
+                        oauth_seal::sanitize_for_terminal(&body.message)
+                    ),
+                    "verify the daemon is healthy: agentsso status",
+                    None,
+                )
+            );
+            return Err(oauth_seal::silent_err_for_code(
+                "connection.precheck_failed",
+                "name pre-check failed",
+            ));
+        }
+        Ok(crate::cli::connect_uds::ControlOutcome::ParseFailure { status_code, .. }) => {
+            eprint!(
+                "{}",
+                render::error_block(
+                    "connection.precheck_failed",
+                    &format!(
+                        "duplicate-name pre-check returned an unparseable response (HTTP {status_code})"
+                    ),
+                    "verify the daemon is healthy: agentsso status",
+                    None,
+                )
+            );
+            return Err(oauth_seal::silent_err_for_code(
+                "connection.precheck_failed",
+                "name pre-check parse failure",
+            ));
+        }
+        Err(e) => {
+            eprint!(
+                "{}",
+                render::error_block(
+                    "connection.precheck_failed",
+                    &format!("duplicate-name pre-check transport error: {e}"),
+                    "verify the daemon is healthy: agentsso status",
+                    None,
+                )
+            );
+            return Err(oauth_seal::silent_err_for_code(
+                "connection.precheck_failed",
+                "name pre-check transport failure",
+            ));
+        }
     }
-
-    // Kill-switch gate before any OAuth flow.
-    oauth_seal::probe_daemon_kill_state_or_exit().await?;
-
-    // Daemon-reachable gate (the daemon owns the seal/vault writes).
-    let handle = match crate::cli::connect_uds::require_daemon_running(&home).await {
-        Ok(h) => h,
-        Err(e) => return Err(e.context("connection add: daemon not reachable")),
-    };
 
     let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let stdin_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
@@ -308,36 +363,34 @@ async fn add(args: AddArgs) -> Result<()> {
     Ok(())
 }
 
-// ── store helpers ───────────────────────────────────────────────────
+// ── control-plane resolve helper ────────────────────────────────────
 
-fn open_connection_store(home: &std::path::Path) -> Result<Arc<dyn ConnectionStore>> {
-    Ok(Arc::new(permitlayer_core::store::fs::ConnectionFsStore::new(home.to_path_buf())?))
-}
-
-/// Resolve a `name | id-text` selector to a connection record. Matches a
-/// ULID id first, then a `name`.
-async fn resolve_selector(
-    store: &Arc<dyn ConnectionStore>,
+/// Resolve a `name | id-text` selector to a `ConnectionRecord` via the
+/// daemon control plane (Story 11.18 — the operator can't read the
+/// root-private store in-process). `Ok(None)` on a `connection.not_found`
+/// 404; any other failure is a hard error rendered to the operator.
+async fn resolve_selector_cp(
+    handle: &crate::cli::connect_uds::ConnectControlHandle,
     selector: &str,
 ) -> Result<Option<ConnectionRecord>> {
-    if let Some(id) = ConnectionId::from_ulid_str(selector)
-        && let Some(rec) = store.get(id).await?
-    {
-        return Ok(Some(rec));
+    match crate::cli::connect_uds::get_connection_record(handle, selector).await {
+        Ok(crate::cli::connect_uds::ControlOutcome::Ok(resp)) => Ok(Some(resp.connection)),
+        Ok(crate::cli::connect_uds::ControlOutcome::Err { body, .. })
+            if body.code == "connection.not_found" =>
+        {
+            Ok(None)
+        }
+        Ok(crate::cli::connect_uds::ControlOutcome::Err { status_code, body }) => {
+            anyhow::bail!(
+                "connection lookup failed (HTTP {status_code}): {}",
+                oauth_seal::sanitize_for_terminal(&body.message)
+            )
+        }
+        Ok(crate::cli::connect_uds::ControlOutcome::ParseFailure { status_code, .. }) => {
+            anyhow::bail!("connection lookup returned an unparseable response (HTTP {status_code})")
+        }
+        Err(e) => anyhow::bail!("connection lookup transport error: {e}"),
     }
-    let all = store.list().await?;
-    Ok(all.into_iter().find(|r| r.name == selector))
-}
-
-/// Resolve a connection by its display `name` only (no id matching). Used
-/// by the `add` name-uniqueness guard (F7) — a fresh `--name` collision is
-/// a name collision, not an id one.
-async fn resolve_by_name(
-    store: &Arc<dyn ConnectionStore>,
-    name: &str,
-) -> Result<Option<ConnectionRecord>> {
-    let all = store.list().await?;
-    Ok(all.into_iter().find(|r| r.name == name))
 }
 
 // ── list ────────────────────────────────────────────────────────────
@@ -347,8 +400,25 @@ async fn list() -> Result<()> {
     use crate::design::terminal::{ColorSupport, TableLayout};
 
     let home = crate::cli::agentsso_home()?;
-    let store = open_connection_store(&home)?;
-    let mut connections = store.list().await?;
+    // Story 11.18: read records via the control plane (daemon runs as root
+    // and can read the root-private `connections/` dir).
+    let handle = match crate::cli::connect_uds::require_daemon_running(&home).await {
+        Ok(h) => h,
+        Err(e) => return Err(e.context("connection list: daemon not reachable")),
+    };
+    let mut connections = match crate::cli::connect_uds::get_connection_records(&handle).await {
+        Ok(crate::cli::connect_uds::ControlOutcome::Ok(resp)) => resp.connections,
+        Ok(crate::cli::connect_uds::ControlOutcome::Err { status_code, body }) => {
+            anyhow::bail!(
+                "connection list failed (HTTP {status_code}): {}",
+                oauth_seal::sanitize_for_terminal(&body.message)
+            )
+        }
+        Ok(crate::cli::connect_uds::ControlOutcome::ParseFailure { status_code, .. }) => {
+            anyhow::bail!("connection list returned an unparseable response (HTTP {status_code})")
+        }
+        Err(e) => anyhow::bail!("connection list transport error: {e}"),
+    };
     connections.sort_by(|a, b| a.name.cmp(&b.name));
 
     if connections.is_empty() {
@@ -392,8 +462,11 @@ async fn list() -> Result<()> {
 
 async fn inspect(args: InspectArgs) -> Result<()> {
     let home = crate::cli::agentsso_home()?;
-    let store = open_connection_store(&home)?;
-    let Some(record) = resolve_selector(&store, &args.selector).await? else {
+    let handle = match crate::cli::connect_uds::require_daemon_running(&home).await {
+        Ok(h) => h,
+        Err(e) => return Err(e.context("connection inspect: daemon not reachable")),
+    };
+    let Some(record) = resolve_selector_cp(&handle, &args.selector).await? else {
         eprint!(
             "{}",
             render::error_block(
@@ -439,49 +512,82 @@ async fn inspect(args: InspectArgs) -> Result<()> {
 
 async fn revoke(args: RevokeArgs) -> Result<()> {
     let home = crate::cli::agentsso_home()?;
-    let connection_store = open_connection_store(&home)?;
-    let Some(record) = resolve_selector(&connection_store, &args.selector).await? else {
-        eprint!(
-            "{}",
-            render::error_block(
-                "connection.not_found",
-                &format!("no connection matching '{}'", args.selector),
-                "list connections:  agentsso connection list",
-                None,
-            )
-        );
-        return Err(oauth_seal::exit2());
+    // Story 11.18: the cascade (record + 3 sealed slots + every binding)
+    // runs daemon-side (the operator can't write the root-private stores).
+    let handle = match crate::cli::connect_uds::require_daemon_running(&home).await {
+        Ok(h) => h,
+        Err(e) => return Err(e.context("connection revoke: daemon not reachable")),
     };
-    let id = record.id;
-
-    // 1. Remove the sealed slots (all three) via the credential store.
-    let credential_store: Arc<dyn CredentialStore> =
-        Arc::new(permitlayer_core::store::fs::CredentialFsStore::new(home.clone())?);
-    for slot in [Slot::Access, Slot::Refresh, Slot::Client] {
-        credential_store.remove(id, slot).await?;
-    }
-
-    // 2. Remove every binding that references this connection id. One
-    //    pass over each agent's binding set (so a later `/mcp/<name>`
-    //    resolves no binding → 403).
-    let binding_store: Arc<dyn BindingStore> =
-        Arc::new(permitlayer_core::store::fs::BindingFsStore::new(home.clone())?);
-    let mut bindings_removed = 0usize;
-    for agent in binding_store.list_agents().await? {
-        if binding_store.remove(&agent, id).await? {
-            bindings_removed += 1;
+    match crate::cli::connect_uds::post_revoke_connection(&handle, &args.selector).await {
+        Ok(crate::cli::connect_uds::ControlOutcome::Ok(resp)) => {
+            println!();
+            println!("\u{2713} connection '{}' revoked", resp.connection_name);
+            println!(
+                "  sealed credential slots removed, {} binding(s) detached",
+                resp.bindings_removed
+            );
+            println!();
+            Ok(())
+        }
+        Ok(crate::cli::connect_uds::ControlOutcome::Err { body, .. })
+            if body.code == "connection.not_found" =>
+        {
+            eprint!(
+                "{}",
+                render::error_block(
+                    "connection.not_found",
+                    &format!("no connection matching '{}'", args.selector),
+                    "list connections:  agentsso connection list",
+                    None,
+                )
+            );
+            Err(oauth_seal::exit2())
+        }
+        Ok(crate::cli::connect_uds::ControlOutcome::Err { status_code, body }) => {
+            eprint!(
+                "{}",
+                render::error_block(
+                    &oauth_seal::sanitize_for_terminal(&body.code),
+                    &format!(
+                        "connection revoke failed (HTTP {status_code}): {}",
+                        oauth_seal::sanitize_for_terminal(&body.message)
+                    ),
+                    "verify the daemon is healthy: agentsso status",
+                    None,
+                )
+            );
+            Err(oauth_seal::silent_err_for_code("connection.revoke_failed", "revoke failed"))
+        }
+        Ok(crate::cli::connect_uds::ControlOutcome::ParseFailure { status_code, .. }) => {
+            eprint!(
+                "{}",
+                render::error_block(
+                    "connection.revoke_failed",
+                    &format!(
+                        "connection revoke returned an unparseable response (HTTP {status_code})"
+                    ),
+                    "verify the daemon is healthy: agentsso status",
+                    None,
+                )
+            );
+            Err(oauth_seal::silent_err_for_code("connection.revoke_failed", "revoke parse failure"))
+        }
+        Err(e) => {
+            eprint!(
+                "{}",
+                render::error_block(
+                    "connection.revoke_failed",
+                    &format!("connection revoke transport error: {e}"),
+                    "verify the daemon is healthy: agentsso status",
+                    None,
+                )
+            );
+            Err(oauth_seal::silent_err_for_code(
+                "connection.revoke_failed",
+                "revoke transport failure",
+            ))
         }
     }
-
-    // 3. Remove the connection record last (its absence is the
-    //    authoritative "revoked" signal for the proxy authz path).
-    connection_store.remove(id).await?;
-
-    println!();
-    println!("\u{2713} connection '{}' revoked ({id})", record.name);
-    println!("  sealed credential slots removed, {bindings_removed} binding(s) detached");
-    println!();
-    Ok(())
 }
 
 // ── label helpers ───────────────────────────────────────────────────

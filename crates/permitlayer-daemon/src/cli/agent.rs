@@ -133,22 +133,29 @@ pub async fn run(args: AgentArgs) -> Result<()> {
 }
 
 /// `agentsso agent bindings <agent>` — list the agent's connection
-/// bindings (Story 11.14). In-process read of `BindingStore`, joined to
-/// each binding's `ConnectionRecord` (name + connector) for display.
+/// bindings (Story 11.14). Story 11.18: reads via the daemon control
+/// plane (the operator can't read the root-private `bindings/` +
+/// `connections/` dirs in-process); the daemon (root) joins each binding
+/// to its connection record and returns secret-free rows.
 async fn bindings_agent(args: BindingsArgs) -> Result<()> {
-    use permitlayer_core::store::connection::ConnectionTier;
-    use permitlayer_core::store::{BindingStore, ConnectionStore};
-    use std::sync::Arc;
-
     let home = crate::cli::agentsso_home()?;
-    let binding_store: Arc<dyn BindingStore> =
-        Arc::new(permitlayer_core::store::fs::BindingFsStore::new(home.clone())?);
-    let connection_store: Arc<dyn ConnectionStore> =
-        Arc::new(permitlayer_core::store::fs::ConnectionFsStore::new(home.clone())?);
-
-    let mut bindings = binding_store.get(&args.name).await?;
-    // Deterministic order: by connection id text.
-    bindings.sort_by(|a, b| a.connection_id.to_string().cmp(&b.connection_id.to_string()));
+    let handle = match crate::cli::connect_uds::require_daemon_running(&home).await {
+        Ok(h) => h,
+        Err(e) => return Err(e.context("agent bindings: daemon not reachable")),
+    };
+    let bindings = match crate::cli::connect_uds::get_agent_bindings(&handle, &args.name).await {
+        Ok(crate::cli::connect_uds::ControlOutcome::Ok(resp)) => resp.bindings,
+        Ok(crate::cli::connect_uds::ControlOutcome::Err { status_code, body }) => {
+            anyhow::bail!(
+                "agent bindings failed (HTTP {status_code}): {}",
+                crate::cli::oauth_seal::sanitize_for_terminal(&body.message)
+            )
+        }
+        Ok(crate::cli::connect_uds::ControlOutcome::ParseFailure { status_code, .. }) => {
+            anyhow::bail!("agent bindings returned an unparseable response (HTTP {status_code})")
+        }
+        Err(e) => anyhow::bail!("agent bindings transport error: {e}"),
+    };
 
     if bindings.is_empty() {
         print!(
@@ -165,27 +172,18 @@ async fn bindings_agent(args: BindingsArgs) -> Result<()> {
     let support = ColorSupport::detect();
     let layout = TableLayout::detect();
     let headers = &["CONNECTION", "CONNECTOR", "TIER", "POLICY", "ALIAS"];
-    let mut rows: Vec<Vec<TableCell>> = Vec::with_capacity(bindings.len());
-    for b in &bindings {
-        // Join to the connection record for the display name + connector.
-        // A binding whose connection is gone (e.g. revoked mid-flight)
-        // still lists — show the raw id so the operator can see the dangler.
-        let (name, connector) = match connection_store.get(b.connection_id).await? {
-            Some(rec) => (rec.name, rec.connector_id),
-            None => (format!("{} (missing)", b.connection_id), "-".to_owned()),
-        };
-        let tier = match b.tier {
-            ConnectionTier::Read => "read",
-            ConnectionTier::ReadWrite => "read-write",
-        };
-        rows.push(vec![
-            TableCell::Plain(name),
-            TableCell::Plain(connector),
-            TableCell::Plain(tier.to_owned()),
-            TableCell::Plain(b.policy.clone().unwrap_or_else(|| "-".to_owned())),
-            TableCell::Plain(b.alias.clone().unwrap_or_else(|| "-".to_owned())),
-        ]);
-    }
+    let rows: Vec<Vec<TableCell>> = bindings
+        .iter()
+        .map(|b| {
+            vec![
+                TableCell::Plain(b.connection_name.clone()),
+                TableCell::Plain(b.connector_id.clone()),
+                TableCell::Plain(b.tier.clone()),
+                TableCell::Plain(b.policy.clone().unwrap_or_else(|| "-".to_owned())),
+                TableCell::Plain(b.alias.clone().unwrap_or_else(|| "-".to_owned())),
+            ]
+        })
+        .collect();
     match table(headers, &rows, layout, &theme, support) {
         Ok(rendered) => print!("{rendered}"),
         Err(e) => {

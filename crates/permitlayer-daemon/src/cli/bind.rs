@@ -18,14 +18,10 @@
 //!   operator CLI can do directly, like `connection list/revoke`) — no
 //!   policy check, so no daemon round-trip.
 
-use std::sync::Arc;
-
 use anyhow::Result;
 use clap::Args;
 
 use permitlayer_core::store::connection::ConnectionRecord;
-use permitlayer_core::store::{BindingStore, ConnectionStore};
-use permitlayer_credential::ConnectionId;
 
 use crate::cli::oauth_seal;
 use crate::design::render;
@@ -56,29 +52,33 @@ pub struct UnbindArgs {
     pub connection: String,
 }
 
-// ── store helpers ───────────────────────────────────────────────────
+// ── control-plane resolve helper ────────────────────────────────────
 
-fn open_connection_store(home: &std::path::Path) -> Result<Arc<dyn ConnectionStore>> {
-    Ok(Arc::new(permitlayer_core::store::fs::ConnectionFsStore::new(home.to_path_buf())?))
-}
-
-fn open_binding_store(home: &std::path::Path) -> Result<Arc<dyn BindingStore>> {
-    Ok(Arc::new(permitlayer_core::store::fs::BindingFsStore::new(home.to_path_buf())?))
-}
-
-/// Resolve a `name | id-text` selector to a connection record (matches a
-/// ULID id first, then a `name`). Mirrors `connection inspect`.
-pub(crate) async fn resolve_connection(
-    store: &Arc<dyn ConnectionStore>,
+/// Resolve a `name | id-text` selector to a `ConnectionRecord` via the
+/// daemon control plane (Story 11.18 — the operator can't read the
+/// root-private store in-process). `Ok(None)` on `connection.not_found`.
+async fn resolve_connection_cp(
+    handle: &crate::cli::connect_uds::ConnectControlHandle,
     selector: &str,
 ) -> Result<Option<ConnectionRecord>> {
-    if let Some(id) = ConnectionId::from_ulid_str(selector)
-        && let Some(rec) = store.get(id).await?
-    {
-        return Ok(Some(rec));
+    match crate::cli::connect_uds::get_connection_record(handle, selector).await {
+        Ok(crate::cli::connect_uds::ControlOutcome::Ok(resp)) => Ok(Some(resp.connection)),
+        Ok(crate::cli::connect_uds::ControlOutcome::Err { body, .. })
+            if body.code == "connection.not_found" =>
+        {
+            Ok(None)
+        }
+        Ok(crate::cli::connect_uds::ControlOutcome::Err { status_code, body }) => {
+            anyhow::bail!(
+                "connection lookup failed (HTTP {status_code}): {}",
+                oauth_seal::sanitize_for_terminal(&body.message)
+            )
+        }
+        Ok(crate::cli::connect_uds::ControlOutcome::ParseFailure { status_code, .. }) => {
+            anyhow::bail!("connection lookup returned an unparseable response (HTTP {status_code})")
+        }
+        Err(e) => anyhow::bail!("connection lookup transport error: {e}"),
     }
-    let all = store.list().await?;
-    Ok(all.into_iter().find(|r| r.name == selector))
 }
 
 // ── bind ────────────────────────────────────────────────────────────
@@ -90,10 +90,16 @@ pub async fn run_bind(args: BindArgs) -> Result<()> {
         crate::telemetry::init_tracing("warn", None, 30).context("tracing init failed")?;
     let home = crate::cli::agentsso_home()?;
 
-    // Resolve the connection selector → id in-process (the daemon handler
-    // keys on the id). A missing connection errors before the daemon hop.
-    let connection_store = open_connection_store(&home)?;
-    let Some(connection) = resolve_connection(&connection_store, &args.connection).await? else {
+    // `bind` goes control-plane: the daemon owns the store reads (operator
+    // can't read the root-private state dir) AND the optional --policy is
+    // checked against the live PolicySet.
+    let handle = match crate::cli::connect_uds::require_daemon_running(&home).await {
+        Ok(h) => h,
+        Err(e) => return Err(e.context("bind: daemon not reachable")),
+    };
+
+    // Resolve the connection selector → id via the control plane.
+    let Some(connection) = resolve_connection_cp(&handle, &args.connection).await? else {
         eprint!(
             "{}",
             render::error_block(
@@ -104,13 +110,6 @@ pub async fn run_bind(args: BindArgs) -> Result<()> {
             )
         );
         return Err(oauth_seal::exit2());
-    };
-
-    // `bind` goes control-plane: the optional --policy is checked against
-    // the daemon's live PolicySet.
-    let handle = match crate::cli::connect_uds::require_daemon_running(&home).await {
-        Ok(h) => h,
-        Err(e) => return Err(e.context("bind: daemon not reachable")),
     };
 
     let req = crate::cli::connect_uds::BindRequest {
@@ -197,8 +196,14 @@ pub async fn run_bind(args: BindArgs) -> Result<()> {
 
 pub async fn run_unbind(args: UnbindArgs) -> Result<()> {
     let home = crate::cli::agentsso_home()?;
-    let connection_store = open_connection_store(&home)?;
-    let Some(connection) = resolve_connection(&connection_store, &args.connection).await? else {
+    // Story 11.18: connection-resolve + binding removal both go
+    // control-plane (the operator can't read/write the root-private state
+    // dir). Bearer-immutable: the handler touches only `bindings/<agent>.toml`.
+    let handle = match crate::cli::connect_uds::require_daemon_running(&home).await {
+        Ok(h) => h,
+        Err(e) => return Err(e.context("unbind: daemon not reachable")),
+    };
+    let Some(connection) = resolve_connection_cp(&handle, &args.connection).await? else {
         eprint!(
             "{}",
             render::error_block(
@@ -211,10 +216,61 @@ pub async fn run_unbind(args: UnbindArgs) -> Result<()> {
         return Err(oauth_seal::exit2());
     };
 
-    // In-process store delete (bearer-immutable: only touches
-    // `bindings/<agent>.toml`).
-    let binding_store = open_binding_store(&home)?;
-    let removed = binding_store.remove(&args.agent, connection.id).await?;
+    let req = crate::cli::connect_uds::UnbindRequest {
+        agent: &args.agent,
+        connection_id: &connection.id.to_string(),
+    };
+    let removed = match crate::cli::connect_uds::post_unbind(&handle, &req).await {
+        Ok(crate::cli::connect_uds::ControlOutcome::Ok(resp)) => resp.removed,
+        Ok(crate::cli::connect_uds::ControlOutcome::Err { status_code, body }) => {
+            eprint!(
+                "{}",
+                render::error_block(
+                    &oauth_seal::sanitize_for_terminal(&body.code),
+                    &format!(
+                        "unbind failed (HTTP {status_code}): {}",
+                        oauth_seal::sanitize_for_terminal(&body.message)
+                    ),
+                    "verify the daemon is healthy: agentsso status",
+                    None,
+                )
+            );
+            return Err(oauth_seal::silent_err_for_code(
+                "connection.unbind_failed",
+                "unbind failed",
+            ));
+        }
+        Ok(crate::cli::connect_uds::ControlOutcome::ParseFailure { status_code, .. }) => {
+            eprint!(
+                "{}",
+                render::error_block(
+                    "binding.protocol_error",
+                    &format!("unbind returned an unparseable response (HTTP {status_code})"),
+                    "verify the daemon is healthy: agentsso status",
+                    None,
+                )
+            );
+            return Err(oauth_seal::silent_err_for_code(
+                "connection.unbind_failed",
+                "unbind parse failure",
+            ));
+        }
+        Err(transport_err) => {
+            eprint!(
+                "{}",
+                render::error_block(
+                    "binding.daemon_unreachable",
+                    &format!("unbind transport error: {transport_err}"),
+                    "verify the daemon is healthy: agentsso status",
+                    None,
+                )
+            );
+            return Err(oauth_seal::silent_err_for_code(
+                "connection.unbind_failed",
+                "unbind transport failure",
+            ));
+        }
+    };
     if !removed {
         eprint!(
             "{}",

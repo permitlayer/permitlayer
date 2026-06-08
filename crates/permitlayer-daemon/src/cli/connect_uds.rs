@@ -567,6 +567,146 @@ pub(crate) async fn post_bind(
     parse_outcome(status, &response_body)
 }
 
+// ── Story 11.18: connection/binding read + revoke + unbind clients ──
+//
+// The operator can't read the root-private state dir in-process; these
+// route every connection/bind/agent-bindings store touch through the
+// daemon (root). Response bodies carry NO secrets (`ConnectionRecord` /
+// `Binding` are token-free).
+
+/// Response body for `GET /v1/control/connections/records`. Mirrors
+/// `server::control::ConnectionRecordsResponse`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ConnectionRecordsResponse {
+    pub connections: Vec<permitlayer_core::store::connection::ConnectionRecord>,
+}
+
+/// `connection list` (Story 11.18): list every `ConnectionRecord`.
+pub(crate) async fn get_connection_records(
+    handle: &ConnectControlHandle,
+) -> Result<ControlOutcome<ConnectionRecordsResponse>> {
+    let (status, response_body) = http_get_with_status_via(
+        &handle.endpoint,
+        "/v1/control/connections/records",
+        handle.control_token.as_deref(),
+    )
+    .await?;
+    parse_outcome(status, &response_body)
+}
+
+/// Response body for `GET /v1/control/connections/record/{selector}`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ConnectionRecordResponse {
+    pub connection: permitlayer_core::store::connection::ConnectionRecord,
+}
+
+/// `inspect` / `bind`/`unbind` connection-resolve / `add` F7 name-check
+/// (Story 11.18): resolve ONE connection record by name|id. 404 maps to
+/// `ControlOutcome::Err { code: "connection.not_found" }`.
+pub(crate) async fn get_connection_record(
+    handle: &ConnectControlHandle,
+    selector: &str,
+) -> Result<ControlOutcome<ConnectionRecordResponse>> {
+    let encoded = url_path_encode(selector);
+    let path = format!("/v1/control/connections/record/{encoded}");
+    let (status, response_body) =
+        http_get_with_status_via(&handle.endpoint, &path, handle.control_token.as_deref()).await?;
+    parse_outcome(status, &response_body)
+}
+
+/// Response body for `POST /v1/control/connections/{selector}/revoke`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct RevokeConnectionResponse {
+    #[allow(dead_code)]
+    pub status: String,
+    #[allow(dead_code)]
+    pub connection_id: String,
+    pub connection_name: String,
+    pub bindings_removed: usize,
+}
+
+/// `connection revoke` (Story 11.18): cascade-revoke daemon-side.
+pub(crate) async fn post_revoke_connection(
+    handle: &ConnectControlHandle,
+    selector: &str,
+) -> Result<ControlOutcome<RevokeConnectionResponse>> {
+    let encoded = url_path_encode(selector);
+    let path = format!("/v1/control/connections/{encoded}/revoke");
+    let (status, response_body) = http_post_json_with_status_via(
+        &handle.endpoint,
+        &path,
+        "",
+        handle.control_token.as_deref(),
+    )
+    .await?;
+    parse_outcome(status, &response_body)
+}
+
+/// One binding row joined to its connection display metadata. Mirrors
+/// `server::control::AgentBindingRow` (secret-free).
+#[derive(Debug, Deserialize)]
+pub(crate) struct AgentBindingRow {
+    #[allow(dead_code)]
+    pub connection_id: String,
+    pub connection_name: String,
+    pub connector_id: String,
+    pub tier: String,
+    #[serde(default)]
+    pub policy: Option<String>,
+    #[serde(default)]
+    pub alias: Option<String>,
+}
+
+/// Response body for `GET /v1/control/agent/{name}/bindings`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct AgentBindingsResponse {
+    pub bindings: Vec<AgentBindingRow>,
+}
+
+/// `agent bindings` (Story 11.18): list an agent's bindings joined to
+/// their connection records.
+pub(crate) async fn get_agent_bindings(
+    handle: &ConnectControlHandle,
+    agent: &str,
+) -> Result<ControlOutcome<AgentBindingsResponse>> {
+    let encoded = url_path_encode(agent);
+    let path = format!("/v1/control/agent/{encoded}/bindings");
+    let (status, response_body) =
+        http_get_with_status_via(&handle.endpoint, &path, handle.control_token.as_deref()).await?;
+    parse_outcome(status, &response_body)
+}
+
+/// Request body for `POST /v1/control/bindings/remove` (Story 11.18).
+#[derive(Debug, Serialize)]
+pub(crate) struct UnbindRequest<'a> {
+    pub agent: &'a str,
+    pub connection_id: &'a str,
+}
+
+/// Response body for `POST /v1/control/bindings/remove`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct UnbindResponse {
+    #[allow(dead_code)]
+    pub status: String,
+    pub removed: bool,
+}
+
+/// `unbind` (Story 11.18): remove a single binding daemon-side.
+pub(crate) async fn post_unbind(
+    handle: &ConnectControlHandle,
+    req: &UnbindRequest<'_>,
+) -> Result<ControlOutcome<UnbindResponse>> {
+    let body = serde_json::to_string(req).context("serialize unbind request")?;
+    let (status, response_body) = http_post_json_with_status_via(
+        &handle.endpoint,
+        "/v1/control/bindings/remove",
+        &body,
+        handle.control_token.as_deref(),
+    )
+    .await?;
+    parse_outcome(status, &response_body)
+}
+
 /// Outcome of a connection-verify POST. The 200 body is `{ ok: true,
 /// ... }` or `{ ok: false, ... }` (the caller branches on `ok`
 /// dynamically); 4xx/5xx use the standard error envelope.

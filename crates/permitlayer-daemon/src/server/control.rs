@@ -3933,6 +3933,585 @@ pub(crate) async fn bind_agent_handler(
         .into_response()
 }
 
+// ──────────────────────────────────────────────────────────────────
+// Story 11.18 — connection/binding read + revoke + unbind over the
+// control plane.
+//
+// The privileged macOS install makes the daemon state dir root-private
+// (`0o710 root:permitlayer-clients`, subdirs `0o700 root`). The
+// unprivileged operator cannot `read_dir`/open `connections/`,
+// `bindings/`, or `vault/` directly (EPERM). These handlers run as the
+// daemon (root), open the stores from `home` per-request (same pattern as
+// `bind_agent_handler` / the seal handler — NOT in `ControlState`), and
+// return SECRET-FREE bodies (`ConnectionRecord`/`Binding` carry no tokens).
+// Loopback + control-token gated by the router layer + `require_loopback`.
+// ──────────────────────────────────────────────────────────────────
+
+/// Derive the daemon's state-dir `home` from `state.vault_dir`
+/// (`<home>/vault`). Returns a typed error response on the impossible
+/// "vault_dir has no parent" layout so handlers can `?`-style early-out.
+// The `Err` variant boxes the axum `Response` (≥128 bytes) to keep these
+// helpers' `Result` small (clippy::result_large_err); call sites `return
+// *resp` on the error path.
+fn home_from_state(state: &ControlState, request_id: &str) -> Result<PathBuf, Box<Response>> {
+    state.vault_dir.parent().map(std::path::Path::to_path_buf).ok_or_else(|| {
+        Box::new(agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "connection.store_unavailable",
+            format!("vault_dir {:?} has no parent — cannot derive store home", state.vault_dir),
+            Some(request_id.to_owned()),
+        ))
+    })
+}
+
+/// Open the `ConnectionFsStore` rooted at `home`, mapping init failure to
+/// a typed error response.
+fn open_connection_store_or_resp(
+    home: &std::path::Path,
+    request_id: &str,
+) -> Result<permitlayer_core::store::fs::ConnectionFsStore, Box<Response>> {
+    permitlayer_core::store::fs::ConnectionFsStore::new(home.to_path_buf()).map_err(|e| {
+        Box::new(agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "connection.store_unavailable",
+            format!("connection store init failed: {e}"),
+            Some(request_id.to_owned()),
+        ))
+    })
+}
+
+/// Resolve a `name | id-text` selector against the connection store
+/// (matches a ULID id first, then a `name`). Mirrors the CLI's former
+/// in-process `resolve_selector`, now daemon-side.
+async fn resolve_connection_selector(
+    store: &permitlayer_core::store::fs::ConnectionFsStore,
+    selector: &str,
+) -> Result<
+    Option<permitlayer_core::store::connection::ConnectionRecord>,
+    permitlayer_core::store::StoreError,
+> {
+    use permitlayer_core::store::ConnectionStore;
+    if let Some(id) = ConnectionId::from_ulid_str(selector)
+        && let Some(rec) = store.get(id).await?
+    {
+        return Ok(Some(rec));
+    }
+    let all = store.list().await?;
+    Ok(all.into_iter().find(|r| r.name == selector))
+}
+
+/// Response body for `GET /v1/control/connections/records`.
+#[derive(Debug, Serialize)]
+pub(crate) struct ConnectionRecordsResponse {
+    pub connections: Vec<permitlayer_core::store::connection::ConnectionRecord>,
+}
+
+/// `GET /v1/control/connections/records` — list every `ConnectionRecord`
+/// (secret-free) for `connection list`. DISTINCT from
+/// `GET /v1/control/connections` (the live request-activity tracker).
+pub(crate) async fn list_connection_records_handler(
+    State(state): State<ControlState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: axum::extract::Request,
+) -> Response {
+    if let Err(e) = require_loopback(peer) {
+        return e.into_response();
+    }
+    let request_id = read_request_id(&req);
+    let home = match home_from_state(&state, &request_id) {
+        Ok(h) => h,
+        Err(resp) => return *resp,
+    };
+    let store = match open_connection_store_or_resp(&home, &request_id) {
+        Ok(s) => s,
+        Err(resp) => return *resp,
+    };
+    match permitlayer_core::store::ConnectionStore::list(&store).await {
+        Ok(mut connections) => {
+            connections.sort_by(|a, b| a.name.cmp(&b.name));
+            (StatusCode::OK, Json(ConnectionRecordsResponse { connections })).into_response()
+        }
+        Err(e) => agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "connection.store_io_failed",
+            format!("connection store read failed: {e}"),
+            Some(request_id),
+        ),
+    }
+}
+
+/// Response body for `GET /v1/control/connections/record/{selector}`.
+#[derive(Debug, Serialize)]
+pub(crate) struct ConnectionRecordResponse {
+    pub connection: permitlayer_core::store::connection::ConnectionRecord,
+}
+
+/// `GET /v1/control/connections/record/{selector}` — resolve ONE record
+/// by name|id (for `inspect`, `bind`/`unbind` connection-resolve, and
+/// `connection add`'s F7 duplicate-name pre-check). 404 `connection.not_found`
+/// when no record matches.
+pub(crate) async fn get_connection_record_handler(
+    State(state): State<ControlState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(selector): Path<String>,
+    req: axum::extract::Request,
+) -> Response {
+    if let Err(e) = require_loopback(peer) {
+        return e.into_response();
+    }
+    let request_id = read_request_id(&req);
+    let home = match home_from_state(&state, &request_id) {
+        Ok(h) => h,
+        Err(resp) => return *resp,
+    };
+    let store = match open_connection_store_or_resp(&home, &request_id) {
+        Ok(s) => s,
+        Err(resp) => return *resp,
+    };
+    match resolve_connection_selector(&store, &selector).await {
+        Ok(Some(connection)) => {
+            (StatusCode::OK, Json(ConnectionRecordResponse { connection })).into_response()
+        }
+        Ok(None) => agent_error_response(
+            StatusCode::NOT_FOUND,
+            "connection.not_found",
+            format!("no connection matching '{selector}'"),
+            Some(request_id),
+        ),
+        Err(e) => agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "connection.store_io_failed",
+            format!("connection store read failed: {e}"),
+            Some(request_id),
+        ),
+    }
+}
+
+/// Response body for `POST /v1/control/connections/{id}/revoke`.
+#[derive(Debug, Serialize)]
+pub(crate) struct RevokeConnectionResponse {
+    pub status: &'static str,
+    pub connection_id: String,
+    pub connection_name: String,
+    pub bindings_removed: usize,
+}
+
+/// `POST /v1/control/connections/{id}/revoke` — cascade-revoke a
+/// connection daemon-side: remove the record + all three sealed slots +
+/// every binding referencing the id. `{id}` is the ULID text OR a name
+/// (resolved like `inspect`). Mirrors the CLI's former in-process cascade.
+pub(crate) async fn revoke_connection_handler(
+    State(state): State<ControlState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(selector): Path<String>,
+    req: axum::extract::Request,
+) -> Response {
+    use permitlayer_core::store::{BindingStore, ConnectionStore, CredentialStore};
+
+    if let Err(e) = require_loopback(peer) {
+        return e.into_response();
+    }
+    let request_id = read_request_id(&req);
+
+    let _permit = match state.agent_crud_semaphore.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return agent_error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "connection.rate_limited",
+                format!(
+                    "too many concurrent agent CRUD operations in flight \
+                     (max {AGENT_CRUD_MAX_CONCURRENT}); retry shortly"
+                ),
+                Some(request_id),
+            );
+        }
+    };
+
+    let home = match home_from_state(&state, &request_id) {
+        Ok(h) => h,
+        Err(resp) => return *resp,
+    };
+    let connection_store = match open_connection_store_or_resp(&home, &request_id) {
+        Ok(s) => s,
+        Err(resp) => return *resp,
+    };
+    let record = match resolve_connection_selector(&connection_store, &selector).await {
+        Ok(Some(r)) => r,
+        Ok(None) => {
+            return agent_error_response(
+                StatusCode::NOT_FOUND,
+                "connection.not_found",
+                format!("no connection matching '{selector}'"),
+                Some(request_id),
+            );
+        }
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "connection.store_io_failed",
+                format!("connection store read failed: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+    let id = record.id;
+
+    // 1. Remove the sealed slots (all three) via the credential store.
+    let credential_store = match permitlayer_core::store::fs::CredentialFsStore::new(home.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "connection.store_unavailable",
+                format!("credential store init failed: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+    for slot in [Slot::Access, Slot::Refresh, Slot::Client] {
+        if let Err(e) = credential_store.remove(id, slot).await {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "connection.store_io_failed",
+                format!("failed to remove sealed slot {slot:?} for connection {id}: {e}"),
+                Some(request_id),
+            );
+        }
+    }
+
+    // 2. Remove every binding that references this connection id (so a
+    //    later `/mcp/<name>` resolves no binding → 403).
+    let binding_store = match permitlayer_core::store::fs::BindingFsStore::new(home.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "connection.store_unavailable",
+                format!("binding store init failed: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+    let agents = match binding_store.list_agents().await {
+        Ok(a) => a,
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "connection.store_io_failed",
+                format!("binding store list failed: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+    let mut bindings_removed = 0usize;
+    for agent in agents {
+        match binding_store.remove(&agent, id).await {
+            Ok(true) => bindings_removed += 1,
+            Ok(false) => {}
+            Err(e) => {
+                return agent_error_response(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "connection.store_io_failed",
+                    format!("binding removal failed for agent {agent:?}: {e}"),
+                    Some(request_id),
+                );
+            }
+        }
+    }
+
+    // 3. Remove the connection record last (its absence is the
+    //    authoritative "revoked" signal for the proxy authz path).
+    if let Err(e) = connection_store.remove(id).await {
+        return agent_error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "connection.store_io_failed",
+            format!("connection record removal failed: {e}"),
+            Some(request_id),
+        );
+    }
+
+    if let Some(audit) = &state.audit_store {
+        let mut event = AuditEvent::with_request_id(
+            request_id.clone(),
+            "-".to_owned(),
+            "permitlayer".to_owned(),
+            id.to_string(),
+            "connection-revoke".to_owned(),
+            "ok".to_owned(),
+            "connection-revoked".to_owned(),
+        );
+        event.extra = serde_json::json!({
+            "connection_id": id.to_string(),
+            "connection_name": record.name,
+            "bindings_removed": bindings_removed,
+        });
+        if let Err(e) = audit.append(event).await {
+            tracing::warn!(error = %e, "connection-revoked audit write failed (best-effort)");
+        }
+    }
+
+    tracing::info!(
+        target: "control",
+        request_id = %request_id,
+        connection = %id,
+        bindings_removed,
+        "connection revoked via control endpoint"
+    );
+
+    (
+        StatusCode::OK,
+        Json(RevokeConnectionResponse {
+            status: "ok",
+            connection_id: id.to_string(),
+            connection_name: record.name,
+            bindings_removed,
+        }),
+    )
+        .into_response()
+}
+
+/// One binding row joined to its connection's display metadata, for
+/// `agent bindings`. Secret-free.
+#[derive(Debug, Serialize)]
+pub(crate) struct AgentBindingRow {
+    /// `connection_id` text (always present, even if the record is gone).
+    pub connection_id: String,
+    /// Connection display name, or a "missing" marker if the record was
+    /// removed out from under the binding (dangling).
+    pub connection_name: String,
+    /// Connector id, or `-` for a dangling binding.
+    pub connector_id: String,
+    pub tier: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<String>,
+}
+
+/// Response body for `GET /v1/control/agent/{name}/bindings`.
+#[derive(Debug, Serialize)]
+pub(crate) struct AgentBindingsResponse {
+    pub bindings: Vec<AgentBindingRow>,
+}
+
+/// `GET /v1/control/agent/{name}/bindings` — list an agent's bindings
+/// joined to their connection records (for `agent bindings`). Secret-free.
+pub(crate) async fn agent_bindings_handler(
+    State(state): State<ControlState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    Path(name): Path<String>,
+    req: axum::extract::Request,
+) -> Response {
+    use permitlayer_core::store::connection::ConnectionTier;
+    use permitlayer_core::store::{BindingStore, ConnectionStore};
+
+    if let Err(e) = require_loopback(peer) {
+        return e.into_response();
+    }
+    let request_id = read_request_id(&req);
+
+    if let Err(e) = validate_agent_name(&name) {
+        return agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "binding.invalid_agent_name",
+            format!("{e}"),
+            Some(request_id),
+        );
+    }
+    let home = match home_from_state(&state, &request_id) {
+        Ok(h) => h,
+        Err(resp) => return *resp,
+    };
+    let binding_store = match permitlayer_core::store::fs::BindingFsStore::new(home.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "binding.store_unavailable",
+                format!("binding store init failed: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+    let connection_store = match open_connection_store_or_resp(&home, &request_id) {
+        Ok(s) => s,
+        Err(resp) => return *resp,
+    };
+
+    let mut bindings = match binding_store.get(&name).await {
+        Ok(b) => b,
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "binding.store_io_failed",
+                format!("binding store read failed: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+    bindings.sort_by(|a, b| a.connection_id.to_string().cmp(&b.connection_id.to_string()));
+
+    let mut rows = Vec::with_capacity(bindings.len());
+    for b in &bindings {
+        let (connection_name, connector_id) =
+            match ConnectionStore::get(&connection_store, b.connection_id).await {
+                Ok(Some(rec)) => (rec.name, rec.connector_id),
+                Ok(None) => (format!("{} (missing)", b.connection_id), "-".to_owned()),
+                Err(e) => {
+                    return agent_error_response(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "binding.store_io_failed",
+                        format!("connection store read failed: {e}"),
+                        Some(request_id),
+                    );
+                }
+            };
+        let tier = match b.tier {
+            ConnectionTier::Read => "read",
+            ConnectionTier::ReadWrite => "read-write",
+        };
+        rows.push(AgentBindingRow {
+            connection_id: b.connection_id.to_string(),
+            connection_name,
+            connector_id,
+            tier: tier.to_owned(),
+            policy: b.policy.clone(),
+            alias: b.alias.clone(),
+        });
+    }
+
+    (StatusCode::OK, Json(AgentBindingsResponse { bindings: rows })).into_response()
+}
+
+/// Request body for `POST /v1/control/bindings/remove` (Story 11.18).
+///
+/// `unbind` removes a SINGLE binding. The binding store lives in the
+/// root-private state dir, so the removal must run daemon-side (the
+/// operator can't write it in-process). Mirrors `BindAgentRequest`'s
+/// agent + connection_id keying.
+#[derive(Debug, Deserialize)]
+pub(crate) struct UnbindAgentRequest {
+    pub agent: String,
+    pub connection_id: String,
+}
+
+/// Response body for `POST /v1/control/bindings/remove`.
+#[derive(Debug, Serialize)]
+pub(crate) struct UnbindAgentResponse {
+    pub status: &'static str,
+    pub removed: bool,
+}
+
+/// `POST /v1/control/bindings/remove` — remove a single `(agent,
+/// connection_id)` binding daemon-side (Story 11.18). Bearer-immutable:
+/// touches only `bindings/<agent>.toml`. `removed: false` (200) when no
+/// such binding existed — the CLI maps that to `binding.not_found` exit 2.
+pub(crate) async fn unbind_agent_handler(
+    State(state): State<ControlState>,
+    ConnectInfo(peer): ConnectInfo<SocketAddr>,
+    req: axum::extract::Request,
+) -> Response {
+    use permitlayer_core::store::BindingStore;
+
+    if let Err(e) = require_loopback(peer) {
+        return e.into_response();
+    }
+    let request_id = read_request_id(&req);
+
+    let _permit = match state.agent_crud_semaphore.clone().try_acquire_owned() {
+        Ok(p) => p,
+        Err(_) => {
+            return agent_error_response(
+                StatusCode::TOO_MANY_REQUESTS,
+                "binding.rate_limited",
+                format!(
+                    "too many concurrent agent CRUD operations in flight \
+                     (max {AGENT_CRUD_MAX_CONCURRENT}); retry shortly"
+                ),
+                Some(request_id),
+            );
+        }
+    };
+
+    let (_parts, body) = req.into_parts();
+    let bytes = match axum::body::to_bytes(body, 16 * 1024).await {
+        Ok(b) => b,
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::BAD_REQUEST,
+                "binding.bad_request",
+                format!("failed to read request body: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+    let payload: UnbindAgentRequest = match serde_json::from_slice(&bytes) {
+        Ok(p) => p,
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::BAD_REQUEST,
+                "binding.bad_request",
+                format!("invalid JSON body: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+    let Some(connection) = ConnectionId::from_ulid_str(&payload.connection_id) else {
+        return agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "binding.bad_request",
+            format!("connection_id {:?} is not a valid ULID", payload.connection_id),
+            Some(request_id),
+        );
+    };
+    if let Err(e) = validate_agent_name(&payload.agent) {
+        return agent_error_response(
+            StatusCode::BAD_REQUEST,
+            "binding.invalid_agent_name",
+            format!("{e}"),
+            Some(request_id),
+        );
+    }
+
+    let home = match home_from_state(&state, &request_id) {
+        Ok(h) => h,
+        Err(resp) => return *resp,
+    };
+    let binding_store = match permitlayer_core::store::fs::BindingFsStore::new(home.clone()) {
+        Ok(s) => s,
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "binding.store_unavailable",
+                format!("binding store init failed: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+    let removed = match binding_store.remove(&payload.agent, connection).await {
+        Ok(r) => r,
+        Err(e) => {
+            return agent_error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "binding.store_io_failed",
+                format!("binding removal failed: {e}"),
+                Some(request_id),
+            );
+        }
+    };
+    if removed {
+        tracing::info!(
+            target: "control",
+            request_id = %request_id,
+            agent = %payload.agent,
+            connection = %connection,
+            "agent unbound from connection via control endpoint"
+        );
+    }
+    (StatusCode::OK, Json(UnbindAgentResponse { status: "ok", removed })).into_response()
+}
+
 /// Predicate: does this verify probe result represent an expired-access-
 /// token 401 (the case the self-heal targets)? Only a
 /// `VerificationFailed` with `status_code == 401` qualifies — every other
@@ -5413,7 +5992,16 @@ pub(crate) fn router(
         .route("/v1/control/agent/{name}/policy_name", get(agent_policy_name_handler))
         .route("/v1/control/credentials/seal", post(credentials_seal_handler))
         .route("/v1/control/connections/{connection_id}/verify", post(credentials_verify_handler))
+        // Story 11.18: connection/binding read + revoke + unbind over the
+        // control plane (operator can't read the root-private state dir).
+        // `/connections/records` (list) is DISTINCT from `/connections`
+        // (the activity tracker below).
+        .route("/v1/control/connections/records", get(list_connection_records_handler))
+        .route("/v1/control/connections/record/{selector}", get(get_connection_record_handler))
+        .route("/v1/control/connections/{selector}/revoke", post(revoke_connection_handler))
+        .route("/v1/control/agent/{name}/bindings", get(agent_bindings_handler))
         .route("/v1/control/bindings", post(bind_agent_handler))
+        .route("/v1/control/bindings/remove", post(unbind_agent_handler))
         .route("/v1/control/policy/{policy_name}/scopes", post(policy_scopes_handler))
         .route("/v1/control/policies/{name}", get(show_policy_handler))
         .route("/v1/control/policies", get(list_policies_handler))
@@ -6889,6 +7477,35 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
         let json = body_json(resp).await;
         assert_eq!(json["error"]["code"], "forbidden_not_loopback");
+    }
+
+    /// Story 11.18: the 5 new connection/binding control-plane routes each
+    /// gate on `require_loopback` first. Assert a non-loopback peer is
+    /// rejected on each — mirroring the whoami/kill non-loopback tests.
+    #[tokio::test]
+    async fn new_connection_routes_reject_non_loopback() {
+        let switch = Arc::new(KillSwitch::new());
+        for (method, path) in [
+            (Method::GET, "/v1/control/connections/records"),
+            (Method::GET, "/v1/control/connections/record/some-name"),
+            (Method::POST, "/v1/control/connections/some-name/revoke"),
+            (Method::GET, "/v1/control/agent/some-agent/bindings"),
+            (Method::POST, "/v1/control/bindings/remove"),
+        ] {
+            let app = build(Arc::clone(&switch));
+            let resp =
+                app.oneshot(req_with_peer(method.clone(), path, non_loopback())).await.unwrap();
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{method} {path} must reject a non-loopback peer"
+            );
+            let json = body_json(resp).await;
+            assert_eq!(
+                json["error"]["code"], "forbidden_not_loopback",
+                "{method} {path} should fail with forbidden_not_loopback"
+            );
+        }
     }
 
     // ── Story 7.30 Task 2: GET /v1/control/agent/{name}/policy_name ──

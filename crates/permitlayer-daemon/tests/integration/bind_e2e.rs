@@ -1,12 +1,15 @@
 //! End-to-end tests for `agentsso bind` / `unbind` / `agent bindings`
 //! (Epic 11, Story 11.14).
 //!
-//! `bind` routes through the daemon control plane (the optional
-//! `--policy` is checked against the live `PolicySet`), so these tests
-//! boot the real daemon. The connection to bind to is seeded directly on
-//! disk (`seed_connection_only`) — but the BINDING itself is created via
-//! the REAL `bind` verb. `unbind` / `agent bindings` are in-process store
-//! ops the CLI does directly.
+//! `bind` / `unbind` / `agent bindings` all route through the daemon
+//! control plane — `bind` so the optional `--policy` is checked against
+//! the live `PolicySet`, and `unbind` / `agent bindings` so the operator
+//! never reads/mutates the root-private store in-process (Story 11.18:
+//! these were in-process store ops until the EPERM fix re-pointed them).
+//! So these tests boot the real daemon. The connection to bind to is
+//! seeded directly on disk (`seed_connection_only`) — but the BINDING
+//! itself is created/removed/listed via the REAL `bind`/`unbind`/`agent
+//! bindings` verbs through the control plane.
 
 use std::process::Command;
 
