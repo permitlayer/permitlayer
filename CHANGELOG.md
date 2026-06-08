@@ -26,13 +26,68 @@ is required when a method is dropped in a major bump.
 
 _No changes yet._
 
-## [1.2.3] - 2026-06-06 — `agentsso` binary
+## [1.3.0] - 2026-06-08 — `agentsso` binary
 
-Patch release. Two MCP proxy fixes surfaced by live agent telemetry.
-Workspace / binary bump 1.2.2 → 1.2.3; plugin host-API unchanged.
+Minor release. Introduces the **connector / connection / binding**
+credential model (Epic 11) — one agent can now hold multiple accounts of
+the same connector, each sealed in isolation and granted at its own tier.
+Also folds in the two live-telemetry MCP proxy fixes originally staged for
+1.2.3 (never tagged). Workspace / binary bump 1.2.2 → 1.3.0; plugin
+host-API surface unchanged (still `1.0.0-rc.1`).
+
+### Highlights
+
+- **Three-noun credential model: connector, connection, binding.** A
+  *connector* is the registry definition of a service (e.g.
+  `google-gmail`). A *connection* is one account's sealed credential,
+  keyed by its own ULID. A *binding* grants one agent access to one
+  connection at a chosen tier. This replaces the old
+  one-shared-credential-per-service model: two accounts of the same
+  connector now coexist, and an agent can bind to several.
+- **Per-connection cryptographic isolation (NFR51).** Each connection's
+  secrets are sealed under a key derived from its own `(ConnectionId,
+  Slot)` — folded into the HKDF info and AEAD additional-authenticated-
+  data — so a sealed blob from one connection cannot be unsealed in the
+  context of another. Slots separate Access / Refresh / Client material.
+- **`agentsso connection add|list|inspect|revoke`.** Add a new account of
+  a connector (drives OAuth, seals tokens under a fresh connection id),
+  list/inspect existing connections, and revoke one (which cascades to
+  drop dependent bindings). `--name` gives a connection a stable alias for
+  addressing.
+- **`agentsso bind|unbind` + `agentsso agent bindings`.** Bind an agent to
+  a connection at a `--grant read|read-write` tier (with an optional
+  `--alias`), list an agent's bindings, and remove one. One agent, many
+  bindings, each at its own tier.
+- **Request-time authorization chain, default-deny.** Every proxied call
+  resolves bearer → agent → binding → connection → connector → tier. The
+  required scope must be in `connector.tiers[tier] ∩
+  connection.granted_scopes ∩ policy`, with distinct 403 classes
+  (`binding.not_found`, `tier.denied`, `scope.not_granted`) so failures
+  are diagnosable.
+- **Account-addressed routing.** The REST tool path
+  `/v1/tools/{selector}/{path}` and the MCP transport `/mcp/{selector}`
+  resolve a binding by connection name/alias, so the *same bearer* hitting
+  two selectors reaches two different accounts' tokens — proven
+  end-to-end against live Google (read on one account, write-denied on a
+  read-only binding).
+- **v2-only clean install.** Fresh installs seal directly into the
+  connection/binding model; a residue guard fails the build if v1-era
+  credential layout leaks into a clean install. Single-user, wipe-and-
+  reseal upgrade model — no in-place data migration.
 
 ### Fixed
 
+- **First connection seal now activates the proxy without a manual
+  `reload`.** Previously the proxy's real routes were only wired at boot,
+  SIGHUP, or an explicit `agentsso reload`; sealing the very first
+  connection left the data plane returning `route.not_implemented`
+  ("proxy service is not active yet") until a reload. The seal handler now
+  activates the proxy routes if credentials are ready.
+- **Connection / binding read+mutate CLI verbs no longer require `sudo`.**
+  `connection list`/`inspect`, `bind`/`unbind`, and `agent bindings` read
+  root-private stores; running them in-process returned `Operation not
+  permitted (os error 1)` for a non-root operator. They now route through
+  the control-plane UDS like every other privileged verb.
 - **Stringified-JSON object args are now coerced instead of rejected.**
   MCP clients (LLMs) frequently pass an object-valued arg
   (`event`/`message`/`draft`/`file`/`query`) as a JSON *string*. The proxy
