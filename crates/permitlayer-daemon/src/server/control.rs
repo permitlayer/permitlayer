@@ -2920,6 +2920,15 @@ pub(crate) async fn credentials_seal_handler(
         "credential sealed via control endpoint"
     );
 
+    // A freshly-booted daemon (no credentials at boot) serves 501 stub
+    // /mcp routes until the proxy is activated. Sealing the FIRST connection
+    // is exactly when sealed credentials begin to exist, so re-activate the
+    // proxy here — otherwise `connection add` (operator's first action) would
+    // leave the routes dead until a manual `agentsso reload`. Idempotent: the
+    // helper no-ops if the proxy is already live (`proxy_stub_branch_active`
+    // CAS). Same check+build the reload handler runs.
+    activate_proxy_routes_if_ready(&state, Some(request_id.clone()), "credentials-seal").await;
+
     (
         StatusCode::OK,
         Json(CredentialsSealResponse { sealed: true, replaced_previous, connection: record }),

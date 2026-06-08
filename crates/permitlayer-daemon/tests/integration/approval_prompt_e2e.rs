@@ -1275,6 +1275,63 @@ fn mcp_initialize_succeeds_after_credential_seal_without_restart() {
 }
 
 #[test]
+fn first_connection_seal_activates_proxy_without_manual_reload() {
+    // Operator-flow regression guard (review 2026-06-08): on a freshly-
+    // booted daemon (no credentials at boot → stub /mcp routes), the FIRST
+    // `connection add` seal must activate the proxy ON ITS OWN — without a
+    // manual `agentsso reload`. The seal handler now calls
+    // `activate_proxy_routes_if_ready`; this proves it end-to-end.
+    let home = tempfile::tempdir().unwrap();
+    std::fs::create_dir_all(home.path().join("config")).unwrap();
+    seed_gmail_readonly_policy(home.path());
+    assert!(!home.path().join("vault").exists(), "test must boot through the stub-only proxy path");
+
+    let (_daemon, port, daemon_pid) = start_daemon_with_env_zero_port(home.path(), &[]);
+    assert!(wait_for_health(port, Duration::from_secs(5)));
+    assert_daemon_pid_matches(port, home.path(), daemon_pid);
+
+    let bearer = register_agent(port, home.path(), "openclaw", "gmail-read-only");
+    let auth_header = format!("Bearer {bearer}");
+    let init_body = mcp_initialize_request();
+    let headers = [
+        ("authorization", auth_header.as_str()),
+        ("x-agentsso-scope", "gmail.readonly"),
+        ("accept", "application/json, text/event-stream"),
+    ];
+
+    // Before any seal: stub route (proxy not active).
+    let (stub_status, _stub_body) = http_post(port, "/mcp/gmail", &init_body, &headers);
+    assert_eq!(stub_status, 501, "pre-seal /mcp/gmail should be the stub route");
+
+    // Seal the first connection + its binding — but DO NOT call reload.
+    let gmail_conn_id = permitlayer_credential::ConnectionId::generate();
+    seal_gmail_credential(port, home.path(), gmail_conn_id);
+    crate::common::seed_connection_and_binding_with_id(
+        home.path(),
+        "openclaw",
+        gmail_conn_id,
+        "google-gmail",
+        "gmail",
+        crate::common::SeedTier::Read,
+        GMAIL_RO_URIS,
+        Some("gmail-read-only"),
+        None,
+    );
+
+    // No reload! The seal handler must have already activated the proxy.
+    let (mcp_status, mcp_body) = http_post(port, "/mcp/gmail", &init_body, &headers);
+    assert_daemon_pid_matches(port, home.path(), daemon_pid); // same daemon — no restart
+    assert_eq!(
+        mcp_status, 200,
+        "the seal alone must activate the proxy (no manual reload): {mcp_body}"
+    );
+    assert!(
+        mcp_body.contains("protocolVersion") && mcp_body.contains("serverInfo"),
+        "initialize response should include MCP server info: {mcp_body}"
+    );
+}
+
+#[test]
 fn unknown_route_returns_json_body() {
     let home = tempfile::tempdir().unwrap();
     std::fs::create_dir_all(home.path().join("config")).unwrap();
