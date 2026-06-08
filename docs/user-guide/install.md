@@ -183,9 +183,12 @@ tiers](connector-tiers.md) for the read-only vs read+write tier model,
 the per-service tool matrix, and the security posture.
 
 > Older docs and CI scripts may still call `agentsso agent register`
-> followed by `agentsso connect <service>`. Those verbs still work,
-> but `quickstart` collapses them into one idempotent command and is
-> the documented entry point.
+> followed by `agentsso connect <service>`. **The `connect` verb was
+> removed in the Epic 11 connection/binding model** — its OAuth + seal
+> flow now lives in `agentsso connection add <connector>`, and
+> `quickstart` collapses register + connect + bind into one idempotent
+> command (the documented entry point). `agent register` still exists for
+> advanced use.
 
 ### Connecting over SSH
 

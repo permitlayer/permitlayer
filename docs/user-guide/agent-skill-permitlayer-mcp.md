@@ -35,6 +35,16 @@ on `127.0.0.1:3820`, namespaced by service:
 
 Bare `/mcp` is not a route — every call goes to a per-service path.
 
+The path segment after `/mcp/` is a **connection selector**, not a fixed
+service name. `gmail`/`calendar`/`drive` work because the first connection
+is named after its service, but a user can connect **multiple accounts of
+the same service** (e.g. work + personal Gmail) as separately-named
+connections and bind the agent to each at its own tier. Address them by
+their distinct names — `/mcp/work-gmail`, `/mcp/personal-gmail` — and the
+selector resolves against your bindings to that specific account's
+credentials. Use the path the user's MCP config snippet gives you per
+connection; don't assume `gmail`.
+
 ## Identity
 
 You hold a single bearer token bound to one policy, minted when an operator

@@ -191,7 +191,7 @@ Workflow:
    and show a "connection refused" error. **That's expected** — this
    host isn't listening, that's the whole point of `--headless`.
 5. Copy the full redirect URL from your browser's address bar.
-6. Paste it into the `agentsso connect` prompt and press Enter.
+6. Paste it into the `agentsso quickstart` prompt and press Enter.
 
 The daemon validates the pasted URL against the redirect URI it
 issued (scheme, host, port, path, and CSRF state must all match)
