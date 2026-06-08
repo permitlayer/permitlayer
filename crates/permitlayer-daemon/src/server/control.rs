@@ -1334,33 +1334,40 @@ pub(crate) async fn reload_handler(
             // Story 7.34 review patch: only warn about an empty directory
             // when it genuinely contains no `.toml` files — not when files
             // exist but simply lack `[[policies]]` tables.
-            let has_toml_files = state.policies_dir.exists()
-                && state.policies_dir.is_dir()
-                && std::fs::read_dir(&state.policies_dir)
+            //
+            // Path-traversal guard: `policies_dir` is a direct child of the
+            // daemon state root; canonicalize + verify containment (against
+            // its parent state root) before the walk so a symlinked
+            // `policies/` is refused, not scanned. `Ok(None)` (dir absent or
+            // not a directory) reuses the existing "no candidate files" path.
+            let scanned_policies_dir = state.policies_dir.parent().and_then(|root| {
+                permitlayer_core::paths::canonical_dir_within_root(&state.policies_dir, root)
                     .ok()
-                    .map(|mut rd| {
-                        rd.any(|e| {
-                            e.ok()
-                                .map(|f| {
-                                    let p = f.path();
-                                    p.extension().map(|ext| ext == "toml").unwrap_or(false)
-                                })
-                                .unwrap_or(false)
-                        })
+                    .flatten()
+            });
+            let has_toml_files = scanned_policies_dir
+                .as_deref()
+                .and_then(|dir| std::fs::read_dir(dir).ok())
+                .map(|mut rd| {
+                    rd.any(|e| {
+                        e.ok()
+                            .map(|f| {
+                                let p = f.path();
+                                p.extension().map(|ext| ext == "toml").unwrap_or(false)
+                            })
+                            .unwrap_or(false)
                     })
-                    .unwrap_or(false);
-            let policy_scan_empty_warning = if state.policies_dir.exists()
-                && state.policies_dir.is_dir()
-                && diff.policies_loaded == 0
-                && !has_toml_files
-            {
-                Some(format!(
-                    "policy directory {} exists but contains no candidate policy files",
-                    policy_scan_path
-                ))
-            } else {
-                None
-            };
+                })
+                .unwrap_or(false);
+            let policy_scan_empty_warning =
+                if scanned_policies_dir.is_some() && diff.policies_loaded == 0 && !has_toml_files {
+                    Some(format!(
+                        "policy directory {} exists but contains no candidate policy files",
+                        policy_scan_path
+                    ))
+                } else {
+                    None
+                };
             let body = ReloadResponse {
                 status: "ok",
                 policies_loaded: diff.policies_loaded,

@@ -1120,7 +1120,24 @@ pub(crate) async fn try_build_proxy_service(
 }
 
 pub(crate) fn vault_has_sealed_credentials(vault_dir: &std::path::Path) -> std::io::Result<bool> {
-    match std::fs::read_dir(vault_dir) {
+    // Path-traversal guard: `vault_dir` is `daemon_state_dir(..).join("vault")`,
+    // a direct child of the daemon state root. Canonicalize and verify it
+    // stays inside that root before walking it — a symlinked `vault/`
+    // pointing elsewhere is refused rather than scanned. A missing dir
+    // resolves to `Ok(None)` → "no credentials" (the prior NotFound case).
+    let Some(parent) = vault_dir.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "vault directory has no parent state root",
+        ));
+    };
+    let canonical_vault =
+        match permitlayer_core::paths::canonical_dir_within_root(vault_dir, parent) {
+            Ok(Some(p)) => p,
+            Ok(None) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+    match std::fs::read_dir(&canonical_vault) {
         Ok(rd) => Ok(rd.filter_map(Result::ok).any(|entry| {
             // Story 7.3 P63: reject non-regular files in the walk.
             let meta = match entry.metadata() {

@@ -6,7 +6,8 @@
 #
 # - the `agent register --json | jq -r .bearer_token` capture pattern,
 # - the `agent register --token-out <path>` 0o600 file write,
-# - the `connect --device-flow --device-flow-timeout` argument grammar,
+# - the `connection add --device-flow --device-flow-timeout` argument
+#   grammar (Epic 11 Story 11.12 replaced the `connect` verb),
 # - the device-flow polling loop (against mockito, not real Google),
 # - the daemon binary's clean boot on macos-14.
 #
@@ -112,12 +113,14 @@ jobs:
       - name: Clap grammar — --device-flow + --headless mutually exclusive
         run: |
           set -euo pipefail
-          # Use a fake (non-existent) oauth client path; clap fires
-          # before file I/O. Status MUST be 2 (clap convention) AND
-          # stderr MUST name the conflicting flag.
+          # Epic 11 (Story 11.12): the `connect` verb was replaced by
+          # `connection add`, which is the new home of the headless /
+          # device-flow OAuth grammar. Use a fake (non-existent) oauth
+          # client path; clap fires before file I/O. Status MUST be 2
+          # (clap convention) AND stderr MUST name the conflicting flag.
           set +e
-          STDERR=$(./target/release/agentsso connect gmail \
-            --agent x --oauth-client /tmp/does-not-exist.json \
+          STDERR=$(./target/release/agentsso connection add gmail \
+            --oauth-client /tmp/does-not-exist.json \
             --device-flow --headless 2>&1)
           STATUS=$?
           set -e
@@ -134,8 +137,8 @@ jobs:
         run: |
           set -euo pipefail
           set +e
-          ./target/release/agentsso connect gmail \
-            --agent x --oauth-client /tmp/does-not-exist.json \
+          ./target/release/agentsso connection add gmail \
+            --oauth-client /tmp/does-not-exist.json \
             --device-flow-timeout 60 2>/dev/null
           STATUS=$?
           set -e
