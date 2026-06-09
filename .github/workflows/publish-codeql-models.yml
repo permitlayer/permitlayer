@@ -1,0 +1,59 @@
+# Publish the permitlayer CodeQL model pack to GHCR.
+#
+# The pack (.github/codeql/permitlayer-models) encodes project-specific
+# sanitizer barriers (models-as-data) so the Rust security queries clear
+# verified false positives AT THE SOURCE while staying live elsewhere —
+# see that directory's README. CodeQL **default setup** consumes the pack
+# at the org level (Settings → Code security → CodeQL model packs), which
+# requires the pack to exist in a registry; this workflow publishes it to
+# `ghcr.io/permitlayer/permitlayer-models`.
+#
+# Re-publishing during model tuning is a `git push` to the pack: bump
+# `version` in qlpack.yml and merge. `codeql pack publish` is a no-op /
+# refuses to overwrite an already-published version, so an unchanged
+# version on an unrelated push does not republish.
+name: Publish CodeQL model pack
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/codeql/permitlayer-models/**'
+      - '.github/workflows/publish-codeql-models.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: publish-codeql-models
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # The CodeQL CLI bundle ships with `codeql pack publish`. Use the
+      # same action the analysis uses so the CLI version tracks the
+      # toolchain. `init` downloads + puts `codeql` on PATH; we run a
+      # throwaway language we don't analyze further (the action requires a
+      # language, but we only need the CLI binary it installs).
+      - name: Set up CodeQL CLI
+        uses: github/codeql-action/init@v4
+        with:
+          languages: actions
+
+      - name: Publish model pack to GHCR
+        run: |
+          set -euo pipefail
+          # `codeql pack publish` pushes to ghcr.io/<scope>/<name> where
+          # <scope> is the pack name's scope (`permitlayer/`). It reads the
+          # github.com Container-registry token from --github-auth-stdin
+          # (here the job's GITHUB_TOKEN, which carries packages:write).
+          printf '%s' "${GITHUB_TOKEN}" \
+            | codeql pack publish --github-auth-stdin .github/codeql/permitlayer-models
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

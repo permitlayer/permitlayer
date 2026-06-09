@@ -545,10 +545,11 @@ fn control_state_endpoint_reports_active_while_killed() {
 }
 
 #[test]
-fn connect_blocked_when_killed() {
-    // Story 7.13: setup → connect rename. The kill-state probe is
-    // ported verbatim into cli/connect.rs and fires the same
-    // `daemon_killed` block + `agentsso resume` remediation.
+fn connection_add_blocked_when_killed() {
+    // Story 11.13: the kill-state probe lives in `cli::oauth_seal` and
+    // fires for `connection add` before any OAuth flow — same
+    // `daemon_killed` block + `agentsso resume` remediation the retired
+    // `connect` verb used.
     let home = tempfile::TempDir::new().unwrap();
     let (child, port) = start_daemon(home.path());
     let _guard = DaemonGuard::new(child);
@@ -560,27 +561,28 @@ fn connect_blocked_when_killed() {
         200
     );
 
-    // Run `agentsso connect gmail --agent me --non-interactive` — it
-    // should be blocked by the kill-state probe before any OAuth flow
-    // starts. The agent name is irrelevant to the probe (which runs
-    // first); the test just needs the args to clap-parse.
-    let out =
-        run_cli(home.path(), port, &["connect", "gmail", "--agent", "me", "--non-interactive"]);
+    // `agentsso connection add google-gmail --name me --non-interactive`
+    // — blocked by the kill-state probe before any OAuth flow starts.
+    let out = run_cli(
+        home.path(),
+        port,
+        &["connection", "add", "google-gmail", "--name", "me", "--non-interactive"],
+    );
     assert_eq!(
         out.status,
         Some(2),
-        "expected connect to exit 2 when daemon killed, got {:?}; stderr={}",
+        "expected connection add to exit 2 when daemon killed, got {:?}; stderr={}",
         out.status,
         out.stderr
     );
     assert!(
         out.stderr.contains("daemon_killed"),
-        "connect stderr missing daemon_killed: {}",
+        "connection add stderr missing daemon_killed: {}",
         out.stderr
     );
     assert!(
         out.stderr.contains("agentsso resume"),
-        "connect stderr missing resume hint: {}",
+        "connection add stderr missing resume hint: {}",
         out.stderr
     );
 }

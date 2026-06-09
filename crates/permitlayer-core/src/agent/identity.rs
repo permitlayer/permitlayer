@@ -112,9 +112,6 @@ fn is_alnum_lower(b: u8) -> bool {
 ///
 /// - `name` — validated identifier. Used as the on-disk filename
 ///   (`agents/<name>.toml`) and the audit-log `agent_id` field.
-/// - `policy_name` — the policy this agent is bound to. NOT validated
-///   against the active `PolicySet` here — that check happens at
-///   register time in the daemon control handler.
 /// - `token_hash` — Argon2id PHC string from `argon2::PasswordHasher`.
 ///   At-rest defense for the on-disk file.
 /// - `lookup_key_hex` — 64-char hex (32 bytes) HMAC-SHA-256 output.
@@ -133,8 +130,6 @@ fn is_alnum_lower(b: u8) -> bool {
 pub struct AgentIdentity {
     /// Validated agent name (path-traversal-safe).
     name: String,
-    /// Policy this agent is bound to.
-    pub policy_name: String,
     /// Argon2id PHC-string hash of the bearer token. The salt is
     /// embedded in the PHC string per RFC 9106 § 4.
     pub token_hash: String,
@@ -168,14 +163,13 @@ impl AgentIdentity {
     /// allowlist.
     pub fn new(
         name: String,
-        policy_name: String,
         token_hash: String,
         lookup_key_hex: String,
         created_at: DateTime<Utc>,
         last_seen_at: Option<DateTime<Utc>>,
     ) -> Result<Self, AgentNameError> {
         validate_agent_name(&name)?;
-        Ok(Self { name, policy_name, token_hash, lookup_key_hex, created_at, last_seen_at })
+        Ok(Self { name, token_hash, lookup_key_hex, created_at, last_seen_at })
     }
 }
 
@@ -186,7 +180,6 @@ impl AgentIdentity {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentIdentityRaw {
     pub name: String,
-    pub policy_name: String,
     pub token_hash: String,
     pub lookup_key_hex: String,
     pub created_at: DateTime<Utc>,
@@ -204,7 +197,6 @@ impl AgentIdentityRaw {
     pub fn into_validated(self) -> Result<AgentIdentity, AgentNameError> {
         AgentIdentity::new(
             self.name,
-            self.policy_name,
             self.token_hash,
             self.lookup_key_hex,
             self.created_at,
@@ -217,7 +209,6 @@ impl From<AgentIdentity> for AgentIdentityRaw {
     fn from(v: AgentIdentity) -> Self {
         Self {
             name: v.name,
-            policy_name: v.policy_name,
             token_hash: v.token_hash,
             lookup_key_hex: v.lookup_key_hex,
             created_at: v.created_at,
@@ -242,7 +233,6 @@ mod tests {
     fn fake_identity(name: &str) -> AgentIdentity {
         AgentIdentity::new(
             name.to_owned(),
-            "default".to_owned(),
             "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".to_owned(),
             "0".repeat(64),
             Utc::now(),
@@ -305,7 +295,6 @@ mod tests {
     fn agent_identity_constructor_validates_name() {
         let bad = AgentIdentity::new(
             "Bad-Name".to_owned(),
-            "default".to_owned(),
             "h".to_owned(),
             "0".repeat(64),
             Utc::now(),
@@ -320,7 +309,10 @@ mod tests {
         let toml_str = toml::to_string_pretty(&original).unwrap();
         let parsed: AgentIdentity = toml::from_str(&toml_str).unwrap();
         assert_eq!(parsed.name(), "email-triage");
-        assert_eq!(parsed.policy_name, "default");
+        assert_eq!(parsed.token_hash, original.token_hash);
+        // Story 11.9: policy_name is gone — an agent's authority is its
+        // set of bindings, not a single policy field.
+        assert!(!toml_str.contains("policy_name"));
     }
 
     #[test]
@@ -329,7 +321,6 @@ mod tests {
         // try_from gate refuses it.
         let toml_str = r#"
 name = "Bad-Name"
-policy_name = "default"
 token_hash = "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA"
 lookup_key_hex = "0000000000000000000000000000000000000000000000000000000000000000"
 created_at = "2026-04-12T00:00:00Z"

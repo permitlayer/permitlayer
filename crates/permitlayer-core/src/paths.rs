@@ -266,6 +266,17 @@ pub fn plugins_dir(home_override: Option<&Path>) -> PathBuf {
     daemon_state_dir(home_override).join("plugins")
 }
 
+/// Connectors directory — host-installed connector definitions
+/// (Epic 11). Each host-installed connector lives under
+/// `connectors/<id>/connector.toml` and is discovered + validated by
+/// `permitlayer_connectors::ConnectorRegistry` at boot (and on
+/// `ArcSwap` reload) with no recompile (FR89). Built-in connectors
+/// are embedded in the binary and do NOT live here. The directory's
+/// absence is normal (a system with no host-installed connectors).
+pub fn connectors_dir(home_override: Option<&Path>) -> PathBuf {
+    daemon_state_dir(home_override).join("connectors")
+}
+
 /// Media directory — transient store for decoded inbound attachments
 /// (e.g. Gmail attachment bytes the proxy materializes so the MCP agent
 /// can read them by local path). Per-agent subdirs live below this.
@@ -296,6 +307,63 @@ pub fn audit_log_path(home_override: Option<&Path>) -> PathBuf {
 #[cfg(not(target_os = "macos"))]
 fn legacy_dot_agentsso() -> PathBuf {
     dirs::home_dir().map(|h| h.join(".agentsso")).unwrap_or_else(|| PathBuf::from(".agentsso"))
+}
+
+/// Canonicalize `dir` and confirm it resolves *inside* `trusted_root`
+/// before any filesystem walk.
+///
+/// Every directory the daemon scans at runtime — `vault/`, `policies/`,
+/// `policies-managed/`, `connectors/` — is built as
+/// `daemon_state_dir(..).join(<literal>)`, i.e. a direct child of the
+/// daemon state root, so callers pass that state root (the scanned dir's
+/// parent) as `trusted_root`. This guard makes the "stays inside the
+/// state root" invariant **locally provable at the read site** instead
+/// of resting on a whole-program argument: it canonicalizes both paths
+/// (resolving symlinks and `..`) and rejects a candidate that escapes
+/// the root. That is genuine defense-in-depth — a symlink at
+/// `<state>/vault` pointing at `/etc` canonicalizes outside the root and
+/// is refused rather than walked — and it is the validation step the
+/// path-traversal lints look for before a `read_dir`/walk on a derived
+/// path.
+///
+/// Returns:
+/// - `Ok(Some(canonical_dir))` when `dir` exists, is a directory, and
+///   canonicalizes to a path at or under `trusted_root` — caller may
+///   walk the returned canonical path.
+/// - `Ok(None)` when `dir` does not exist or is not a directory (a
+///   normal, non-error condition — e.g. an empty install with no vault
+///   yet). Callers treat this as "nothing to scan".
+/// - `Err(_)` on a genuine I/O error during canonicalization, or
+///   `ErrorKind::InvalidInput` if the canonical path escapes
+///   `trusted_root` (the security-relevant rejection).
+pub fn canonical_dir_within_root(
+    dir: &Path,
+    trusted_root: &Path,
+) -> std::io::Result<Option<PathBuf>> {
+    if !dir.is_dir() {
+        // Missing / not-a-dir is a normal "nothing to scan" outcome, not
+        // an error — mirrors the prior `.exists() && .is_dir()` guards.
+        return Ok(None);
+    }
+    let canonical = std::fs::canonicalize(dir)?;
+    // The root may itself be a symlink (e.g. a test tempdir on macOS,
+    // where `/tmp` → `/private/tmp`); canonicalize it too so the
+    // containment check compares like with like. If the root cannot be
+    // canonicalized (it does not exist), the candidate cannot be proven
+    // under it, so reject.
+    let canonical_root = std::fs::canonicalize(trusted_root)?;
+    if canonical == canonical_root || canonical.starts_with(&canonical_root) {
+        Ok(Some(canonical))
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "refusing to scan {}: resolves outside the trusted root {}",
+                canonical.display(),
+                canonical_root.display()
+            ),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -385,5 +453,61 @@ mod tests {
             state.file_name().expect("daemon_state_dir must have a final component"),
             ".agentsso"
         );
+    }
+
+    #[test]
+    fn canonical_dir_within_root_accepts_child_of_root() {
+        let root = tempfile::tempdir().unwrap();
+        let child = root.path().join("vault");
+        std::fs::create_dir(&child).unwrap();
+        let got = canonical_dir_within_root(&child, root.path()).unwrap();
+        // Returns the canonical child path for the caller to walk.
+        assert_eq!(got, Some(std::fs::canonicalize(&child).unwrap()));
+    }
+
+    #[test]
+    fn canonical_dir_within_root_missing_dir_is_ok_none() {
+        let root = tempfile::tempdir().unwrap();
+        let absent = root.path().join("vault");
+        assert_eq!(canonical_dir_within_root(&absent, root.path()).unwrap(), None);
+    }
+
+    #[test]
+    fn canonical_dir_within_root_file_is_ok_none() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("vault");
+        std::fs::write(&file, b"not a dir").unwrap();
+        assert_eq!(canonical_dir_within_root(&file, root.path()).unwrap(), None);
+    }
+
+    // The security-relevant case: a symlinked subdir that escapes the
+    // trusted root must be REFUSED, not walked. Unix-only (symlink + the
+    // semantics the guard defends).
+    #[cfg(unix)]
+    #[test]
+    fn canonical_dir_within_root_rejects_symlink_escaping_root() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        // `<root>/vault` → `<outside>` (an escape).
+        let link = root.path().join("vault");
+        std::os::unix::fs::symlink(outside.path(), &link).unwrap();
+
+        let err = canonical_dir_within_root(&link, root.path())
+            .expect_err("a symlink escaping the root must be rejected");
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+    }
+
+    // A symlink that stays INSIDE the root is fine (canonicalizes under it).
+    #[cfg(unix)]
+    #[test]
+    fn canonical_dir_within_root_allows_symlink_inside_root() {
+        let root = tempfile::tempdir().unwrap();
+        let real = root.path().join("real-vault");
+        std::fs::create_dir(&real).unwrap();
+        let link = root.path().join("vault");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let got = canonical_dir_within_root(&link, root.path()).unwrap();
+        assert_eq!(got, Some(std::fs::canonicalize(&real).unwrap()));
     }
 }

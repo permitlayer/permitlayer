@@ -46,15 +46,14 @@ use axum::routing::{get, post};
 use permitlayer_core::audit::event::AuditEvent;
 use permitlayer_core::scrub::{ScrubEngine, builtin_rules};
 use permitlayer_core::store::{AuditStore, CredentialStore, StoreError};
-use permitlayer_credential::{OAuthRefreshToken, OAuthToken, SealedCredential};
-use permitlayer_oauth::{CredentialMeta, OAuthClient};
+use permitlayer_credential::{ConnectionId, OAuthRefreshToken, OAuthToken, SealedCredential, Slot};
+use permitlayer_oauth::OAuthClient;
 use permitlayer_proxy::request::ProxyRequest;
 use permitlayer_proxy::service::ProxyService;
 use permitlayer_proxy::token::ScopedTokenIssuer;
 use permitlayer_proxy::upstream::UpstreamClient;
 use permitlayer_vault::Vault;
 use tempfile::TempDir;
-use url::Url;
 use zeroize::Zeroizing;
 
 // ---------------------------------------------------------------------------
@@ -87,16 +86,23 @@ fn test_token_issuer() -> ScopedTokenIssuer {
 // ---------------------------------------------------------------------------
 
 struct PersistentMockCredentialStore {
-    /// Maps service key → raw token bytes (access tokens and refresh
-    /// tokens stored uniformly; callers distinguish by key naming
-    /// convention `{service}` vs `{service}-refresh`).
+    /// Maps `(ConnectionId bytes, Slot byte)` → raw token bytes. Story 11.9
+    /// re-keyed the store on `(ConnectionId, Slot)`; the seed helpers and
+    /// `get_raw` translate a legacy service-key string (`gmail`,
+    /// `gmail-refresh`) into that key via the legacy connection-id derivation
+    /// (these tests wire no binding stores), so the store round-trips with the
+    /// proxy/refresh request paths.
     ///
     /// Using raw bytes rather than `SealedCredential` because the
     /// sealed blob type is not `Clone` and the test fixtures need to
     /// read the same credential multiple times.
-    services: Mutex<HashMap<String, Vec<u8>>>,
+    services: Mutex<CredMap>,
     master_key: [u8; 32],
 }
+
+/// Test-store map: `(connection_id_bytes, slot_byte)` → raw sealed-envelope
+/// bytes. Aliased to keep `clippy::type_complexity` quiet on the field.
+type CredMap = HashMap<([u8; 16], u8), Vec<u8>>;
 
 impl PersistentMockCredentialStore {
     fn new(master_key: [u8; 32]) -> Self {
@@ -104,80 +110,94 @@ impl PersistentMockCredentialStore {
     }
 
     fn seed_access_token(&self, service: &str, token_bytes: &[u8]) {
-        self.services.lock().unwrap().insert(service.to_owned(), token_bytes.to_vec());
+        let connection = crate::common::legacy_connection_id_for_service(service);
+        self.services
+            .lock()
+            .unwrap()
+            .insert((*connection.as_bytes(), Slot::Access.slot_byte()), token_bytes.to_vec());
     }
 
     fn seed_refresh_token(&self, service: &str, token_bytes: &[u8]) {
-        self.services.lock().unwrap().insert(format!("{service}-refresh"), token_bytes.to_vec());
+        let connection = crate::common::legacy_connection_id_for_service(service);
+        self.services
+            .lock()
+            .unwrap()
+            .insert((*connection.as_bytes(), Slot::Refresh.slot_byte()), token_bytes.to_vec());
     }
 
+    /// Read the raw stored bytes for a legacy service-key string
+    /// (`gmail`, `gmail-refresh`, `gmail-client`) by decomposing it into
+    /// the `(ConnectionId, Slot)` storage key via the legacy derivation.
     fn get_raw(&self, key: &str) -> Option<Vec<u8>> {
-        self.services.lock().unwrap().get(key).cloned()
+        let (connection, slot) = crate::common::legacy_connection_slot_for_service_key(key);
+        self.services.lock().unwrap().get(&(*connection.as_bytes(), slot.slot_byte())).cloned()
     }
 }
 
 #[async_trait::async_trait]
 impl CredentialStore for PersistentMockCredentialStore {
-    async fn put(&self, service: &str, sealed: SealedCredential) -> Result<(), StoreError> {
+    async fn put(
+        &self,
+        id: ConnectionId,
+        slot: Slot,
+        sealed: SealedCredential,
+    ) -> Result<(), StoreError> {
         // Unseal the incoming blob so we can store the raw bytes (to
         // support re-sealing on subsequent get() calls). This mirrors
         // how a real filesystem store would persist the sealed envelope
         // and re-hand it out on read.
         //
-        // Dispatch on the key-name convention: `{service}-refresh`
-        // carries a refresh token sealed via `vault.seal_refresh`,
-        // everything else is an access token sealed via `vault.seal`.
-        // The matching `get()` path below uses the same dispatch, so
-        // production code that accidentally sealed a refresh token
-        // with `vault.seal()` (or vice versa) produces a crypto error
-        // here instead of silently "working" via fallback — which was
-        // the mock's prior behavior and masked exactly that class of
-        // bug.
+        // Dispatch on the slot: `Slot::Refresh` carries a refresh token
+        // sealed via `vault.seal_refresh`, everything else is an access
+        // token sealed via `vault.seal`. The matching `get()` path below
+        // uses the same dispatch, so production code that accidentally
+        // sealed a refresh token with `vault.seal()` (or vice versa)
+        // produces a crypto error here instead of silently "working".
         let vault = Vault::new(Zeroizing::new(self.master_key), 0);
-        let bytes = if service.ends_with("-refresh") {
+        let bytes = if slot == Slot::Refresh {
             vault
-                .unseal_refresh(service, &sealed)
+                .unseal_refresh(id, slot, &sealed)
                 .map(|refresh| refresh.reveal().to_vec())
                 .map_err(|e| {
                     StoreError::IoError(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
                         format!(
-                            "mock store: unseal_refresh failed for '{service}' \
+                            "mock store: unseal_refresh failed for {id:?}/{slot:?} \
                              (did production code call vault.seal() instead of \
                              vault.seal_refresh()?): {e}"
                         ),
                     ))
                 })?
         } else {
-            vault.unseal(service, &sealed).map(|access| access.reveal().to_vec()).map_err(|e| {
+            vault.unseal(id, slot, &sealed).map(|access| access.reveal().to_vec()).map_err(|e| {
                 StoreError::IoError(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     format!(
-                        "mock store: unseal failed for '{service}' \
+                        "mock store: unseal failed for {id:?}/{slot:?} \
                          (did production code call vault.seal_refresh() instead of \
                          vault.seal()?): {e}"
                     ),
                 ))
             })?
         };
-        self.services.lock().unwrap().insert(service.to_owned(), bytes);
+        self.services.lock().unwrap().insert((*id.as_bytes(), slot.slot_byte()), bytes);
         Ok(())
     }
 
-    async fn get(&self, service: &str) -> Result<Option<SealedCredential>, StoreError> {
-        let bytes = match self.services.lock().unwrap().get(service).cloned() {
-            Some(b) => b,
+    async fn get(
+        &self,
+        id: ConnectionId,
+        slot: Slot,
+    ) -> Result<Option<SealedCredential>, StoreError> {
+        let bytes = match self.services.lock().unwrap().get(&(*id.as_bytes(), slot.slot_byte())) {
+            Some(b) => b.clone(),
             None => return Ok(None),
         };
         let vault = Vault::new(Zeroizing::new(self.master_key), 0);
-        // Same access-vs-refresh heuristic as in put: try the access
-        // variant first, fall back to refresh. The service-name suffix
-        // `-refresh` tells us which sealing function to use at call
-        // time, but we keep the logic identical across both paths to
-        // keep the mock simple.
-        let sealed = if service.ends_with("-refresh") {
+        // Same access-vs-refresh dispatch as in put, on the slot.
+        let sealed = if slot == Slot::Refresh {
             let token = OAuthRefreshToken::from_trusted_bytes(bytes);
-            vault.seal_refresh(service, &token).map_err(|_| {
+            vault.seal_refresh(id, slot, &token).map_err(|_| {
                 StoreError::IoError(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "mock store: seal_refresh failed",
@@ -185,7 +205,7 @@ impl CredentialStore for PersistentMockCredentialStore {
             })?
         } else {
             let token = OAuthToken::from_trusted_bytes(bytes);
-            vault.seal(service, &token).map_err(|_| {
+            vault.seal(id, slot, &token).map_err(|_| {
                 StoreError::IoError(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
                     "mock store: seal failed",
@@ -194,8 +214,17 @@ impl CredentialStore for PersistentMockCredentialStore {
         };
         Ok(Some(sealed))
     }
-    async fn list_services(&self) -> Result<Vec<String>, StoreError> {
-        Ok(self.services.lock().unwrap().keys().cloned().collect())
+    async fn list_connections(&self) -> Result<Vec<ConnectionId>, StoreError> {
+        Ok(self
+            .services
+            .lock()
+            .unwrap()
+            .keys()
+            .map(|(id_bytes, _slot)| ConnectionId::from_bytes(*id_bytes))
+            .collect())
+    }
+    async fn remove(&self, _id: ConnectionId, _slot: Slot) -> Result<bool, StoreError> {
+        Ok(false)
     }
 }
 
@@ -438,23 +467,12 @@ async fn make_test_service_full(
         spawn_mock_upstream_with_stale_bearer(upstream_responses, reject_bearer).await;
     let (oauth_url, oauth_state) = spawn_mock_oauth(oauth_behavior).await;
 
-    // Create a tempdir to serve as vault_dir and write a shared-casa
-    // meta file. This is defense in depth — the oauth_client_overrides
-    // map we inject takes precedence over metadata reads for the
-    // override path, but a valid meta file means any unintended
-    // fallthrough produces a useful error instead of a cryptic one.
+    // The refresh path resolves the OAuth client via the injected
+    // `oauth_client_overrides` map (set on the ProxyService below), so no
+    // on-disk provenance file is needed. (The pre-Epic-11 `-meta.json`
+    // "defense in depth" write was removed with the meta scheme in Story
+    // 11.16 — the override path never reads it.)
     let tempdir = TempDir::new().expect("tempdir");
-    let meta = CredentialMeta {
-        client_type: "shared-casa".to_owned(),
-        client_source: None,
-        client_sealed: false,
-        connected_at: "2026-04-09T12:00:00Z".to_owned(),
-        last_refreshed_at: None,
-        scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".to_owned()],
-        expires_in_secs: Some(3600),
-    };
-    let meta_path = tempdir.path().join(format!("{service_name}-meta.json"));
-    std::fs::write(&meta_path, serde_json::to_string(&meta).unwrap()).expect("write meta");
 
     // Build the persistent credential store and seed tokens.
     let cred_store = Arc::new(PersistentMockCredentialStore::new(TEST_MASTER_KEY));
@@ -476,14 +494,15 @@ async fn make_test_service_full(
         .expect("build mock oauth client"),
     );
 
-    // Build the upstream client pointing at the mock upstream.
-    let mut base_urls = HashMap::new();
-    base_urls.insert(
-        service_name.to_owned(),
-        Url::parse(&format!("{upstream_url}/")).expect("parse upstream url"),
-    );
+    // Build the upstream client pointing at the mock upstream. Use a
+    // default reqwest client (no connect/request timeout) via
+    // `from_client` — the `start_paused = true` tests virtualize the
+    // tokio clock, so `new()`'s real 10s connect timeout would fire at
+    // virtual-time zero and misclassify the OAuth-exhaustion path.
     let reqwest_client = reqwest::Client::builder().build().expect("build reqwest client");
-    let upstream_client = Arc::new(UpstreamClient::with_client_and_urls(reqwest_client, base_urls));
+    let upstream_client = Arc::new(UpstreamClient::from_client(reqwest_client));
+    let connectors =
+        super::common::connector_registry_with(&[(service_name, &format!("{upstream_url}/"))]);
 
     // Assemble the ProxyService with the OAuth override map.
     let mut overrides = HashMap::new();
@@ -495,6 +514,7 @@ async fn make_test_service_full(
         Arc::new(test_vault()),
         Arc::new(test_token_issuer()),
         upstream_client,
+        connectors,
         Arc::clone(&audit_store) as Arc<dyn AuditStore>,
         test_scrub_engine(),
         tempdir.path().to_path_buf(),

@@ -14,24 +14,35 @@
 //! compile time by `tests/compile_fail.rs` + `trybuild`, which proves
 //! the trait rejects plaintext types.
 
+pub mod binding;
+pub mod connection;
 pub mod error;
 pub mod fs;
 #[cfg(any(test, feature = "test-seam"))]
 pub mod test_seams;
 pub mod validate;
 
-use permitlayer_credential::SealedCredential;
+use permitlayer_credential::{ConnectionId, SealedCredential, Slot};
 
 use crate::agent::AgentIdentity;
 use crate::audit::event::AuditEvent;
 
+pub use binding::{Binding, BindingStore};
+pub use connection::{
+    AccountHint, ConnectionRecord, ConnectionStatus, ConnectionStore, ConnectionTier,
+};
 pub use error::{EnvelopeParseError, StoreError};
 pub use validate::validate_service_name;
 
-/// Persist sealed credentials keyed by service name.
+/// Persist sealed credentials keyed by `(ConnectionId, Slot)` (Story 11.9).
+///
+/// The key matches the vault's v2 keying domain (Story 11.8): each
+/// connection's `Access`/`Refresh`/`Client` material is a distinct entry.
+/// On-disk the adapter names files `<connection_id>-<slot>.sealed`, so no
+/// caller-supplied string ever becomes a path component — the id is a
+/// machine-generated ULID and the slot is a fixed label.
 ///
 /// Implementations MUST:
-/// - validate `service` via `validate_service_name` before any I/O
 /// - write atomically (tempfile → fsync → rename → fsync parent dir)
 /// - set restrictive filesystem permissions (0o600 on Unix)
 /// - return `Ok(None)` from `get` when no entry exists
@@ -40,33 +51,49 @@ pub use validate::validate_service_name;
 /// blocking worker via `tokio::task::spawn_blocking`.
 #[async_trait::async_trait]
 pub trait CredentialStore: Send + Sync {
-    /// Store a sealed credential. Overwrites any existing entry for the
-    /// same service via atomic swap — callers see either the old value
-    /// or the new value, never a partial write.
-    async fn put(&self, service: &str, sealed: SealedCredential) -> Result<(), StoreError>;
+    /// Store a sealed credential for `(id, slot)`. Overwrites any existing
+    /// entry via atomic swap — callers see either the old value or the new
+    /// value, never a partial write.
+    async fn put(
+        &self,
+        id: ConnectionId,
+        slot: Slot,
+        sealed: SealedCredential,
+    ) -> Result<(), StoreError>;
 
-    /// Retrieve a sealed credential. Returns `Ok(None)` if no entry
-    /// exists for this service.
-    async fn get(&self, service: &str) -> Result<Option<SealedCredential>, StoreError>;
+    /// Retrieve the sealed credential for `(id, slot)`. Returns `Ok(None)`
+    /// if no entry exists.
+    async fn get(
+        &self,
+        id: ConnectionId,
+        slot: Slot,
+    ) -> Result<Option<SealedCredential>, StoreError>;
 
-    /// Enumerate every service for which a sealed credential is
-    /// persisted. Returns service names (not paths) — callers that need
-    /// the full envelope follow up with [`Self::get`].
+    /// Enumerate every distinct `ConnectionId` for which at least one
+    /// sealed slot is persisted (deduped across slots). Callers that need
+    /// a specific slot's envelope follow up with [`Self::get`].
     ///
     /// Implementations MUST:
     /// - Skip dotfiles, editor lockfiles (`#name#`), tempfiles
-    ///   (`*.tmp.*`), and any non-regular file (symlinks, FIFOs).
-    /// - Validate each candidate name via `validate_service_name` and
-    ///   skip-and-warn on any invalid name (mirrors
+    ///   (`*.tmp.*`), the rotation marker, and any non-regular file
+    ///   (symlinks, FIFOs).
+    /// - Skip-and-warn on any `<ulid>-<slot>.sealed` filename whose ULID
+    ///   prefix or slot label fails to parse (mirrors
     ///   `AgentIdentityStore::list` posture).
-    /// - Tolerate the vault directory being absent — return
-    ///   `Ok(vec![])`.
-    /// - NOT promise any particular order. Callers that need
-    ///   determinism must sort.
+    /// - Tolerate the vault directory being absent — return `Ok(vec![])`.
+    /// - NOT promise any particular order. Callers that need determinism
+    ///   must sort.
     ///
-    /// Used by Story 7.6 (`agentsso rotate-key`) to enumerate every
-    /// vault entry that needs re-encryption under a fresh master key.
-    async fn list_services(&self) -> Result<Vec<String>, StoreError>;
+    /// Used by Story 7.6 (`agentsso rotate-key`) to enumerate every vault
+    /// entry that needs re-encryption under a fresh master key, and by
+    /// `connection list` (Story 11.13).
+    async fn list_connections(&self) -> Result<Vec<ConnectionId>, StoreError>;
+
+    /// Remove the sealed credential for `(id, slot)`. Returns `Ok(true)` if
+    /// a sealed envelope was deleted, `Ok(false)` if none existed (absence
+    /// is not an error). Used by `connection revoke` (Story 11.13) to drop
+    /// every sealed slot of a revoked connection.
+    async fn remove(&self, id: ConnectionId, slot: Slot) -> Result<bool, StoreError>;
 }
 
 /// Append audit events to a durable log.
@@ -155,42 +182,4 @@ pub trait AgentIdentityStore: Send + Sync {
         new_lookup_key_hex: String,
         new_token_hash: String,
     ) -> Result<bool, StoreError>;
-
-    /// Atomically rewrite ONLY the `lookup_key_hex` field of an
-    /// existing agent. Used by the Story 7.22 auto-recovery rotation
-    /// (macOS keychain-ACL break recovery) to recompute every agent's
-    /// HMAC lookup-key off the new master subkey WITHOUT minting a
-    /// fresh bearer token. Operator-held tokens stay valid across the
-    /// binary swap; only the on-disk lookup-key is refreshed.
-    ///
-    /// Implementations MUST:
-    /// - validate `name` via `agent::validate_agent_name` and surface
-    ///   [`StoreError::InvalidAgentName`] on failure
-    /// - mirror `put`'s atomic-write discipline (tempfile → fsync →
-    /// Atomically rewrite ONLY the `policy_name` field of an existing
-    /// agent. Used by `agentsso agent rebind` (Story 7.11) to extend
-    /// or change an agent's policy binding WITHOUT rotating its bearer
-    /// token. The agent's identity (`name`, `token_hash`, `lookup_key_hex`,
-    /// `created_at`, `last_seen_at`) is preserved verbatim.
-    ///
-    /// Implementations MUST:
-    /// - validate `name` via `agent::validate_agent_name` and surface
-    ///   [`StoreError::InvalidAgentName`] on failure
-    /// - mirror `put`'s atomic-write discipline (tempfile → fsync →
-    ///   rename → fsync parent dir; mode `0o600` on Unix in `0o700`
-    ///   parent dir)
-    /// - return `Ok(false)` if no agent with that name exists
-    /// - return `Ok(true)` on a successful rewrite
-    /// - NOT validate `new_policy_name` against any policy registry —
-    ///   the store layer is policy-agnostic. Policy existence MUST be
-    ///   verified by the caller (the daemon control-plane handler)
-    ///   BEFORE invoking this method.
-    ///
-    /// **Why a dedicated 1-field method:** rebind must NEVER mutate
-    /// the token-bearing fields (`token_hash`, `lookup_key_hex`). A
-    /// typed method makes that invariant a compiler-checked property
-    /// (see `update_lookup_key_and_token` for the symmetric posture).
-    /// See `architecture.md` §"Authentication & Security" → "Bearer
-    /// token immutability across policy rebind".
-    async fn update_policy(&self, name: &str, new_policy_name: String) -> Result<bool, StoreError>;
 }

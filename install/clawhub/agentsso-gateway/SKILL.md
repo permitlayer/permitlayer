@@ -1,7 +1,7 @@
 ---
 name: agentsso-gateway
 description: "Stop your OpenClaw agent from leaking credentials. Wraps Gmail/Calendar/Drive access through a local permitlayer daemon with policy enforcement, audit logging, and one-key kill switch."
-version: 1.1.0
+version: 1.2.0
 metadata:
   openclaw:
     requires:
@@ -60,6 +60,28 @@ namespaced by service:
 - `http://127.0.0.1:3820/mcp/drive`
 
 (Bare `/mcp` is **not** a route — every call goes to a per-service path.)
+
+### Multiple accounts of the same service
+
+The path segment after `/mcp/` is a **connection selector**, not a fixed
+service name. `gmail`/`calendar`/`drive` work because the user's first
+connection is named after its service — but the user can connect **more
+than one account of the same service** (e.g. a personal and a work Gmail),
+each as a separately-named connection. The agent is then bound to each at
+its own access tier, and you address them by their distinct names:
+
+- `http://127.0.0.1:3820/mcp/work-gmail`
+- `http://127.0.0.1:3820/mcp/personal-gmail`
+
+The selector resolves against **your** bindings (by alias, then connection
+name) and routes to that specific account's credentials — so the same
+bearer reaching `/mcp/work-gmail` vs `/mcp/personal-gmail` hits two
+different mailboxes, and each can carry a different tier (e.g. work =
+read-write, personal = read-only). When the user has only one account of a
+service, the service-named path is exactly that one connection; nothing
+changes for the single-account case. The MCP config snippet the user gives
+you names the right path per connection — use the path you were given;
+don't assume `gmail`.
 
 You do **not** set HTTP headers by hand. When the user ran
 `agentsso quickstart <service> --mcp-config-out <path>`, it emitted an MCP

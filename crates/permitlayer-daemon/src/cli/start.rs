@@ -393,27 +393,26 @@ async fn route_not_found_handler(request: Request) -> Response {
     )
 }
 
+/// Map of selector → resolved connector MCP service, swapped atomically
+/// when the proxy (re)activates. Keyed by the route selector vocabulary
+/// (bare service name, e.g. `gmail`).
+type ConnectorServiceMap =
+    std::collections::BTreeMap<String, Arc<permitlayer_proxy::transport::mcp::ConnectorMcpService>>;
+
 #[derive(Clone)]
 pub(crate) struct ProxyRouteSlots {
     proxy: Arc<ArcSwapOption<permitlayer_proxy::ProxyService>>,
-    gmail_mcp: Arc<ArcSwapOption<permitlayer_proxy::transport::mcp::GmailMcpService>>,
-    calendar_mcp: Arc<ArcSwapOption<permitlayer_proxy::transport::mcp::CalendarMcpService>>,
-    drive_mcp: Arc<ArcSwapOption<permitlayer_proxy::transport::mcp::DriveMcpService>>,
+    /// Story 11.4: one generic connector-service map replacing the three
+    /// per-service `ArcSwapOption` slots. The dynamic `/mcp/{selector}`
+    /// route resolves a selector against this map.
+    connectors: Arc<arc_swap::ArcSwap<ConnectorServiceMap>>,
 }
 
 impl ProxyRouteSlots {
     pub(crate) fn new(proxy: Option<&Arc<permitlayer_proxy::ProxyService>>) -> Self {
         let slots = Self {
             proxy: Arc::new(ArcSwapOption::from(None::<Arc<permitlayer_proxy::ProxyService>>)),
-            gmail_mcp: Arc::new(ArcSwapOption::from(
-                None::<Arc<permitlayer_proxy::transport::mcp::GmailMcpService>>,
-            )),
-            calendar_mcp: Arc::new(ArcSwapOption::from(
-                None::<Arc<permitlayer_proxy::transport::mcp::CalendarMcpService>>,
-            )),
-            drive_mcp: Arc::new(ArcSwapOption::from(
-                None::<Arc<permitlayer_proxy::transport::mcp::DriveMcpService>>,
-            )),
+            connectors: Arc::new(arc_swap::ArcSwap::from_pointee(ConnectorServiceMap::new())),
         };
         if let Some(proxy) = proxy {
             slots.activate(Arc::clone(proxy));
@@ -422,13 +421,21 @@ impl ProxyRouteSlots {
     }
 
     pub(crate) fn activate(&self, proxy: Arc<permitlayer_proxy::ProxyService>) {
-        let gmail = permitlayer_proxy::transport::mcp::mcp_service(Arc::clone(&proxy));
-        let calendar = permitlayer_proxy::transport::mcp::calendar_mcp_service(Arc::clone(&proxy));
-        let drive = permitlayer_proxy::transport::mcp::drive_mcp_service(Arc::clone(&proxy));
+        use permitlayer_proxy::transport::mcp::{connector_mcp_service, selector_to_connector_id};
 
-        self.gmail_mcp.store(Some(Arc::new(gmail)));
-        self.calendar_mcp.store(Some(Arc::new(calendar)));
-        self.drive_mcp.store(Some(Arc::new(drive)));
+        // Build the built-in connector services under their route
+        // selectors. Host-installed connectors gain entries here with the
+        // declarative-passthrough story; `connector_mcp_service` returns
+        // None for any non-built-in id today.
+        let mut map = ConnectorServiceMap::new();
+        for selector in ["gmail", "calendar", "drive"] {
+            if let Some(id) = selector_to_connector_id(selector)
+                && let Some(svc) = connector_mcp_service(id, Arc::clone(&proxy))
+            {
+                map.insert(selector.to_owned(), Arc::new(svc));
+            }
+        }
+        self.connectors.store(Arc::new(map));
         self.proxy.store(Some(proxy));
     }
 }
@@ -442,32 +449,19 @@ pub(crate) struct ProxyActivationContext {
     pub routes: ProxyRouteSlots,
 }
 
-async fn dynamic_gmail_mcp_handler(
-    slot: Arc<ArcSwapOption<permitlayer_proxy::transport::mcp::GmailMcpService>>,
+/// Story 11.4: the single dynamic connector-MCP route handler. Resolves
+/// `{selector}` against the activated connector-service map and forwards
+/// to the matching service. An unknown selector (or a connector not yet
+/// activated) falls through to `not_implemented_handler` — MCP
+/// not-found, never a panic. This is also the host-installed stub
+/// surface (a non-built-in selector resolves to no service today).
+async fn dynamic_connector_mcp_handler(
+    connectors: Arc<arc_swap::ArcSwap<ConnectorServiceMap>>,
+    Path(selector): Path<String>,
     request: Request,
 ) -> Response {
-    match slot.load_full() {
-        Some(service) => service.handle(request).await.into_response(),
-        None => not_implemented_handler(request).await,
-    }
-}
-
-async fn dynamic_calendar_mcp_handler(
-    slot: Arc<ArcSwapOption<permitlayer_proxy::transport::mcp::CalendarMcpService>>,
-    request: Request,
-) -> Response {
-    match slot.load_full() {
-        Some(service) => service.handle(request).await.into_response(),
-        None => not_implemented_handler(request).await,
-    }
-}
-
-async fn dynamic_drive_mcp_handler(
-    slot: Arc<ArcSwapOption<permitlayer_proxy::transport::mcp::DriveMcpService>>,
-    request: Request,
-) -> Response {
-    match slot.load_full() {
-        Some(service) => service.handle(request).await.into_response(),
+    match connectors.load().get(&selector) {
+        Some(service) => service.handle(request).await,
         None => not_implemented_handler(request).await,
     }
 }
@@ -1069,22 +1063,81 @@ pub(crate) async fn try_build_proxy_service(
         }
     };
 
-    Some(Arc::new(permitlayer_proxy::ProxyService::new(
-        credential_store,
-        vault,
-        token_issuer,
-        upstream_client,
-        Arc::clone(audit_store),
-        Arc::clone(scrub_engine),
-        config.paths.home.join("vault"),
-        // Decoded inbound attachments (Gmail `attachments.get`) are
-        // materialized here for the MCP agent to read by local path.
-        config.paths.home.join("media"),
-    )))
+    // Story 11.5: the connector registry resolves each request's service
+    // → upstream base_url + allowed_hosts (replacing the deleted base_urls
+    // map). Built-ins always load; host-installed connectors are scanned
+    // from `<state>/connectors/<id>/` (FR89). A built-in parse/validate
+    // failure is a ship-time bug — fall back to 501 routes rather than
+    // crash boot.
+    let connectors = match permitlayer_connectors::ConnectorRegistry::load(Some(
+        &config.paths.home.join("connectors"),
+    )) {
+        Ok(r) => Arc::new(r),
+        Err(e) => {
+            tracing::warn!(error = %e, "connector registry load failed — tool routes will serve 501");
+            return None;
+        }
+    };
+
+    // Story 11.10: the request-time authz chain resolves
+    // bearer → agent → binding → connection → connector → tier. The proxy
+    // needs the binding + connection stores to map a request's selector to
+    // the agent's granted connection and key the credential vault by the
+    // connection's real ULID (not the legacy service string).
+    let binding_store: Arc<dyn permitlayer_core::store::BindingStore> =
+        match permitlayer_core::store::fs::BindingFsStore::new(config.paths.home.clone()) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                tracing::warn!(error = %e, "binding store init failed — tool routes will serve 501");
+                return None;
+            }
+        };
+    let connection_store: Arc<dyn permitlayer_core::store::ConnectionStore> =
+        match permitlayer_core::store::fs::ConnectionFsStore::new(config.paths.home.clone()) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                tracing::warn!(error = %e, "connection store init failed — tool routes will serve 501");
+                return None;
+            }
+        };
+
+    Some(Arc::new(
+        permitlayer_proxy::ProxyService::new(
+            credential_store,
+            vault,
+            token_issuer,
+            upstream_client,
+            connectors,
+            Arc::clone(audit_store),
+            Arc::clone(scrub_engine),
+            config.paths.home.join("vault"),
+            // Decoded inbound attachments (Gmail `attachments.get`) are
+            // materialized here for the MCP agent to read by local path.
+            config.paths.home.join("media"),
+        )
+        .with_binding_resolution(binding_store, connection_store),
+    ))
 }
 
 pub(crate) fn vault_has_sealed_credentials(vault_dir: &std::path::Path) -> std::io::Result<bool> {
-    match std::fs::read_dir(vault_dir) {
+    // Path-traversal guard: `vault_dir` is `daemon_state_dir(..).join("vault")`,
+    // a direct child of the daemon state root. Canonicalize and verify it
+    // stays inside that root before walking it — a symlinked `vault/`
+    // pointing elsewhere is refused rather than scanned. A missing dir
+    // resolves to `Ok(None)` → "no credentials" (the prior NotFound case).
+    let Some(parent) = vault_dir.parent() else {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "vault directory has no parent state root",
+        ));
+    };
+    let canonical_vault =
+        match permitlayer_core::paths::canonical_dir_within_root(vault_dir, parent) {
+            Ok(Some(p)) => p,
+            Ok(None) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+    match std::fs::read_dir(&canonical_vault) {
         Ok(rd) => Ok(rd.filter_map(Result::ok).any(|entry| {
             // Story 7.3 P63: reject non-regular files in the walk.
             let meta = match entry.metadata() {
@@ -1479,6 +1532,8 @@ async fn try_build_agent_runtime(
 ) -> Result<
     (
         Option<Arc<dyn AgentIdentityStore>>,
+        Option<Arc<dyn permitlayer_core::store::BindingStore>>,
+        Option<Arc<dyn permitlayer_core::store::ConnectionStore>>,
         Arc<AgentRegistry>,
         Arc<zeroize::Zeroizing<[u8; LOOKUP_KEY_BYTES]>>,
     ),
@@ -1496,6 +1551,31 @@ async fn try_build_agent_runtime(
                 error = %e,
                 "agent identity store creation failed — `agentsso agent register` will be unavailable; existing tool routes serve 401 auth.invalid_token"
             );
+            None
+        }
+    };
+
+    // Story 11.10: the binding + connection stores let the middleware
+    // resolve `(agent, selector) → binding → connection` so `PolicyLayer`
+    // can evaluate the binding's policy (incl. `Decision::Prompt` →
+    // approval) and `handle_inner` can gate on tier ∩ granted_scopes and
+    // key the credential vault by the connection's ULID. `Option<>` for
+    // the same graceful-degradation reason as `agent_store`.
+    let binding_store_mw = match permitlayer_core::store::fs::BindingFsStore::new(
+        config.paths.home.clone(),
+    ) {
+        Ok(s) => Some(Arc::new(s) as Arc<dyn permitlayer_core::store::BindingStore>),
+        Err(e) => {
+            tracing::warn!(error = %e, "binding store creation failed — binding-gated tool routes will default-deny");
+            None
+        }
+    };
+    let connection_store_mw = match permitlayer_core::store::fs::ConnectionFsStore::new(
+        config.paths.home.clone(),
+    ) {
+        Ok(s) => Some(Arc::new(s) as Arc<dyn permitlayer_core::store::ConnectionStore>),
+        Err(e) => {
+            tracing::warn!(error = %e, "connection store creation failed — binding-gated tool routes will default-deny");
             None
         }
     };
@@ -1575,7 +1655,7 @@ async fn try_build_agent_runtime(
         );
     }
 
-    Ok((agent_store, agent_registry, Arc::new(lookup_key)))
+    Ok((agent_store, binding_store_mw, connection_store_mw, agent_registry, Arc::new(lookup_key)))
 }
 
 /// Structured fail-fast errors from [`run`] at daemon startup.
@@ -3185,8 +3265,13 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
     // subkey (Story 4.4). Always gets a real master-key-derived
     // subkey now that Story 1.15 has provisioned the master key
     // eagerly above — no more zero-placeholder branch.
-    let (agent_store, agent_registry, agent_lookup_key) =
+    let (agent_store, binding_store_mw, connection_store_mw, agent_registry, agent_lookup_key) =
         try_build_agent_runtime(&config, &master_key).await?;
+
+    // (Story 11.9/11.10: the `<home>/connections/` + `<home>/bindings/`
+    // directories are provisioned by the `BindingFsStore`/`ConnectionFsStore`
+    // constructors inside `try_build_agent_runtime` above — both 0o700, both
+    // created on first boot. The middleware + proxy authz consume them.)
 
     // 7c. Shared mutex guarding the load-diff-store sequence in
     // `reload_policies_with_diff_locked`. Prevents concurrent reloads
@@ -3469,6 +3554,8 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         Arc::clone(&agent_registry),
         Arc::clone(&agent_lookup_key),
         agent_store.clone(),
+        binding_store_mw.clone(),
+        connection_store_mw.clone(),
         Arc::clone(&approval_service),
         Arc::clone(&approval_timeout_atomic),
         conn_tracker_sink,
@@ -3534,11 +3621,7 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
         // out of the middleware chain so unauthenticated unknown paths hit
         // the JSON 404 body instead of AuthLayer's 401.
         #[cfg(debug_assertions)]
-        let gmail_slot = Arc::clone(&proxy_route_slots.gmail_mcp);
-        #[cfg(debug_assertions)]
-        let calendar_slot = Arc::clone(&proxy_route_slots.calendar_mcp);
-        #[cfg(debug_assertions)]
-        let drive_slot = Arc::clone(&proxy_route_slots.drive_mcp);
+        let connectors_slot = Arc::clone(&proxy_route_slots.connectors);
         #[cfg(debug_assertions)]
         let proxy_slot = Arc::clone(&proxy_route_slots.proxy);
         #[cfg(debug_assertions)]
@@ -3546,27 +3629,17 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
             .route("/health", get(health_handler))
             .route("/v1/health", get(health_handler))
             .route(
-                "/mcp/gmail",
-                any(move |req| dynamic_gmail_mcp_handler(Arc::clone(&gmail_slot), req)),
-            )
-            .route(
-                "/mcp/calendar",
-                any(move |req| dynamic_calendar_mcp_handler(Arc::clone(&calendar_slot), req)),
-            )
-            .route(
-                "/mcp/drive",
-                any(move |req| dynamic_drive_mcp_handler(Arc::clone(&drive_slot), req)),
+                "/mcp/{selector}",
+                any(move |path, req| {
+                    dynamic_connector_mcp_handler(Arc::clone(&connectors_slot), path, req)
+                }),
             )
             .route(
                 "/v1/tools/{service}/{*path}",
                 any(move |path, req| dynamic_proxy_handler(Arc::clone(&proxy_slot), path, req)),
             );
         #[cfg(not(debug_assertions))]
-        let gmail_slot = Arc::clone(&proxy_route_slots.gmail_mcp);
-        #[cfg(not(debug_assertions))]
-        let calendar_slot = Arc::clone(&proxy_route_slots.calendar_mcp);
-        #[cfg(not(debug_assertions))]
-        let drive_slot = Arc::clone(&proxy_route_slots.drive_mcp);
+        let connectors_slot = Arc::clone(&proxy_route_slots.connectors);
         #[cfg(not(debug_assertions))]
         let proxy_slot = Arc::clone(&proxy_route_slots.proxy);
         #[cfg(not(debug_assertions))]
@@ -3574,16 +3647,10 @@ pub async fn run(args: StartArgs) -> Result<(), StartError> {
             .route("/health", get(health_handler))
             .route("/v1/health", get(health_handler))
             .route(
-                "/mcp/gmail",
-                any(move |req| dynamic_gmail_mcp_handler(Arc::clone(&gmail_slot), req)),
-            )
-            .route(
-                "/mcp/calendar",
-                any(move |req| dynamic_calendar_mcp_handler(Arc::clone(&calendar_slot), req)),
-            )
-            .route(
-                "/mcp/drive",
-                any(move |req| dynamic_drive_mcp_handler(Arc::clone(&drive_slot), req)),
+                "/mcp/{selector}",
+                any(move |path, req| {
+                    dynamic_connector_mcp_handler(Arc::clone(&connectors_slot), path, req)
+                }),
             )
             .route(
                 "/v1/tools/{service}/{*path}",
@@ -4493,7 +4560,7 @@ mod tests {
         let sealed = SealedCredential::from_trusted_bytes(
             vec![0xAB; 48],
             [0x11u8; 12],
-            b"permitlayer-vault-v1:gmail".to_vec(),
+            b"test-envelope-aad:gmail".to_vec(),
             permitlayer_credential::SEALED_CREDENTIAL_VERSION,
             KeyId::new(key_id),
         );

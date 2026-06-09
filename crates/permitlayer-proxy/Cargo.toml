@@ -33,6 +33,10 @@ tracing.workspace = true
 ulid.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
+# Story 11.16: `plugin_host_services` reads `ConnectionRecord` TOMLs from
+# `<home>/connections/` (v2 provenance) synchronously, mirroring
+# `ConnectionFsStore`'s on-disk shape without the async store dep.
+toml.workspace = true
 arc-swap.workspace = true
 reqwest.workspace = true
 chrono.workspace = true

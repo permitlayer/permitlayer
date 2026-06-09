@@ -9,6 +9,8 @@
 // allowing here covers every submodule without per-file boilerplate.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
+mod common;
+mod connection_binding_poc;
 mod host_api_e2e;
 mod mcp_conformance;
 mod mcp_transport;

@@ -52,10 +52,10 @@
 //! |----------------------------|-------------------------------------|
 //! | `retry_dispatch_failed`    | `ProxyService::try_refresh_and_retry` (post-core retry path) |
 
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use permitlayer_core::store::{CredentialStore, StoreError};
+use permitlayer_credential::{ConnectionId, Slot};
 use permitlayer_oauth::{OAuthClient, OAuthError};
 use permitlayer_vault::Vault;
 use tracing::warn;
@@ -127,19 +127,8 @@ pub enum RefreshOutcome {
         new_access_bytes: Zeroizing<Vec<u8>>,
         /// Computed expiry timestamp for the new access token, if the
         /// provider returned an `expires_in` field. Used by the
-        /// CLI's success output and by Task 4's meta-file update.
+        /// proxy retry path's audit `extra`.
         new_expiry_at: Option<chrono::DateTime<chrono::Utc>>,
-        /// The exact timestamp persisted to `meta.last_refreshed_at`
-        /// during this refresh, OR `None` if the meta-file write
-        /// failed. Story 1.14b code-review m1 fix: returning the
-        /// persisted value (rather than letting the CLI compute its
-        /// own `Utc::now()` later) means `agentsso credentials
-        /// status` and the CLI's success output show the same
-        /// "last refresh" timestamp the meta file was actually
-        /// written with. `None` means the meta write failed and the
-        /// CLI should not display a "last refresh" line because the
-        /// status command will show the OLD persisted value.
-        last_refreshed_at: Option<chrono::DateTime<chrono::Utc>>,
     },
     /// No refresh was attempted because the `{service}-refresh` vault
     /// entry is missing (graceful-degradation case for older installs
@@ -328,20 +317,11 @@ pub type OAuthClientResolver<'a> =
 /// - Emit audit events (per AC 5 ownership split — callers own this)
 /// - Retry the original upstream request (proxy-specific, handled in
 ///   `ProxyService::try_refresh_and_retry` after this returns `Ok`)
-///
-/// This function DOES:
-/// - Update `{vault_dir}/{service}-meta.json` with a fresh
-///   `last_refreshed_at` timestamp AND a fresh `expires_in_secs`
-///   on successful refresh (Story 1.14b Task 4 + code-review M1
-///   fix, closing AC 2). The meta-file write is async — wrapped
-///   in `tokio::task::spawn_blocking` (Story 1.14b code-review M2
-///   fix) so the parent-directory fsync does not block the
-///   executor. The read-merge-write sequence runs inside the same
-///   blocking task to narrow the concurrent-writer window
-///   (Story 1.14b code-review M4 fix). Best-effort: failures are
-///   logged via `tracing::warn!` and do NOT fail the refresh —
-///   the tokens are already durably persisted; only the display
-///   timestamp and validity computation are affected.
+/// - Write any provenance file. Story 11.16 (v2-only) removed the
+///   `{service}-meta.json` scheme; `last_refreshed_at`/`expires_in_secs`
+///   lived only there and the `ConnectionRecord` does not track them.
+///   On success the new access + refresh tokens are durably persisted in
+///   the credential store and that is the whole side effect.
 ///
 /// Preserves all Story 1.14a review-fix contracts:
 /// - **M3**: UTF-8 validation runs BEFORE any vault seal or store put
@@ -354,14 +334,19 @@ pub type OAuthClientResolver<'a> =
 pub async fn refresh_service(
     vault: &Arc<Vault>,
     credential_store: &Arc<dyn CredentialStore>,
-    vault_dir: &Path,
     service: &str,
+    connection: ConnectionId,
     oauth_client_resolver: &OAuthClientResolver<'_>,
 ) -> Result<RefreshOutcome, RefreshFlowError> {
-    let refresh_service_key = format!("{service}-refresh");
+    // The vault + store key on `(ConnectionId, Slot)` (Story 11.8/11.9): the
+    // refresh token seals/unseals and stores under `connection` +
+    // `Slot::Refresh`; the access token under `connection` + `Slot::Access`.
+    // Story 11.10: `connection` is the real binding-resolved id passed in by
+    // the caller (`ProxyService::handle_inner` / the CLI refresh path), no
+    // longer derived from the service string.
 
     // Step 1: Fetch the sealed refresh credential.
-    let sealed_refresh = match credential_store.get(&refresh_service_key).await {
+    let sealed_refresh = match credential_store.get(connection, Slot::Refresh).await {
         Ok(Some(sealed)) => sealed,
         Ok(None) => {
             warn!(
@@ -380,9 +365,8 @@ pub async fn refresh_service(
 
     // Step 2: Unseal the refresh token. Synchronous crypto → spawn_blocking.
     let vault_for_unseal = Arc::clone(vault);
-    let refresh_service_for_unseal = refresh_service_key.clone();
     let unseal_result = tokio::task::spawn_blocking(move || {
-        vault_for_unseal.unseal_refresh(&refresh_service_for_unseal, &sealed_refresh)
+        vault_for_unseal.unseal_refresh(connection, Slot::Refresh, &sealed_refresh)
     })
     .await;
 
@@ -465,9 +449,8 @@ pub async fn refresh_service(
     // can always recover via the old refresh token.
     if let Some(new_refresh) = refresh_result.new_refresh_token {
         let vault_for_seal = Arc::clone(vault);
-        let refresh_service_for_seal = refresh_service_key.clone();
         let seal_result = tokio::task::spawn_blocking(move || {
-            vault_for_seal.seal_refresh(&refresh_service_for_seal, &new_refresh)
+            vault_for_seal.seal_refresh(connection, Slot::Refresh, &new_refresh)
         })
         .await;
 
@@ -492,7 +475,7 @@ pub async fn refresh_service(
             }
         };
 
-        if let Err(e) = credential_store.put(&refresh_service_key, sealed_new_refresh).await {
+        if let Err(e) = credential_store.put(connection, Slot::Refresh, sealed_new_refresh).await {
             return Err(RefreshFlowError::PersistenceFailed {
                 service: service.to_owned(),
                 stage: PersistStage::RefreshTokenStore,
@@ -501,11 +484,10 @@ pub async fn refresh_service(
         }
     }
 
-    // Step 5b: Persist the new ACCESS token.
+    // Step 5b: Persist the new ACCESS token (base connection + Slot::Access).
     let vault_for_access_seal = Arc::clone(vault);
-    let service_for_access_seal = service.to_owned();
     let seal_result = tokio::task::spawn_blocking(move || {
-        vault_for_access_seal.seal(&service_for_access_seal, &new_access)
+        vault_for_access_seal.seal(connection, Slot::Access, &new_access)
     })
     .await;
 
@@ -528,7 +510,7 @@ pub async fn refresh_service(
         }
     };
 
-    if let Err(e) = credential_store.put(service, sealed_new_access).await {
+    if let Err(e) = credential_store.put(connection, Slot::Access, sealed_new_access).await {
         return Err(RefreshFlowError::PersistenceFailed {
             service: service.to_owned(),
             stage: PersistStage::AccessTokenStore,
@@ -536,137 +518,11 @@ pub async fn refresh_service(
         });
     }
 
-    // Task 4 (Story 1.14b): Update the meta file's
-    // `last_refreshed_at` AND `expires_in_secs` (M1 fix). Best-effort
-    // — failures log a warning but do not fail the refresh; the
-    // tokens are already durably persisted, only the display
-    // timestamp is affected. See `update_last_refreshed_at`'s doc
-    // comment for the M1/M2/M4 review-fix rationale.
-    //
-    // m1 fix (post-review): the helper returns the exact timestamp
-    // it persisted (or `None` if the meta write failed) so the CLI's
-    // success output displays the same value `agentsso credentials
-    // status` would show. No more drift between the two views.
-    let last_refreshed_at =
-        update_last_refreshed_at(vault_dir, service, refresh_result.expires_in).await;
-
-    Ok(RefreshOutcome::Refreshed { rotated, new_access_bytes, new_expiry_at, last_refreshed_at })
-}
-
-/// Update the `{service}-meta.json` file with the new
-/// `last_refreshed_at` timestamp AND the new `expires_in_secs`
-/// (Story 1.14b code-review fix M1). Best-effort — failures are
-/// logged via `tracing::warn!` and do NOT fail the refresh (the
-/// tokens are already durably persisted; only the display timestamp
-/// and validity computation are affected).
-///
-/// ## Why both fields are updated
-///
-/// The Story 1.14b code review (M1) found that updating only
-/// `last_refreshed_at` while leaving `expires_in_secs` at its setup
-/// value caused `compute_token_validity` to display wrong expiries
-/// whenever the provider returned a different `expires_in` than the
-/// setup response. Worst case: setup returned `None`, refresh
-/// returned `Some(3600)` → status displayed "unknown" forever after
-/// every refresh. This function now updates both fields atomically.
-///
-/// ## Why the function is async + spawn_blocking
-///
-/// Story 1.14b code review M2: the previous synchronous version did
-/// `std::fs::read_to_string` + `serde_json::from_str` + tempfile
-/// create + write + fsync + parent fsync, all from the proxy's
-/// async request-handling task. Under load, parent-directory fsync
-/// can stall the executor thread for tens to hundreds of
-/// milliseconds. All other vault operations in this module are
-/// wrapped in `spawn_blocking`; this one was overlooked. Now fixed.
-///
-/// ## Why we re-read inside the blocking task
-///
-/// Story 1.14b code review M4: the previous version did read +
-/// parse + mutate + write with no lock. A concurrent
-/// `agentsso setup` (or another refresh from the daemon while the
-/// CLI runs) could write `meta_path` between the read and the
-/// persist, causing the second writer to silently clobber unrelated
-/// fields like `scopes` or `client_source`. Doing the read INSIDE
-/// the spawn_blocking task immediately before the write narrows the
-/// window from "across the entire async refresh state machine" to
-/// "the duration of one synchronous filesystem op", which is
-/// microseconds.
-///
-/// This is not a complete fix — a true compare-and-swap would
-/// require a sidecar lock file or RPC-through-daemon — but it's
-/// good enough for the documented "do not run while the daemon is
-/// active" contract. The CLI's startup warning still applies.
-pub async fn update_last_refreshed_at(
-    vault_dir: &Path,
-    service: &str,
-    new_expires_in: Option<std::time::Duration>,
-) -> Option<chrono::DateTime<chrono::Utc>> {
-    let meta_path: PathBuf = vault_dir.join(format!("{service}-meta.json"));
-    let service_owned = service.to_owned();
-
-    // M2: wrap the entire read-merge-write sequence in spawn_blocking
-    // so the parent fsync inside write_metadata_atomic does not
-    // block the tokio runtime. M4: the read happens INSIDE this
-    // blocking task, immediately before the write, so concurrent
-    // writers from setup or another refresh have a much narrower
-    // window to interleave.
-    //
-    // m1 fix: capture `now` ONCE inside the blocking task and return
-    // it on success. The CLI uses this value for its success output
-    // so the displayed "last refresh" matches the persisted value
-    // exactly (not a slightly-later `Utc::now()` from the caller).
-    let join_result =
-        tokio::task::spawn_blocking(move || -> Result<chrono::DateTime<chrono::Utc>, String> {
-            // Read current meta.
-            let contents = std::fs::read_to_string(&meta_path)
-                .map_err(|e| format!("read {}: {e}", meta_path.display()))?;
-
-            // Parse.
-            let mut meta: permitlayer_oauth::metadata::CredentialMeta =
-                serde_json::from_str(&contents)
-                    .map_err(|e| format!("parse {}: {e}", meta_path.display()))?;
-
-            // Merge: only touch last_refreshed_at and expires_in_secs.
-            // Every other field (client_type, client_source, connected_at,
-            // scopes) is preserved from the freshly-read meta — this is
-            // the M4 race-window narrowing. If a concurrent setup wrote
-            // new scopes between the original refresh-flow start and now,
-            // we use those new scopes, not a stale snapshot.
-            let now = chrono::Utc::now();
-            meta.last_refreshed_at = Some(now.to_rfc3339());
-            if let Some(d) = new_expires_in {
-                meta.expires_in_secs = Some(d.as_secs());
-            }
-
-            // Write atomically.
-            permitlayer_oauth::metadata::write_metadata_atomic(&meta_path, &meta)
-                .map_err(|e| format!("write {}: {e}", meta_path.display()))?;
-
-            Ok(now)
-        })
-        .await;
-
-    match join_result {
-        Ok(Ok(now)) => Some(now),
-        Ok(Err(detail)) => {
-            warn!(
-                service = %service_owned,
-                error = %detail,
-                "refresh: could not update meta file \
-                 (agentsso credentials status may display stale last-refresh time \
-                 and/or stale expires_in_secs)"
-            );
-            None
-        }
-        Err(join_err) => {
-            warn!(
-                service = %service_owned,
-                error = %join_err,
-                "refresh: meta-update spawn_blocking task panicked \
-                 (agentsso credentials status may display stale last-refresh time)"
-            );
-            None
-        }
-    }
+    // Story 11.16 (v2-only): the `{service}-meta.json` provenance file is
+    // gone — `last_refreshed_at`/`expires_in_secs` lived only in it, and
+    // the `ConnectionRecord` doesn't track a per-refresh timestamp (it
+    // isn't needed for v2). The new access + refresh tokens are already
+    // durably persisted in the credential store above; there is nothing
+    // more to write.
+    Ok(RefreshOutcome::Refreshed { rotated, new_access_bytes, new_expiry_at })
 }

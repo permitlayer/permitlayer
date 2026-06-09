@@ -66,7 +66,7 @@ const MAX_AGENT_FILE_BYTES: usize = 64 * 1024;
 ///
 /// `name_locks` is a per-name async-mutex map that serializes all
 /// agent-file mutations on the SAME name. Mutations (`put`, `remove`,
-/// `update_policy`, `update_lookup_key_and_token`) acquire the
+/// `update_lookup_key_and_token`) acquire the
 /// per-name lock with `lock().await`; `touch_last_seen` (hot auth
 /// path) uses `try_lock` and SKIPS the touch if the name is busy —
 /// a lost touch is recovered by the next successful auth, preserving
@@ -251,7 +251,7 @@ impl AgentIdentityStore for AgentIdentityFsStore {
 
         // Story 7.11 review-round-2 Q4: acquire the per-name async
         // lock for the read-modify-write critical section. Serializes
-        // `put` against `update_policy` / `update_lookup_key_and_token`
+        // `put` against `update_lookup_key_and_token`
         // / `remove` for the same name. The earlier `in_flight_names`
         // try-set rejects only register-vs-register; this lock
         // catches the cross-mutation cases that try-set missed.
@@ -376,7 +376,7 @@ impl AgentIdentityStore for AgentIdentityFsStore {
         }
         // Story 7.11 review-round-2 Q4: serialize remove against
         // concurrent put/update_*. The `unlink` syscall itself is
-        // atomic, but a concurrent `update_policy` that has
+        // atomic, but a concurrent `update_lookup_key_and_token` that has
         // already-read but not-yet-written the agent could race
         // remove and produce a phantom file (rename of tempfile to
         // a path the operator just deleted).
@@ -422,7 +422,7 @@ impl AgentIdentityStore for AgentIdentityFsStore {
 
         // Story 7.11 review-round-2 Q4: per-name lock makes the
         // get-then-write critical section atomic against concurrent
-        // put / remove / update_policy / touch_last_seen on the
+        // put / remove / update_lookup_key_and_token / touch_last_seen on the
         // same name.
         let lock = self.name_lock_for(name);
         let _name_lock = lock.lock().await;
@@ -441,7 +441,6 @@ impl AgentIdentityStore for AgentIdentityFsStore {
         // but checking is cheap).
         let updated = AgentIdentity::new(
             current.name().to_owned(),
-            current.policy_name.clone(),
             new_token_hash,
             new_lookup_key_hex,
             current.created_at,
@@ -449,63 +448,6 @@ impl AgentIdentityStore for AgentIdentityFsStore {
         )
         .map_err(|e| StoreError::AgentSerializationFailed {
             reason: format!("identity reconstruction failed during rotation: {e}"),
-            source: Some(Box::new(e)),
-        })?;
-
-        self.write_atomic(&updated).await?;
-        Ok(true)
-    }
-
-    async fn update_policy(&self, name: &str, new_policy_name: String) -> Result<bool, StoreError> {
-        // Story 7.11. Reads the current on-disk record and rewrites
-        // ONLY `policy_name`; every other field — including the token-
-        // bearing `token_hash` and `lookup_key_hex` — is preserved
-        // verbatim. Same atomic-write discipline as `put`,
-        // `touch_last_seen`, and `update_lookup_key_and_token`.
-        //
-        // Bearer-token immutability across policy rebind is the load-
-        // bearing UX invariant of the onboarding-flow restructure
-        // (sprint-change-proposal-2026-05-06.md). Operators can extend
-        // an agent's scopes without rotating tokens in every MCP-client
-        // config. See `architecture.md` §"Authentication & Security".
-        //
-        // Note: this method does NOT validate `new_policy_name`
-        // against any policy registry. The store layer is policy-
-        // agnostic. The daemon control-plane handler MUST verify
-        // policy existence against `PolicySet` before calling this.
-        if validate_agent_name(name).is_err() {
-            return Err(StoreError::InvalidAgentName { input: name.to_owned() });
-        }
-
-        // Story 7.11 review-round-2 Q4: per-name lock makes the
-        // get-then-write critical section atomic. Without it a
-        // concurrent `touch_last_seen` between this `get` and the
-        // `write_atomic` below would have its `last_seen_at` advance
-        // silently reverted by the rewrite (which uses the stale
-        // `current.last_seen_at` captured before the touch).
-        let lock = self.name_lock_for(name);
-        let _name_lock = lock.lock().await;
-
-        let current = match self.get(name).await? {
-            Some(c) => c,
-            // Agent went away between the handler's existence check and
-            // this rewrite (concurrent `agent remove`). Caller maps
-            // Ok(false) to HTTP 404 agent.not_found.
-            None => return Ok(false),
-        };
-
-        // Re-construct the identity with the new policy_name; every
-        // other field is carried through unchanged.
-        let updated = AgentIdentity::new(
-            current.name().to_owned(),
-            new_policy_name,
-            current.token_hash.clone(),
-            current.lookup_key_hex.clone(),
-            current.created_at,
-            current.last_seen_at,
-        )
-        .map_err(|e| StoreError::AgentSerializationFailed {
-            reason: format!("identity reconstruction failed during rebind: {e}"),
             source: Some(Box::new(e)),
         })?;
 
@@ -536,7 +478,7 @@ impl AgentIdentityStore for AgentIdentityFsStore {
         //
         // Story 7.11 review-round-2 Q4: this method uses TRY-LOCK,
         // not blocking lock. The hot auth path must not stall behind
-        // a concurrent `update_policy` or `remove`. If the per-name
+        // a concurrent `update_lookup_key_and_token` or `remove`. If the per-name
         // lock is held by another mutation, skip the touch — the
         // next successful auth will touch again. A lost touch is
         // acceptable (timestamps are advisory); a stalled auth is
@@ -841,7 +783,7 @@ fn create_agents_dir(dir: &Path) -> Result<(), StoreError> {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-    use chrono::Utc;
+    use chrono::{TimeZone, Utc};
     use tempfile::TempDir;
 
     /// Story 7.11 review-round-1 D11: the 0o500-dir atomicity tests
@@ -865,7 +807,6 @@ mod tests {
     fn fake_identity(name: &str) -> AgentIdentity {
         AgentIdentity::new(
             name.to_owned(),
-            "default".to_owned(),
             "$argon2id$v=19$m=19456,t=2,p=1$c2FsdA$aGFzaA".to_owned(),
             "00".repeat(32),
             Utc::now(),
@@ -886,7 +827,6 @@ mod tests {
         store.put(identity.clone()).await.unwrap();
         let got = store.get("agent1").await.unwrap().unwrap();
         assert_eq!(got.name(), "agent1");
-        assert_eq!(got.policy_name, "default");
     }
 
     #[tokio::test]
@@ -1033,7 +973,6 @@ mod tests {
         let store = new_store(&tmp);
 
         let mut id = fake_identity("rotator");
-        id.policy_name = "gmail-readonly".to_owned();
         let original_created_at = id.created_at;
         let original_last_seen = chrono::Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap();
         id.last_seen_at = Some(original_last_seen);
@@ -1051,7 +990,6 @@ mod tests {
         assert_eq!(after.token_hash, new_hash);
         // Every other field is preserved exactly.
         assert_eq!(after.name(), "rotator");
-        assert_eq!(after.policy_name, "gmail-readonly");
         assert_eq!(after.created_at, original_created_at);
         assert_eq!(after.last_seen_at, Some(original_last_seen));
     }
@@ -1103,8 +1041,7 @@ mod tests {
 
         let tmp = TempDir::new().unwrap();
         let store = new_store(&tmp);
-        let mut id = fake_identity("atomic-victim");
-        id.policy_name = "default".to_owned();
+        let id = fake_identity("atomic-victim");
         let original_lookup = id.lookup_key_hex.clone();
         let original_hash = id.token_hash.clone();
         let original_created_at = id.created_at;
@@ -1162,262 +1099,6 @@ mod tests {
             stray_tempfiles.is_empty(),
             "no .tmp.* orphans should remain after the failed update; found {stray_tempfiles:?}"
         );
-    }
-
-    // ── Story 7.11: update_policy ─────────────────────────────────
-
-    #[tokio::test]
-    async fn update_policy_preserves_other_fields() {
-        // Story 7.11 AC #1: rebind mutates ONLY policy_name. Token
-        // hash, lookup key, name, created_at, last_seen_at are
-        // byte-identical pre/post.
-        let tmp = TempDir::new().unwrap();
-        let store = new_store(&tmp);
-
-        let mut id = fake_identity("rebind-target");
-        id.policy_name = "gmail-read-only".to_owned();
-        let original_created_at = id.created_at;
-        let original_last_seen = chrono::Utc.with_ymd_and_hms(2024, 5, 6, 19, 30, 0).unwrap();
-        id.last_seen_at = Some(original_last_seen);
-        let original_token_hash = id.token_hash.clone();
-        let original_lookup_key = id.lookup_key_hex.clone();
-        store.put(id.clone()).await.unwrap();
-
-        let updated =
-            store.update_policy("rebind-target", "gmail-and-calendar".to_owned()).await.unwrap();
-        assert!(updated, "rebind on existing agent must return Ok(true)");
-
-        let after = store.get("rebind-target").await.unwrap().unwrap();
-        // The ONLY field that changed is policy_name.
-        assert_eq!(after.policy_name, "gmail-and-calendar");
-        // Every token-bearing or identity-bearing field is preserved
-        // verbatim — this is the bearer-token-immutable-across-rebind
-        // invariant in storage form.
-        assert_eq!(after.token_hash, original_token_hash);
-        assert_eq!(after.lookup_key_hex, original_lookup_key);
-        assert_eq!(after.name(), "rebind-target");
-        assert_eq!(after.created_at, original_created_at);
-        assert_eq!(after.last_seen_at, Some(original_last_seen));
-    }
-
-    #[tokio::test]
-    async fn update_policy_returns_false_for_missing_agent() {
-        // Story 7.11 AC #3: rebind on a missing agent returns
-        // Ok(false). Caller maps to HTTP 404 agent.not_found.
-        let tmp = TempDir::new().unwrap();
-        let store = new_store(&tmp);
-        let updated = store.update_policy("ghost", "any-policy".to_owned()).await.unwrap();
-        assert!(!updated, "missing agent must return Ok(false)");
-    }
-
-    #[tokio::test]
-    async fn update_policy_rejects_invalid_name() {
-        // Defense in depth: even though the daemon control-plane
-        // validates names too, the store enforces validate_agent_name.
-        let tmp = TempDir::new().unwrap();
-        let store = new_store(&tmp);
-        let err = store.update_policy("../etc/passwd", "any-policy".to_owned()).await.unwrap_err();
-        assert!(matches!(err, StoreError::InvalidAgentName { .. }));
-    }
-
-    #[tokio::test]
-    async fn update_policy_atomic_via_rename_seam_no_partial_file() {
-        // Story 7.11 review-round-1 D1: REAL rename-failure test.
-        // The pre-existing 0o500-dir tests block tempfile *creation*,
-        // not rename. This test uses the `test_seam::RenameFailGuard`
-        // to inject a synthetic rename failure AFTER the tempfile is
-        // created — the actual code path the "atomicity" claim is
-        // about. Asserts:
-        //   1. update_policy returns Err.
-        //   2. The on-disk agent file is byte-identical to pre-update.
-        //   3. No `.tmp.*` orphan remains (TempfileGuard fires).
-        let tmp = TempDir::new().unwrap();
-        let store = new_store(&tmp);
-        let mut id = fake_identity("rename-seam-victim");
-        id.policy_name = "before".to_owned();
-        store.put(id.clone()).await.unwrap();
-
-        let agent_path = tmp.path().join("agents").join("rename-seam-victim.toml");
-        let pre_bytes = std::fs::read(&agent_path).unwrap();
-
-        // Hold the guard for the scope of update_policy. The seam
-        // forces `atomic_write` to fail at the rename step.
-        let result = {
-            let _fail_guard = super::test_seam::RenameFailGuard::new();
-            store.update_policy("rename-seam-victim", "after".to_owned()).await
-        };
-        // Guard dropped here; FAIL_RENAME cleared.
-
-        assert!(
-            result.is_err(),
-            "update_policy must return Err when the rename seam injects a failure"
-        );
-
-        // The on-disk file is byte-identical — no torn TOML, no
-        // partial write. Tempfile cleanup happened via TempfileGuard.
-        let post_bytes = std::fs::read(&agent_path).unwrap();
-        assert_eq!(
-            post_bytes, pre_bytes,
-            "agent file must be byte-identical after a failed rename"
-        );
-
-        let after = store.get("rename-seam-victim").await.unwrap().unwrap();
-        assert_eq!(after.policy_name, "before");
-
-        let agents_dir = tmp.path().join("agents");
-        let stray_tempfiles: Vec<_> = std::fs::read_dir(&agents_dir)
-            .unwrap()
-            .flatten()
-            .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|n| n.contains(".tmp."))
-            .collect();
-        assert!(
-            stray_tempfiles.is_empty(),
-            "TempfileGuard must clean up after rename-seam failure; found {stray_tempfiles:?}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn update_policy_atomic_no_partial_file() {
-        // Story 7.11: atomic-write proof. If update_policy aborts at
-        // the rename boundary, the on-disk file MUST be byte-identical
-        // to the pre-update version. Mirrors update_lookup_key_and_token's
-        // atomicity test.
-        // Story 7.11 review-round-1 D11: skip under sudo/CI-as-root.
-        // Story 7.11 review-round-1 D1: this test exercises tempfile-
-        // creation-failure (0o500 blocks open). For real rename-
-        // failure coverage see `update_policy_atomic_via_rename_seam_no_partial_file`.
-        if skip_if_root() {
-            return;
-        }
-        use std::os::unix::fs::PermissionsExt;
-
-        let tmp = TempDir::new().unwrap();
-        let store = new_store(&tmp);
-        let mut id = fake_identity("atomic-rebind-victim");
-        id.policy_name = "before".to_owned();
-        store.put(id.clone()).await.unwrap();
-
-        // Snapshot the on-disk file bytes pre-update.
-        let agent_path = tmp.path().join("agents").join("atomic-rebind-victim.toml");
-        let pre_bytes = std::fs::read(&agent_path).unwrap();
-
-        // Force the rename to fail by making the agents dir read-only.
-        let agents_dir = tmp.path().join("agents");
-        let original_perms = std::fs::metadata(&agents_dir).unwrap().permissions();
-        std::fs::set_permissions(&agents_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
-
-        let result = store.update_policy("atomic-rebind-victim", "after".to_owned()).await;
-
-        // Restore permissions BEFORE asserting so a panic doesn't
-        // leak read-only state into TempDir's RAII cleanup.
-        std::fs::set_permissions(&agents_dir, original_perms).unwrap();
-
-        assert!(result.is_err(), "rename into a read-only dir must fail");
-
-        // The on-disk file is byte-identical to pre-update — no torn
-        // TOML, no partial write.
-        let post_bytes = std::fs::read(&agent_path).unwrap();
-        assert_eq!(
-            post_bytes, pre_bytes,
-            "agent file must be byte-identical after a failed update_policy"
-        );
-
-        // Belt-and-suspenders: read back through the store and
-        // confirm policy_name is still the pre-update value.
-        let after = store.get("atomic-rebind-victim").await.unwrap().unwrap();
-        assert_eq!(after.policy_name, "before");
-
-        // No orphaned tempfile.
-        let stray_tempfiles: Vec<_> = std::fs::read_dir(&agents_dir)
-            .unwrap()
-            .flatten()
-            .filter_map(|e| e.file_name().into_string().ok())
-            .filter(|n| n.contains(".tmp."))
-            .collect();
-        assert!(
-            stray_tempfiles.is_empty(),
-            "no .tmp.* orphans should remain after the failed update; found {stray_tempfiles:?}"
-        );
-    }
-
-    use chrono::TimeZone as _;
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn concurrent_touch_does_not_revert_concurrent_update_policy() {
-        // Story 7.11 review-round-2 Q4: the per-name lock makes
-        // update_policy atomic against touch_last_seen on the same
-        // name. Without the lock, a touch landing between
-        // update_policy's `get` and `write_atomic` would have its
-        // last_seen_at advance silently reverted.
-        //
-        // Story 7.11 review-round-3 #8 — honesty note: this test
-        // asserts the post-conditions that the lock is supposed to
-        // guarantee, but it does NOT mechanically prove the lock is
-        // load-bearing. Without the lock, the surviving last_seen_at
-        // *might* still be the latest touch (if the touch wins the
-        // race) — the failure mode is probabilistic. A truly proving
-        // test needs deterministic fault injection (e.g. yield-points
-        // injected mid-update_policy). That's a future enhancement.
-        // For now: the assertions still catch gross regressions
-        // (policy_name reverting, token fields mutating) and serve
-        // as a smoke test that the workload doesn't deadlock or
-        // panic.
-        //
-        // This test interleaves N touches with one update_policy
-        // call and asserts:
-        //   1. policy_name reflects the update_policy result.
-        //   2. token-bearing fields preserved verbatim.
-        use std::sync::Arc;
-        use std::time::Duration;
-
-        let tmp = TempDir::new().unwrap();
-        let store = Arc::new(new_store(&tmp));
-        let mut id = fake_identity("concurrent-victim");
-        id.policy_name = "before".to_owned();
-        store.put(id.clone()).await.unwrap();
-
-        // Fire one update_policy and N touches concurrently. The
-        // update_policy starts after a tiny delay to ensure some
-        // touches land first AND interleave.
-        let store_update = Arc::clone(&store);
-        let update_handle = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-            store_update.update_policy("concurrent-victim", "after".to_owned()).await.unwrap()
-        });
-
-        let mut touch_handles = Vec::new();
-        for i in 0..16 {
-            let store = Arc::clone(&store);
-            touch_handles.push(tokio::spawn(async move {
-                let mut copy = fake_identity("concurrent-victim");
-                copy.policy_name = "before".to_owned();
-                copy.last_seen_at =
-                    Some(chrono::Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, i % 60).unwrap());
-                let _ = store.touch_last_seen(copy).await;
-            }));
-        }
-
-        let updated = update_handle.await.unwrap();
-        assert!(updated, "update_policy must return Ok(true)");
-
-        for h in touch_handles {
-            h.await.unwrap();
-        }
-
-        // Assertion 1: policy_name reflects the update_policy result
-        // (NOT reverted to "before" by a concurrent touch).
-        let final_state = store.get("concurrent-victim").await.unwrap().unwrap();
-        assert_eq!(
-            final_state.policy_name, "after",
-            "update_policy result MUST NOT be silently reverted by concurrent touch_last_seen"
-        );
-
-        // Assertion 2: token-bearing fields preserved verbatim.
-        // `update_policy` must not have touched these.
-        assert_eq!(final_state.token_hash, id.token_hash);
-        assert_eq!(final_state.lookup_key_hex, id.lookup_key_hex);
     }
 
     #[tokio::test]

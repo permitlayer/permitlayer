@@ -12,9 +12,10 @@ pub const GMAIL_READONLY: &str = "https://www.googleapis.com/auth/gmail.readonly
 /// row for it — so the fixture loaded structurally yet mapped to no
 /// metadata. This adds the missing constant + `scope_info` entry to make
 /// `scopes.rs` coherent with the long-standing fixture + allowlist. It is
-/// deliberately NOT added to `default_scopes_for_service` (no
-/// metadata-only default-grant tier was ever wired, and Story 9.1
-/// exposes no metadata-only tool — see story Dev Notes / Task 7).
+/// deliberately in the gmail connector's `[scopes]` vocab but in **no
+/// access tier** (no metadata-only grant tier was ever wired, and Story
+/// 9.1 exposes no metadata-only tool — see story Dev Notes / Task 7).
+/// Story 11.7 moved the tier sets into the connector defs.
 pub const GMAIL_METADATA: &str = "https://www.googleapis.com/auth/gmail.metadata";
 pub const GMAIL_MODIFY: &str = "https://www.googleapis.com/auth/gmail.modify";
 pub const GMAIL_SEND: &str = "https://www.googleapis.com/auth/gmail.send";
@@ -22,10 +23,11 @@ pub const GMAIL_SEND: &str = "https://www.googleapis.com/auth/gmail.send";
 /// (create/update/send) accept `gmail.compose` as their minimum — NOT
 /// `gmail.send` (verified against Google's REST reference 2026-05-17:
 /// `users.drafts.send` accepts mail.google.com / gmail.modify /
-/// gmail.compose only). Like the other write scopes it is deliberately
-/// NOT in `default_scopes_for_service` — the write tier is a Story 9.4
-/// policy choice, not a default OAuth grant (same rule as 9.1's
-/// `GMAIL_METADATA`).
+/// gmail.compose only). Like the other write scopes it is in the gmail
+/// connector's `read-write` tier but not its `read` tier — the write tier
+/// is a policy choice, not a default OAuth grant (same rule as 9.1's
+/// `GMAIL_METADATA`). Story 11.7 moved the tier sets into the connector
+/// defs.
 pub const GMAIL_COMPOSE: &str = "https://www.googleapis.com/auth/gmail.compose";
 
 // Calendar scopes
@@ -103,81 +105,15 @@ pub fn scope_info(scope_uri: &str) -> Option<ScopeInfo> {
     }
 }
 
-/// Return `ScopeInfo` entries for a service's default scopes.
-#[must_use]
-pub fn default_scope_infos_for_service(service: &str) -> Vec<ScopeInfo> {
-    default_scopes_for_service(service).into_iter().filter_map(scope_info).collect()
-}
-
-/// Return the default scope set for a given service name.
-///
-/// Unknown services return an empty vec (the caller decides whether
-/// that is an error).
-#[must_use]
-pub fn default_scopes_for_service(service: &str) -> Vec<&'static str> {
-    match service {
-        "gmail" => vec![GMAIL_READONLY],
-        "calendar" => vec![CALENDAR_READONLY, CALENDAR_EVENTS],
-        "drive" => vec![DRIVE_READONLY, DRIVE_FILE],
-        _ => vec![],
-    }
-}
-
-/// OAuth scopes to request for a read-**WRITE** connect of `service`.
-///
-/// Superset of the read-only grant ([`default_scopes_for_service`]): the
-/// write tier needs the upstream write scopes present in the **sealed
-/// credential**, not just in the policy allowlist. The policy allowlist
-/// gates which scopes an agent may *use*; it cannot authorize an upstream
-/// Google call for a scope the credential never obtained at consent time.
-/// Before this helper existed, `agentsso quickstart <svc> --read-write`
-/// bound the agent to the `-read-write` policy but still requested only
-/// the read-only OAuth scopes — so every write 403'd with
-/// `scope-insufficient`. This is the scope set the OAuth consent must
-/// request so writes actually work.
-///
-/// The gmail set deliberately omits [`GMAIL_METADATA`]: `gmail.readonly`
-/// already satisfies metadata reads upstream, and requesting both adds
-/// consent friction without granting anything new. (The `gmail-read-write`
-/// policy still *lists* `gmail.metadata` — that's an allowlist entry, not
-/// an OAuth request.)
-///
-/// `calendar` and `drive` write sets equal their read-only defaults today
-/// (their `*.events` / `*.file` scopes already cover writes), so those
-/// services are unaffected by the read/write split — kept explicit here so
-/// a future write-only scope is a one-line change.
-#[must_use]
-pub fn read_write_scopes_for_service(service: &str) -> Vec<&'static str> {
-    match service {
-        "gmail" => vec![GMAIL_READONLY, GMAIL_SEND, GMAIL_COMPOSE, GMAIL_MODIFY],
-        "calendar" => vec![CALENDAR_READONLY, CALENDAR_EVENTS],
-        "drive" => vec![DRIVE_READONLY, DRIVE_FILE],
-        _ => vec![],
-    }
-}
-
-/// Resolve the OAuth scope set to request for `service`, keyed by whether
-/// the connect is read-**write** (`write = true`) or read-only.
-///
-/// Single entry point so callers (`agentsso connect`, `quickstart`) don't
-/// branch on the access level inline. `write = false` is byte-identical to
-/// [`default_scopes_for_service`] (back-compat for read-only flows).
-#[must_use]
-pub fn scopes_for_access(service: &str, write: bool) -> Vec<&'static str> {
-    if write { read_write_scopes_for_service(service) } else { default_scopes_for_service(service) }
-}
-
-/// `ScopeInfo` entries for the scope set [`scopes_for_access`] resolves —
-/// the access-level-aware sibling of [`default_scope_infos_for_service`].
-///
-/// Used by the `connect` consent preview and the `quickstart` summary so
-/// neither hand-rolls the `scopes_for_access(..).filter_map(scope_info)`
-/// mapping. Unknown scope URIs are dropped (same contract as
-/// `default_scope_infos_for_service`).
-#[must_use]
-pub fn scope_infos_for_access(service: &str, write: bool) -> Vec<ScopeInfo> {
-    scopes_for_access(service, write).into_iter().filter_map(scope_info).collect()
-}
+// Story 11.7: per-service scope *set* resolution
+// (`default_scopes_for_service` / `read_write_scopes_for_service` /
+// `scopes_for_access` and their `ScopeInfo` wrappers) moved out of
+// `scopes.rs` into the connector defs — the registry is now the single
+// source of truth for "which scopes does this access tier grant". The
+// daemon CLI resolves the tier→URI set via
+// `ResolvedConnector::tier_scope_uris`, then maps each URI through
+// `scope_info` below for the consent display. `scopes.rs` keeps only the
+// provider-generic display metadata + the scope constants.
 
 /// Story 7.13: convert a granted OAuth scope URI to its policy-file
 /// short name.
@@ -193,46 +129,15 @@ pub fn uri_to_short_name(scope_uri: &str) -> Option<&'static str> {
     scope_info(scope_uri).map(|info| info.short_name)
 }
 
-/// Story 7.13: return the policy-file short names for a service's
-/// default scopes.
-///
-/// Used by `agentsso connect` for its "is the credential already
-/// sealed AND covers all the requested scopes?" idempotency check
-/// in Step 2 (skip OAuth + seal phase). The returned `Vec<&str>`
-/// preserves declaration order from `default_scopes_for_service`.
-#[must_use]
-pub fn requested_short_names_for_service(service: &str) -> Vec<&'static str> {
-    default_scopes_for_service(service).into_iter().filter_map(uri_to_short_name).collect()
-}
-
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn gmail_returns_readonly_scope() {
-        let scopes = default_scopes_for_service("gmail");
-        assert_eq!(scopes, vec![GMAIL_READONLY]);
-    }
-
-    #[test]
-    fn calendar_returns_readonly_and_events_scopes() {
-        let scopes = default_scopes_for_service("calendar");
-        assert_eq!(scopes, vec![CALENDAR_READONLY, CALENDAR_EVENTS]);
-    }
-
-    #[test]
-    fn drive_returns_readonly_and_file_scopes() {
-        let scopes = default_scopes_for_service("drive");
-        assert_eq!(scopes, vec![DRIVE_READONLY, DRIVE_FILE]);
-    }
-
-    #[test]
-    fn unknown_service_returns_empty() {
-        let scopes = default_scopes_for_service("unknown");
-        assert!(scopes.is_empty());
-    }
+    // Story 11.7: per-service scope-*set* tests moved to
+    // `permitlayer-connectors` (`tier_scope_uris_pin_to_legacy_scope_sets`).
+    // What remains here is the provider-generic `scope_info` /
+    // `uri_to_short_name` display surface `scopes.rs` still owns.
 
     #[test]
     fn each_known_scope_has_info() {
@@ -264,7 +169,9 @@ mod tests {
 
     /// Story 9.1 Task 7 reconciliation: `gmail.metadata` shipped in the
     /// `gmail-read-only` fixture + plugin scope_allowlist since the initial
-    /// public release but had no `scope_info` row. It now resolves...
+    /// public release but had no `scope_info` row. It must still resolve.
+    /// (Whether it appears in any access tier is now the connector defs'
+    /// concern — it deliberately appears in `[scopes]` but no tier.)
     #[test]
     fn gmail_metadata_scope_is_reconciled() {
         let info = scope_info(GMAIL_METADATA);
@@ -274,15 +181,6 @@ mod tests {
         assert_eq!(info.short_name, "gmail.metadata");
         assert!(!info.description.is_empty());
         assert_eq!(uri_to_short_name(GMAIL_METADATA), Some("gmail.metadata"));
-    }
-
-    /// ...but it is deliberately NOT in the gmail default grant (no
-    /// metadata-only default tier was ever wired — Story 9.1 Dev Notes).
-    #[test]
-    fn gmail_metadata_not_in_default_grant() {
-        let scopes = default_scopes_for_service("gmail");
-        assert_eq!(scopes, vec![GMAIL_READONLY]);
-        assert!(!scopes.contains(&GMAIL_METADATA));
     }
 
     /// Story 9.2: `gmail.compose` resolves (drafts create/update/send
@@ -299,29 +197,6 @@ mod tests {
         assert_eq!(uri_to_short_name(GMAIL_COMPOSE), Some("gmail.compose"));
     }
 
-    /// ...and like every write scope it is NOT in the gmail default
-    /// grant (write tier is a Story 9.4 policy choice, not a default).
-    #[test]
-    fn gmail_compose_not_in_default_grant() {
-        let scopes = default_scopes_for_service("gmail");
-        assert_eq!(scopes, vec![GMAIL_READONLY]);
-        assert!(!scopes.contains(&GMAIL_COMPOSE));
-    }
-
-    #[test]
-    fn default_scope_infos_for_gmail() {
-        let infos = default_scope_infos_for_service("gmail");
-        assert_eq!(infos.len(), 1);
-        assert_eq!(infos[0].short_name, "gmail.readonly");
-        assert_eq!(infos[0].description, "Read your email messages and settings");
-    }
-
-    #[test]
-    fn default_scope_infos_for_unknown_service() {
-        let infos = default_scope_infos_for_service("unknown");
-        assert!(infos.is_empty());
-    }
-
     #[test]
     fn uri_to_short_name_round_trips_for_known_scopes() {
         assert_eq!(uri_to_short_name(GMAIL_READONLY), Some("gmail.readonly"));
@@ -332,77 +207,5 @@ mod tests {
     #[test]
     fn uri_to_short_name_returns_none_for_unknown() {
         assert_eq!(uri_to_short_name("https://example.com/some.unknown.scope"), None);
-    }
-
-    #[test]
-    fn requested_short_names_for_calendar() {
-        let names = requested_short_names_for_service("calendar");
-        assert_eq!(names, vec!["calendar.readonly", "calendar.events"]);
-    }
-
-    #[test]
-    fn requested_short_names_for_unknown_is_empty() {
-        let names = requested_short_names_for_service("unknown");
-        assert!(names.is_empty());
-    }
-
-    /// The core fix: a read-write gmail connect must request the write
-    /// scopes (send/compose/modify) at consent time, not just readonly.
-    /// Before this, the OAuth grant was readonly-only and every write 403'd.
-    #[test]
-    fn read_write_scopes_for_gmail_includes_write_scopes() {
-        let scopes = read_write_scopes_for_service("gmail");
-        assert!(scopes.contains(&GMAIL_READONLY), "must keep read access");
-        assert!(scopes.contains(&GMAIL_SEND), "must request send");
-        assert!(scopes.contains(&GMAIL_COMPOSE), "must request compose (drafts)");
-        assert!(scopes.contains(&GMAIL_MODIFY), "must request modify");
-        // Deliberately NOT requesting gmail.metadata (gmail.readonly covers it).
-        assert!(!scopes.contains(&GMAIL_METADATA), "metadata is redundant with readonly");
-    }
-
-    /// Back-compat: calendar's write set equals its read-only default
-    /// (calendar.events already covers writes), so read/write splitting
-    /// leaves calendar flows byte-identical.
-    #[test]
-    fn read_write_scopes_for_calendar_equals_default() {
-        assert_eq!(
-            read_write_scopes_for_service("calendar"),
-            default_scopes_for_service("calendar")
-        );
-    }
-
-    /// Back-compat: drive's write set equals its read-only default.
-    #[test]
-    fn read_write_scopes_for_drive_equals_default() {
-        assert_eq!(read_write_scopes_for_service("drive"), default_scopes_for_service("drive"));
-    }
-
-    #[test]
-    fn read_write_scopes_for_unknown_is_empty() {
-        assert!(read_write_scopes_for_service("unknown").is_empty());
-    }
-
-    /// `scopes_for_access(svc, false)` must be byte-identical to the
-    /// historical default-grant (the read-only flow is unchanged).
-    #[test]
-    fn scopes_for_access_read_matches_default() {
-        for svc in ["gmail", "calendar", "drive", "unknown"] {
-            assert_eq!(
-                scopes_for_access(svc, false),
-                default_scopes_for_service(svc),
-                "read access for {svc} must match the default grant"
-            );
-        }
-    }
-
-    #[test]
-    fn scopes_for_access_write_matches_read_write_set() {
-        for svc in ["gmail", "calendar", "drive", "unknown"] {
-            assert_eq!(
-                scopes_for_access(svc, true),
-                read_write_scopes_for_service(svc),
-                "write access for {svc} must match the read-write set"
-            );
-        }
     }
 }

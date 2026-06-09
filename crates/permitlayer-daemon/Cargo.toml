@@ -50,6 +50,9 @@ required-features = ["test-seam"]
 
 [dependencies]
 permitlayer-proxy.workspace = true
+# Story 11.5: connector registry — resolves a request's service to the
+# connector's upstream base_url + allowed_hosts at proxy construction.
+permitlayer-connectors.workspace = true
 permitlayer-oauth.workspace = true
 permitlayer-vault.workspace = true
 # Story 7.6b round-1 review: rotation read-back-verify uses

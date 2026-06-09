@@ -94,6 +94,13 @@ pub struct AuthLayer {
     registry: Arc<AgentRegistry>,
     daemon_lookup_key: Arc<Zeroizing<[u8; LOOKUP_KEY_BYTES]>>,
     agent_store: Option<Arc<dyn AgentIdentityStore>>,
+    /// Story 11.10: optional binding + connection stores. When both are
+    /// `Some`, `AuthService` resolves the request's binding on auth success
+    /// and stamps `AgentPolicyBinding(binding.policy)` so `PolicyLayer` +
+    /// the approval engine (which run before the proxy service) can see the
+    /// binding's policy. `None` → stamp an empty policy (legacy/unit path).
+    binding_store: Option<Arc<dyn permitlayer_core::store::BindingStore>>,
+    connection_store: Option<Arc<dyn permitlayer_core::store::ConnectionStore>>,
     audit_dispatcher: Arc<AuditDispatcher>,
 }
 
@@ -112,14 +119,31 @@ impl AuthLayer {
     /// the same subkey Arc across the middleware and the control plane
     /// (see `cli/start.rs::run`); this ensures there is exactly one
     /// backing allocation for the subkey bytes across the daemon.
+    ///
+    /// Story 11.10: `binding_store` + `connection_store` are `Option<>`
+    /// for the same graceful-degradation + legacy-unit-test reasons as
+    /// `agent_store`. When both are `Some`, auth-success resolves the
+    /// request's binding and stamps the binding's `policy` into
+    /// `AgentPolicyBinding` so the policy/approval engine downstream can
+    /// act on it; when either is `None`, an empty policy is stamped and
+    /// `ProxyService::handle_inner` owns the authoritative binding authz.
     #[must_use]
     pub fn new(
         registry: Arc<AgentRegistry>,
         daemon_lookup_key: Arc<Zeroizing<[u8; LOOKUP_KEY_BYTES]>>,
         agent_store: Option<Arc<dyn AgentIdentityStore>>,
+        binding_store: Option<Arc<dyn permitlayer_core::store::BindingStore>>,
+        connection_store: Option<Arc<dyn permitlayer_core::store::ConnectionStore>>,
         audit_dispatcher: Arc<AuditDispatcher>,
     ) -> Self {
-        Self { registry, daemon_lookup_key, agent_store, audit_dispatcher }
+        Self {
+            registry,
+            daemon_lookup_key,
+            agent_store,
+            binding_store,
+            connection_store,
+            audit_dispatcher,
+        }
     }
 }
 
@@ -132,6 +156,8 @@ impl<S> Layer<S> for AuthLayer {
             registry: Arc::clone(&self.registry),
             daemon_lookup_key: Arc::clone(&self.daemon_lookup_key),
             agent_store: self.agent_store.clone(),
+            binding_store: self.binding_store.clone(),
+            connection_store: self.connection_store.clone(),
             audit_dispatcher: Arc::clone(&self.audit_dispatcher),
         }
     }
@@ -144,6 +170,8 @@ pub struct AuthService<S> {
     registry: Arc<AgentRegistry>,
     daemon_lookup_key: Arc<Zeroizing<[u8; LOOKUP_KEY_BYTES]>>,
     agent_store: Option<Arc<dyn AgentIdentityStore>>,
+    binding_store: Option<Arc<dyn permitlayer_core::store::BindingStore>>,
+    connection_store: Option<Arc<dyn permitlayer_core::store::ConnectionStore>>,
     audit_dispatcher: Arc<AuditDispatcher>,
 }
 
@@ -256,6 +284,14 @@ where
         // Clone everything the async block needs up front — `self`
         // and `req` both cross the await boundary.
         let agent_store = self.agent_store.clone();
+        // Story 11.10: the binding/connection stores + the request path
+        // (for selector extraction) the auth-success branch needs to
+        // resolve the binding's policy. The path is captured to an owned
+        // String now because `req` is mutated (extensions) inside the
+        // async block, so we cannot borrow `req.uri()` across the await.
+        let binding_store = self.binding_store.clone();
+        let connection_store = self.connection_store.clone();
+        let request_path = req.uri().path().to_owned();
         // Story 7.37: the data path must also advance the IN-MEMORY
         // registry's last_seen (what `agentsso agent list` reads), not
         // just the fs store — otherwise an actively-authenticating
@@ -333,9 +369,40 @@ where
 
             // 7. Success: stamp extensions, fire-and-forget last_seen_at update.
             let agent_name = agent.name().to_owned();
-            let policy_name = agent.policy_name.clone();
+            // Story 11.9/11.10: `AgentIdentity` no longer carries
+            // `policy_name` — an agent's authority is its *set* of bindings.
+            // Resolve the binding addressed by this request's selector and
+            // surface its `policy` so `PolicyLayer` + the approval engine
+            // (both downstream but BEFORE the proxy service) can evaluate
+            // it (including `Decision::Prompt` → approval). The
+            // authoritative tier/granted-scope gate + the `binding.not_found`
+            // 403 stay in `ProxyService::handle_inner`; this stamp only
+            // surfaces the policy name.
+            //
+            //   - both stores `Some` + a matching live binding → stamp
+            //     `binding.policy` (empty string if the binding names no
+            //     policy → `PolicyLayer` pass-through, as before),
+            //   - both stores `Some` + NO match → stamp empty; do NOT 403
+            //     here — `handle_inner` produces the single, authoritative
+            //     `binding.not_found` deny (one source of truth),
+            //   - stores `None` (legacy/unit) → stamp empty.
+            let policy_binding = match resolve_policy_binding(
+                binding_store.as_ref(),
+                connection_store.as_ref(),
+                &agent_name,
+                &request_path,
+            )
+            .await
+            {
+                Ok(p) => p,
+                // F2 fail-closed: a binding-store read error denies the
+                // request (5xx) rather than stamping empty (pass-through),
+                // so a restrictive binding.policy can't be bypassed by an
+                // I/O flake while the sibling tier/scope gates still deny.
+                Err(e) => return Ok(e.into_response_with_request_id(request_id)),
+            };
             req.extensions_mut().insert(AgentId(agent_name.clone()));
-            req.extensions_mut().insert(AgentPolicyBinding(policy_name));
+            req.extensions_mut().insert(AgentPolicyBinding(policy_binding));
 
             // Surface the resolved agent_id on the request-trace span
             // (RequestTraceLayer at `middleware/trace.rs` initializes
@@ -369,6 +436,61 @@ where
 
             inner.call(req).await
         })
+    }
+}
+
+/// Resolve the `AgentPolicyBinding` string to stamp on auth success
+/// (Story 11.10).
+///
+/// Returns the matched binding's `policy` (empty string when the binding
+/// names no policy → `PolicyLayer` pass-through), or an empty string when
+/// the stores are not wired, the path carries no connection selector, or
+/// the agent holds no live binding for the selector. A *miss* is
+/// deliberately NOT a deny here — `ProxyService::handle_inner` owns the
+/// single authoritative `binding.not_found` 403.
+///
+/// **F2 fix (review 2026-06-07): a store-read ERROR fails CLOSED.** It
+/// returns `Err(ProxyError::Internal)` so the caller denies the request,
+/// matching the fail-closed posture of the tier/granted-scope gates in
+/// `handle_inner` (which return `Internal` on the same store-read error).
+/// Previously this degraded to an empty stamp (pass-through), so an I/O
+/// flake on the binding-store read could silently bypass a restrictive
+/// `binding.policy` while the sibling gates still denied — an asymmetric
+/// fail-open on a security control. The two surfaces now agree.
+async fn resolve_policy_binding(
+    binding_store: Option<&Arc<dyn permitlayer_core::store::BindingStore>>,
+    connection_store: Option<&Arc<dyn permitlayer_core::store::ConnectionStore>>,
+    agent_name: &str,
+    request_path: &str,
+) -> Result<String, ProxyError> {
+    let (Some(binding_store), Some(connection_store)) = (binding_store, connection_store) else {
+        return Ok(String::new());
+    };
+    let Some(selector) = crate::binding_resolve::selector_from_path(request_path) else {
+        return Ok(String::new());
+    };
+    match crate::binding_resolve::resolve_agent_binding(
+        binding_store,
+        connection_store,
+        agent_name,
+        selector,
+    )
+    .await
+    {
+        Ok(Some((binding, _connection))) => Ok(binding.policy.unwrap_or_default()),
+        Ok(None) => Ok(String::new()),
+        Err(e) => {
+            warn!(
+                agent_name = %agent_name,
+                selector = %selector,
+                error = %e,
+                "auth: binding lookup for policy stamp failed; denying (fail-closed, \
+                 symmetric with the handle_inner tier/scope gates)"
+            );
+            Err(ProxyError::Internal {
+                message: format!("binding store read failed during policy resolution: {e}"),
+            })
+        }
     }
 }
 
@@ -510,10 +632,11 @@ fn hmac_hit_argon2id_miss_message() -> &'static str {
      client is presenting a STALE or ROTATED bearer token — the agent \
      was re-registered / rotated / reconnected and its token changed, \
      but this client still holds the old one. Fix: re-fetch the MCP \
-     client snippet (re-run `agentsso connect` / `agentsso agent \
-     register` and redeploy the new bearer). Far less likely: genuine \
-     in-memory agent-map corruption (would require process \
-     compromise). The agent_name is in the structured fields below."
+     client snippet (re-run `agentsso quickstart <service>` or rotate \
+     with `agentsso agent rotate <agent>` and redeploy the new bearer). \
+     Far less likely: genuine in-memory agent-map corruption (would \
+     require process compromise). The agent_name is in the structured \
+     fields below."
 }
 
 #[cfg(test)]
@@ -570,9 +693,12 @@ mod tests {
         // Lookup key is HMAC over the AGENT NAME, not the token.
         let lookup_key = compute_lookup_key(&daemon_key, name.as_bytes());
         let hash = hash_token(token_string.as_bytes()).unwrap();
+        // Story 11.9: `AgentIdentity` no longer carries `policy_name`. The
+        // `policy` arg is retained on `fixture` only to keep call sites
+        // readable about intent; binding/authority now lives in bindings.
+        let _ = policy;
         let agent = AgentIdentity::new(
             name.to_owned(),
-            policy.to_owned(),
             hash,
             lookup_key_to_hex(&lookup_key),
             Utc::now(),
@@ -675,7 +801,9 @@ mod tests {
             .layer(AuthLayer::new(
                 registry,
                 Arc::new(Zeroizing::new(daemon_key)),
-                None,
+                None, // agent_store
+                None, // binding_store (Story 11.10)
+                None, // connection_store (Story 11.10)
                 Arc::clone(&dispatcher),
             ))
             .service(tower::service_fn(handler));
@@ -696,7 +824,12 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::OK);
         let body = resp.into_body().collect().await.unwrap().to_bytes();
         let body_str = String::from_utf8(body.to_vec()).unwrap();
-        assert_eq!(body_str, "email-triage|email-read-only");
+        // Story 11.9: AuthLayer stamps an EMPTY `AgentPolicyBinding` now —
+        // an agent's authority moved out of `AgentIdentity.policy_name`
+        // (deleted) into its set of bindings, resolved downstream in
+        // `ProxyService::handle_inner` (Story 11.10). The handler echoes
+        // `{agent_id}|{policy_binding}`, so the policy half is empty.
+        assert_eq!(body_str, "email-triage|");
     }
 
     // ── 401 paths ──────────────────────────────────────────────────
@@ -960,8 +1093,8 @@ mod tests {
             "message must lead with the stale/rotated-token cause: {msg:?}"
         );
         assert!(
-            lower.contains("re-fetch") && lower.contains("agentsso connect"),
-            "message must give the actionable fix (re-fetch the snippet via agentsso connect): {msg:?}"
+            lower.contains("re-fetch") && lower.contains("agentsso quickstart"),
+            "message must give the actionable fix (re-fetch the snippet via agentsso quickstart): {msg:?}"
         );
 
         // It must NOT *lead* with corruption. Corruption may still be
@@ -997,6 +1130,8 @@ mod tests {
             registry,
             Arc::new(Zeroizing::new(daemon_key)),
             Some(Arc::clone(&agent_store)),
+            None, // binding_store (Story 11.10)
+            None, // connection_store (Story 11.10)
             Arc::new(AuditDispatcher::none()),
         );
         let svc = ServiceBuilder::new().layer(layer).service(tower::service_fn(handler));
@@ -1113,7 +1248,6 @@ mod tests {
         //      (post-restart). The NEW token must succeed; the OLD
         //      token must fail (token_hash no longer matches).
         let agent_name = "rotated-agent";
-        let policy = "default";
 
         // Pre-rotation context (the OLD subkey + token are
         // implicit — rotation has discarded them by the time the
@@ -1130,7 +1264,6 @@ mod tests {
         // what the daemon would see post-rotation-and-restart.
         let agent = AgentIdentity::new(
             agent_name.to_owned(),
-            policy.to_owned(),
             new_token_hash,
             lookup_key_to_hex(&new_lookup_key),
             Utc::now(),
@@ -1162,7 +1295,6 @@ mod tests {
         // didn't change), but the Argon2id verify against the new
         // token_hash MUST fail.
         let agent_name = "rotated-agent";
-        let policy = "default";
 
         let old_token_bytes = generate_bearer_token_bytes();
         let old_token = format!("agt_v2_{}_{}", agent_name, base64_url(&old_token_bytes));
@@ -1177,7 +1309,6 @@ mod tests {
 
         let agent = AgentIdentity::new(
             agent_name.to_owned(),
-            policy.to_owned(),
             new_token_hash,
             lookup_key_to_hex(&new_lookup_key),
             Utc::now(),

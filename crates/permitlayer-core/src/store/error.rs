@@ -121,6 +121,37 @@ pub enum StoreError {
     /// `permitlayer_core::vault::lock::VaultLockError`.
     #[error("vault lock acquisition failed")]
     VaultLockFailed(#[source] crate::vault::lock::VaultLockError),
+    /// Connection name violates the allowlist (Story 11.9). Same
+    /// allowlist shape as `InvalidServiceName`; the namespace is the
+    /// `connections/` directory.
+    #[error("connection name '{input}' does not match allowlist pattern")]
+    InvalidConnectionName {
+        /// The invalid connection name (safe to echo — never secret).
+        input: String,
+    },
+    /// A `ConnectionStore`/`BindingStore` record failed (de)serialization
+    /// (Story 11.9). Connection/binding records carry no secrets, so the
+    /// reason string is safe to surface.
+    #[error("{kind} record (de)serialization failed for '{id}': {reason}")]
+    RecordSerdeFailed {
+        /// Which store produced the failure (`"connection"` / `"binding"`).
+        kind: &'static str,
+        /// The record identifier (connection id or agent name).
+        id: String,
+        reason: String,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
+    /// A binding `(agent, connection_id)` already exists (Story 11.9).
+    /// The primary key refuses to clobber an existing grant; the caller
+    /// must `unbind` first to change tier/policy/alias.
+    #[error("binding for agent '{agent}' → connection '{connection_id}' already exists")]
+    BindingAlreadyExists {
+        /// The agent name.
+        agent: String,
+        /// The connection id (ULID text).
+        connection_id: String,
+    },
 }
 
 /// Structural parse failures for the on-disk sealed-credential envelope.

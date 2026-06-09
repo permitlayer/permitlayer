@@ -1,0 +1,77 @@
+# Built-in connector definition — Google Drive.
+# Story 11.2 (Epic 11). Embedded via include_str!; the source of truth for
+# routing, scope vocab, access tiers, and tool METADATA. Per-tool handler
+# logic (response shaping, attachment handling, validation, query building)
+# lives in Rust keyed by tool name (hybrid model — see 11.4). Metadata here
+# is pinned against the live handler table by tests.
+
+[connector]
+id = "google-drive"
+display_name = "Google Drive"
+version = "1.0.0"
+trust_tier = "built-in"
+
+[auth]
+flavor = "oauth2"
+auth_url = "https://accounts.google.com/o/oauth2/v2/auth"
+token_url = "https://oauth2.googleapis.com/token"
+
+[upstream]
+base_url = "https://www.googleapis.com/drive/v3/"
+allowed_hosts = ["www.googleapis.com"]
+
+[scopes]
+"drive.readonly" = "https://www.googleapis.com/auth/drive.readonly"
+"drive.file" = "https://www.googleapis.com/auth/drive.file"
+
+[tiers]
+read = ["drive.readonly", "drive.file"]
+read-write = ["drive.readonly", "drive.file"]
+
+[[tools]]
+name = "drive.files.list"
+required_scope = "drive.readonly"
+method = "GET"
+path = "files"
+
+[[tools]]
+name = "drive.files.get"
+required_scope = "drive.readonly"
+method = "GET"
+path = "files/{fileId}"
+
+[[tools]]
+name = "drive.files.search"
+required_scope = "drive.readonly"
+method = "GET"
+path = "files"
+
+[[tools]]
+name = "drive.files.create"
+required_scope = "drive.file"
+method = "POST"
+path = "files"
+
+[[tools]]
+name = "drive.files.update"
+required_scope = "drive.file"
+method = "PATCH"
+path = "files/{fileId}"
+
+[[tools]]
+name = "drive.files.delete"
+required_scope = "drive.file"
+method = "DELETE"
+path = "files/{fileId}"
+
+[[tools]]
+name = "drive.files.copy"
+required_scope = "drive.file"
+method = "POST"
+path = "files/{fileId}/copy"
+
+[[tools]]
+name = "drive.about.get"
+required_scope = "drive.readonly"
+method = "GET"
+path = "about"

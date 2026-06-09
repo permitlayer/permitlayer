@@ -144,10 +144,14 @@ deny = [
     # permitlayer-connectors: embedded JS assets consumed by the proxy
     # (future JS-port dispatch path) AND by permitlayer-plugins (Story 6.3
     # loader — `builtin_connectors()` enumerated at daemon boot to register
-    # Gmail/Calendar/Drive into `PluginRegistry`).
+    # Gmail/Calendar/Drive into `PluginRegistry`). Epic 11 (Story 11.12)
+    # added a direct daemon dependency: the connection CLI verbs and the
+    # `connection add` control handler load `ConnectorRegistry` to validate
+    # the connector id and resolve its trust tier.
     { crate = "permitlayer-connectors", wrappers = [
         "permitlayer-proxy",
         "permitlayer-plugins",
+        "permitlayer-daemon",
     ] },
 
     # permitlayer-proxy: consumed only by the daemon binary.

@@ -314,15 +314,18 @@ impl ConnTrackerAdapter {
 
 impl permitlayer_proxy::middleware::ConnTrackerSink for ConnTrackerAdapter {
     fn record(&self, agent_name: &str) {
-        let policy_name = self
-            .registry
-            .snapshot()
-            .get_by_name(agent_name)
-            .map(|i| i.policy_name.clone())
-            .unwrap_or_default();
+        // Story 11.9: `AgentIdentity` no longer carries `policy_name` —
+        // an agent's authority is its *set* of bindings (resolved by the
+        // proxy authz path in Story 11.10), not a single policy field.
+        // The connection-tracker's `policy_name` column is recorded
+        // empty until that lands; the connection is still tracked so
+        // operators see the activity in the connections table. The
+        // `registry` lookup is retained — Story 11.10 swaps the empty
+        // string for the resolved binding.
+        let _ = self.registry.snapshot().get_by_name(agent_name);
         let _ = self.tracker.record_request(
             agent_name,
-            &policy_name,
+            "",
             chrono::Utc::now(),
             std::time::Instant::now(),
         );

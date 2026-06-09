@@ -329,7 +329,6 @@ fn pre_seed_agent(home: &std::path::Path, name: &str) {
     let token_hash = hash_token(token.as_bytes()).unwrap();
     let agent = AgentIdentity::new(
         name.to_owned(),
-        "default".to_owned(),
         token_hash,
         lookup_key_to_hex(&lookup),
         Utc::now(),

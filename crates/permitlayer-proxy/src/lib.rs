@@ -6,6 +6,7 @@
 
 #![forbid(unsafe_code)]
 
+pub(crate) mod binding_resolve;
 pub mod error;
 pub mod middleware;
 pub mod plugin_host_services;

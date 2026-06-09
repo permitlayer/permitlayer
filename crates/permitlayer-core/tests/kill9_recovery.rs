@@ -34,9 +34,17 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use permitlayer_core::store::CredentialStore;
 use permitlayer_core::store::fs::credential_fs::{CredentialFsIo, CredentialFsStore};
-use permitlayer_credential::{KeyId, SEALED_CREDENTIAL_VERSION, SealedCredential};
+use permitlayer_credential::{
+    ConnectionId, KeyId, SEALED_CREDENTIAL_VERSION, SealedCredential, Slot,
+};
 use tempfile::TempDir;
 use walkdir::WalkDir;
+
+/// Fixed connection id used by every put/get in this test (Story 11.9 —
+/// the store keys on `(ConnectionId, Slot)`, not a service string).
+fn kill9_id() -> ConnectionId {
+    ConnectionId::from_bytes([0x9b; 16])
+}
 
 /// Sentinel bytes that MUST NEVER appear in any on-disk artifact. The
 /// `test_` prefix matches the Story 1.1 convention so accidental
@@ -48,7 +56,7 @@ const SENTINEL: &[u8] = b"test_plaintext_oauth_token_bytes_v1_sentinel";
 /// NOT contain `SENTINEL` — the fixture builder uses a distinct byte
 /// pattern for the ciphertext (0xAA).
 fn fixture_a() -> SealedCredential {
-    let aad = [b"permitlayer-vault-v1:", b"gmail" as &[u8]].concat();
+    let aad = [b"test-envelope-aad:", b"gmail" as &[u8]].concat();
     let ciphertext = vec![0xAAu8; 48];
     let nonce = [0x11u8; 12];
     SealedCredential::from_trusted_bytes(
@@ -61,7 +69,7 @@ fn fixture_a() -> SealedCredential {
 }
 
 fn fixture_b() -> SealedCredential {
-    let aad = [b"permitlayer-vault-v1:", b"gmail" as &[u8]].concat();
+    let aad = [b"test-envelope-aad:", b"gmail" as &[u8]].concat();
     let ciphertext = vec![0xBBu8; 48];
     let nonce = [0x22u8; 12];
     SealedCredential::from_trusted_bytes(
@@ -208,13 +216,10 @@ fn contains_subsequence(haystack: &[u8], needle: &[u8]) -> bool {
 
 /// Reconstruct a real (non-faulty) store at `home` and call `get`.
 /// Used after every simulated crash to verify recovery state.
-async fn verify_get_returns_one_of(
-    home: &Path,
-    service: &str,
-    valid_options: &[Option<&SealedCredential>],
-) {
+async fn verify_get_returns_one_of(home: &Path, valid_options: &[Option<&SealedCredential>]) {
     let store = CredentialFsStore::new(home.to_path_buf()).expect("post-crash store must re-open");
-    let got = store.get(service).await.expect("get must not error on crash-recovery");
+    let got =
+        store.get(kill9_id(), Slot::Access).await.expect("get must not error on crash-recovery");
     match &got {
         None => {
             assert!(
@@ -250,7 +255,7 @@ async fn first_write_crash_leaves_empty_or_complete() {
 
         let a = fixture_a();
         let expected_if_rename_succeeded = fixture_a();
-        let result = store.put("gmail", a).await;
+        let result = store.put(kill9_id(), Slot::Access, a).await;
 
         // At points 1–4 (before rename), result MUST be Err (pre-rename
         // crash points all propagate the injected error). At point 5
@@ -263,13 +268,12 @@ async fn first_write_crash_leaves_empty_or_complete() {
             | CrashPoint::BeforeRename => {
                 assert!(result.is_err(), "{crash_point:?} should fail put()");
                 // File must not exist.
-                verify_get_returns_one_of(&home, "gmail", &[None]).await;
+                verify_get_returns_one_of(&home, &[None]).await;
             }
             CrashPoint::BeforeSyncParentDir => {
                 assert!(result.is_err(), "BeforeSyncParentDir should fail put()");
                 // Rename already succeeded — file exists with new contents.
-                verify_get_returns_one_of(&home, "gmail", &[Some(&expected_if_rename_succeeded)])
-                    .await;
+                verify_get_returns_one_of(&home, &[Some(&expected_if_rename_succeeded)]).await;
             }
         }
 
@@ -294,14 +298,17 @@ async fn overwrite_crash_preserves_prior_or_commits_new() {
 
         // First: write fixture A successfully (real I/O, no fault).
         let store_clean = CredentialFsStore::new(home.clone()).expect("clean store construct");
-        store_clean.put("gmail", fixture_a()).await.expect("first put must succeed");
+        store_clean
+            .put(kill9_id(), Slot::Access, fixture_a())
+            .await
+            .expect("first put must succeed");
         drop(store_clean);
 
         // Second: write fixture B, crashing at `crash_point`.
         let io = Arc::new(FaultyFsIo::new(crash_point));
         let store_faulty =
             CredentialFsStore::new_with_io(home.clone(), io).expect("faulty store construct");
-        let result = store_faulty.put("gmail", fixture_b()).await;
+        let result = store_faulty.put(kill9_id(), Slot::Access, fixture_b()).await;
 
         let prior = fixture_a();
         let new_one = fixture_b();
@@ -312,12 +319,12 @@ async fn overwrite_crash_preserves_prior_or_commits_new() {
             | CrashPoint::BeforeRename => {
                 assert!(result.is_err(), "{crash_point:?} should fail put()");
                 // Pre-rename crash: prior fixture A must still be intact.
-                verify_get_returns_one_of(&home, "gmail", &[Some(&prior)]).await;
+                verify_get_returns_one_of(&home, &[Some(&prior)]).await;
             }
             CrashPoint::BeforeSyncParentDir => {
                 assert!(result.is_err(), "BeforeSyncParentDir should fail put()");
                 // Rename already swapped A → B; store returns B.
-                verify_get_returns_one_of(&home, "gmail", &[Some(&new_one)]).await;
+                verify_get_returns_one_of(&home, &[Some(&new_one)]).await;
             }
         }
 

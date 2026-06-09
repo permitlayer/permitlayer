@@ -1454,13 +1454,12 @@ fn wait_for_label_released_inner<P, S>(
 {
     let max_polls = (budget.as_millis() / interval.as_millis().max(1)).max(1) as usize;
     for _ in 0..max_polls {
-        if let Ok((stdout, stderr)) = print() {
-            if stdout.contains(LABEL_RELEASED_SUBSTRING)
-                || stderr.contains(LABEL_RELEASED_SUBSTRING)
-            {
-                // Label drained — safe to bootstrap.
-                return;
-            }
+        if let Ok((stdout, stderr)) = print()
+            && (stdout.contains(LABEL_RELEASED_SUBSTRING)
+                || stderr.contains(LABEL_RELEASED_SUBSTRING))
+        {
+            // Label drained — safe to bootstrap.
+            return;
         }
         sleep(interval);
     }

@@ -315,8 +315,13 @@ fn seed_credentials_under_current_primary(home: &std::path::Path, services: &[&s
     let vault = Vault::new(Zeroizing::new(key), key_id);
     for svc in services {
         let token = OAuthToken::from_trusted_bytes(format!("test-token-for-{svc}").into_bytes());
-        let sealed = vault.seal(svc, &token).unwrap();
+        let (conn, slot) = crate::common::connection_slot_for_service_key(svc);
+        let sealed = vault.seal(conn, slot, &token).unwrap();
         let bytes = encode_envelope(&sealed);
-        std::fs::write(vault_dir.join(format!("{svc}.sealed")), bytes).unwrap();
+        // Story 11.9: the credential store keys on `(ConnectionId, Slot)`;
+        // rotate-key enumerates via `list_connections`, which parses the
+        // `<ulid>-<slot>.sealed` filename. Write under that name so the
+        // resume path discovers and reseals the envelope.
+        std::fs::write(vault_dir.join(format!("{conn}-{}.sealed", slot.label())), bytes).unwrap();
     }
 }

@@ -18,20 +18,22 @@ use axum::Router;
 use permitlayer_core::audit::event::AuditEvent;
 use permitlayer_core::scrub::{ScrubEngine, builtin_rules};
 use permitlayer_core::store::{AuditStore, CredentialStore, StoreError};
-use permitlayer_credential::{OAuthToken, SealedCredential};
+use permitlayer_credential::{ConnectionId, OAuthToken, SealedCredential, Slot};
 use permitlayer_proxy::error::AgentId;
 use permitlayer_proxy::service::ProxyService;
 use permitlayer_proxy::token::ScopedTokenIssuer;
 use permitlayer_proxy::transport::mcp::mcp_service;
 use permitlayer_proxy::upstream::UpstreamClient;
 use permitlayer_vault::Vault;
-use url::Url;
 use zeroize::Zeroizing;
 
 const TEST_MASTER_KEY: [u8; 32] = [0x42; 32];
 
 struct MockCredentialStore {
-    services: HashMap<String, Vec<u8>>,
+    // Keyed on `(ConnectionId bytes, Slot byte)` per the Story 11.9 store
+    // re-key; `add_service` seeds under the legacy connection-id derivation
+    // (no binding stores wired) + Slot::Access.
+    services: HashMap<([u8; 16], u8), Vec<u8>>,
     master_key: [u8; 32],
 }
 
@@ -41,30 +43,48 @@ impl MockCredentialStore {
     }
 
     fn add_service(&mut self, service: &str, token_bytes: &[u8]) {
-        self.services.insert(service.to_owned(), token_bytes.to_vec());
+        let connection = crate::common::legacy_connection_id_for_service(service);
+        self.services
+            .insert((*connection.as_bytes(), Slot::Access.slot_byte()), token_bytes.to_vec());
     }
 }
 
 #[async_trait::async_trait]
 impl CredentialStore for MockCredentialStore {
-    async fn put(&self, _service: &str, _sealed: SealedCredential) -> Result<(), StoreError> {
+    async fn put(
+        &self,
+        _id: ConnectionId,
+        _slot: Slot,
+        _sealed: SealedCredential,
+    ) -> Result<(), StoreError> {
         Ok(())
     }
-    async fn get(&self, service: &str) -> Result<Option<SealedCredential>, StoreError> {
-        match self.services.get(service) {
+    async fn get(
+        &self,
+        id: ConnectionId,
+        slot: Slot,
+    ) -> Result<Option<SealedCredential>, StoreError> {
+        match self.services.get(&(*id.as_bytes(), slot.slot_byte())) {
             Some(token_bytes) => {
                 let vault = Vault::new(Zeroizing::new(self.master_key), 0);
                 let token = OAuthToken::from_trusted_bytes(token_bytes.clone());
-                match vault.seal(service, &token) {
+                match vault.seal(id, slot, &token) {
                     Ok(sealed) => Ok(Some(sealed)),
-                    Err(_) => panic!("mock seal failed for {service}"),
+                    Err(_) => panic!("mock seal failed for {id:?}/{slot:?}"),
                 }
             }
             None => Ok(None),
         }
     }
-    async fn list_services(&self) -> Result<Vec<String>, StoreError> {
-        Ok(self.services.keys().cloned().collect())
+    async fn list_connections(&self) -> Result<Vec<ConnectionId>, StoreError> {
+        Ok(self
+            .services
+            .keys()
+            .map(|(id_bytes, _slot)| ConnectionId::from_bytes(*id_bytes))
+            .collect())
+    }
+    async fn remove(&self, _id: ConnectionId, _slot: Slot) -> Result<bool, StoreError> {
+        Ok(false)
     }
 }
 
@@ -108,9 +128,7 @@ async fn start_mcp_server_with_agent(
     let mut cred_store = MockCredentialStore::new(TEST_MASTER_KEY);
     cred_store.add_service("gmail", b"test-oauth-access-token");
 
-    let client = reqwest::Client::builder().build().unwrap();
-    let mut base_urls = HashMap::new();
-    base_urls.insert("gmail".to_owned(), Url::parse(upstream_url).unwrap());
+    let connectors = super::common::connector_registry_with(&[("gmail", upstream_url)]);
 
     let audit_store = Arc::new(MockAuditStore::new());
 
@@ -122,7 +140,8 @@ async fn start_mcp_server_with_agent(
             rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut key);
             ScopedTokenIssuer::new(Zeroizing::new(key))
         }),
-        Arc::new(UpstreamClient::with_client_and_urls(client, base_urls)),
+        Arc::new(UpstreamClient::new().unwrap()),
+        connectors,
         Arc::clone(&audit_store) as Arc<dyn AuditStore>,
         Arc::new(ScrubEngine::new(builtin_rules().to_vec()).unwrap()),
         std::env::temp_dir(),

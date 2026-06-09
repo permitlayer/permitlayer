@@ -4,7 +4,6 @@ use std::path::PathBuf;
 
 use permitlayer_oauth::google::consent::GoogleOAuthConfig;
 use permitlayer_oauth::google::scopes;
-use permitlayer_oauth::metadata::CredentialMeta;
 
 // ── GoogleOAuthConfig tests ──────────────────────────────────────────
 
@@ -74,94 +73,31 @@ fn from_client_json_wrong_structure_returns_invalid_error() {
 }
 
 // ── Scope tests ──────────────────────────────────────────────────────
+//
+// Story 11.7: the per-service scope *data* (`default_scopes_for_service`
+// / `read_write_scopes_for_service` / `scopes_for_access`) moved out of
+// `scopes.rs` into the connector defs. The byte-identical-scope-set
+// regression pin now lives in `permitlayer-connectors`
+// (`registry::tests::tier_scope_uris_pin_to_legacy_scope_sets`), which
+// asserts the same gmail read-write = readonly+send+compose+modify
+// contract this file used to cover. `scopes.rs` keeps only the provider-
+// generic display metadata (`scope_info` / `uri_to_short_name`), exercised
+// by its own unit tests.
 
 #[test]
-fn gmail_default_scopes() {
-    let scopes = scopes::default_scopes_for_service("gmail");
-    assert_eq!(scopes, vec![scopes::GMAIL_READONLY]);
+fn scope_info_round_trips_for_known_uris() {
+    // The display-metadata surface `scopes.rs` retains: a granted URI maps
+    // to its policy short name + a human description.
+    let info = scopes::scope_info(scopes::GMAIL_SEND).expect("gmail.send has scope_info");
+    assert_eq!(info.short_name, "gmail.send");
+    assert!(!info.description.is_empty());
+    assert_eq!(scopes::uri_to_short_name(scopes::GMAIL_READONLY), Some("gmail.readonly"));
+    assert!(scopes::scope_info("https://example.com/unknown").is_none());
 }
 
-#[test]
-fn calendar_default_scopes() {
-    let scopes = scopes::default_scopes_for_service("calendar");
-    assert_eq!(scopes, vec![scopes::CALENDAR_READONLY, scopes::CALENDAR_EVENTS]);
-}
-
-#[test]
-fn drive_default_scopes() {
-    let scopes = scopes::default_scopes_for_service("drive");
-    assert_eq!(scopes, vec![scopes::DRIVE_READONLY, scopes::DRIVE_FILE]);
-}
-
-#[test]
-fn unknown_service_returns_empty_scopes() {
-    let scopes = scopes::default_scopes_for_service("slack");
-    assert!(scopes.is_empty());
-}
-
-/// RC1 contract at the consent boundary: a read-WRITE gmail connect must
-/// ask Google for the write scopes, not just readonly. Before the fix,
-/// `--read-write` requested only `gmail.readonly`, so the sealed credential
-/// could never send/modify and every write 403'd `scope-insufficient`.
-#[test]
-fn gmail_read_write_consent_requests_write_scopes() {
-    let scopes = scopes::scopes_for_access("gmail", true);
-    assert!(scopes.contains(&scopes::GMAIL_READONLY));
-    assert!(scopes.contains(&scopes::GMAIL_SEND), "read-write consent must request gmail.send");
-    assert!(scopes.contains(&scopes::GMAIL_COMPOSE), "must request gmail.compose for drafts");
-    assert!(scopes.contains(&scopes::GMAIL_MODIFY), "must request gmail.modify");
-}
-
-/// And the read path is unchanged: `scopes_for_access(_, false)` equals the
-/// historical default grant for every service (back-compat).
-#[test]
-fn read_access_consent_matches_default_grant() {
-    for svc in ["gmail", "calendar", "drive", "slack"] {
-        assert_eq!(scopes::scopes_for_access(svc, false), scopes::default_scopes_for_service(svc),);
-    }
-}
-
-// ── CredentialMeta tests ─────────────────────────────────────────────
-
-#[test]
-fn credential_meta_roundtrip_shared_casa() {
-    let meta = CredentialMeta {
-        client_type: "shared-casa".to_owned(),
-        client_source: None,
-        client_sealed: false,
-        connected_at: "2026-04-06T12:00:00Z".to_owned(),
-        last_refreshed_at: None,
-        scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".to_owned()],
-        expires_in_secs: Some(3600),
-    };
-
-    let json = serde_json::to_string(&meta).unwrap();
-    let deserialized: CredentialMeta = serde_json::from_str(&json).unwrap();
-    assert_eq!(deserialized.client_type, "shared-casa");
-    assert!(deserialized.client_source.is_none());
-}
-
-#[test]
-fn credential_meta_roundtrip_byo() {
-    let meta = CredentialMeta {
-        client_type: "byo".to_owned(),
-        client_source: Some("./my-client.json".to_owned()),
-        client_sealed: false,
-        connected_at: "2026-04-06T12:00:00Z".to_owned(),
-        last_refreshed_at: None,
-        scopes: vec![
-            "https://www.googleapis.com/auth/gmail.readonly".to_owned(),
-            "https://www.googleapis.com/auth/gmail.modify".to_owned(),
-        ],
-        expires_in_secs: None,
-    };
-
-    let json = serde_json::to_string(&meta).unwrap();
-    let deserialized: CredentialMeta = serde_json::from_str(&json).unwrap();
-    assert_eq!(deserialized.client_type, "byo");
-    assert_eq!(deserialized.client_source.as_deref(), Some("./my-client.json"));
-    assert_eq!(deserialized.scopes.len(), 2);
-}
+// (CredentialMeta serde round-trip tests removed in Story 11.16 — the
+// `-meta.json` provenance type was deleted; the ConnectionRecord is the
+// provenance now, tested in permitlayer-core's connection_fs.rs.)
 
 // ── Error display safety ─────────────────────────────────────────────
 

@@ -94,12 +94,39 @@ async fn debug_plugin_echo_returns_host_api_version_e2e() {
     assert_eq!(handle_result.unwrap(), "1.0.0-rc.1");
 }
 
+/// Story 11.16: seed a `ConnectionRecord` named `name` at
+/// `<home>/connections/<id>.toml` and return the `<home>/vault` dir to
+/// pass as `vault_dir` (its parent yields the `connections/` dir the host
+/// API reads). The host API treats a present ConnectionRecord — not a
+/// `{service}-meta.json` file — as a "connected service".
+fn seed_connection(home: &std::path::Path, name: &str) -> std::path::PathBuf {
+    use permitlayer_core::store::connection::{ConnectionRecord, ConnectionStatus, ConnectionTier};
+    let vault_dir = home.join("vault");
+    std::fs::create_dir_all(&vault_dir).unwrap();
+    let conn_dir = home.join("connections");
+    std::fs::create_dir_all(&conn_dir).unwrap();
+    let id = permitlayer_credential::ConnectionId::generate();
+    let record = ConnectionRecord {
+        id,
+        connector_id: "google-gmail".to_owned(),
+        name: name.to_owned(),
+        account_hint: None,
+        granted_scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".to_owned()],
+        tier: ConnectionTier::Read,
+        created_at: chrono::Utc::now(),
+        status: ConnectionStatus::Active,
+    };
+    std::fs::write(conn_dir.join(format!("{id}.toml")), toml::to_string_pretty(&record).unwrap())
+        .unwrap();
+    vault_dir
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn debug_plugin_echo_oauth_token_round_trip_e2e() {
     let dir = tempfile::tempdir().unwrap();
-    // Seed a vault meta entry so the service is "connected."
-    std::fs::write(dir.path().join("gmail-meta.json"), r#"{"client_type":"shared-casa"}"#).unwrap();
-    let services = build_services(dir.path().to_owned(), "debug-plugin-echo");
+    // Seed a connection named `gmail` so the service is "connected" (v2).
+    let vault_dir = seed_connection(dir.path(), "gmail");
+    let services = build_services(vault_dir, "debug-plugin-echo");
     let plugin_runtime = Arc::new(PluginRuntime::new_default().unwrap());
 
     let result = tokio::task::spawn_blocking(move || -> Result<String, String> {

@@ -8,14 +8,20 @@ use permitlayer_oauth::google::scopes;
 use permitlayer_oauth::google::verify;
 
 // ── Scope info tests ────────────────────────────────────────────────
+//
+// Story 11.7: per-service scope *sets* moved to the connector defs, so the
+// `default_scope_infos_for_service(svc)` wrapper is gone. The remaining
+// `scopes.rs` surface is the provider-generic `scope_info` display
+// metadata — asserted here directly on the scope constants. (Which scopes
+// a service grants is now pinned in `permitlayer-connectors`'s
+// `tier_scope_uris_pin_to_legacy_scope_sets`.)
 
 #[test]
-fn scope_info_for_all_default_gmail_scopes() {
-    let infos = scopes::default_scope_infos_for_service("gmail");
-    assert_eq!(infos.len(), 1);
-    assert_eq!(infos[0].uri, scopes::GMAIL_READONLY);
-    assert_eq!(infos[0].short_name, "gmail.readonly");
-    assert_eq!(infos[0].description, "Read your email messages and settings");
+fn scope_info_for_gmail_readonly() {
+    let info = scopes::scope_info(scopes::GMAIL_READONLY).expect("gmail.readonly has info");
+    assert_eq!(info.uri, scopes::GMAIL_READONLY);
+    assert_eq!(info.short_name, "gmail.readonly");
+    assert_eq!(info.description, "Read your email messages and settings");
 }
 
 #[test]
@@ -24,19 +30,24 @@ fn scope_info_returns_none_for_unknown_uri() {
 }
 
 #[test]
-fn default_scope_infos_for_calendar() {
-    let infos = scopes::default_scope_infos_for_service("calendar");
-    assert_eq!(infos.len(), 2);
-    assert_eq!(infos[0].short_name, "calendar.readonly");
-    assert_eq!(infos[1].short_name, "calendar.events");
+fn scope_info_for_calendar_scopes() {
+    assert_eq!(
+        scopes::scope_info(scopes::CALENDAR_READONLY).map(|i| i.short_name),
+        Some("calendar.readonly")
+    );
+    assert_eq!(
+        scopes::scope_info(scopes::CALENDAR_EVENTS).map(|i| i.short_name),
+        Some("calendar.events")
+    );
 }
 
 #[test]
-fn default_scope_infos_for_drive() {
-    let infos = scopes::default_scope_infos_for_service("drive");
-    assert_eq!(infos.len(), 2);
-    assert_eq!(infos[0].short_name, "drive.readonly");
-    assert_eq!(infos[1].short_name, "drive.file");
+fn scope_info_for_drive_scopes() {
+    assert_eq!(
+        scopes::scope_info(scopes::DRIVE_READONLY).map(|i| i.short_name),
+        Some("drive.readonly")
+    );
+    assert_eq!(scopes::scope_info(scopes::DRIVE_FILE).map(|i| i.short_name), Some("drive.file"));
 }
 
 // ── VerificationFailed error tests ──────────────────────────────────

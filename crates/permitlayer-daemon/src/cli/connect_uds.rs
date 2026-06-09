@@ -1,18 +1,23 @@
-//! UDS client glue for `agentsso connect` (Story 7.30).
+//! UDS client glue for the connection/bind control-plane verbs.
 //!
-//! The connect flow used to read the agent store, vault, and master
-//! key directly. Post-7.30 those touchpoints all move daemon-side:
-//! - `GET /v1/control/agent/{name}/policy_name` — resolve policy.
-//! - `GET /v1/control/credentials/{service}/meta` — idempotent re-run check.
-//! - `POST /v1/control/credentials/seal` — seal access/refresh + meta.
-//! - `POST /v1/control/credentials/{service}/verify` — verify probe.
-//! - `POST /v1/control/policy/{policy_name}/scopes` — merge scopes + reload.
+//! The CLI never reads the agent store, vault, or master key directly —
+//! every credential touchpoint is daemon-side. Post-Epic-11 the live
+//! endpoints this module calls are:
+//! - `POST /v1/control/credentials/seal` — seal access/refresh/client under
+//!   `(connection_id, slot)` + write the `ConnectionRecord` (Story 11.12).
+//! - `POST /v1/control/connections/{connection_id}/verify` — verify probe
+//!   keyed on the connection id (Story 11.12 Fork 4).
+//! - `POST /v1/control/bindings` — create an (agent, connection) binding
+//!   after a live-PolicySet check (Story 11.14).
+//!
+//! (The pre-Epic-11 `{service}/meta` read and `{service}/verify` /
+//! `agent/{name}/policy_name` / `policy/{name}/scopes` endpoints + the
+//! `connect` verb were removed in Stories 11.12/11.13.)
 //!
 //! This module owns the typed request/response shapes (mirrored from
-//! `crates/permitlayer-daemon/src/server/control.rs` Story 7.30
-//! endpoint definitions) and the daemon-must-be-running gate that
-//! renders structured remediation when the operator hasn't installed
-//! or started the daemon yet.
+//! `crates/permitlayer-daemon/src/server/control.rs`) and the
+//! daemon-must-be-running gate that renders structured remediation when
+//! the operator hasn't installed or started the daemon yet.
 
 use std::path::Path;
 
@@ -157,8 +162,8 @@ pub(crate) async fn require_daemon_running(
             let reason = DaemonDownReason::ControlTokenRejected { status };
             render_daemon_must_run(&endpoint, &reason);
             let _ = home;
-            Err(crate::cli::connect::silent_err_for_code(
-                "connect.daemon_must_run",
+            Err(crate::cli::oauth_seal::silent_err_for_code(
+                "connection.daemon_must_run",
                 "daemon is up but rejected the control token",
             ))
         }
@@ -166,8 +171,8 @@ pub(crate) async fn require_daemon_running(
             let reason = classify_daemon_down_reason(&endpoint, &err);
             render_daemon_must_run(&endpoint, &reason);
             let _ = home; // home no longer used; PID-file probe dropped (P25).
-            Err(crate::cli::connect::silent_err_for_code(
-                "connect.daemon_must_run",
+            Err(crate::cli::oauth_seal::silent_err_for_code(
+                "connection.daemon_must_run",
                 "daemon is not running or control plane unreachable",
             ))
         }
@@ -377,9 +382,9 @@ fn render_daemon_must_run(endpoint: &ControlEndpoint, reason: &DaemonDownReason)
     eprint!(
         "{}",
         render::error_block(
-            "connect.daemon_must_run",
+            "connection.daemon_must_run",
             "agentsso daemon is not running or its control plane is unreachable — \
-             `agentsso connect` writes credentials through the daemon and requires it to be up.",
+             `agentsso connection add` writes credentials through the daemon and requires it to be up.",
             &remediation,
             None,
         )
@@ -396,94 +401,43 @@ fn render_daemon_must_run(endpoint: &ControlEndpoint, reason: &DaemonDownReason)
 // allow blocks intentional rather than silently `#[serde(skip)]`-ing
 // them and losing wire-shape pinning.
 
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-pub(crate) struct AgentPolicyNameResponse {
-    pub name: String,
-    pub policy_name: String,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct CredentialMetaResponse {
-    pub exists: bool,
-    pub meta: Option<permitlayer_oauth::metadata::CredentialMeta>,
-}
-
+/// Seal request body — Story 11.12 reshape: keys on `connection_id` +
+/// `connector_id`/`name`/`tier` (+ optional `account_hint`), not a bare
+/// `service` string. Mirrors `server::control::CredentialsSealRequest`.
 #[derive(Debug, Serialize)]
 pub(crate) struct CredentialsSealRequest<'a> {
-    pub service: &'a str,
-    pub agent: &'a str,
+    pub connection_id: &'a str,
+    pub connector_id: &'a str,
+    pub name: &'a str,
+    pub tier: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account_hint: Option<&'a str>,
     pub access_token: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub refresh_token: Option<&'a str>,
     pub granted_scopes: &'a [String],
     pub client_type: &'a str,
-    /// Story 7.35: the parsed BYO OAuth client bundle as canonical JSON
-    /// (`SealedClientBundle`), NOT a filesystem path. The CLI already
-    /// parsed the client JSON; it sends the parsed bundle over this UDS
-    /// (which already carries plaintext access/refresh tokens) and the
-    /// daemon seals it into the vault under `{service}-client`. Replaces
-    /// the pre-7.35 `client_source` path that the proxy re-read in
-    /// plaintext on every refresh.
+    /// The parsed BYO OAuth client bundle as canonical JSON
+    /// (`SealedClientBundle`), sealed into the connection's `Client` slot.
     pub client_bundle_json: &'a str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub expires_in_secs: Option<u64>,
     pub if_exists: &'a str,
 }
 
-#[allow(dead_code)]
+/// Seal response — Story 11.12: carries the persisted `ConnectionRecord`.
 #[derive(Debug, Deserialize)]
 pub(crate) struct CredentialsSealResponse {
+    #[allow(dead_code)]
     pub sealed: bool,
+    #[allow(dead_code)]
     pub replaced_previous: bool,
-    pub meta: permitlayer_oauth::metadata::CredentialMeta,
+    pub connection: permitlayer_core::store::connection::ConnectionRecord,
 }
 
-#[derive(Debug, Serialize)]
+/// Verify request body — Story 11.12: connection-bound, only `project_id`.
+#[derive(Debug, Serialize, Default)]
 pub(crate) struct CredentialsVerifyRequest<'a> {
-    pub agent: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_id: Option<&'a str>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-pub(crate) struct CredentialsVerifyOk {
-    pub ok: bool, // true here
-    #[serde(default)]
-    pub summary: Option<String>,
-    #[serde(default)]
-    pub email: Option<String>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-pub(crate) struct CredentialsVerifyStructuredError {
-    pub ok: bool, // false here
-    pub status_code: Option<u16>,
-    pub verify_reason: Option<String>,
-    pub remediation_url: Option<String>,
-    pub reason_text: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-pub(crate) struct PolicyScopesRequest<'a> {
-    pub short_names: &'a [&'a str],
-    /// Story 10.6: the agent being extended. The daemon materializes a
-    /// per-agent operator policy under this name when the agent's bound
-    /// policy is a managed tier that can't be extended in place.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub agent_name: Option<&'a str>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Deserialize)]
-pub(crate) struct PolicyScopesResponse {
-    pub policy_name: String,
-    pub before: Vec<String>,
-    pub added: Vec<String>,
-    pub after: Vec<String>,
-    pub reloaded: bool,
 }
 
 #[allow(dead_code)]
@@ -545,28 +499,6 @@ fn parse_outcome<T: for<'de> Deserialize<'de>>(
 
 // ── Typed call helpers ─────────────────────────────────────────────
 
-pub(crate) async fn get_agent_policy_name(
-    handle: &ConnectControlHandle,
-    agent: &str,
-) -> Result<ControlOutcome<AgentPolicyNameResponse>> {
-    let encoded = url_path_encode(agent);
-    let path = format!("/v1/control/agent/{encoded}/policy_name");
-    let (status, body) =
-        http_get_with_status_via(&handle.endpoint, &path, handle.control_token.as_deref()).await?;
-    parse_outcome(status, &body)
-}
-
-pub(crate) async fn get_credentials_meta(
-    handle: &ConnectControlHandle,
-    service: &str,
-) -> Result<ControlOutcome<CredentialMetaResponse>> {
-    let encoded = url_path_encode(service);
-    let path = format!("/v1/control/credentials/{encoded}/meta");
-    let (status, body) =
-        http_get_with_status_via(&handle.endpoint, &path, handle.control_token.as_deref()).await?;
-    parse_outcome(status, &body)
-}
-
 pub(crate) async fn post_credentials_seal(
     handle: &ConnectControlHandle,
     req: &CredentialsSealRequest<'_>,
@@ -591,29 +523,222 @@ pub(crate) async fn post_credentials_seal(
     parse_outcome(status, &response_body)
 }
 
-/// Outcome of a verify POST. Like `ControlOutcome<T>` but the
-/// success body shape isn't strict-typed — verify can return either
-/// `{ ok: true, ... }` or `{ ok: false, ... }` at HTTP 200, both of
-/// which the CLI's retry loop branches on dynamically.
-pub(crate) enum VerifyOutcome {
-    /// 2xx response with a parseable JSON body.
-    Body { status_code: u16, body: serde_json::Value },
-    /// 4xx/5xx response with the standard error envelope.
-    Err { status_code: u16, body: ControlErrorBody },
-    /// Round-1 review P29: response body didn't parse as JSON at
-    /// all. Distinct from a transport failure so the verify retry
-    /// loop can re-attempt on parse-failure instead of aborting.
-    ParseFailure { status_code: u16, raw_body: String },
+/// Request body for `POST /v1/control/bindings` (Story 11.14). Mirrors
+/// `server::control::BindAgentRequest`.
+#[derive(Debug, Serialize)]
+pub(crate) struct BindRequest<'a> {
+    pub agent: &'a str,
+    pub connection_id: &'a str,
+    pub tier: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub policy: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub alias: Option<&'a str>,
 }
 
-pub(crate) async fn post_credentials_verify(
+/// Response body for a successful bind. Only the fields the CLI renders
+/// are mirrored.
+#[derive(Debug, Deserialize)]
+pub(crate) struct BindResponse {
+    #[allow(dead_code)]
+    pub status: String,
+    pub connection_name: String,
+    pub tier: String,
+    #[serde(default)]
+    pub policy: Option<String>,
+    #[serde(default)]
+    pub alias: Option<String>,
+}
+
+/// Story 11.14: `bind` routes through the daemon so the optional
+/// `--policy` is checked against the live compiled `PolicySet`.
+pub(crate) async fn post_bind(
     handle: &ConnectControlHandle,
-    service: &str,
+    req: &BindRequest<'_>,
+) -> Result<ControlOutcome<BindResponse>> {
+    let body = serde_json::to_string(req).context("serialize bind request")?;
+    let (status, response_body) = http_post_json_with_status_via(
+        &handle.endpoint,
+        "/v1/control/bindings",
+        &body,
+        handle.control_token.as_deref(),
+    )
+    .await?;
+    parse_outcome(status, &response_body)
+}
+
+// ── Story 11.18: connection/binding read + revoke + unbind clients ──
+//
+// The operator can't read the root-private state dir in-process; these
+// route every connection/bind/agent-bindings store touch through the
+// daemon (root). Response bodies carry NO secrets (`ConnectionRecord` /
+// `Binding` are token-free).
+
+/// Response body for `GET /v1/control/connections/records`. Mirrors
+/// `server::control::ConnectionRecordsResponse`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ConnectionRecordsResponse {
+    pub connections: Vec<permitlayer_core::store::connection::ConnectionRecord>,
+}
+
+/// `connection list` (Story 11.18): list every `ConnectionRecord`.
+pub(crate) async fn get_connection_records(
+    handle: &ConnectControlHandle,
+) -> Result<ControlOutcome<ConnectionRecordsResponse>> {
+    let (status, response_body) = http_get_with_status_via(
+        &handle.endpoint,
+        "/v1/control/connections/records",
+        handle.control_token.as_deref(),
+    )
+    .await?;
+    parse_outcome(status, &response_body)
+}
+
+/// Response body for `GET /v1/control/connections/record/{selector}`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ConnectionRecordResponse {
+    pub connection: permitlayer_core::store::connection::ConnectionRecord,
+}
+
+/// `inspect` / `bind`/`unbind` connection-resolve / `add` F7 name-check
+/// (Story 11.18): resolve ONE connection record by name|id. 404 maps to
+/// `ControlOutcome::Err { code: "connection.not_found" }`.
+pub(crate) async fn get_connection_record(
+    handle: &ConnectControlHandle,
+    selector: &str,
+) -> Result<ControlOutcome<ConnectionRecordResponse>> {
+    let encoded = url_path_encode(selector);
+    let path = format!("/v1/control/connections/record/{encoded}");
+    let (status, response_body) =
+        http_get_with_status_via(&handle.endpoint, &path, handle.control_token.as_deref()).await?;
+    parse_outcome(status, &response_body)
+}
+
+/// Response body for `POST /v1/control/connections/{selector}/revoke`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct RevokeConnectionResponse {
+    #[allow(dead_code)]
+    pub status: String,
+    #[allow(dead_code)]
+    pub connection_id: String,
+    pub connection_name: String,
+    pub bindings_removed: usize,
+}
+
+/// `connection revoke` (Story 11.18): cascade-revoke daemon-side.
+pub(crate) async fn post_revoke_connection(
+    handle: &ConnectControlHandle,
+    selector: &str,
+) -> Result<ControlOutcome<RevokeConnectionResponse>> {
+    let encoded = url_path_encode(selector);
+    let path = format!("/v1/control/connections/{encoded}/revoke");
+    let (status, response_body) = http_post_json_with_status_via(
+        &handle.endpoint,
+        &path,
+        "",
+        handle.control_token.as_deref(),
+    )
+    .await?;
+    parse_outcome(status, &response_body)
+}
+
+/// One binding row joined to its connection display metadata. Mirrors
+/// `server::control::AgentBindingRow` (secret-free).
+#[derive(Debug, Deserialize)]
+pub(crate) struct AgentBindingRow {
+    #[allow(dead_code)]
+    pub connection_id: String,
+    pub connection_name: String,
+    pub connector_id: String,
+    pub tier: String,
+    #[serde(default)]
+    pub policy: Option<String>,
+    #[serde(default)]
+    pub alias: Option<String>,
+}
+
+/// Response body for `GET /v1/control/agent/{name}/bindings`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct AgentBindingsResponse {
+    pub bindings: Vec<AgentBindingRow>,
+}
+
+/// `agent bindings` (Story 11.18): list an agent's bindings joined to
+/// their connection records.
+pub(crate) async fn get_agent_bindings(
+    handle: &ConnectControlHandle,
+    agent: &str,
+) -> Result<ControlOutcome<AgentBindingsResponse>> {
+    let encoded = url_path_encode(agent);
+    let path = format!("/v1/control/agent/{encoded}/bindings");
+    let (status, response_body) =
+        http_get_with_status_via(&handle.endpoint, &path, handle.control_token.as_deref()).await?;
+    parse_outcome(status, &response_body)
+}
+
+/// Request body for `POST /v1/control/bindings/remove` (Story 11.18).
+#[derive(Debug, Serialize)]
+pub(crate) struct UnbindRequest<'a> {
+    pub agent: &'a str,
+    pub connection_id: &'a str,
+}
+
+/// Response body for `POST /v1/control/bindings/remove`.
+#[derive(Debug, Deserialize)]
+pub(crate) struct UnbindResponse {
+    #[allow(dead_code)]
+    pub status: String,
+    pub removed: bool,
+}
+
+/// `unbind` (Story 11.18): remove a single binding daemon-side.
+pub(crate) async fn post_unbind(
+    handle: &ConnectControlHandle,
+    req: &UnbindRequest<'_>,
+) -> Result<ControlOutcome<UnbindResponse>> {
+    let body = serde_json::to_string(req).context("serialize unbind request")?;
+    let (status, response_body) = http_post_json_with_status_via(
+        &handle.endpoint,
+        "/v1/control/bindings/remove",
+        &body,
+        handle.control_token.as_deref(),
+    )
+    .await?;
+    parse_outcome(status, &response_body)
+}
+
+/// Outcome of a connection-verify POST. The 200 body is `{ ok: true,
+/// ... }` or `{ ok: false, ... }` (the caller branches on `ok`
+/// dynamically); 4xx/5xx use the standard error envelope.
+pub(crate) enum VerifyOutcome {
+    /// 2xx response with a parseable JSON body.
+    Body {
+        #[allow(dead_code)]
+        status_code: u16,
+        body: serde_json::Value,
+    },
+    /// 4xx/5xx response with the standard error envelope.
+    Err { status_code: u16, body: ControlErrorBody },
+    /// Response body that didn't parse as JSON at all.
+    ParseFailure {
+        status_code: u16,
+        #[allow(dead_code)]
+        raw_body: String,
+    },
+}
+
+/// Story 11.12: verify a connection's sealed credential against the live
+/// provider via the daemon (which holds the master key) —
+/// `POST /v1/control/connections/{connection_id}/verify`. Called by
+/// `connection add` (verify-on-seal) and `connection inspect`.
+pub(crate) async fn post_connection_verify(
+    handle: &ConnectControlHandle,
+    connection_id: &str,
     req: &CredentialsVerifyRequest<'_>,
 ) -> Result<VerifyOutcome> {
     let body = serde_json::to_string(req).context("serialize verify request")?;
-    let encoded = url_path_encode(service);
-    let path = format!("/v1/control/credentials/{encoded}/verify");
+    let encoded = url_path_encode(connection_id);
+    let path = format!("/v1/control/connections/{encoded}/verify");
     let (status, response_body) = http_post_json_with_status_via(
         &handle.endpoint,
         &path,
@@ -638,30 +763,9 @@ pub(crate) async fn post_credentials_verify(
     }
 }
 
-pub(crate) async fn post_policy_scopes(
-    handle: &ConnectControlHandle,
-    policy_name: &str,
-    req: &PolicyScopesRequest<'_>,
-) -> Result<ControlOutcome<PolicyScopesResponse>> {
-    let body = serde_json::to_string(req).context("serialize policy-scopes request")?;
-    let encoded = url_path_encode(policy_name);
-    let path = format!("/v1/control/policy/{encoded}/scopes");
-    let (status, response_body) = http_post_json_with_status_via(
-        &handle.endpoint,
-        &path,
-        &body,
-        handle.control_token.as_deref(),
-    )
-    .await?;
-    parse_outcome(status, &response_body)
-}
-
-/// Minimal URL path-segment encoder for agent/service/policy names.
-///
-/// The names that flow through this function have already passed the
-/// daemon's allowlist regex (alphanumerics + `-` + `_`), so this is
-/// strictly defense-in-depth against future name-shape changes. We
-/// percent-encode anything outside `[A-Za-z0-9._-]`.
+/// Minimal URL path-segment encoder for the connection-id path param.
+/// Percent-encodes anything outside `[A-Za-z0-9._-]` (ULID text is
+/// already in that set; this is defense-in-depth).
 fn url_path_encode(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for b in s.bytes() {
@@ -678,27 +782,6 @@ fn url_path_encode(s: &str) -> String {
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn url_path_encode_passes_safe_chars() {
-        assert_eq!(url_path_encode("claude-desktop"), "claude-desktop");
-        assert_eq!(url_path_encode("gmail-read-only"), "gmail-read-only");
-        assert_eq!(url_path_encode("agent.v1_2"), "agent.v1_2");
-    }
-
-    #[test]
-    fn url_path_encode_escapes_path_separator_and_whitespace() {
-        // `.` is in the safe-char allowlist (it appears in legitimate
-        // policy/agent names like `gmail.read-only`), so `..` passes
-        // through. The load-bearing traversal guard is escaping `/`
-        // and `\\` — the daemon-side allowlist + the URL routing
-        // handle the rest.
-        assert_eq!(url_path_encode("a/b"), "a%2Fb");
-        assert_eq!(url_path_encode("a\\b"), "a%5Cb");
-        assert_eq!(url_path_encode("a b"), "a%20b");
-        // Whole `../` sequence escapes its `/`.
-        assert_eq!(url_path_encode("../etc"), "..%2Fetc");
-    }
 
     // ── Round-1 review P41: discriminate daemon-must-run remediation
     // branches. The classifier branches on the io::Error ErrorKind and

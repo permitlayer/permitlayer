@@ -52,16 +52,14 @@ pub enum AgentCommand {
     /// in-flight requests using the old snapshot finish, new requests
     /// return 401.
     Remove(RemoveArgs),
-    /// Update an agent's policy binding without rotating its bearer
-    /// token (Story 7.11). Use this to extend an agent's scopes —
-    /// e.g., switch a Gmail-only agent to a policy that also covers
-    /// Calendar — without re-pasting a new token into your MCP-client
-    /// config.
-    Rebind(RebindArgs),
     /// Atomically rotate an agent's bearer token. The old bearer is
     /// invalidated immediately after the new token is durably persisted.
     /// The new plaintext bearer is displayed once on stdout (Story 7.34).
     Rotate(RotateArgs),
+    /// List an agent's connection bindings (Story 11.14) — each grant's
+    /// connection (name + connector), tier, optional policy + alias.
+    /// Replaces the single-policy view deleted in 11.9 (FR47).
+    Bindings(BindingsArgs),
 }
 
 #[derive(Args)]
@@ -106,13 +104,9 @@ pub struct RemoveArgs {
 }
 
 #[derive(Args)]
-pub struct RebindArgs {
-    /// Name of the agent to rebind.
+pub struct BindingsArgs {
+    /// Name of the agent whose bindings to list.
     pub name: String,
-    /// Policy to rebind the agent to. Must already exist in the daemon
-    /// policy directory.
-    #[arg(long)]
-    pub policy: String,
 }
 
 #[derive(Args)]
@@ -133,9 +127,71 @@ pub async fn run(args: AgentArgs) -> Result<()> {
         AgentCommand::Register(a) => register_agent(a).await,
         AgentCommand::List => list_agents().await,
         AgentCommand::Remove(a) => remove_agent(a).await,
-        AgentCommand::Rebind(a) => rebind_agent(a).await,
         AgentCommand::Rotate(a) => rotate_agent(a).await,
+        AgentCommand::Bindings(a) => bindings_agent(a).await,
     }
+}
+
+/// `agentsso agent bindings <agent>` — list the agent's connection
+/// bindings (Story 11.14). Story 11.18: reads via the daemon control
+/// plane (the operator can't read the root-private `bindings/` +
+/// `connections/` dirs in-process); the daemon (root) joins each binding
+/// to its connection record and returns secret-free rows.
+async fn bindings_agent(args: BindingsArgs) -> Result<()> {
+    let home = crate::cli::agentsso_home()?;
+    let handle = match crate::cli::connect_uds::require_daemon_running(&home).await {
+        Ok(h) => h,
+        Err(e) => return Err(e.context("agent bindings: daemon not reachable")),
+    };
+    let bindings = match crate::cli::connect_uds::get_agent_bindings(&handle, &args.name).await {
+        Ok(crate::cli::connect_uds::ControlOutcome::Ok(resp)) => resp.bindings,
+        Ok(crate::cli::connect_uds::ControlOutcome::Err { status_code, body }) => {
+            anyhow::bail!(
+                "agent bindings failed (HTTP {status_code}): {}",
+                crate::cli::oauth_seal::sanitize_for_terminal(&body.message)
+            )
+        }
+        Ok(crate::cli::connect_uds::ControlOutcome::ParseFailure { status_code, .. }) => {
+            anyhow::bail!("agent bindings returned an unparseable response (HTTP {status_code})")
+        }
+        Err(e) => anyhow::bail!("agent bindings transport error: {e}"),
+    };
+
+    if bindings.is_empty() {
+        print!(
+            "{}",
+            empty_state(
+                &format!("agent '{}' has no bindings", args.name),
+                "bind it to a connection:  agentsso bind <agent> <connection> --grant read",
+            )
+        );
+        return Ok(());
+    }
+
+    let theme = Theme::load(&home);
+    let support = ColorSupport::detect();
+    let layout = TableLayout::detect();
+    let headers = &["CONNECTION", "CONNECTOR", "TIER", "POLICY", "ALIAS"];
+    let rows: Vec<Vec<TableCell>> = bindings
+        .iter()
+        .map(|b| {
+            vec![
+                TableCell::Plain(b.connection_name.clone()),
+                TableCell::Plain(b.connector_id.clone()),
+                TableCell::Plain(b.tier.clone()),
+                TableCell::Plain(b.policy.clone().unwrap_or_else(|| "-".to_owned())),
+                TableCell::Plain(b.alias.clone().unwrap_or_else(|| "-".to_owned())),
+            ]
+        })
+        .collect();
+    match table(headers, &rows, layout, &theme, support) {
+        Ok(rendered) => print!("{rendered}"),
+        Err(e) => {
+            tracing::error!(error = %e, "agent bindings table render failed");
+            anyhow::bail!("failed to render agent bindings: {e}");
+        }
+    }
+    Ok(())
 }
 
 pub(crate) fn policies_dir_remediation(home: &std::path::Path) -> String {
@@ -688,128 +744,6 @@ async fn remove_agent(args: RemoveArgs) -> Result<()> {
     Ok(())
 }
 
-/// Rebind an agent to a new policy without rotating its bearer token
-/// (Story 7.11). The bearer-token-immutable-across-rebind invariant
-/// is the load-bearing property — operators can extend an agent's
-/// scopes via the policy file + `agent rebind` without touching
-/// downstream MCP-client configs.
-async fn rebind_agent(args: RebindArgs) -> Result<()> {
-    let config = load_daemon_config_or_default_with_warn("agent rebind");
-    let home = config.paths.home.clone();
-
-    // Same Plan B operator-token discipline as `agent register` /
-    // `agent remove`. Daemon must be running (HTTP call); the
-    // `error_block_daemon_unreachable` path renders the right error
-    // message if the daemon is down.
-    let body = serde_json::json!({
-        "name": args.name,
-        "policy_name": args.policy,
-    })
-    .to_string();
-    let endpoint = resolve_control_endpoint(&config);
-    let token = crate::cli::kill::read_control_token(&home);
-    let response =
-        match http_post_json_via(&endpoint, "/v1/control/agent/rebind", &body, token.as_deref())
-            .await
-        {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::debug!(error = %e, endpoint = %endpoint, "agent rebind request failed");
-                eprint!("{}", error_block_daemon_unreachable_endpoint("agent rebind", &endpoint));
-                std::process::exit(3);
-            }
-        };
-
-    let parsed: serde_json::Value = match serde_json::from_str(&response) {
-        Ok(v) => v,
-        Err(e) => {
-            tracing::debug!(error = %e, body = %response, "unexpected agent rebind response");
-            eprint!("{}", error_block_protocol_error());
-            std::process::exit(3);
-        }
-    };
-
-    // Bug 2: surface nested control-plane auth errors before the flat
-    // branch (which would otherwise report `agent.unknown_error`).
-    if let Some((code, message)) = crate::cli::kill::nested_control_plane_auth_error(&parsed) {
-        eprint!(
-            "{}",
-            error_block(&code, &message, crate::cli::kill::CONTROL_AUTH_REMEDIATION, None)
-        );
-        std::process::exit(3);
-    }
-    // Story 7.11 review-round-1 P4: explicit positive `status == "ok"`
-    // check. Pre-existing register/remove handlers fall through to
-    // success on missing/unknown status — the rebind path tightens
-    // this. Everything that's NOT an explicit "ok" or "error" gets
-    // routed to `error_block_protocol_error` rather than silently
-    // printing a phony success.
-    let status = parsed["status"].as_str();
-    if status == Some("error") {
-        let code = parsed["code"].as_str().unwrap_or("agent.unknown_error").to_owned();
-        let message = parsed["message"].as_str().unwrap_or("(no message provided)").to_owned();
-        let suggested = match code.as_str() {
-            "agent.unknown_policy" => policies_dir_remediation(&home),
-            "agent.not_found" => format!(
-                "register the agent first: agentsso agent register {} --policy={}",
-                args.name, args.policy
-            ),
-            "agent.rate_limited" => "wait briefly and retry".to_owned(),
-            "agent.registry_reload_failed" => {
-                "the agent file was rewritten on disk but the in-memory registry is stale; \
-                 run `agentsso reload` to recover"
-                    .to_owned()
-            }
-            _ => "see message above".to_owned(),
-        };
-        eprint!("{}", error_block(&code, &message, &suggested, None));
-        // Story 7.11 review-round-2 Q2: route through the shared
-        // `agent_control_exit_code` helper. The earlier round-1 P3
-        // hand-rolled this same mapping inline; round-2 promoted it
-        // to a shared helper so register/list/remove/rebind agree.
-        std::process::exit(agent_control_exit_code(&code));
-    } else if status != Some("ok") {
-        // Unknown status (missing, null, or anything other than
-        // "ok"/"error"). The daemon should never produce this shape,
-        // but if it does (network corruption, future schema drift,
-        // proxy interposition), fall back to a protocol error rather
-        // than printing a phony success block.
-        tracing::debug!(
-            body = %response,
-            "unexpected agent rebind response: status was neither 'ok' nor 'error'"
-        );
-        eprint!("{}", error_block_protocol_error());
-        std::process::exit(3);
-    }
-
-    // status == Some("ok") — render success.
-    let agent = match parsed.get("agent") {
-        Some(a) if a.is_object() => a,
-        _ => {
-            // Server returned `status: ok` but no `agent` payload.
-            // Defense in depth — same bucket as protocol error.
-            tracing::debug!(
-                body = %response,
-                "agent rebind ok-response missing 'agent' field"
-            );
-            eprint!("{}", error_block_protocol_error());
-            std::process::exit(3);
-        }
-    };
-    let name = agent["name"].as_str().unwrap_or(&args.name);
-    let policy_name = agent["policy_name"].as_str().unwrap_or(&args.policy);
-
-    // The reassurance-line is operator-facing and required by the
-    // story spec (Task 3.3) — it makes the bearer-token-immutable
-    // invariant visible at the moment it matters most.
-    println!();
-    println!("✓ agent '{name}' rebound → policy '{policy_name}'");
-    println!("  (bearer token unchanged — your MCP-client config does NOT need to be updated)");
-    println!();
-
-    Ok(())
-}
-
 /// `agentsso agent rotate <name>` — atomically mint a new bearer token
 /// and invalidate the old one (Story 7.34).
 async fn rotate_agent(args: RotateArgs) -> Result<()> {
@@ -944,7 +878,7 @@ async fn rotate_agent(args: RotateArgs) -> Result<()> {
 }
 
 /// Story 7.11 review-round-2 Q2: centralized exit-code mapping for
-/// `agentsso agent` subcommands (register / list / remove / rebind).
+/// `agentsso agent` subcommands (register / list / remove / rotate).
 ///
 /// The contract:
 /// - **2** = operator-correctable precondition. The command's target
@@ -1037,29 +971,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn clap_parses_rebind_with_policy_flag() {
-        let parsed = CliWrapper::parse_from([
-            "agent",
-            "rebind",
-            "email-triage",
-            "--policy=email-and-calendar",
-        ]);
-        match parsed.cmd {
-            AgentCommand::Rebind(r) => {
-                assert_eq!(r.name, "email-triage");
-                assert_eq!(r.policy, "email-and-calendar");
-            }
-            _ => panic!("expected Rebind variant"),
-        }
-    }
-
-    #[test]
-    fn clap_rebind_requires_policy_flag() {
-        // `agent rebind <name>` without --policy must fail to parse.
-        let result = CliWrapper::try_parse_from(["agent", "rebind", "email-triage"]);
-        assert!(result.is_err(), "rebind without --policy must fail clap parse");
-    }
+    // Story 11.9 deleted the `agent rebind` command (policy_name is no
+    // longer a per-agent field; bindings replace it in 11.14), so the
+    // `clap_parses_rebind_*` parse tests were removed with it.
 
     // Story 7.11 review-round-2 Q2: exit-code helper unit tests.
     // Pins the contract so register/list/remove/rebind agree.

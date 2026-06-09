@@ -1,111 +1,66 @@
-//! `agentsso quickstart <service>` — connect ONE agent to ONE Google
-//! service in a single command (UX-overhaul Story 5).
+//! `agentsso quickstart <connector> --agent <name> [--read-write]` — the
+//! single-account one-liner (FR5).
 //!
-//! ## Model (owner-confirmed, final)
+//! ## Model (Story 11.15 — composes the Epic-11 primitives)
 //!
-//! The daemon is **headless**. There is NO approval, NO prompt-on-write,
-//! NO human-in-the-loop. Access is a binary scope capability chosen up
-//! front:
+//! The daemon is **headless** — no approval, no prompt, no
+//! human-in-the-loop. Access is a binary capability chosen up front
+//! (`--read` default / `--read-write`). Quickstart is the all-in-one verb
+//! that COMPOSES the new nouns:
 //!
-//! - `--read`       → bind the agent to the shipped `<svc>-read-only` policy
-//! - `--read-write` → bind the agent to the shipped `<svc>-read-write` policy
+//! 1. **Preflight**: under `--non-interactive` an access flag is required
+//!    (`quickstart.access_unspecified`, exit 2); the connector is
+//!    validated via the registry (`quickstart.unknown_service`, exit 2);
+//!    the kill switch + daemon-reachable gates fire before any mutation.
+//! 2. **`connection add`** (reuse [`oauth_seal::oauth_dance_and_seal`]):
+//!    mint a ULID, run the OAuth dance, seal the three slots, write the
+//!    `ConnectionRecord` (tier from `--read-write`). The connection is
+//!    named `<agent>-<connector-bare>` (e.g. `me-gmail`).
+//! 3. **Auto-register the agent** if absent (quickstart mints the bearer),
+//!    then **`bind`** the agent to the connection at the tier with the
+//!    connection name as the selector `--alias`, so `/mcp/<name>`
+//!    resolves (reuse the 11.14 control-plane [`post_bind`] client).
+//! 4. **Emit** the OpenClaw `/mcp/<name>` snippet (the agent's single
+//!    bearer + connection-path addressing). `--mcp-config-out` writes the
+//!    snippet to a 0o644 file for cross-user handoff.
 //!
-//! There is no third option, no `none`, no tier name the operator types,
-//! and no danger-confirmation string. Quickstart binds the agent BY
-//! NAME to a shipped policy; every shipped policy uses
-//! `approval-mode = "auto"` (the only disposition this headless
-//! product ships — `prompt` is purged from the bundle because on a
-//! headless daemon it could only ever 503). So a `-read-only` tier
-//! grants reads only (writes denied by absent scope) and a
-//! `-read-write` tier additionally grants that service's write scopes,
-//! auto-approved with no gate.
-//!
-//! ## Flow
-//!
-//! 1. Validate the service against the same allowlist `connect` uses.
-//! 2. Resolve the access level (flag / interactive selection / hard
-//!    error when neither a flag nor a TTY is present — we cannot prompt
-//!    with no human present, the same reason approvals do not exist).
-//! 3. **Kill-switch gate** (before anything mutating) — a killed daemon
-//!    must never leave a registered-but-inert agent behind.
-//! 4. **Daemon-reachable gate** — reuse `connect`'s structured
-//!    install/start remediation block, plus one steer line pointing at
-//!    the single privileged step (`sudo agentsso setup`).
-//! 5. Register the agent bound to the resolved policy (the bearer token
-//!    is held in memory ONLY — quickstart never writes it anywhere).
-//! 6. Drive the existing `connect` orchestration: OAuth, seal, verify,
-//!    scope-merge, rebind, and MCP-snippet emission. `connect` owns
-//!    the snippet emitter (it hardcodes `"transport":"streamable-http"`
-//!    via `cli::openclaw`), so quickstart never re-emits a snippet.
-//! 7. Print a plain-language summary of what the agent can now do.
-//!
-//! ## Reused public seams vs locally-reimplemented private siblings
-//!
-//! - PUBLIC, reused as-is: `connect::run`, `connect::exit2`,
-//!   `connect_uds::require_daemon_running`, `kill::{resolve_control_endpoint,
-//!   read_control_token, http_get_via, http_post_json_via}`.
-//! - PRIVATE to a sibling, reimplemented locally here with the same
-//!   discipline `doctor` used for `sha256_file`: the kill-state probe
-//!   (private to `connect.rs`) and the register POST (private to
-//!   `agent.rs`). The post-connect summary renders through the shared
-//!   `design::render` hierarchy helpers (matching `connect`'s idiom).
+//! Ordering is connection-add → bind → snippet. If `bind` fails after the
+//! connection is sealed, the connection persists and the operator is told
+//! to `bind`/`connection revoke` manually — never a silent half-state.
 
-use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
 use anyhow::Result;
 use clap::Args;
 
-use crate::cli::silent_cli_error;
+use crate::cli::oauth_seal;
 use crate::design::render;
 
-// ── Service allowlist ───────────────────────────────────────────────
-//
-// Same set `connect.rs` uses (`SUPPORTED_SERVICES`); kept as a private
-// const here rather than re-exporting connect's private one so the
-// two stay independently greppable and a future divergence is loud.
+// ── Access level ────────────────────────────────────────────────────
 
-const SUPPORTED_SERVICES: &[&str] = &["gmail", "calendar", "drive"];
-
-fn is_supported_service(service: &str) -> bool {
-    SUPPORTED_SERVICES.contains(&service)
-}
-
-// ── Access level → shipped policy name ──────────────────────────────
-
-/// The binary access capability. NOT a tier, NOT an approval mode —
-/// just "which shipped policy do we bind the agent to".
+/// The binary access capability: which OAuth tier the connection
+/// requests, and the tier the binding grants.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Access {
     Read,
     ReadWrite,
 }
 
-/// Map `(service, write)` to the EXACT shipped policy name.
-///
-/// No string interpolation — an explicit match so a future bundle
-/// rename is a compile/test failure here, not a production
-/// `agent.unknown_policy` at register time. The unit tests pin every
-/// returned literal against `include_str!("default_policy.toml")`.
-fn policy_for(service: &str, write: bool) -> &'static str {
-    match (service, write) {
-        ("gmail", false) => "gmail-read-only",
-        ("gmail", true) => "gmail-read-write",
-        ("calendar", false) => "calendar-read-only",
-        ("calendar", true) => "calendar-read-write",
-        ("drive", false) => "drive-read-only",
-        ("drive", true) => "drive-read-write",
-        // Unreachable: callers validate `service` against
-        // `SUPPORTED_SERVICES` first. Kept total so the fn has no
-        // panic path; the empty string would surface as a daemon-side
-        // `agent.unknown_policy` (loud) rather than a silent misbind.
-        _ => "",
+impl Access {
+    /// Tier string for `connection add` / `bind` (`read` | `read-write`).
+    fn tier(self) -> &'static str {
+        match self {
+            Access::Read => "read",
+            Access::ReadWrite => "read-write",
+        }
+    }
+    fn is_write(self) -> bool {
+        matches!(self, Access::ReadWrite)
     }
 }
 
-/// Parse one interactive selection line into an [`Access`]. `None`
-/// means "unrecognized — caller should re-ask once, then default to
-/// read". Pure (no I/O) so it is unit-testable.
+/// Parse one interactive selection line into an [`Access`]. `None` means
+/// "unrecognized — re-ask once, then default to read". Pure (no I/O).
 fn parse_access_line(line: &str) -> Option<Access> {
     match line.trim().to_lowercase().as_str() {
         "" | "1" | "read" => Some(Access::Read),
@@ -114,103 +69,159 @@ fn parse_access_line(line: &str) -> Option<Access> {
     }
 }
 
+/// Interactive access selection (numbered choice). Re-asks once on
+/// unrecognized input, then defaults to read.
+fn prompt_access(connector: &str) -> Access {
+    use std::io::{BufRead, Write};
+    let stdin = std::io::stdin();
+    for attempt in 0..2 {
+        print!(
+            "What should this agent be able to do with {connector}?  \
+             [1] read (default)  [2] read & write: "
+        );
+        let _ = std::io::stdout().flush();
+        let mut line = String::new();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) => return Access::Read,
+            Ok(_) => {
+                if let Some(a) = parse_access_line(&line) {
+                    return a;
+                }
+                if attempt == 0 {
+                    println!("  please answer 1 or 2.");
+                }
+            }
+            Err(_) => return Access::Read,
+        }
+    }
+    Access::Read
+}
+
 // ── CLI args ────────────────────────────────────────────────────────
 
-/// Arguments for `agentsso quickstart <service>`.
+/// Arguments for `agentsso quickstart <connector>`.
 ///
 /// `--read` / `--read-write` are mutually exclusive plain flags (clap
-/// rejects both). They are NOT a `--tier <enum>` the operator types.
+/// rejects both).
 #[derive(Args, Debug)]
 pub struct QuickstartArgs {
-    /// Service to connect: `gmail`, `calendar`, or `drive`.
+    /// Connector to connect: `gmail`, `calendar`, or `drive` (or the
+    /// canonical `google-*` id). Validated against the registry.
     pub service: String,
 
-    /// Bind the agent to the shipped read-only policy and request only
-    /// read-only OAuth scopes (the agent can READ; writes are denied).
+    /// Request the read-only tier (the default). The agent can READ;
+    /// writes are denied by absent scope.
     #[arg(long, conflicts_with = "read_write")]
     pub read: bool,
 
-    /// Bind the agent to the shipped read-write policy AND request the
-    /// write OAuth scopes from Google (gmail.send/compose/modify, …), so
-    /// the sealed credential can actually send/modify — not just the
-    /// policy binding. The agent can READ and WRITE (send/modify/delete)
-    /// with no gate; the daemon is headless. The Google consent screen
-    /// will list the write scopes.
+    /// Request the read-write tier — the OAuth grant includes the write
+    /// scopes so the sealed credential can send/modify. The daemon is
+    /// headless; there is no per-write gate.
     #[arg(long = "read-write", conflicts_with = "read")]
     pub read_write: bool,
 
-    /// Path to a Google OAuth client JSON file. Forwarded to the
-    /// `connect` orchestration; still required for the OAuth step.
+    /// Path to a Google OAuth client JSON file (BYO client).
     #[arg(long = "oauth-client", value_name = "PATH")]
     pub oauth_client: Option<PathBuf>,
 
-    /// Write the OpenClaw MCP config snippet to this path (forwarded
-    /// to `connect`, which owns snippet emission).
+    /// Write the OpenClaw MCP config snippet to this path (0o644, for
+    /// cross-user handoff).
     #[arg(long = "mcp-config-out", value_name = "PATH")]
     pub mcp_config_out: Option<PathBuf>,
 
-    /// Agent name to create. Defaults to `<service>-quickstart`.
+    /// Agent name to create/use. Defaults to `<connector-bare>-quickstart`.
     #[arg(long)]
     pub agent: Option<String>,
 
-    /// Allow running from an effective-root shell with SUDO_USER set
-    /// (forwarded to `connect`). CI / embedded installs only.
+    /// Allow running from an effective-root shell with SUDO_USER set.
     #[arg(long)]
     pub allow_root: bool,
 
-    /// Skip all interactive prompts. Without `--read`/`--read-write`
-    /// this is a hard error (we cannot prompt with no human present).
+    /// Skip all interactive prompts. Without `--read`/`--read-write` this
+    /// is a hard error (we cannot prompt with no human present).
     #[arg(long)]
     pub non_interactive: bool,
 
-    /// Show the full per-step progress trace from the underlying
-    /// `connect` flow. Forwarded to `connect`; default output collapses
-    /// the steps into a one-line summary.
+    /// Use Google OAuth 2.0 device flow (RFC 8628) for the OAuth step.
+    #[arg(long)]
+    pub device_flow: bool,
+
+    /// Device-flow poll timeout (seconds).
+    #[arg(long, default_value = "120", requires = "device_flow")]
+    pub device_flow_timeout: u64,
+
+    /// Show the full per-step progress trace.
     #[arg(short = 'v', long)]
     pub verbose: bool,
 }
 
 // ── Run ─────────────────────────────────────────────────────────────
 
-/// Run the `quickstart` subcommand.
+/// The bare service selector for a canonical connector id (for the
+/// default agent name + connection-name derivation).
+fn bare_selector(connector_id: &str) -> &str {
+    match connector_id {
+        "google-gmail" => "gmail",
+        "google-calendar" => "calendar",
+        "google-drive" => "drive",
+        other => other,
+    }
+}
+
+/// Run the `quickstart` subcommand: `connection add` → `bind` → snippet.
 pub async fn run(args: QuickstartArgs) -> Result<()> {
     use anyhow::Context as _;
 
-    // Single-shot CLI command — install only the stdout subscriber
-    // (mirror connect::run). Default to `warn` so a clean run shows no
-    // timestamped `INFO` flow chrome; `-v` restores `info`.
     let log_level = if args.verbose { "info" } else { "warn" };
     let _guards =
         crate::telemetry::init_tracing(log_level, None, 30).context("tracing init failed")?;
 
-    let service = args.service.trim().to_lowercase();
-
-    // ── Step 1 — service allowlist ──────────────────────────────────
-    if !is_supported_service(&service) {
-        eprint!(
-            "{}",
-            render::error_block(
-                "quickstart.unknown_service",
-                &format!(
-                    "unsupported service '{service}'. Supported services: {}",
-                    SUPPORTED_SERVICES.join(", ")
-                ),
-                &format!(
-                    "agentsso quickstart <service> --read | --read-write\n\n  \
-                     supported services: {}",
-                    SUPPORTED_SERVICES.join(", ")
-                ),
-                None,
-            )
-        );
-        return Err(crate::cli::connect::exit2());
+    #[cfg(unix)]
+    {
+        let hint = format!("agentsso quickstart {}", args.service);
+        crate::cli::root_guard::ensure_not_sudo_root_shell_with(
+            "quickstart",
+            &hint,
+            args.allow_root,
+            nix::unistd::geteuid().as_raw(),
+            std::env::var("SUDO_USER").ok().as_deref(),
+        )?;
     }
 
-    // ── Step 2 — resolve the access level ───────────────────────────
-    //
-    // Precedence: explicit flag → interactive selection → hard error.
-    let stdout_is_tty = std::io::stdout().is_terminal();
-    let stdin_is_tty = std::io::stdin().is_terminal();
+    let service = args.service.trim().to_lowercase();
+
+    // ── Preflight 1 — connector validity (registry, FR89) ──────────
+    let registry = permitlayer_connectors::ConnectorRegistry::load(Some(
+        &permitlayer_core::paths::connectors_dir(
+            permitlayer_core::paths::home_override().as_deref(),
+        ),
+    ))
+    .context("connector registry load failed")?;
+    let connector = match registry.resolve_selector(&service) {
+        Some(c) => c,
+        None => {
+            let supported = registry.selectors().join(", ");
+            eprint!(
+                "{}",
+                render::error_block(
+                    "quickstart.unknown_service",
+                    &format!("unsupported service '{service}'. Supported services: {supported}"),
+                    &format!(
+                        "agentsso quickstart <service> --read | --read-write\n\n  \
+                         supported services: {supported}"
+                    ),
+                    None,
+                )
+            );
+            return Err(oauth_seal::exit2());
+        }
+    };
+    let connector_id = connector.id().to_owned();
+    let bare = bare_selector(&connector_id).to_owned();
+
+    // ── Preflight 2 — resolve the access level ─────────────────────
+    let stdout_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdout());
+    let stdin_is_tty = std::io::IsTerminal::is_terminal(&std::io::stdin());
     let interactive = !args.non_interactive && stdin_is_tty && stdout_is_tty;
 
     let access = if args.read {
@@ -229,357 +240,215 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
                 None,
             )
         );
-        return Err(crate::cli::connect::exit2());
+        return Err(oauth_seal::exit2());
     };
-    let write = matches!(access, Access::ReadWrite);
 
-    let agent_name = args.agent.clone().unwrap_or_else(|| format!("{service}-quickstart"));
+    // Agent name + derived connection name (`<agent>-<connector-bare>`).
+    let agent_name = args.agent.clone().unwrap_or_else(|| format!("{bare}-quickstart"));
+    let connection_name = format!("{agent_name}-{bare}");
     let home = crate::cli::agentsso_home()?;
 
-    tracing::info!(
-        home = %home.display(),
-        service = %service,
-        agent = %agent_name,
-        access = ?access,
-        "starting quickstart flow"
-    );
+    // ── Preflight 3 — kill switch (before any mutation) ────────────
+    oauth_seal::probe_daemon_kill_state_or_exit().await?;
 
-    // ── Step 3 — kill-switch gate (BEFORE anything mutating) ────────
-    //
-    // Runs before the daemon-reachable gate so the more-specific
-    // `agentsso resume` remediation wins (same ordering connect.rs
-    // uses). A killed daemon must never leave a registered-but-inert
-    // agent behind, so this MUST precede agent registration.
-    probe_kill_state_or_exit().await?;
-
-    // ── Step 4 — daemon-reachable gate ──────────────────────────────
-    //
-    // `require_daemon_running` already prints the structured
-    // install/start block on failure; quickstart adds ONE steer line
-    // pointing at the single privileged step.
+    // ── Preflight 4 — daemon-reachable gate ────────────────────────
     let handle = match crate::cli::connect_uds::require_daemon_running(&home).await {
         Ok(h) => h,
         Err(e) => {
             eprintln!("\n  the one privileged step is:  sudo agentsso setup");
-            // `require_daemon_running` already attached the
-            // SilentCliError + ConnectExitCode markers; surface our
-            // own internal description but keep the original error in
-            // the chain so the exit-code dispatcher still sees them.
             return Err(e.context("quickstart: daemon not reachable"));
         }
     };
 
-    // ── Step 5 — register the agent bound to the resolved policy ────
-    // Story 10.7: `None` means the agent already existed — quickstart
-    // EXTENDS it (Step 6's connect path resolves the agent's current
-    // policy + adds the new service's scopes, bearer preserved) rather
-    // than aborting. A fresh registration returns `Some(bearer)`.
-    let policy = policy_for(&service, write);
-    let bearer = register_agent_capture_bearer(&handle, &agent_name, policy, &home).await?;
-    if bearer.is_none() {
-        println!(
-            "  agent '{agent_name}' already exists \u{2014} extending it with {service} \
-             (bearer token unchanged)"
-        );
-    }
-
-    // ── Step 6 — drive the existing connect orchestration ───────────
-    //
-    // connect::run performs OAuth + seal + verify + scope-merge +
-    // rebind AND emits the MCP block (its emitter hardcodes
-    // `"transport":"streamable-http"` via cli::openclaw). quickstart
-    // does NOT re-emit a snippet — that would duplicate/diverge.
-    crate::cli::connect::run(crate::cli::connect::ConnectArgs {
-        service: service.clone(),
-        agent: agent_name.clone(),
-        oauth_client: args.oauth_client.clone(),
-        non_interactive: args.non_interactive,
-        headless: false,
-        device_flow: false,
-        device_flow_timeout: 120,
-        force: false,
-        // RC1: carry the read-write intent into the OAuth grant so connect
-        // requests the write scopes from Google — not just the read-write
-        // *policy* binding (which alone leaves a read-only credential that
-        // 403s on every write). `write` is the access level resolved above.
-        read_write: write,
-        // Story 10.7: pass the fresh bearer for a new agent, or `None`
-        // for an existing one — connect resolves the existing token and
-        // emits the snippet either way.
-        bearer_token: bearer,
-        mcp_config_out: args.mcp_config_out.clone(),
-        allow_root: args.allow_root,
-        verbose: args.verbose,
-    })
+    // ── Step 1 — connection add (OAuth dance + seal) ───────────────
+    let theme = crate::design::theme::Theme::load(&home);
+    let oauth_config = oauth_seal::resolve_oauth_client(
+        args.oauth_client.as_deref(),
+        &connector_id,
+        &connection_name,
+        &theme,
+        interactive,
+    )
+    .await?;
+    let connection_id = permitlayer_credential::ConnectionId::generate();
+    let record = oauth_seal::oauth_dance_and_seal(
+        &handle,
+        oauth_seal::OAuthSealInputs {
+            connector: &connector,
+            connector_id: &connector_id,
+            name: &connection_name,
+            read_write: access.is_write(),
+            oauth_config,
+            connection_id,
+            interactive,
+            headless: false,
+            device_flow: args.device_flow,
+            device_flow_timeout: args.device_flow_timeout,
+        },
+    )
     .await?;
 
-    // ── Step 7 — plain-language summary ─────────────────────────────
-    print_summary(&service, &agent_name, access, args.verbose);
+    // ── Step 2 — auto-register the agent (mint bearer) ─────────────
+    //
+    // The connection is now sealed. From here, a failure leaves the
+    // connection in place (the operator is told they can `bind`/`revoke`
+    // manually) rather than silently half-completing.
+    let bearer = register_agent_capture_bearer(&handle, &agent_name, access.is_write(), &service)
+        .await
+        .inspect_err(|_e| {
+            eprintln!(
+                "  note: connection '{}' was sealed but agent registration failed — \
+                 the connection persists; re-run quickstart or `agentsso connection revoke {}`.",
+                record.name, record.name
+            );
+        })?;
 
-    Ok(())
-}
-
-/// Interactive access selection. Plain numbered choice — NOT a y/N,
-/// NOT a danger confirmation, no verbatim danger string. Re-asks once
-/// on unrecognized input, then defaults to read.
-fn prompt_access(service: &str) -> Access {
-    use std::io::BufRead;
-
-    let stdin = std::io::stdin();
-    for attempt in 0..2 {
-        print!(
-            "What should this agent be able to do with {service}?  \
-             [1] read (default)  [2] read & write: "
-        );
-        let _ = std::io::stdout().flush();
-
-        let mut line = String::new();
-        match stdin.lock().read_line(&mut line) {
-            Ok(0) => {
-                // EOF mid-prompt — treat as the read default rather
-                // than spinning. (The non-interactive hard-error path
-                // already covers "no human"; this is the rarer
-                // closed-stdin-after-TTY-detect case.)
-                return Access::Read;
-            }
-            Ok(_) => {
-                if let Some(a) = parse_access_line(&line) {
-                    return a;
-                }
-                if attempt == 0 {
-                    println!("  please answer 1 or 2.");
-                }
-            }
-            Err(_) => return Access::Read,
+    // ── Step 3 — bind the agent to the connection ──────────────────
+    let req = crate::cli::connect_uds::BindRequest {
+        agent: &agent_name,
+        connection_id: &record.id.to_string(),
+        tier: access.tier(),
+        policy: None,
+        alias: Some(&connection_name),
+    };
+    match crate::cli::connect_uds::post_bind(&handle, &req).await {
+        Ok(crate::cli::connect_uds::ControlOutcome::Ok(_)) => {}
+        Ok(crate::cli::connect_uds::ControlOutcome::Err { status_code, body }) => {
+            eprint!(
+                "{}",
+                render::error_block(
+                    "quickstart.bind_failed",
+                    &format!(
+                        "connection '{}' was sealed but binding agent '{}' failed \
+                         (HTTP {status_code}, {}): {}",
+                        record.name,
+                        agent_name,
+                        oauth_seal::sanitize_for_terminal(&body.code),
+                        oauth_seal::sanitize_for_terminal(&body.message)
+                    ),
+                    &format!(
+                        "the connection persists; bind manually:  \
+                         agentsso bind {agent_name} {connection_name} --grant {}\n  \
+                         or remove it:  agentsso connection revoke {connection_name}",
+                        access.tier()
+                    ),
+                    None,
+                )
+            );
+            return Err(oauth_seal::silent_err_for_code(
+                "connection.bind_failed",
+                "quickstart bind failed",
+            ));
+        }
+        Ok(crate::cli::connect_uds::ControlOutcome::ParseFailure { status_code, .. }) => {
+            eprint!(
+                "{}",
+                render::error_block(
+                    "quickstart.bind_failed",
+                    &format!(
+                        "connection '{}' sealed but bind returned an unparseable response (HTTP {status_code})",
+                        record.name
+                    ),
+                    "verify the daemon is healthy: agentsso status",
+                    None,
+                )
+            );
+            return Err(oauth_seal::silent_err_for_code(
+                "connection.bind_failed",
+                "quickstart bind parse failure",
+            ));
+        }
+        Err(transport_err) => {
+            eprint!(
+                "{}",
+                render::error_block(
+                    "quickstart.bind_failed",
+                    &format!(
+                        "connection '{}' sealed but bind transport failed: {transport_err}",
+                        record.name
+                    ),
+                    "verify the daemon is healthy: agentsso status",
+                    None,
+                )
+            );
+            return Err(oauth_seal::silent_err_for_code(
+                "connection.bind_failed",
+                "quickstart bind transport failure",
+            ));
         }
     }
-    Access::Read
-}
 
-/// Plain-language post-connect summary, rendered through the shared
-/// `design::render` hierarchy helpers so it matches `connect`'s output
-/// idiom (one accent headline + a dim detail block). All chrome goes to
-/// **stderr** — `connect` already emitted the snippet payload on stdout
-/// (Step 7), and quickstart adds no payload of its own.
-///
-/// Default = headline + the single capability line. The "runs headless …
-/// capability is fixed by the access level chosen" sentence restates the
-/// capability line, so it only renders under `-v` (Rule of Silence).
-fn print_summary(service: &str, agent: &str, access: Access, verbose: bool) {
-    use crate::design::terminal::ColorSupport;
-    use crate::design::theme::Theme;
+    // ── Step 4 — emit the OpenClaw `/mcp/<name>` snippet ───────────
+    let bind_addr =
+        crate::cli::kill::load_daemon_config_or_default_with_warn("quickstart openclaw")
+            .http
+            .bind_addr;
+    if !bind_addr.ip().is_loopback() {
+        eprintln!(
+            "  warn: daemon bound to non-loopback {bind_addr} — the snippet's bearer will travel \
+             over the network"
+        );
+    }
+    let snippet = crate::cli::openclaw::build_snippet(&connection_name, &bearer, bind_addr);
+    crate::cli::openclaw::emit_snippet(&snippet, args.mcp_config_out.as_deref(), &connection_name)
+        .map_err(|e| anyhow::anyhow!("failed to emit MCP snippet: {e}"))?;
 
-    let support = ColorSupport::detect();
-    let theme = Theme::default();
-
-    let capability = match access {
-        Access::Read => format!("can READ {service}; writes are denied"),
-        Access::ReadWrite => {
-            format!("can READ and WRITE {service} (send/modify/delete), no gate")
-        }
-    };
-
-    eprint!(
-        "{}",
-        render::success_headline(
-            &format!("quickstart complete \u{00b7} agent {agent} \u{2192} {service}"),
-            &theme,
-            support,
-        )
+    // ── Summary ────────────────────────────────────────────────────
+    println!();
+    println!(
+        "\u{2713} quickstart complete \u{00b7} agent '{}' \u{2192} connection '{}' ({})",
+        agent_name,
+        connection_name,
+        access.tier()
     );
-    if verbose {
-        // RC6: list the OAuth scopes this access level actually requested, so
-        // the operator can confirm a `--read-write` connect really pulled in
-        // send/compose/modify (the RC1 fix). Short names, policy-file shape.
-        let write = matches!(access, Access::ReadWrite);
-        let scope_names = permitlayer_oauth::google::scopes::scopes_for_access(service, write)
-            .into_iter()
-            .filter_map(permitlayer_oauth::google::scopes::uri_to_short_name)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let scopes_line = format!("scopes granted: {scope_names}");
-        let detail = [
-            capability.as_str(),
-            scopes_line.as_str(),
-            "runs headless \u{2014} no approval, no prompt; capability is fixed by the access level chosen",
-        ];
-        eprint!("{}", render::detail_block(&detail, &theme, support));
-    } else {
-        eprint!("{}", render::detail_block(&[capability.as_str()], &theme, support));
-    }
-    eprintln!();
-}
-
-// ── Locally-reimplemented private siblings ──────────────────────────
-
-/// Local reimplementation of `connect.rs`'s PRIVATE
-/// `probe_daemon_kill_state_or_exit` (it cannot be called from here).
-///
-/// Short-circuits to `Ok(())` (quickstart proceeds) when: no PID file
-/// / daemon not running / any probe failure (refused, timeout,
-/// non-JSON). Returns `Err` only when the daemon explicitly reports
-/// `{"active": true}`. Failing-open on a broken probe is intentional
-/// defense-in-depth — exactly mirrors connect.rs's tolerance.
-async fn probe_kill_state_or_exit() -> Result<()> {
-    use crate::config::{CliOverrides, DaemonConfig};
-    use crate::lifecycle::pid::PidFile;
-
-    let config = match DaemonConfig::load(&CliOverrides::default()) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(
-                target: "quickstart",
-                error = %e,
-                "DaemonConfig::load failed during kill-state probe; proceeding",
-            );
-            return Ok(());
-        }
-    };
-    let home = &config.paths.home;
-
-    let daemon_running = matches!(PidFile::read(home), Ok(Some(_)))
-        && matches!(PidFile::is_daemon_running(home), Ok(true));
-    if !daemon_running {
-        return Ok(());
-    }
-
-    let endpoint = crate::cli::kill::resolve_control_endpoint(&config);
-    let probe_deadline = std::time::Duration::from_millis(500);
-    let control_token = crate::cli::kill::read_control_token(home);
-
-    let probe_result = tokio::time::timeout(
-        probe_deadline,
-        crate::cli::kill::http_get_via(&endpoint, "/v1/control/state", control_token.as_deref()),
-    )
-    .await;
-
-    let body = match probe_result {
-        Ok(Ok(body)) => body,
-        Ok(Err(e)) => {
-            tracing::warn!(
-                target: "quickstart",
-                error = %e,
-                "kill-state probe failed; proceeding",
-            );
-            return Ok(());
-        }
-        Err(_elapsed) => {
-            tracing::warn!(
-                target: "quickstart",
-                "kill-state probe timed out; proceeding",
-            );
-            return Ok(());
-        }
-    };
-
-    #[derive(serde::Deserialize)]
-    struct StateSnapshot {
-        active: bool,
-    }
-    let snapshot: StateSnapshot = match serde_json::from_str(&body) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::warn!(
-                target: "quickstart",
-                error = %e,
-                body = %body,
-                "unexpected state response; proceeding",
-            );
-            return Ok(());
-        }
-    };
-
-    if snapshot.active {
-        eprint!(
-            "{}",
-            render::error_block(
-                "daemon_killed",
-                "permitlayer is in kill state \u{2014} quickstart will not connect an \
-                 agent that cannot act",
-                "agentsso resume",
-                None,
-            )
-        );
-        return Err(silent_cli_error("quickstart: daemon in kill state"));
-    }
-
+    println!("  address it as /mcp/{connection_name}");
+    println!();
     Ok(())
 }
 
-/// Local reimplementation of the `agent.rs` PRIVATE register POST
-/// (~the `register_agent` body). Mirrors that flow: POST
-/// `/v1/control/agent/register`, parse JSON, render the matching
-/// error_block on a non-`ok` status, and on success extract
-/// `bearer_token` (the exact field `agent.rs` reads) into memory ONLY
-/// — quickstart never writes it.
-/// Register the agent and capture its bearer token for the snippet.
+/// Register the agent and capture its minted bearer. Returns the bearer
+/// on a fresh registration. An already-existing agent is NOT an error
+/// (quickstart is idempotent on re-run) — but quickstart needs the bearer
+/// to emit the snippet, and a re-registration can't retrieve the old
+/// token, so a duplicate is surfaced with the manual remediation.
 ///
-/// Story 10.7 (idempotency): returns `Ok(None)` when the agent ALREADY
-/// exists (`agent.duplicate_name`) instead of aborting with a
-/// "remove it first" remediation. The caller then skips the
-/// fresh-register output and proceeds to the connect-extend path
-/// (Step 6), which resolves the agent's current policy, adds the new
-/// service's scopes (materializing a per-agent policy if needed,
-/// Story 10.5/10.6), rebinds with the bearer PRESERVED, and emits the
-/// snippet. `Ok(Some(bearer))` is a freshly-registered agent.
+/// `policy` passed to register: post-11.9 the register `--policy` is a
+/// validated-but-not-bound relic (authority flows via `bind`); quickstart
+/// passes a shipped managed policy name so the register handler's
+/// existence check passes. The binding's authority is set by Step 3's
+/// `bind` (its alias makes `/mcp/<name>` resolve).
 async fn register_agent_capture_bearer(
     handle: &crate::cli::connect_uds::ConnectControlHandle,
     agent: &str,
-    policy: &str,
-    home: &std::path::Path,
-) -> Result<Option<String>> {
-    let body = serde_json::json!({
-        "name": agent,
-        "policy_name": policy,
-    })
-    .to_string();
+    write: bool,
+    service: &str,
+) -> Result<String> {
+    let policy = shipped_policy_for(service, write);
+    let body = serde_json::json!({ "name": agent, "policy_name": policy }).to_string();
 
-    // Retry the register POST on transient TRANSPORT errors. The control
-    // plane was just proven live by `require_daemon_running`'s whoami
-    // probe, so a failed connect here is a momentary UDS blip (accept-
-    // backlog pressure on a busy/just-started daemon), not "daemon down".
-    // A one-shot POST would fail-fast and leave the operator with a
-    // spurious `register_failed`; a few short-backoff retries close the
-    // window. A non-transport error (the daemon answered) is returned as
-    // a normal response and handled below — we only retry the connect.
-    let response = {
-        let mut attempt = crate::cli::kill::http_post_json_via(
-            &handle.endpoint,
-            "/v1/control/agent/register",
-            &body,
-            handle.control_token.as_deref(),
-        )
-        .await;
-        let mut backoff_ms = 100u64;
-        for _ in 0..4 {
-            if attempt.is_ok() {
-                break;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(backoff_ms)).await;
-            backoff_ms = (backoff_ms * 2).min(500);
-            attempt = crate::cli::kill::http_post_json_via(
-                &handle.endpoint,
-                "/v1/control/agent/register",
-                &body,
-                handle.control_token.as_deref(),
-            )
-            .await;
-        }
-        match attempt {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::debug!(error = %e, "quickstart agent register request failed after retries");
-                eprint!(
-                    "{}",
-                    render::error_block(
-                        "quickstart.register_failed",
-                        "could not reach the daemon control plane to register the agent",
-                        "agentsso doctor",
-                        None,
-                    )
-                );
-                return Err(silent_cli_error("quickstart: agent register transport failed"));
-            }
+    let response = match crate::cli::kill::http_post_json_via(
+        &handle.endpoint,
+        "/v1/control/agent/register",
+        &body,
+        handle.control_token.as_deref(),
+    )
+    .await
+    {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::debug!(error = %e, "quickstart agent register request failed");
+            eprint!(
+                "{}",
+                render::error_block(
+                    "quickstart.register_failed",
+                    "could not reach the daemon control plane to register the agent",
+                    "agentsso doctor",
+                    None,
+                )
+            );
+            return Err(crate::cli::silent_cli_error(
+                "quickstart: agent register transport failed",
+            ));
         }
     };
 
@@ -596,53 +465,42 @@ async fn register_agent_capture_bearer(
                     None,
                 )
             );
-            return Err(silent_cli_error("quickstart: agent register protocol error"));
+            return Err(crate::cli::silent_cli_error("quickstart: agent register protocol error"));
         }
     };
 
-    // Nested control-plane auth errors carry a top-level
-    // `status:"error"` AND a nested `error.code`; detect them first
-    // (same ordering agent.rs uses) so they surface the real cause
-    // instead of a useless `agent.unknown_error`.
     if let Some((code, message)) = crate::cli::kill::nested_control_plane_auth_error(&parsed) {
         eprint!(
             "{}",
             render::error_block(&code, &message, crate::cli::kill::CONTROL_AUTH_REMEDIATION, None)
         );
-        return Err(silent_cli_error("quickstart: agent register auth rejected"));
+        return Err(crate::cli::silent_cli_error("quickstart: agent register auth rejected"));
     }
 
     let status = parsed["status"].as_str();
     if status == Some("error") {
         let code = parsed["code"].as_str().unwrap_or("agent.unknown_error").to_owned();
         let message = parsed["message"].as_str().unwrap_or("(no message provided)").to_owned();
-        // Story 10.7: an already-registered agent is NOT an error for
-        // quickstart — it means "extend this agent." Return Ok(None) so
-        // the caller proceeds to the connect-extend path (which adds the
-        // new service's scopes, preserving the existing bearer) instead
-        // of telling the operator to destroy + recreate the agent.
-        if code == "agent.duplicate_name" {
-            tracing::debug!(
-                agent,
-                "quickstart: agent exists — extending instead of re-registering"
-            );
-            return Ok(None);
-        }
-        let remediation = match code.as_str() {
-            "agent.unknown_policy" => format!(
-                "the shipped policy '{policy}' is missing from {}/policies — run \
-                 sudo agentsso setup to restage the managed bundle",
-                home.display()
-            ),
-            _ => "see message above".to_owned(),
+        let remediation = if code == "agent.duplicate_name" {
+            // Quickstart can't retrieve an existing agent's bearer. Surface
+            // it as a clean error pointing at the bind+snippet path.
+            format!(
+                "agent '{agent}' already exists — quickstart can't recover its bearer. \
+                 Bind it directly and re-paste your existing bearer:  \
+                 agentsso bind {agent} <connection> --grant <tier>"
+            )
+        } else if code == "agent.unknown_policy" {
+            format!(
+                "the shipped policy '{policy}' is missing — run `sudo agentsso setup` to restage \
+                 the managed bundle"
+            )
+        } else {
+            "see message above".to_owned()
         };
         eprint!("{}", render::error_block(&code, &message, &remediation, None));
-        return Err(silent_cli_error("quickstart: agent register returned error status"));
+        return Err(crate::cli::silent_cli_error("quickstart: agent register returned error"));
     } else if status != Some("ok") {
-        tracing::debug!(
-            body = %response,
-            "unexpected register status: neither 'ok' nor 'error'"
-        );
+        tracing::debug!(body = %response, "unexpected register status: neither 'ok' nor 'error'");
         eprint!(
             "{}",
             render::error_block(
@@ -652,44 +510,57 @@ async fn register_agent_capture_bearer(
                 None,
             )
         );
-        return Err(silent_cli_error("quickstart: agent register unknown status"));
+        return Err(crate::cli::silent_cli_error("quickstart: agent register unknown status"));
     }
 
-    // agent.rs extracts `parsed["bearer_token"]` — match exactly.
     let bearer = parsed["bearer_token"].as_str().unwrap_or("").to_owned();
     if bearer.is_empty() {
         eprint!(
             "{}",
             render::error_block(
                 "quickstart.register_failed",
-                "the daemon registered the agent but returned no bearer token",
+                "agent register succeeded but returned no bearer token",
                 "agentsso doctor",
                 None,
             )
         );
-        return Err(silent_cli_error("quickstart: agent register missing bearer token"));
+        return Err(crate::cli::silent_cli_error(
+            "quickstart: agent register missing bearer token",
+        ));
     }
-    Ok(Some(bearer))
+    Ok(bearer)
+}
+
+/// Map `(service, write)` to a shipped managed policy name (passed to the
+/// register handler's existence check; authority flows via `bind`).
+fn shipped_policy_for(service: &str, write: bool) -> &'static str {
+    match (service, write) {
+        ("gmail", false) => "gmail-read-only",
+        ("gmail", true) => "gmail-read-write",
+        ("calendar", false) => "calendar-read-only",
+        ("calendar", true) => "calendar-read-write",
+        ("drive", false) => "drive-read-only",
+        ("drive", true) => "drive-read-write",
+        // Canonical-id callers (e.g. `google-gmail`): strip the prefix.
+        ("google-gmail", false) => "gmail-read-only",
+        ("google-gmail", true) => "gmail-read-write",
+        ("google-calendar", false) => "calendar-read-only",
+        ("google-calendar", true) => "calendar-read-write",
+        ("google-drive", false) => "drive-read-only",
+        ("google-drive", true) => "drive-read-write",
+        _ => "gmail-read-only",
+    }
 }
 
 // ── Tests ───────────────────────────────────────────────────────────
-//
-// This crate is `#![forbid(unsafe_code)]`; `std::env::set_var` is
-// unsafe in edition 2024 — NO env-mutating tests. All unit tests are
-// pure (no I/O, no env). End-to-end behavior is covered in
-// `tests/integration/quickstart_e2e.rs`.
 
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 mod tests {
     use super::*;
 
-    /// Every `policy_for` return value must be EXACTLY the shipped
-    /// policy name AND must appear verbatim as `name = "<literal>"` in
-    /// the bundled `default_policy.toml`. A future bundle rename then
-    /// breaks the build here, not production.
     #[test]
-    fn policy_for_returns_exact_shipped_literals() {
+    fn shipped_policy_for_returns_exact_shipped_literals() {
         let bundle = include_str!("default_policy.toml");
         let cases: &[(&str, bool, &str)] = &[
             ("gmail", false, "gmail-read-only"),
@@ -700,26 +571,30 @@ mod tests {
             ("drive", true, "drive-read-write"),
         ];
         for (svc, write, expected) in cases {
-            assert_eq!(
-                policy_for(svc, *write),
-                *expected,
-                "policy_for({svc}, {write}) literal drifted"
-            );
+            assert_eq!(shipped_policy_for(svc, *write), *expected);
             assert!(
                 bundle.contains(&format!("name = \"{expected}\"")),
-                "shipped default_policy.toml is missing `name = \"{expected}\"` — \
-                 quickstart would mis-bind in production"
+                "shipped default_policy.toml is missing `name = \"{expected}\"`"
             );
         }
     }
 
     #[test]
+    fn bare_selector_strips_google_prefix() {
+        assert_eq!(bare_selector("google-gmail"), "gmail");
+        assert_eq!(bare_selector("google-calendar"), "calendar");
+        assert_eq!(bare_selector("google-drive"), "drive");
+        assert_eq!(bare_selector("custom-thing"), "custom-thing");
+    }
+
+    #[test]
     fn service_predicate_accepts_known_rejects_others() {
+        let registry = permitlayer_connectors::ConnectorRegistry::load(None).unwrap();
         for ok in ["gmail", "calendar", "drive"] {
-            assert!(is_supported_service(ok), "{ok} should be supported");
+            assert!(registry.resolve_selector(ok).is_some(), "{ok} should be supported");
         }
         for bad in ["salesforce", "Gmail", "", "drive ", "slack"] {
-            assert!(!is_supported_service(bad), "{bad:?} must be rejected");
+            assert!(registry.resolve_selector(bad).is_none(), "{bad:?} must be rejected");
         }
     }
 
@@ -744,17 +619,11 @@ mod tests {
         }
     }
 
-    /// The interactive parser's documented "re-ask once then default
-    /// to read on junk" contract, exercised at the pure level: junk →
-    /// `None` (caller re-asks), and a second junk → still `None`
-    /// (caller defaults to read). This pins the semantics without the
-    /// I/O loop.
     #[test]
-    fn junk_then_junk_yields_default_read_semantics() {
-        assert_eq!(parse_access_line("garbage"), None);
-        assert_eq!(parse_access_line("more-garbage"), None);
-        // The fallback the loop applies after two misses:
-        let fallback = parse_access_line("garbage").unwrap_or(Access::Read);
-        assert_eq!(fallback, Access::Read);
+    fn access_tier_strings() {
+        assert_eq!(Access::Read.tier(), "read");
+        assert_eq!(Access::ReadWrite.tier(), "read-write");
+        assert!(Access::ReadWrite.is_write());
+        assert!(!Access::Read.is_write());
     }
 }

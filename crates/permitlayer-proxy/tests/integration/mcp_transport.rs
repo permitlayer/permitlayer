@@ -15,7 +15,7 @@ use axum::http::{HeaderMap, Method, StatusCode};
 use permitlayer_core::audit::event::AuditEvent;
 use permitlayer_core::scrub::{ScrubEngine, builtin_rules};
 use permitlayer_core::store::{AuditStore, CredentialStore, StoreError};
-use permitlayer_credential::{OAuthToken, SealedCredential};
+use permitlayer_credential::{ConnectionId, OAuthToken, SealedCredential, Slot};
 use permitlayer_proxy::request::ProxyRequest;
 use permitlayer_proxy::service::ProxyService;
 use permitlayer_proxy::token::ScopedTokenIssuer;
@@ -23,7 +23,6 @@ use permitlayer_proxy::transport::mcp::{CalendarMcpServer, DriveMcpServer, Gmail
 use permitlayer_proxy::upstream::UpstreamClient;
 use permitlayer_vault::Vault;
 use rmcp::ServerHandler;
-use url::Url;
 use zeroize::Zeroizing;
 
 // --- Test Helpers (same pattern as proxy_service.rs) ---
@@ -45,7 +44,10 @@ fn test_token_issuer() -> ScopedTokenIssuer {
 }
 
 struct MockCredentialStore {
-    services: HashMap<String, Vec<u8>>,
+    // Keyed on `(ConnectionId bytes, Slot byte)` per the Story 11.9 store
+    // re-key; `add_service` seeds under the legacy connection-id derivation
+    // (no binding stores wired) + Slot::Access.
+    services: HashMap<([u8; 16], u8), Vec<u8>>,
     master_key: [u8; 32],
 }
 
@@ -55,30 +57,48 @@ impl MockCredentialStore {
     }
 
     fn add_service(&mut self, service: &str, token_bytes: &[u8]) {
-        self.services.insert(service.to_owned(), token_bytes.to_vec());
+        let connection = crate::common::legacy_connection_id_for_service(service);
+        self.services
+            .insert((*connection.as_bytes(), Slot::Access.slot_byte()), token_bytes.to_vec());
     }
 }
 
 #[async_trait::async_trait]
 impl CredentialStore for MockCredentialStore {
-    async fn put(&self, _service: &str, _sealed: SealedCredential) -> Result<(), StoreError> {
+    async fn put(
+        &self,
+        _id: ConnectionId,
+        _slot: Slot,
+        _sealed: SealedCredential,
+    ) -> Result<(), StoreError> {
         Ok(())
     }
-    async fn get(&self, service: &str) -> Result<Option<SealedCredential>, StoreError> {
-        match self.services.get(service) {
+    async fn get(
+        &self,
+        id: ConnectionId,
+        slot: Slot,
+    ) -> Result<Option<SealedCredential>, StoreError> {
+        match self.services.get(&(*id.as_bytes(), slot.slot_byte())) {
             Some(token_bytes) => {
                 let vault = Vault::new(Zeroizing::new(self.master_key), 0);
                 let token = OAuthToken::from_trusted_bytes(token_bytes.clone());
-                match vault.seal(service, &token) {
+                match vault.seal(id, slot, &token) {
                     Ok(sealed) => Ok(Some(sealed)),
-                    Err(_) => panic!("mock seal failed for {service}"),
+                    Err(_) => panic!("mock seal failed for {id:?}/{slot:?}"),
                 }
             }
             None => Ok(None),
         }
     }
-    async fn list_services(&self) -> Result<Vec<String>, StoreError> {
-        Ok(self.services.keys().cloned().collect())
+    async fn list_connections(&self) -> Result<Vec<ConnectionId>, StoreError> {
+        Ok(self
+            .services
+            .keys()
+            .map(|(id_bytes, _slot)| ConnectionId::from_bytes(*id_bytes))
+            .collect())
+    }
+    async fn remove(&self, _id: ConnectionId, _slot: Slot) -> Result<bool, StoreError> {
+        Ok(false)
     }
 }
 
@@ -112,10 +132,8 @@ async fn build_service(server_url: &str) -> (Arc<ProxyService>, Arc<MockAuditSto
     let vault = Arc::new(test_vault());
     let token_issuer = Arc::new(test_token_issuer());
 
-    let client = reqwest::Client::builder().build().unwrap();
-    let mut base_urls = HashMap::new();
-    base_urls.insert("gmail".to_owned(), Url::parse(server_url).unwrap());
-    let upstream_client = Arc::new(UpstreamClient::with_client_and_urls(client, base_urls));
+    let upstream_client = Arc::new(UpstreamClient::new().unwrap());
+    let connectors = super::common::connector_registry_with(&[("gmail", server_url)]);
 
     let audit_store = Arc::new(MockAuditStore::new());
 
@@ -124,6 +142,7 @@ async fn build_service(server_url: &str) -> (Arc<ProxyService>, Arc<MockAuditSto
         vault,
         token_issuer,
         upstream_client,
+        connectors,
         Arc::clone(&audit_store) as Arc<dyn AuditStore>,
         test_scrub_engine(),
         std::env::temp_dir(),
@@ -148,6 +167,7 @@ fn mcp_tool_listing_returns_five_gmail_tools() {
         vault,
         token_issuer,
         Arc::new(upstream),
+        super::common::default_connector_registry(),
         audit_store as Arc<dyn AuditStore>,
         test_scrub_engine(),
         std::env::temp_dir(),
@@ -192,6 +212,7 @@ fn mcp_tool_input_schemas_have_no_meta_schema_declaration() {
         vault,
         token_issuer,
         Arc::new(upstream),
+        super::common::default_connector_registry(),
         audit_store as Arc<dyn AuditStore>,
         test_scrub_engine(),
         std::env::temp_dir(),
@@ -239,6 +260,56 @@ fn mcp_tool_input_schemas_have_no_meta_schema_declaration() {
 }
 
 #[test]
+fn connector_mcp_service_resolves_builtins_and_rejects_unknown() {
+    // Story 11.4: the generic resolver builds a service for each built-in
+    // connector id and returns None for any non-built-in id (the
+    // host-installed passthrough is stubbed — the route maps None to MCP
+    // not-found, never a panic).
+    use permitlayer_proxy::transport::mcp::{
+        ConnectorMcpService, connector_mcp_service, selector_to_connector_id,
+    };
+
+    let vault = Arc::new(test_vault());
+    let cred_store = MockCredentialStore::new(TEST_MASTER_KEY);
+    let upstream = UpstreamClient::new().unwrap();
+    let audit_store = Arc::new(MockAuditStore::new());
+    let token_issuer = Arc::new(test_token_issuer());
+    let proxy = Arc::new(ProxyService::new(
+        Arc::new(cred_store) as Arc<dyn CredentialStore>,
+        vault,
+        token_issuer,
+        Arc::new(upstream),
+        super::common::default_connector_registry(),
+        audit_store as Arc<dyn AuditStore>,
+        test_scrub_engine(),
+        std::env::temp_dir(),
+        std::env::temp_dir().join("permitlayer-test-media"),
+    ));
+
+    // Selector vocabulary maps to canonical ids.
+    assert_eq!(selector_to_connector_id("gmail"), Some("google-gmail"));
+    assert_eq!(selector_to_connector_id("calendar"), Some("google-calendar"));
+    assert_eq!(selector_to_connector_id("drive"), Some("google-drive"));
+    assert_eq!(selector_to_connector_id("acme"), None);
+
+    // Each built-in id yields its matching service arm.
+    assert!(matches!(
+        connector_mcp_service("google-gmail", Arc::clone(&proxy)),
+        Some(ConnectorMcpService::Gmail(_))
+    ));
+    assert!(matches!(
+        connector_mcp_service("google-calendar", Arc::clone(&proxy)),
+        Some(ConnectorMcpService::Calendar(_))
+    ));
+    assert!(matches!(
+        connector_mcp_service("google-drive", Arc::clone(&proxy)),
+        Some(ConnectorMcpService::Drive(_))
+    ));
+    // A non-built-in id resolves to no service (stub for host-installed).
+    assert!(connector_mcp_service("acme-widgets", proxy).is_none());
+}
+
+#[test]
 fn mcp_server_info_has_correct_name_and_version() {
     // Build a minimal GmailMcpServer (needs a real ProxyService, but we
     // only call get_info which doesn't touch it).
@@ -253,6 +324,7 @@ fn mcp_server_info_has_correct_name_and_version() {
         vault,
         token_issuer,
         Arc::new(upstream),
+        super::common::default_connector_registry(),
         audit_store as Arc<dyn AuditStore>,
         test_scrub_engine(),
         std::env::temp_dir(),
@@ -354,14 +426,8 @@ async fn mcp_search_constructs_correct_query_string() {
 #[tokio::test]
 async fn mcp_tool_error_returns_error_string_not_transport_error() {
     // Use an unreachable upstream to trigger an error.
-    let client = reqwest::Client::builder()
-        .connect_timeout(std::time::Duration::from_millis(100))
-        .timeout(std::time::Duration::from_millis(200))
-        .build()
-        .unwrap();
-    let mut base_urls = HashMap::new();
-    base_urls.insert("gmail".to_owned(), Url::parse("http://127.0.0.1:1/").unwrap());
-    let upstream_client = Arc::new(UpstreamClient::with_client_and_urls(client, base_urls));
+    let upstream_client = Arc::new(UpstreamClient::new().unwrap());
+    let connectors = super::common::connector_registry_with(&[("gmail", "http://127.0.0.1:1/")]);
 
     let mut cred_store = MockCredentialStore::new(TEST_MASTER_KEY);
     cred_store.add_service("gmail", b"test-oauth-access-token");
@@ -371,6 +437,7 @@ async fn mcp_tool_error_returns_error_string_not_transport_error() {
         Arc::new(test_vault()),
         Arc::new(test_token_issuer()),
         upstream_client,
+        connectors,
         Arc::new(MockAuditStore::new()) as Arc<dyn AuditStore>,
         test_scrub_engine(),
         std::env::temp_dir(),

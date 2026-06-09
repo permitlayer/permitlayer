@@ -74,3 +74,8 @@ credentials.json
 # Personal collaboration preferences (Austin)
 # ============================================================================
 /CLAUDE.md
+
+# Local workflow scratch notes (handoffs, retros, validation packages).
+# Working artifacts, not project deliverables — never committed.
+/workflow-*.md
+/workflow-*.toml

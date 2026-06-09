@@ -1,0 +1,32 @@
+# CodeQL model pack — permitlayer-specific sanitizers/validators.
+#
+# A models-as-data (MaD) pack that teaches CodeQL's Rust queries about
+# two project-specific facts the built-in heuristics cannot see, so the
+# affected alerts clear AT THE SOURCE (the rules stay fully live for any
+# other code):
+#
+#   1. `paths::canonical_dir_within_root` is a path-traversal barrier:
+#      it canonicalizes a directory AND verifies the result stays under a
+#      trusted root before returning it, so its output is safe to walk.
+#
+#   2. `AccountHint::masked` is a cleartext-logging barrier: it returns a
+#      redacted form of the account hint (PII), so its output is safe to
+#      print/log.
+#
+# Consumed via CodeQL model packs in code scanning. For DEFAULT setup the
+# pack is published to GHCR and added at the org level
+# (Settings → Code security → CodeQL model packs); see README in this
+# directory for the publish + enable runbook.
+#
+# Schema reference (authoritative): the Rust extensible predicates
+# `barrierModel` / `barrierGuardModel` are defined in
+# github/codeql:rust/ql/lib/codeql/rust/dataflow/internal/ModelsAsData.qll
+#   barrierModel:      path; output; kind; provenance
+#   barrierGuardModel: path; input; acceptingValue; kind; provenance
+library: true
+name: permitlayer/permitlayer-models
+version: 0.1.0
+extensionTargets:
+  codeql/rust-all: '*'
+dataExtensions:
+  - models/**/*.model.yml
