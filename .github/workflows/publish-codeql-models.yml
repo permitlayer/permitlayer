@@ -36,15 +36,28 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      # The CodeQL CLI bundle ships with `codeql pack publish`. Use the
-      # same action the analysis uses so the CLI version tracks the
-      # toolchain. `init` downloads + puts `codeql` on PATH; we run a
-      # throwaway language we don't analyze further (the action requires a
-      # language, but we only need the CLI binary it installs).
-      - name: Set up CodeQL CLI
-        uses: github/codeql-action/init@v4
-        with:
-          languages: actions
+      # Download the official CodeQL CLI **bundle** and put `codeql` on
+      # PATH. NOTE: `github/codeql-action/init` does NOT expose a `codeql`
+      # binary to later `run:` steps (it runs analysis itself), so a bare
+      # `codeql ...` there fails with exit 127. The bundle is the supported
+      # way to get the standalone CLI in CI. Pinned to a known release so
+      # publishes are reproducible; bump deliberately.
+      - name: Set up CodeQL CLI (bundle)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          CODEQL_BUNDLE_TAG: codeql-bundle-v2.25.6
+        run: |
+          set -euo pipefail
+          gh release download "$CODEQL_BUNDLE_TAG" \
+            --repo github/codeql-action \
+            --pattern 'codeql-bundle-linux64.tar.gz' \
+            --output /tmp/codeql-bundle.tar.gz
+          mkdir -p "$RUNNER_TEMP/codeql-home"
+          tar -xzf /tmp/codeql-bundle.tar.gz -C "$RUNNER_TEMP/codeql-home"
+          echo "$RUNNER_TEMP/codeql-home/codeql" >> "$GITHUB_PATH"
+
+      - name: Verify CLI is on PATH
+        run: codeql version
 
       - name: Publish model pack to GHCR
         run: |
