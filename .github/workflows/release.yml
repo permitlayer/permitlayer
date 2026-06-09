@@ -1496,11 +1496,24 @@ jobs:
             --token-out "$RUNNER_TEMP/release-inspector.token"
           TOKEN="$(cat "$RUNNER_TEMP/release-inspector.token")"
           CONTROL_TOKEN="$(cat "$HOME/.agentsso/control.token")"
+          # Epic 11 (Story 11.12): the seal endpoint is connection-keyed.
+          # The caller mints the connection's ULID and carries the
+          # connection's connector_id/name/tier — the old `service` +
+          # `agent` fields are gone. A fixed valid ULID is fine for this
+          # throwaway CI daemon (`agentsso connection add` mints a fresh
+          # one per connection in real use).
+          CONNECTION_ID="01ARZ3NDEKTSV4RRFFQ69G5FAV"
           curl -fsS -X POST "http://127.0.0.1:3820/v1/control/credentials/seal" \
             -H "Content-Type: application/json" \
             -H "X-Agentsso-Control: $CONTROL_TOKEN" \
-            -d '{"service":"gmail","agent":"release-inspector","access_token":"ya29.release-smoke-access-token","refresh_token":"1//release-smoke-refresh-token","granted_scopes":["https://www.googleapis.com/auth/gmail.readonly"],"client_type":"byo","client_bundle_json":"{\"client_id\":\"123.apps.googleusercontent.com\",\"client_secret\":\"GOCSPX-release-smoke-secret\",\"project_id\":\"release-smoke-proj\",\"v\":1}","expires_in_secs":3600,"if_exists":"replace"}'
+            -d '{"connection_id":"'"$CONNECTION_ID"'","connector_id":"google-gmail","name":"gmail","tier":"read","access_token":"ya29.release-smoke-access-token","refresh_token":"1//release-smoke-refresh-token","granted_scopes":["https://www.googleapis.com/auth/gmail.readonly"],"client_type":"byo","client_bundle_json":"{\"client_id\":\"123.apps.googleusercontent.com\",\"client_secret\":\"GOCSPX-release-smoke-secret\",\"project_id\":\"release-smoke-proj\",\"v\":1}","expires_in_secs":3600,"if_exists":"replace"}'
           agentsso reload
+          # Epic 11 (Story 11.14): `/mcp/<selector>` authorizes per-agent
+          # bindings at request time — the agent must hold a binding to
+          # the connection or every data-plane request is denied. The
+          # connection is named `gmail`, so the existing
+          # PROXY_TARGET=/mcp/gmail resolves it by connection name.
+          agentsso bind release-inspector gmail --grant read
           export TOKEN
           export PROXY_TARGET="http://127.0.0.1:3820/mcp/gmail"
 
