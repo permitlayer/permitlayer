@@ -309,8 +309,6 @@ async fn main() -> ExitCode {
         // correctable → 2; conflict/system → 3) via `cli::oauth_seal`.
         Some(Commands::Bind(args)) => connection_to_exit_code(cli::bind::run_bind(args).await),
         Some(Commands::Unbind(args)) => connection_to_exit_code(cli::bind::run_unbind(args).await),
-        // Quickstart is a stub until Story 11.15 (it errors via
-        // `oauth_seal::exit2`), routed through the same exit dispatcher.
         Some(Commands::Quickstart(args)) => {
             connection_to_exit_code(cli::quickstart::run(args).await)
         }

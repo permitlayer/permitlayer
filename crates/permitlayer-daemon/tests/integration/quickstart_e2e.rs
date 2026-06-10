@@ -224,6 +224,70 @@ fn quickstart_read_and_read_write_are_mutually_exclusive() {
     );
 }
 
+#[test]
+fn quickstart_headless_and_device_flow_are_mutually_exclusive() {
+    let home = tempfile::TempDir::new().unwrap();
+    let (status, _stdout, stderr) =
+        run_cli(home.path(), &["quickstart", "gmail", "--read", "--headless", "--device-flow"]);
+    assert_eq!(status, Some(2), "clap conflict → exit 2; stderr={stderr}");
+    assert!(
+        stderr.contains("--headless") || stderr.contains("--device-flow"),
+        "stderr should name the conflicting flag: {stderr}"
+    );
+}
+
+/// `--headless` must actually reach `OAuthSealInputs` (a clap-accept
+/// test alone would pass with the flag parsed but never wired — the
+/// exact bug class this flag's introduction fixes). EOF on stdin is
+/// the headless paste flow's documented cancel path, so the run fails
+/// without any Google round-trip — but ONLY the headless branch prints
+/// the paste-consent block first. Asserting on that block proves the
+/// flag propagated through quickstart into the OAuth dance.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn quickstart_headless_flag_reaches_oauth_dance() {
+    let home = tempfile::TempDir::new().unwrap();
+    std::fs::create_dir_all(home.path().join("config")).unwrap();
+    let daemon = start_daemon(DaemonTestConfig {
+        port: 0,
+        home: home.path().to_path_buf(),
+        ..Default::default()
+    });
+    let port = daemon.port;
+    assert!(wait_for_health(port), "daemon did not become healthy");
+    assert!(wait_for_control_ready(home.path(), port), "daemon control plane did not become ready");
+
+    let oauth_client = write_fake_oauth_client(home.path());
+    let home_path = home.path().to_path_buf();
+    let (status, stderr) = tokio::task::spawn_blocking(move || {
+        let output = Command::new(agentsso_bin())
+            .args([
+                "quickstart",
+                "gmail",
+                "--read",
+                "--headless",
+                "--oauth-client",
+                oauth_client.to_str().unwrap(),
+            ])
+            .env("AGENTSSO_PATHS__HOME", home_path.to_str().unwrap())
+            .env("AGENTSSO_HTTP__BIND_ADDR", format!("127.0.0.1:{port}"))
+            .env("AGENTSSO_TEST_MASTER_KEY_HEX", crate::common::TEST_MASTER_KEY_HEX)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .expect("spawn agentsso quickstart --headless");
+        (output.status.code(), String::from_utf8_lossy(&output.stderr).into_owned())
+    })
+    .await
+    .expect("join quickstart child");
+
+    assert!(
+        stderr.contains("Paste redirect URL"),
+        "headless paste prompt must render — the flag did not reach the OAuth dance: {stderr}"
+    );
+    assert_ne!(status, Some(0), "EOF on stdin is a cancel — the run must not succeed");
+}
+
 fn write_fake_oauth_client(home: &std::path::Path) -> std::path::PathBuf {
     // Valid-shape Google "installed app" client JSON — `resolve_oauth_client`
     // parses it so the device-flow dance can use its client_id.

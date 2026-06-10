@@ -70,12 +70,21 @@ agentsso quickstart calendar --read-write --oauth-client ./client_secret.json
 # → binds the agent to calendar-read-write
 ```
 
-To move an existing agent between tiers, re-run `quickstart` for the
-service with the other flag (e.g. `--read-write` instead of `--read`).
-`quickstart` is idempotent; the second run rebinds the agent to the
-new policy and emits a fresh MCP config snippet. The bearer token is
-printed once during the run — capture it then, or pass
-`--mcp-config-out <path>` to write the full config snippet to disk.
+To move an existing agent between tiers, unbind and re-bind with the
+new grant:
+
+```sh
+agentsso unbind calendar-quickstart calendar-quickstart-calendar
+agentsso bind calendar-quickstart calendar-quickstart-calendar --grant read-write
+```
+
+Re-running `quickstart` for an agent that already exists errors with
+`agent.duplicate_name` — quickstart can't recover an existing agent's
+bearer token, so it refuses rather than mint a half-configured
+duplicate; the error's remediation points at the `bind` path. The
+bearer token is printed once during the first run — capture it then,
+or pass `--mcp-config-out <path>` to write the full config snippet to
+disk.
 
 To narrow a tier further (e.g. only the primary calendar, or one Drive
 folder), copy the tier policy in `default.toml` to a new named policy

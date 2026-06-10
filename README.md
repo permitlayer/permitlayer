@@ -158,7 +158,7 @@ agentsso quickstart gmail --read --oauth-client ./client_secret.json --headless
 
 For truly headless boxes (no browser available at all on the target
 machine, e.g. CI runners, cloud-init provisioning, fully-headless
-servers), use `--device-flow` instead. The daemon prints a URL + code,
+servers), use `--device-flow` instead. The CLI prints a URL + code,
 you complete consent on any device with a browser (laptop, phone), and
 polling completes without operator interaction at the target machine:
 
@@ -176,7 +176,7 @@ agentsso quickstart gmail --read --oauth-client ./client_secret_device.json \
 redirect flow takes a different code path). It is compatible with
 `--non-interactive` — that's the canonical scripted-headless invocation.
 
-In headless mode the daemon prints the authorization URL, attempts to
+In headless mode the CLI prints the authorization URL, attempts to
 copy it to your terminal's clipboard via OSC 52 (works in iTerm2,
 Kitty, Wezterm, VS Code's integrated terminal — silently no-ops in
 others, in which case mouse-select the URL above), and then waits for
@@ -193,7 +193,7 @@ Workflow:
 5. Copy the full redirect URL from your browser's address bar.
 6. Paste it into the `agentsso quickstart` prompt and press Enter.
 
-The daemon validates the pasted URL against the redirect URI it
+The CLI validates the pasted URL against the redirect URI it
 issued (scheme, host, port, path, and CSRF state must all match)
 and exchanges the authorization code for tokens locally.
 

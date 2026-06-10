@@ -21,6 +21,7 @@ pub mod client;
 pub mod error;
 pub mod google;
 pub(crate) mod headless;
+pub mod osc52;
 pub mod pkce;
 pub mod refresh;
 

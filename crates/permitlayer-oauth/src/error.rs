@@ -393,7 +393,7 @@ impl OAuthError {
                 "The file must be a Google Cloud Console OAuth client JSON (installed or web type)."
             }
             Self::SealedClientBundleInvalid { .. } => {
-                "The sealed OAuth client bundle is unreadable. Re-run `agentsso connection add <connector> --oauth-client <path>` to re-seal it."
+                "The sealed OAuth client bundle is unreadable. Re-run the same command with `--oauth-client <path>` to re-seal it."
             }
             Self::VerificationFailed { .. } => VERIFY_FAILED_GENERIC_REMEDIATION,
             Self::PastedUrlMalformed => {
@@ -408,21 +408,24 @@ impl OAuthError {
             Self::PastedUrlMissingState => {
                 "Paste the full redirect URL including the `state` query parameter — it's part of the URL after `?state=...`."
             }
+            // Remediations below are verb-neutral: both `quickstart`
+            // and `connection add` reach these paths, so naming one
+            // verb sends operators of the other to the wrong command.
             Self::PastedUrlStateMismatch => {
-                "The pasted URL is from a different setup session. Re-run `agentsso connection add <connector> --headless` to start a fresh flow."
+                "The pasted URL is from a different setup session. Re-run the same command with `--headless` to start a fresh flow."
             }
             // Story 7.17 device flow:
             Self::DeviceCodeExpired => {
-                "Re-run `agentsso connection add <connector> --device-flow` to issue a fresh device code, then approve consent before it expires."
+                "Re-run the same command with `--device-flow` to issue a fresh device code, then approve consent before it expires."
             }
             Self::DeviceFlowTimeout { .. } => {
-                "Re-run `agentsso connection add <connector> --device-flow` and approve consent more quickly, or extend the deadline with `--device-flow-timeout <seconds>`."
+                "Re-run the same command with `--device-flow` and approve consent more quickly, or extend the deadline with `--device-flow-timeout <seconds>`."
             }
             Self::DeviceCodeDenied => {
-                "Re-run `agentsso connection add <connector> --device-flow` and click 'Allow' on the Google consent page."
+                "Re-run the same command with `--device-flow` and click 'Allow' on the Google consent page."
             }
             Self::DeviceFlowProtocol { .. } => {
-                "Verify the OAuth client is of type 'TV and Limited Input Device' (not 'Desktop app'). Re-run `agentsso connection add <connector> --device-flow --oauth-client <path>` once the client type is fixed."
+                "Verify the OAuth client is of type 'TV and Limited Input Device' (not 'Desktop app'). Re-run with `--device-flow --oauth-client <path>` once the client type is fixed."
             }
         }
     }
