@@ -219,7 +219,9 @@ impl OAuthClient {
         // Await authorization code from callback server.
         let code =
             callback_server.code_receiver.await.map_err(|_| OAuthError::CallbackTimeout {
-                timeout_secs: timeout.unwrap_or(Duration::from_secs(120)).as_secs(),
+                timeout_secs: timeout
+                    .unwrap_or(Duration::from_secs(crate::callback::DEFAULT_TIMEOUT_SECS))
+                    .as_secs(),
             })??;
 
         // Exchange code for tokens.
@@ -554,15 +556,15 @@ pub(crate) fn should_skip_browser_open() -> bool {
     false
 }
 
-/// Print the non-GUI consent block: prominent copy-paste markers
-/// around the OAuth URL plus a suggestion to re-run with
-/// `--headless` or `--device-flow` so the redirect can be captured
-/// without a local browser. `open_err` is `Some` when the block is
+/// Print the non-GUI consent block and attempt an OSC 52 clipboard
+/// copy of the URL (fire-and-forget; tunnels through SSH to the
+/// operator's local clipboard). `open_err` is `Some` when the block is
 /// shown because `open::that()` failed (vs. shown because
 /// `should_skip_browser_open` tripped up front).
 fn print_non_gui_consent_block(url: &str, open_err: Option<&std::io::Error>) {
     let mut stderr = std::io::stderr();
     let _ = render_non_gui_consent_block(&mut stderr, url, open_err);
+    crate::osc52::emit_osc52_copy(url);
 }
 
 fn render_non_gui_consent_block<W: std::io::Write>(
@@ -577,19 +579,33 @@ fn render_non_gui_consent_block<W: std::io::Write>(
         writeln!(w, "  detected non-GUI / cross-session context — skipping browser-open.")?;
     }
     writeln!(w)?;
-    writeln!(w, "  ── copy this URL into a browser on any device ──────────────")?;
+    writeln!(w, "  the consent redirect lands on a 127.0.0.1 port this process is")?;
+    writeln!(w, "  listening on, so only a browser ON THIS MACHINE can finish this")?;
+    writeln!(
+        w,
+        "  run (it gives up after {}s). From SSH or another device, Ctrl-C",
+        crate::callback::DEFAULT_TIMEOUT_SECS
+    )?;
+    writeln!(w, "  and re-run with one of:")?;
+    writeln!(w)?;
+    writeln!(w, "    --headless        — paste the post-consent URL back via stdin")?;
+    writeln!(w, "                        (best for SSH; consent can happen in a")?;
+    writeln!(w, "                        browser on another device)")?;
+    writeln!(w, "    --device-flow     — Google OAuth 2.0 device flow (RFC 8628;")?;
+    writeln!(w, "                        best for truly browser-less hosts)")?;
+    writeln!(w)?;
+    writeln!(w, "  if this machine DOES have a local browser and detection misfired")?;
+    writeln!(w, "  (e.g. tmux/screen preserving SSH_TTY across a local reattach),")?;
+    writeln!(w, "  re-run with AGENTSSO_FORCE_BROWSER_OPEN=1 instead.")?;
+    writeln!(w)?;
+    writeln!(w, "  ── open this URL in a browser on this machine ──────────────")?;
     writeln!(w)?;
     writeln!(w, "    {url}")?;
     writeln!(w)?;
     writeln!(w, "  ─────────────────────────────────────────────────────────────")?;
     writeln!(w)?;
-    writeln!(w, "  this OAuth flow needs to receive the redirect URL too. Re-run")?;
-    writeln!(w, "  with one of:")?;
-    writeln!(w)?;
-    writeln!(w, "    --headless        — paste the post-consent URL back via stdin")?;
-    writeln!(w, "                        (best for SSH from a machine with a browser)")?;
-    writeln!(w, "    --device-flow     — Google OAuth 2.0 device flow (RFC 8628;")?;
-    writeln!(w, "                        best for truly browser-less hosts)")?;
+    writeln!(w, "  (attempted to copy the URL to your terminal's clipboard — if")?;
+    writeln!(w, "   your terminal supports OSC 52, paste it directly.)")?;
     writeln!(w)?;
     Ok(())
 }
@@ -640,10 +656,23 @@ mod tests {
         assert!(text.contains("--headless"));
         assert!(text.contains("--device-flow"));
         assert!(text.contains("non-GUI"));
+        assert!(text.contains("this machine"));
+        assert!(text.contains("AGENTSSO_FORCE_BROWSER_OPEN"));
+        assert!(text.contains("clipboard"));
+        // The wait bound must come from the callback const, not a
+        // re-hardcoded literal.
+        assert!(text.contains(&format!("{}s", crate::callback::DEFAULT_TIMEOUT_SECS)));
         // rc.13 anti-regression: never recommend a curl-from-this-host
         // recipe (that fallback was misleading because the OAuth code
         // grant requires the browser callback, not just a fetch).
         assert!(!text.contains("curl"), "rc.13: drop the misleading curl-from-this-host hint");
+        // 1.3.x anti-regression: the loopback redirect_uri can only be
+        // completed by a same-machine browser; never claim "any device"
+        // for the URL-open path (that's --headless/--device-flow turf).
+        assert!(
+            !text.contains("any device"),
+            "loopback callback only completes on this machine — don't claim 'any device'"
+        );
     }
 
     /// When the consent block is rendered because `open::that()`

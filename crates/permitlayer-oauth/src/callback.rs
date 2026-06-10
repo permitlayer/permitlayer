@@ -29,8 +29,10 @@ use subtle::ConstantTimeEq;
 
 use crate::error::OAuthError;
 
-/// Default timeout for the callback server (seconds).
-const DEFAULT_TIMEOUT_SECS: u64 = 120;
+/// Default timeout for the callback server (seconds). Public so CLI
+/// surfaces (spinner message, consent-block copy) can state the real
+/// wait bound instead of hardcoding a drifting literal.
+pub const DEFAULT_TIMEOUT_SECS: u64 = 120;
 
 /// Query parameters expected on the callback URL.
 #[derive(serde::Deserialize)]
