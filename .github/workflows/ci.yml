@@ -5,6 +5,13 @@ on:
   push:
     branches: [main]
 
+# Least-privilege default for every job: the CI token can read the repo
+# and nothing else. No job in this workflow writes to GitHub (no
+# releases, no issues, no packages); jobs that ever need more must
+# declare it at the job level.
+permissions:
+  contents: read
+
 # Cancel superseded runs on the same ref so newer pushes don't wait for stale
 # builds — but NEVER cancel runs on `main`, because every main-branch commit
 # must complete its security gates (audit, deny, credential discipline) and
@@ -23,13 +30,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install Rust toolchain
         # rust-toolchain.toml pins the channel automatically.
         run: |
           rustup show active-toolchain || rustup toolchain install
           rustup component add rustfmt clippy
       - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # permitlayer-keystore's Linux backend links libdbus via the
       # `keyring` crate → `secret-service` → `dbus-rs` → `libdbus-sys`
       # chain. Cross-compiling clippy on Linux still triggers the
@@ -65,6 +74,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install Rust toolchain
         run: |
           rustup show active-toolchain || rustup toolchain install
@@ -85,7 +96,7 @@ jobs:
         # restoring them from cache anyway. Only the toolchain itself
         # (under `~/.rustup/`) and target/ need to be cached; both
         # remain cached because they're separate paths.
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
         with:
           cache-bin: false
       # Try the fast path first (taiki-e/install-action pulls a
@@ -97,7 +108,7 @@ jobs:
       # `cargo install` route below.
       - name: Install cargo-nextest (fast path)
         id: nextest-fast
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
         continue-on-error: true
         with:
           tool: cargo-nextest
@@ -156,10 +167,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: cargo xtask validate-credentials
         run: cargo xtask validate-credentials
 
@@ -168,10 +181,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: cargo xtask contrast-check
         run: cargo xtask contrast-check
 
@@ -180,10 +195,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       # Diff the live permitlayer-plugins host-API surface against
       # the committed host-api.lock. Fails on breaking changes that
       # were not accompanied by a major-version bump of
@@ -196,6 +213,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install shellcheck and minisign
         run: |
           sudo apt-get update
@@ -223,6 +242,8 @@ jobs:
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Test Homebrew patch script (brew style enforced)
         run: ./scripts/test-patch-homebrew-formula.sh
 
@@ -239,25 +260,49 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Run install.ps1 unit tests
         shell: pwsh
         run: pwsh ./scripts/test-install-ps1.ps1
+
+  # Workflow security audit. Replaces CodeQL (removed 2026-06-09 —
+  # its Rust taint queries were structurally noisy on a credentials
+  # codebase whose domain vocabulary collides with the sensitive-name
+  # heuristics; the compiler-enforced invariants + tests + reviews
+  # carry the Rust side). zizmor covers the GitHub Actions attack
+  # surface: excessive token permissions, credential persistence,
+  # template injection, unpinned third-party actions. Policy and
+  # scoped exemptions (with rationale) live in .github/zizmor.yml.
+  zizmor:
+    name: Workflow security (zizmor)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      # Version-pinned so a new zizmor release with new audits can't
+      # turn the gate red without a deliberate bump.
+      - name: Run zizmor
+        run: pipx run zizmor==1.25.2 .github/workflows/
 
   security:
     name: Security audit + deny
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - name: Install Rust toolchain
         run: rustup show active-toolchain || rustup toolchain install
       - name: Cache cargo registry
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
       - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
         with:
           tool: cargo-audit@0.22
       - name: Install cargo-deny
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@fd2f5e3d644b484055ebf4268f474c565f148f25 # v2.81.9
         with:
           tool: cargo-deny@0.19
       # Advisory ignores are duplicated here and in deny.toml —
