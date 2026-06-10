@@ -2,8 +2,21 @@ name: CI
 
 on:
   pull_request:
+    # Docs-only changes don't need the build matrix (or any of these
+    # jobs — none of them read markdown). A PR touching code AND docs
+    # still runs everything: paths-ignore only skips when EVERY changed
+    # file matches.
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
   push:
     branches: [main]
+    # NOTE: docs-only pushes to main produce NO CI run on that commit.
+    # The release gate ("CI green on the exact tag commit") must then
+    # look back to the newest commit that touched code.
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
 
 # Least-privilege default for every job: the CI token can read the repo
 # and nothing else. No job in this workflow writes to GitHub (no
@@ -70,7 +83,15 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [macos-14, macos-15-intel, ubuntu-latest, windows-latest]
+        # PR runs use the two FAST legs (~3.5 min wall); the slow legs
+        # (macos-15-intel ~8 min — slow Intel hardware — and
+        # windows-latest ~6.5 min) run on every push to main instead.
+        # NFR47 four-OS keystore parity still gates: a parity
+        # regression surfaces on main minutes after merge, before any
+        # release (release tags require CI green on the exact commit).
+        # The intel leg is also the flakiest (agent_register retry
+        # flake), so this halves PR wall-clock AND cuts re-run churn.
+        os: ${{ github.event_name == 'push' && fromJSON('["macos-14", "macos-15-intel", "ubuntu-latest", "windows-latest"]') || fromJSON('["macos-14", "ubuntu-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
