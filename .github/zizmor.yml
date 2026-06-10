@@ -1,0 +1,45 @@
+# zizmor configuration — GitHub Actions security policy for permitlayer.
+#
+# zizmor replaced CodeQL as this repo's workflow-security gate
+# (2026-06-09). It runs in CI (`ci.yml` → `zizmor` job, version-pinned)
+# and must pass with zero findings; every exemption below is scoped and
+# carries its rationale. Run locally with:
+#
+#   zizmor .github/workflows/
+#
+rules:
+  unpinned-uses:
+    config:
+      policies:
+        # GitHub-official actions may be referenced by major-version tag.
+        # They are maintained by GitHub, the tags are protected, and
+        # ref-pinning them is the posture cargo-dist's generated
+        # release.yml ships with — hash-pinning inside that generated
+        # file would be overwritten on the next `dist init`.
+        "actions/*": ref-pin
+        # Everything else (third-party) must be pinned to a commit hash
+        # with a `# vX.Y.Z` comment naming the audited release.
+        "*": hash-pin
+
+  template-injection:
+    ignore:
+      # All template-injection findings are in cargo-dist's GENERATED
+      # sections of release.yml (`${{ github.ref_name }}`,
+      # `${{ matrix.* }}`, `${{ needs.plan.outputs.* }}` interpolated
+      # into `run:` blocks). The interpolated values are either
+      # owner-controlled (the pushed tag name — only pushers can mint
+      # tags, and a pusher can already edit the workflow itself) or
+      # derived from repo-internal data (dist-manifest computed from
+      # Cargo.toml). The pull_request paths never interpolate the ref
+      # (guarded by `!github.event.pull_request`). Refactoring these to
+      # env-indirection means hand-editing generated code that the next
+      # `dist init` regenerates; the upstream fix belongs to cargo-dist.
+      - release.yml
+
+  unpinned-images:
+    ignore:
+      # `container: ${{ matrix.container.image }}` in cargo-dist's
+      # generated build matrix — the image value comes from dist's own
+      # plan output (repo-internal), and an expression can't be
+      # hash-pinned. Same generated-code rationale as above.
+      - release.yml
