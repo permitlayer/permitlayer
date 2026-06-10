@@ -25,7 +25,7 @@
 #   barrierGuardModel: path; input; acceptingValue; kind; provenance
 library: true
 name: permitlayer/permitlayer-models
-version: 0.1.0
+version: 0.1.1
 extensionTargets:
   codeql/rust-all: '*'
 dataExtensions:

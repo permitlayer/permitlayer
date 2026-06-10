@@ -34,12 +34,23 @@ auto-discovered from the repo. Steps:
    # → ghcr.io/permitlayer/permitlayer-models
    ```
 
-2. **Enable for default setup** (org admin, UI):
+2. **Make the GHCR package public** (org admin, UI). The code-scanning
+   runner pulls the pack anonymously; a private package fails with
+   `WARNING: Unable to download pack` in the scan log and the models
+   silently don't apply (the scan still reports success —
+   `--tolerate-errors`). Two clicks, in order:
+   - org **Settings → Packages → Package creation**: check **Public**
+     (otherwise the package page shows "Setting is disabled by
+     organization administrators").
+   - package **settings → Danger Zone → Change visibility → Public**
+     (`https://github.com/orgs/permitlayer/packages/container/permitlayer-models/settings`).
+
+3. **Enable for default setup** (org admin, UI):
    `permitlayer` org → **Settings → Code security → CodeQL model packs**
    → add `permitlayer/permitlayer-models`. Default setup then injects the
    pack on every scan of eligible repos.
 
-3. **Verify**: re-run code scanning on the PR; the modeled alerts clear.
+4. **Verify**: re-run code scanning on the PR; the modeled alerts clear.
    Tuning rounds (if any) edit `models/*.model.yml`, bump `version` in
    `qlpack.yml`, re-publish, re-scan.
 
