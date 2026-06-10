@@ -160,10 +160,12 @@ or `<svc>-read-write`) **and** decides which OAuth scopes the Google
 consent screen requests — `--read-write` pulls in the write scopes
 (e.g. `gmail.send`/`compose`/`modify`) so the sealed credential can
 actually write, not just the policy. A browser opens for Google
-consent; tokens are sealed locally. `quickstart` is idempotent — re-run
-it any time to refresh scope, rotate credentials, or repoint a client.
-(Re-running `--read-write` over an existing read-only credential
-re-prompts for consent to add the write scopes.)
+consent; tokens are sealed locally. `quickstart` is for FIRST-time
+setup of an agent: re-running it for an agent that already exists
+errors with `agent.duplicate_name` (it can't recover the existing
+bearer token). To change an existing agent's tier, `unbind` then
+`bind` with the new `--grant`; to rotate credentials, use
+`agentsso connection add` with a new connection or revoke first.
 
 Useful flags:
 
@@ -186,7 +188,7 @@ the per-service tool matrix, and the security posture.
 > followed by `agentsso connect <service>`. **The `connect` verb was
 > removed in the Epic 11 connection/binding model** — its OAuth + seal
 > flow now lives in `agentsso connection add <connector>`, and
-> `quickstart` collapses register + connect + bind into one idempotent
+> `quickstart` collapses register + connect + bind into one
 > command (the documented entry point). `agent register` still exists for
 > advanced use.
 
@@ -396,6 +398,10 @@ press Ctrl-C and re-run with one of:
   truly browser-less hosts (CI runners, cloud-init). Requires an
   OAuth client of type **TV and Limited Input Device** (separate
   Google client type from the Desktop app type).
+- `AGENTSSO_FORCE_BROWSER_OPEN=1` — the inverse problem: detection
+  trips but this machine DOES have a usable local browser (e.g.
+  tmux/screen preserving `SSH_TTY` across a local reattach). Set this
+  env var on the re-run to force the browser-open path.
 
 ### MCP client can't connect to `127.0.0.1:3820`
 

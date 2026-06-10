@@ -376,7 +376,10 @@ pub(crate) async fn oauth_dance_and_seal(
                 .unwrap_or_else(|_| indicatif::ProgressStyle::default_spinner()),
         );
         spinner.enable_steady_tick(std::time::Duration::from_millis(120));
-        spinner.set_message("waiting for browser consent...");
+        spinner.set_message(format!(
+            "waiting for browser consent (times out after {}s)...",
+            permitlayer_oauth::callback::DEFAULT_TIMEOUT_SECS
+        ));
         let guard = SpinnerGuard::new(spinner);
         let r = client.authorize(scopes_owned.clone(), None).await;
         drop(guard);

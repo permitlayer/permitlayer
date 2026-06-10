@@ -133,7 +133,7 @@ pub(crate) fn print_headless_consent_block(url: &str) {
     eprintln!();
     eprintln!("    {url}");
     eprintln!();
-    emit_osc52_copy(url);
+    permitlayer_oauth::osc52::emit_osc52_copy(url);
     eprintln!("  (Attempted to copy the URL to your terminal's clipboard. If your");
     eprintln!("   terminal supports OSC 52, paste it directly. Otherwise select");
     eprintln!("   and copy the URL above manually.)");
@@ -143,35 +143,6 @@ pub(crate) fn print_headless_consent_block(url: &str) {
     eprintln!("  Copy the full redirect URL from your browser's address bar and");
     eprintln!("  paste it below.");
     eprintln!();
-}
-
-fn emit_osc52_copy(text: &str) {
-    let payload = encode_base64_standard(text.as_bytes());
-    eprint!("\x1b]52;c;{payload}\x07");
-    let _ = std::io::stderr().flush();
-}
-
-fn encode_base64_standard(bytes: &[u8]) -> String {
-    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
-    for chunk in bytes.chunks(3) {
-        let b0 = chunk[0];
-        let b1 = chunk.get(1).copied().unwrap_or(0);
-        let b2 = chunk.get(2).copied().unwrap_or(0);
-        out.push(ALPHABET[(b0 >> 2) as usize] as char);
-        out.push(ALPHABET[(((b0 & 0b11) << 4) | (b1 >> 4)) as usize] as char);
-        if chunk.len() >= 2 {
-            out.push(ALPHABET[(((b1 & 0b1111) << 2) | (b2 >> 6)) as usize] as char);
-        } else {
-            out.push('=');
-        }
-        if chunk.len() >= 3 {
-            out.push(ALPHABET[(b2 & 0b111111) as usize] as char);
-        } else {
-            out.push('=');
-        }
-    }
-    out
 }
 
 /// Read the operator's pasted redirect URL from stdin. Bounded
@@ -219,24 +190,6 @@ pub(crate) async fn read_pasted_redirect_url() -> Result<String, permitlayer_oau
         });
     }
     Ok(trimmed.to_owned())
-}
-
-#[cfg(test)]
-#[allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-mod base64_tests {
-    use super::encode_base64_standard;
-
-    /// RFC 4648 §10 test vectors.
-    #[test]
-    fn rfc4648_vectors() {
-        assert_eq!(encode_base64_standard(b""), "");
-        assert_eq!(encode_base64_standard(b"f"), "Zg==");
-        assert_eq!(encode_base64_standard(b"fo"), "Zm8=");
-        assert_eq!(encode_base64_standard(b"foo"), "Zm9v");
-        assert_eq!(encode_base64_standard(b"foob"), "Zm9vYg==");
-        assert_eq!(encode_base64_standard(b"fooba"), "Zm9vYmE=");
-        assert_eq!(encode_base64_standard(b"foobar"), "Zm9vYmFy");
-    }
 }
 
 #[cfg(test)]

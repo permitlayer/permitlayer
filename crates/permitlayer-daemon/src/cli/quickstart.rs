@@ -142,6 +142,12 @@ pub struct QuickstartArgs {
     #[arg(long)]
     pub non_interactive: bool,
 
+    /// Skip browser launch; print the auth URL and accept a pasted
+    /// redirect URL via stdin. Mutually exclusive with `--device-flow`
+    /// (the paste flow needs a controlling terminal).
+    #[arg(long, conflicts_with = "non_interactive", conflicts_with = "device_flow")]
+    pub headless: bool,
+
     /// Use Google OAuth 2.0 device flow (RFC 8628) for the OAuth step.
     #[arg(long)]
     pub device_flow: bool,
@@ -281,7 +287,7 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
             oauth_config,
             connection_id,
             interactive,
-            headless: false,
+            headless: args.headless,
             device_flow: args.device_flow,
             device_flow_timeout: args.device_flow_timeout,
         },
@@ -407,10 +413,10 @@ pub async fn run(args: QuickstartArgs) -> Result<()> {
 }
 
 /// Register the agent and capture its minted bearer. Returns the bearer
-/// on a fresh registration. An already-existing agent is NOT an error
-/// (quickstart is idempotent on re-run) — but quickstart needs the bearer
-/// to emit the snippet, and a re-registration can't retrieve the old
-/// token, so a duplicate is surfaced with the manual remediation.
+/// on a fresh registration. Quickstart needs the bearer to emit the
+/// snippet, and a re-registration can't retrieve the old token, so an
+/// already-existing agent is surfaced as `agent.duplicate_name` with
+/// the manual bind remediation.
 ///
 /// `policy` passed to register: post-11.9 the register `--policy` is a
 /// validated-but-not-bound relic (authority flows via `bind`); quickstart
@@ -625,5 +631,49 @@ mod tests {
         assert_eq!(Access::ReadWrite.tier(), "read-write");
         assert!(Access::ReadWrite.is_write());
         assert!(!Access::Read.is_write());
+    }
+
+    /// `QuickstartArgs` is a flattened `Args` struct (no subcommand
+    /// enum), so clap-level parse tests need a `Parser` wrapper.
+    #[derive(clap::Parser)]
+    #[command(name = "quickstart")]
+    struct ArgsWrapper {
+        #[command(flatten)]
+        args: QuickstartArgs,
+    }
+
+    #[test]
+    fn headless_flag_parses() {
+        use clap::Parser as _;
+        let w = ArgsWrapper::try_parse_from(["quickstart", "gmail", "--read", "--headless"])
+            .expect("--headless must be a valid quickstart flag");
+        assert!(w.args.headless);
+        assert!(w.args.read);
+    }
+
+    #[test]
+    fn headless_conflicts_with_device_flow() {
+        use clap::Parser as _;
+        let r = ArgsWrapper::try_parse_from([
+            "quickstart",
+            "gmail",
+            "--read",
+            "--headless",
+            "--device-flow",
+        ]);
+        assert!(r.is_err(), "--headless + --device-flow must be a clap conflict");
+    }
+
+    #[test]
+    fn headless_conflicts_with_non_interactive() {
+        use clap::Parser as _;
+        let r = ArgsWrapper::try_parse_from([
+            "quickstart",
+            "gmail",
+            "--read",
+            "--headless",
+            "--non-interactive",
+        ]);
+        assert!(r.is_err(), "--headless + --non-interactive must be a clap conflict");
     }
 }

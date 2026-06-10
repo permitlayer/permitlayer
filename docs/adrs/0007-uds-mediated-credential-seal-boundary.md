@@ -44,6 +44,8 @@ The CLI now detects non-GUI / cross-session contexts before calling `open::that(
    - macOS: `stat -f %Su /dev/console` ≠ `$SUDO_USER` → cross-session. As a tiebreaker for the rare case where the equality holds by coincidence, `SSH_AUTH_SOCK` pointing at `/tmp/ssh-*` or `/var/tmp/ssh-*` (i.e. a forwarded sshd socket, not the launchd-managed local agent at `/private/tmp/com.apple.launchd.*/Listeners`) also trips skip.
 3. `AGENTSSO_FORCE_BROWSER_FALLBACK=1` env (test seam).
 
+`AGENTSSO_FORCE_BROWSER_OPEN=1` is the inverse, operator-facing escape hatch: it forces the browser-open path when a heuristic false-positives on a machine that does have a usable local browser (the canonical case is tmux/screen preserving `SSH_TTY` across a local reattach). It takes precedence over heuristics 1-2 but not over the test seam.
+
 When the heuristics don't trip, `open::that()` runs in `tokio::task::spawn_blocking` and its result is awaited normally. A wall-clock timeout was considered and rejected: `open::that()` returns when LaunchServices accepts the URL (microseconds), not when the browser is on-screen, and `tokio::time::timeout` does not cancel the inner blocking task — a wedged `LSOpenURLsWithRole` would still leak its worker thread. Any `Err` from `open::that()` itself routes to the same non-GUI consent block (with the underlying `io::Error` rendered) so the operator sees the `--headless` / `--device-flow` hints regardless of failure mode.
 
 ## Plaintext-token threat model
