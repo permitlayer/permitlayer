@@ -26,6 +26,41 @@ is required when a method is dropped in a major bump.
 
 _No changes yet._
 
+## [1.3.1] - 2026-06-10 — `agentsso` binary
+
+Patch release. Onboarding UX fixes from the first real SSH onboarding
+pass against a 1.3.0 install. Workspace / binary bump 1.3.0 → 1.3.1;
+plugin host-API surface unchanged (still `1.0.0-rc.1`).
+
+### Fixed
+
+- **`agentsso quickstart --headless` now exists.** The non-GUI consent
+  block and the install guide both pointed at `--headless`, but only
+  `connection add` had the flag — quickstart rejected its own
+  remediation. Same clap shape as `connection add` (conflicts with
+  `--non-interactive` and `--device-flow`).
+- **The non-GUI consent block tells the truth.** It claimed the OAuth
+  URL could be opened "in a browser on any device" — false: the
+  loopback `127.0.0.1:<port>/callback` redirect only completes from a
+  browser on the same machine. The block now leads with the
+  Ctrl-C-and-re-run path (`--headless` / `--device-flow`), states the
+  loopback constraint and the real 120s wait bound, and surfaces the
+  `AGENTSSO_FORCE_BROWSER_OPEN=1` override for detection
+  false-positives (tmux/screen preserving `SSH_TTY`).
+- **OSC 52 clipboard copy on the non-GUI block.** The consent URL is
+  now copied to the operator's terminal clipboard (tunnels through SSH)
+  from the browser-skip path too, not just `--headless` — shared
+  implementation in the new `permitlayer_oauth::osc52` module.
+- **Verb-neutral OAuth error remediations.** Six error remediations
+  hardcoded `agentsso connection add ...` even when the operator ran
+  `quickstart` (three were reachable via `quickstart --device-flow`).
+- The "waiting for browser consent" spinner states its timeout.
+- Docs: corrected the false "quickstart is idempotent" claims (re-runs
+  error with `agent.duplicate_name`; tier moves are `unbind` +
+  `bind --grant`), documented `AGENTSSO_FORCE_BROWSER_OPEN` in the
+  install guide and ADR-0007, and fixed "the daemon prints" → the CLI
+  in the README headless section.
+
 ## [1.3.0] - 2026-06-08 — `agentsso` binary
 
 Minor release. Introduces the **connector / connection / binding**
